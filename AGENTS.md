@@ -186,10 +186,8 @@ identity of every outgoing request:
   for SOCKS) and exits 2 on a bad one, since a broken proxy would
   otherwise make every provider silently return nothing. Recommend
   `socks5h://` (DNS at the proxy).
-- **Identity**: `scholar/<version> (+https://github.com/dbosk/scholar)`,
-  overridable by `SCHOLAR_USER_AGENT`. No email in it on purpose: the
-  UA goes to every host (publishers included); OpenAlex/Crossref/
-  Unpaywall get `SCHOLAR_EMAIL` via their own parameters. A
+- **Identity**: `scholar/<version> (+https://github.com/dbosk/scholar;
+  mailto:<SCHOLAR_EMAIL>)`, overridable by `SCHOLAR_USER_AGENT`. A
   caller's own User-Agent header is kept (DBLP's `DBLP_USER_AGENT`,
   arXiv's `arxiv.py/...`). Never imitate a browser: bot checks
   (Cloudflare challenges, login pages) are a stopping point, not
