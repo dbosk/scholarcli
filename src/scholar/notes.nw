@@ -116,7 +116,7 @@ from cachetools import TTLCache, cached
 import click
 import platformdirs
 
-from scholar.utils import legacy_hash_paper_id
+from scholar.utils import atomic_write_text, legacy_hash_paper_id
 @
 
 \subsection{Timestamp Representation}
@@ -597,13 +597,50 @@ def invalidate_notes_cache() -> None:
 def _get_cached_notes() -> dict[str, PaperNote]:
     """Load notes with short-lived cache for bulk operations."""
     return _load_all_notes()
+@
+
+\paragraph{Never treat a broken file as an empty one.}
+Every change to a note is a read--modify--write of the whole file.  The
+loader used to return an empty dictionary when the file existed but
+could not be parsed, so the next [[save_note]] wrote a file holding only
+the new note, and every other note was gone
+(\url{https://github.com/dbosk/scholar/issues/114}).  The writers made it
+worse by swallowing [[OSError]], so a failed write looked like a
+successful one.  This is the same failure class as the session file
+(\cref{sec:session-integrity}), and it gets the same remedies:
+\begin{description}
+\item[Unreadable is an error] A file that exists but cannot be read or
+  parsed raises [[NotesFileError]], which names the file.  Missing is
+  still empty: that is simply a user without notes yet.  Reading and
+  writing commands alike stop, which is the point: nothing may be
+  written over a file we could not read.  The CLI turns the error into
+  one line (\cref{sec:cli-main}).
+\item[Writes are atomic, with a backup] [[atomic_write_text]]
+  (\cref{sec:atomic-write}) replaces the file in one rename and keeps
+  the previous version as [[.bak]], so a crash mid-write cannot leave a
+  truncated file in the first place.
+\item[Write errors are reported] A failed write raises
+  [[NotesFileError]] too, instead of pretending to have saved.
+\end{description}
+The per-query decision files (\cref{sec:notes-search-decisions}) are
+handled the same way.
+
+<<paper notes functions>>=
+class NotesFileError(Exception):
+    """A notes or search-decisions file cannot be read or written."""
+
+    def __init__(self, path: Path, cause: Exception, action: str = "read"):
+        self.path = path
+        self.cause = cause
+        super().__init__(f"Cannot {action} notes file {path}: {cause}")
 
 
 def _load_all_notes() -> dict[str, PaperNote]:
     """
     Load all paper notes from disk.
 
-    Returns empty dict if file doesn't exist or is corrupted.
+    Returns an empty dict if the file does not exist. Raises
+    `NotesFileError` if it exists but cannot be read or parsed.
     Note: For bulk operations, prefer _get_cached_notes() to avoid
     repeated disk reads.
     """
@@ -617,22 +654,80 @@ def _load_all_notes() -> dict[str, PaperNote]:
             pid: PaperNote.from_dict(note_data)
             for pid, note_data in data.items()
         }
-    except (json.JSONDecodeError, OSError, KeyError):
-        return {}
+    except (json.JSONDecodeError, OSError, KeyError, ValueError,
+            TypeError, AttributeError) as error:
+        raise NotesFileError(notes_file, error) from error
 
 
 def _save_all_notes(notes: dict[str, PaperNote]) -> None:
     """
-    Save all paper notes to disk.
+    Save all paper notes to disk atomically, keeping a `.bak`.
+
+    Raises `NotesFileError` if the file cannot be written.
     """
     invalidate_notes_cache()  # Clear cache since notes are changing
     notes_file = get_data_dir() / NOTES_FILE
     data = {pid: note.to_dict() for pid, note in notes.items()}
     try:
-        with open(notes_file, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-    except OSError:
-        pass  # Silently fail if we can't write
+        atomic_write_text(
+            notes_file,
+            json.dumps(data, indent=2, ensure_ascii=False),
+            backup=True,
+        )
+    except OSError as error:
+        raise NotesFileError(notes_file, error, "write") from error
+@
+
+The regression test corrupts the notes file and then tries to add a note:
+the attempt must fail with the file named, and the file must be exactly
+as it was.  A write that fails must say so.
+
+<<test functions>>=
+class TestNotesFileIntegrity:
+    """A broken notes file is never read as empty or overwritten."""
+
+    def test_corrupt_notes_file_is_not_overwritten(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        invalidate_notes_cache()
+        paper = Paper(title="T", authors=["A"], doi="10.1/wp1-notes")
+        save_note(paper, "First note.")
+        notes_file = get_data_dir() / NOTES_FILE
+        truncated = notes_file.read_text()[:20]
+        notes_file.write_text(truncated)
+        invalidate_notes_cache()
+
+        other = Paper(title="U", authors=["B"], doi="10.1/wp1-notes-2")
+        with pytest.raises(NotesFileError, match="paper_notes.json"):
+            save_note(other, "Second note.")
+        assert notes_file.read_text() == truncated
+
+    def test_saves_keep_a_backup(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        invalidate_notes_cache()
+        paper = Paper(title="T", authors=["A"], doi="10.1/wp1-notes")
+        save_note(paper, "First note.")
+        save_note(paper, "Second note.")
+        backup = get_data_dir() / (NOTES_FILE + ".bak")
+        assert "First note." in backup.read_text()
+
+    def test_write_error_is_reported(self, tmp_path, monkeypatch):
+        import scholar.notes as notes
+
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        invalidate_notes_cache()
+
+        def failing_write(*args, **kwargs):
+            raise OSError("No space left on device")
+
+        monkeypatch.setattr(notes, "atomic_write_text", failing_write)
+        paper = Paper(title="T", authors=["A"], doi="10.1/wp1-notes")
+        with pytest.raises(NotesFileError, match="Cannot write"):
+            save_note(paper, "Lost?")
+@
+
+<<paper notes functions>>=
 
 
 def get_note(paper: Any) -> PaperNote | None:
@@ -1163,9 +1258,14 @@ class TestNotesCache:
 
 
 \section{Search Decisions Functions}
+\label{sec:notes-search-decisions}
 
 Search decisions are stored per-query, allowing us to restore the previous
 review state when repeating a search. Each query gets its own JSON file.
+Like the notes file, a decision file that exists but cannot be parsed
+raises [[NotesFileError]] rather than reading as \enquote{no previous
+decisions}, which would let the next save replace it; and it is written
+atomically with a [[.bak]].
 
 <<search decisions functions>>=
 def load_search_decisions(query: str) -> SearchDecisions | None:
@@ -1177,19 +1277,23 @@ def load_search_decisions(query: str) -> SearchDecisions | None:
     
     Returns:
         SearchDecisions if found, None otherwise.
+
+    Raises:
+        NotesFileError: The file exists but cannot be read or parsed.
     """
     query_hash = get_query_hash(query)
     decisions_file = get_decisions_dir() / f"{query_hash}.json"
-    
+
     if not decisions_file.exists():
         return None
-    
+
     try:
         with open(decisions_file, "r", encoding="utf-8") as f:
             data = json.load(f)
         return SearchDecisions.from_dict(data)
-    except (json.JSONDecodeError, OSError, KeyError):
-        return None
+    except (json.JSONDecodeError, OSError, KeyError, ValueError,
+            TypeError, AttributeError) as error:
+        raise NotesFileError(decisions_file, error) from error
 
 
 def save_search_decisions(
@@ -1214,15 +1318,15 @@ def save_search_decisions(
     
     decisions_file = get_decisions_dir() / f"{query_hash}.json"
     try:
-        with open(decisions_file, "w", encoding="utf-8") as f:
-            json.dump(
-                search_decisions.to_dict(),
-                f,
-                indent=2,
-                ensure_ascii=False,
-            )
-    except OSError:
-        pass  # Silently fail
+        atomic_write_text(
+            decisions_file,
+            json.dumps(
+                search_decisions.to_dict(), indent=2, ensure_ascii=False
+            ),
+            backup=True,
+        )
+    except OSError as error:
+        raise NotesFileError(decisions_file, error, "write") from error
 
 
 def get_previous_decision(query: str, paper: Any) -> ReviewDecisionRecord | None:
@@ -1286,6 +1390,22 @@ def clear_all_decisions() -> int:
         except OSError:
             pass
     return count
+@
+
+A corrupt decision file is an error, not an absent one, and stays as it
+was:
+
+<<test functions>>=
+def test_corrupt_decision_file_is_an_error(tmp_path, monkeypatch):
+    """load_search_decisions refuses a broken file instead of ignoring it."""
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+    record = ReviewDecisionRecord(status="kept", title="T")
+    save_search_decisions("wp1 query", {"doi:10.1/wp1": record})
+    path = get_decisions_dir() / f"{get_query_hash('wp1 query')}.json"
+    path.write_text("{")
+    with pytest.raises(NotesFileError, match=path.name):
+        load_search_decisions("wp1 query")
+    assert path.read_text() == "{"
 @
 
 \subsection{Migrating a paper's identity}

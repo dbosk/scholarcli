@@ -287,6 +287,12 @@ context (#107). `review.save_session` now:
 that exists but does not parse. `create_review_session` uses it, so
 `search -n`/`--review`/`rq` stop with one line instead of rebuilding over
 the file. Read-only callers still get `None` plus a warning.
+Notes (`paper_notes.json`) and per-query decision files follow the same
+rules (#114). A file that exists but does not parse raises
+`notes.NotesFileError` instead of reading as empty, which used to make
+the next save erase every other note. Writes are atomic with a `.bak`,
+and write errors raise instead of being swallowed. `cli.main()` turns
+the error into one line and exit 1.
 `sessions export` stages all its files with `utils.staged_outputs` and
 moves them into place only if every format succeeded (#83).
 `sessions list` warns on stderr about sessions with records but no
