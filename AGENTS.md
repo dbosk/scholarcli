@@ -154,6 +154,13 @@ the `ratelimit._sleep` test seam); hits on a retry are logged at INFO,
 the count goes to `last_retries` → `SearchResult.retries`, and a zero
 that survives is recorded (and cached) as 0, not as failed (#82).
 
+DBLP author names carry homonym numbers (`Wei Wang 0001`); `_convert_hit`
+drops a trailing space + exactly four digits
+(`strip_dblp_homonym_number`), else the number becomes the surname in
+cite keys, `audit_work_key` and the legacy hash id (#120). No session
+reconciliation for hash ids recorded with the number; cached DBLP
+results keep it until `scholar cache clear`.
+
 ### Scopus Empty Results
 
 A Scopus search with no hits returns one placeholder entry,
