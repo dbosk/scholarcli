@@ -3731,6 +3731,7 @@ class DBLPProvider:
     <<dblp search method>>
     <<dblp sanitize query>>
     <<dblp zero-hit warning>>
+    <<dblp zero-hit retry>>
     <<dblp fetch pages>>
     <<dblp fetch one page>>
     <<dblp check method>>
@@ -3776,6 +3777,7 @@ def search(
     the API's per-request maximum (1000 results per page).
     """
     self.last_error = None
+    self.last_retries = 0
     sanitized = self._sanitize_query(query)
     cache_key = (query, limit, filters.cache_key() if filters else "")
     if cache_key in self._cache:
@@ -3792,6 +3794,7 @@ def search(
 
     try:
         papers = self._fetch_pages(sanitized, limit, filters)
+        papers = self._retry_zero_hits(sanitized, limit, filters, papers)
     except RateLimited as e:
         # A persistent cooldown is active; the limiter already logged it.
         self.last_error = str(e)
@@ -3982,14 +3985,15 @@ class TestDBLPQuerySanitization:
                 provider.search(query)
                 provider.search(query)
 
-            assert mock_get.call_count == 1
+            # one request plus the zero-hit retries; the rerun is cached
+            assert mock_get.call_count == 1 + len(DBLP_ZERO_HIT_RETRY_DELAYS)
         warnings = [
             r for r in caplog.records if "implicit AND" in r.message
         ]
         assert len(warnings) == 2
 
     def test_cache_keyed_on_raw_query(self):
-        """Repeating a boolean-laden query makes only one HTTP request."""
+        """Repeating a boolean-laden query is answered from the cache."""
         provider = DBLPProvider()
 
         with patch("requests.get") as mock_get:
@@ -3997,7 +4001,153 @@ class TestDBLPQuerySanitization:
             provider.search("misconceptions AND novice")
             provider.search("misconceptions AND novice")
 
-            assert mock_get.call_count == 1
+            # one request plus the zero-hit retries; the repeat is cached
+            assert mock_get.call_count == 1 + len(DBLP_ZERO_HIT_RETRY_DELAYS)
+@
+
+\subsubsection{Retrying an empty answer}
+\label{sec:dblp-zero-hit-retry}
+
+DBLP has a second way of failing without saying so.  Under a burst of
+queries it sometimes answers with perfectly good JSON that reports zero
+hits, and the same query a little later returns papers
+(\url{https://github.com/dbosk/scholar/issues/82}: in a session of
+about two thousand records, re-runs of queries recorded as empty did
+find papers).  Nothing in the response tells this apart from a genuine
+negative, so we cannot detect it; we can only ask again.
+
+A query of [[DBLP_RETRY_MIN_TERMS]] or more terms that comes back
+empty is therefore repeated, after [[DBLP_ZERO_HIT_RETRY_DELAYS]]
+seconds (2, then 5), until it returns hits or the delays run out.  A
+single term is not repeated: one word that matches no title is the
+ordinary negative, and repeating every typo would double the requests
+for nothing.  The delays grow because throttling is a matter of
+recent request rate, and a backoff gives the rate time to fall; they
+stay short because a genuinely empty multi-term query---common, given
+DBLP's implicit AND---pays them in full.
+
+This is not the auto-relaxing we rejected for overconstrained queries
+(\cref{sec:dblp-sanitize}): the query sent is identical every time, so
+the result stays traceable to the recorded query.  What the record does
+gain is the number of repeats, in [[last_retries]] and from there in the
+search record (\cref{sec:search-result-error} of the core module), so a
+reader can see that the hits---or the zero---came only on a later
+attempt.  An empty answer that survives the retries is recorded and
+cached as zero, a genuine negative as far as we can tell; a retry that
+fails outright (non-JSON, persistent 429) makes the whole search fail,
+since the zero before it is then not trustworthy either.
+
+The waits go through [[ratelimit._sleep]], the seam the test suite
+already disables (\cref{ch:ratelimit}), so tests exercise the retries
+without waiting for them.
+
+<<dblp zero-hit retry>>=
+def _retry_zero_hits(
+    self,
+    sanitized: str,
+    limit: int,
+    filters: SearchFilters | None,
+    papers: list[Paper],
+) -> list[Paper]:
+    """Repeat a multi-term query that returned nothing.
+
+    DBLP's throttling can return zero hits for a query that has some.
+    Counts the repeats in `last_retries`; exceptions propagate, so a
+    failed retry fails the search.
+    """
+    if papers or len(sanitized.split()) < DBLP_RETRY_MIN_TERMS:
+        return papers
+    for delay in DBLP_ZERO_HIT_RETRY_DELAYS:
+        ratelimit._sleep(delay)
+        self.last_retries += 1
+        papers = self._fetch_pages(sanitized, limit, filters)
+        if papers:
+            logger.info(
+                "dblp: retry %d of '%s' returned %d hits after an "
+                "empty answer (throttled)",
+                self.last_retries, sanitized, len(papers),
+            )
+            break
+    return papers
+@
+
+Let's verify the retry from every side: hits on the second attempt are
+kept and counted, a zero that survives all retries is a recorded zero
+(not a failure), the delays are the ones the prose promises, a single
+term is not retried, and a retry that fails fails the search:
+
+<<test functions>>=
+class TestDBLPZeroHitRetry:
+    """Tests for retrying DBLP's empty answers."""
+
+    <<dblp zero-hit retry test methods>>
+<<dblp zero-hit retry test methods>>=
+@staticmethod
+def _page(titles):
+    response = Mock()
+    response.status_code = 200
+    response.raise_for_status = Mock()
+    response.json.return_value = {"result": {"hits": {
+        "@total": str(len(titles)),
+        "hit": [{"info": {"title": t}} for t in titles],
+    }}}
+    return response
+
+def test_hits_on_retry_are_kept(self, monkeypatch, caplog):
+    delays = []
+    monkeypatch.setattr(ratelimit, "_sleep", delays.append)
+    provider = DBLPProvider()
+    with patch("requests.get", side_effect=[
+        self._page([]), self._page(["Found Later"]),
+    ]):
+        with caplog.at_level(logging.INFO, logger="scholar.providers"):
+            papers = provider.search("literate programming")
+    assert [p.title for p in papers] == ["Found Later"]
+    assert provider.last_retries == 1
+    assert provider.last_error is None
+    assert delays == [DBLP_ZERO_HIT_RETRY_DELAYS[0]]
+    assert any("after an empty answer" in r.message for r in caplog.records)
+
+def test_zero_after_retries_is_a_zero(self, monkeypatch):
+    delays = []
+    monkeypatch.setattr(ratelimit, "_sleep", delays.append)
+    provider = DBLPProvider()
+    with patch("requests.get", return_value=self._page([])) as mock_get:
+        assert provider.search("literate programming") == []
+        assert mock_get.call_count == 3
+    assert provider.last_retries == 2
+    assert provider.last_error is None
+    assert delays == [2.0, 5.0]
+
+def test_single_term_not_retried(self):
+    provider = DBLPProvider()
+    with patch("requests.get", return_value=self._page([])) as mock_get:
+        assert provider.search("zyzzyva") == []
+        assert mock_get.call_count == 1
+    assert provider.last_retries == 0
+
+def test_failed_retry_fails_the_search(self):
+    provider = DBLPProvider()
+    page = Mock(status_code=200, headers={"Content-Type": "text/html"})
+    page.raise_for_status = Mock()
+    page.json.side_effect = ValueError("Expecting value")
+    with patch("requests.get", side_effect=[self._page([]), page]):
+        assert provider.search("literate programming") == []
+    assert provider.last_error == "non-JSON response (HTTP 200, text/html)"
+    assert provider.last_retries == 1
+
+def test_retries_reach_the_search_result(self, monkeypatch):
+    from scholar import providers as providers_module
+
+    provider = DBLPProvider()
+    monkeypatch.setattr(providers_module, "PROVIDERS", {"dblp": provider})
+    with patch("requests.get", side_effect=[
+        self._page([]), self._page([]), self._page(["Third Time"]),
+    ]):
+        results = Search("literate programming").execute(providers=["dblp"])
+    assert results[0].retries == 2
+    assert results[0].error is None
+    assert len(results[0].papers) == 1
 @
 
 \subsubsection{Paging through results}
@@ -4302,6 +4452,7 @@ register_provider(DBLPProvider())
 <<dblp imports>>=
 import requests
 
+from scholar import ratelimit
 from scholar.scholar import normalize_venue
 @
 
@@ -4312,6 +4463,8 @@ DBLP_MAX_RETRIES = 3       # extra attempts on HTTP 429 before giving up
 DBLP_RETRY_BACKOFF = 2.0   # base seconds for the exponential 429 back-off
 DBLP_BOOLEAN_TOKENS = frozenset({"AND", "OR", "NOT"})
 DBLP_MANY_TERMS = 4        # warn on zero hits at or above this many terms
+DBLP_RETRY_MIN_TERMS = 2   # repeat empty answers from this many terms up
+DBLP_ZERO_HIT_RETRY_DELAYS = (2.0, 5.0)  # seconds before each repeat
 @
 
 \subsection{Testing DBLP provider}
