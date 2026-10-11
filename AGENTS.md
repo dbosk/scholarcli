@@ -389,9 +389,11 @@ report body builders (`build_review_provenance_latex`,
   `off-topic-false-hit` (4), pending (5), other (6). The caption never
   names the session (it is a `%` comment in the fragment) and ends with
   a full-name-first "Databases:" sentence built from the providers
-  present in the rows; one whose `SearchRecord`s carry errors is marked
+  the session searched (search records that answered at least once,
+  zero hits included, plus the rows; rows only for old sessions); one
+  whose `SearchRecord`s carry errors is marked
   "failed for k of n queries" / "incomplete for k of n queries"
-  (localised), and one that failed everywhere has no rows, so it is not
+  (localised), and one that failed every query outright is not
   named. `--bearing-only` lists only orders 0-2 and states the other
   counts in the caption. `all` stays csv + latex.
 - The TUI's `prompt_for_report` keeps the standalone default.
