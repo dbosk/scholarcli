@@ -4967,36 +4967,7 @@ def sessions_export(
         )
         output = f"review_{safe_name}"
 
-    files_created = []
-
-    if format_type in ("csv", "all"):
-        csv_path = Path(f"{output}.csv")
-        generate_csv_report(session, csv_path)
-        files_created.append(csv_path)
-
-    if format_type in ("latex", "all"):
-        tex_path = Path(f"{output}.tex")
-        generate_latex_report(session, tex_path, standalone=standalone)
-        files_created.append(tex_path)
-        files_created.append(tex_path.with_suffix(".bib"))
-
-    if format_type == "table":
-        table_path = Path(f"{output}.tex")
-        default_label = "".join(
-            c if c.isalnum() or c in "-_" else "_"
-            for c in (session.name or session.query)[:30]
-        )
-        generate_audit_table(
-            session,
-            table_path,
-            label=label or default_label,
-            lang=lang,
-            track=track,
-            theme_names=theme_names,
-            bearing_only=bearing_only,
-            truncate_titles=truncate_titles,
-        )
-        files_created.append(table_path)
+    <<write the export files all or nothing>>
 
     console.print("[green]Exported:[/green]")
     for f in files_created:
@@ -5064,6 +5035,124 @@ def _print_fragment_hint(console: Console, bib_name: str) -> None:
         f"\\addbibresource{{{escape(bib_name)}}} and the packages listed "
         "in its header to the preamble, and compile with biber.[/dim]"
     )
+@
+
+\paragraph{Writing the export all or nothing.}
+\label{sec:sessions-export-atomic}
+An export of several files is only useful as a set: the [[.tex]] cites
+keys from the [[.bib]], and a [[.csv]] next to them is expected to list the
+same decisions.  [[sessions export -f all]] used to write the [[.csv]]
+first and the [[.bib]] and [[.tex]] afterwards, so when the \LaTeX{} step
+crashed (once on a list-valued venue) the user was left with a fresh
+[[.csv]] beside a stale [[.tex]] that still compiled, and a traceback that
+had scrolled past (\url{https://github.com/dbosk/scholar/issues/83}).
+A partial export is worse than none.
+
+So the generators now write into a staging directory next to the targets
+([[staged_outputs]], \cref{sec:atomic-write}), and the files are moved
+into place only when every format has been built.  The generators need no
+change: each receives a path in the staging directory under the final
+file name, and the \LaTeX{} report derives its [[.bib]] from that path as
+before.  Any failure, a bug in a generator as much as a missing output
+directory, ends in one error line and exit code~1, with the previous
+outputs untouched.  The traceback goes to the debug log, where
+[[--verbose]] shows it.
+
+<<write the export files all or nothing>>=
+from scholar.utils import staged_outputs
+
+out_base = Path(output)
+files_created = []
+tex_path = Path(f"{output}.tex")
+try:
+    with staged_outputs(out_base.parent) as staging:
+        staged = staging / out_base.name
+
+        if format_type in ("csv", "all"):
+            generate_csv_report(session, Path(f"{staged}.csv"))
+            files_created.append(Path(f"{output}.csv"))
+
+        if format_type in ("latex", "all"):
+            generate_latex_report(
+                session, Path(f"{staged}.tex"), standalone=standalone
+            )
+            files_created.append(tex_path)
+            files_created.append(tex_path.with_suffix(".bib"))
+
+        if format_type == "table":
+            default_label = "".join(
+                c if c.isalnum() or c in "-_" else "_"
+                for c in (session.name or session.query)[:30]
+            )
+            generate_audit_table(
+                session,
+                Path(f"{staged}.tex"),
+                label=label or default_label,
+                lang=lang,
+                track=track,
+                theme_names=theme_names,
+                bearing_only=bearing_only,
+                truncate_titles=truncate_titles,
+            )
+            files_created.append(tex_path)
+except Exception as error:
+    logger.debug("Export of %s failed", name, exc_info=True)
+    console.print(
+        f"[red]Export failed, no files were written or changed: "
+        f"{escape(type(error).__name__)}: {escape(str(error))}[/red]"
+    )
+    raise typer.Exit(1)
+@
+
+The regression test makes the \LaTeX{} step fail after it has already
+written its [[.bib]], over an earlier complete export.  The earlier
+[[.csv]], [[.bib]] and [[.tex]] must survive byte for byte, no staging
+directory may be left behind, and the user gets one line, not a
+traceback.
+
+<<test functions>>=
+def test_failed_export_leaves_previous_outputs(tmp_path, monkeypatch):
+    """A failing LaTeX step must not leave a half-new export (#83)."""
+    from datetime import datetime
+    from scholar import review
+    from scholar.scholar import Paper
+
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+    session = review.ReviewSession(
+        query="q", providers=["openalex"], timestamp=datetime(2026, 1, 1),
+        name="atomic",
+    )
+    session.decisions = [review.ReviewDecision(
+        paper=Paper(title="Kept", authors=["A"], year=2024,
+                    doi="10.1/wp1-export"),
+        provider="openalex", status=review.DecisionStatus.KEPT,
+    )]
+    review.save_session(session)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    out = out_dir / "rep"
+    result = runner.invoke(
+        app, ["sessions", "export", "atomic", "-f", "all", "-o", str(out)]
+    )
+    assert result.exit_code == 0, result.output
+    before = {p.name: p.read_bytes() for p in out_dir.iterdir()}
+    assert set(before) == {"rep.csv", "rep.tex", "rep.bib"}
+
+    def failing_latex(session, output_path, *, standalone=True):
+        output_path.with_suffix(".bib").write_text("half-new bib")
+        raise AttributeError("'list' object has no attribute 'replace'")
+
+    session.decisions[0].tags = ["changed"]
+    review.save_session(session)
+    monkeypatch.setattr(review, "generate_latex_report", failing_latex)
+    result = runner.invoke(
+        app, ["sessions", "export", "atomic", "-f", "all", "-o", str(out)]
+    )
+    assert result.exit_code == 1
+    assert "Export failed" in result.output
+    assert "Traceback" not in result.output
+    after = {p.name: p.read_bytes() for p in out_dir.iterdir()}
+    assert after == before
 @
 
 The export command is exercised end to end through the CLI runner with a
