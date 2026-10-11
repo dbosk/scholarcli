@@ -370,8 +370,21 @@ batch once with the vocabulary spelled out when a paper would be left
 without tags. A session without tags imposes nothing unless
 `llm classify --tag` (the `vocabulary=` argument) seeds it; with
 `--allow-new-tags` (`allow_new_tags=`) the prompt asks the model to
-prefer the vocabulary but nothing is dropped or retried. The `llm`
+prefer the vocabulary and new tags are not dropped. The `llm`
 module is looked up via `globals()` so tests can substitute a fake model.
+
+Tag kinds: note tags (`NOTE_TAGS`, the union of every language's
+`AUDIT_STRINGS[lang]["notes"]`) are human-only, never offered (not even
+on examples' tag lines) and dropped if returned (`excluded_tags=`, also
+under `--allow-new-tags`). When the vocabulary holds any of
+`AUDIT_CATEGORIES`, the prompt lists them in a separate "Category
+(exactly one per paper)" section and the theme lists become optional
+extras; `parse_llm_response(category_tags=…)` sets
+`LLMDecision.category_problem` unless exactly one category remains
+after mapping, that triggers the same single retry, and a paper still
+invalid afterwards gets no decision (stays pending) and is listed in
+`LLMBatchResult.withheld`, which `llm classify` prints at the end.
+Sessions without category tags are classified as before.
 
 ### Interactive Tutorials (`scholar tutorial`)
 
