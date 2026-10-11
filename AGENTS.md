@@ -329,8 +329,12 @@ report body builders (`build_review_provenance_latex`,
   `_unique_by_paper_id`) use it; the builders keep the `cite_key`
   resolver because the two look keys up by different identities.
   Changing the scheme requires a `SYNTHESIS_CACHE_VERSION` bump (now
-  `v5`: cached prose cites keys literally). `search -f bibtex`
-  (`cli._bibtex_key`) is a separate, older scheme.
+  `v5`: cached prose cites keys literally). `search -f bibtex` and
+  `bibtex+prov` use it too (#122, `cli._keyed_papers`: keys assigned
+  once over all results in output order); this changed their keys
+  for comma-form names, apostrophes and clashes. `prov import/export`
+  match entries by `Paper.id`, never by key, so old `.bib` files still
+  round-trip.
 - `scholar sessions export -f table --lang en|sv --label L --track T
   --theme TAG=NAME -o base` writes `base.tex`, always a fragment: one
   row per *work* (`audit_work_key`: title and first-author surname
