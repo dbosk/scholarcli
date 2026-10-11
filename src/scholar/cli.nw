@@ -67,6 +67,7 @@ across bibliographic databases.
 <<output formatters>>
 <<typer application>>
 <<completion functions>>
+<<session error helpers>>
 <<search command>>
 <<rq command>>
 <<currency reporting helpers>>
@@ -746,14 +747,18 @@ logger.debug(f"Retrieved {len(results)} result sets")
 # If review mode, launch TUI instead of displaying results
 if review:
     from scholar.tui import run_review
+    from scholar.review import SessionFileError
     session_name = name if name else query
-    run_review(
-        merged_results,
-        query,
-        session_name,
-        prompt_report=report,
-        search_filters=filters,
-    )
+    try:
+        run_review(
+            merged_results,
+            query,
+            session_name,
+            prompt_report=report,
+            search_filters=filters,
+        )
+    except SessionFileError as error:
+        exit_on_unreadable_session(error)
     return
 
 # An explicit -n without --review still records the search
@@ -794,15 +799,42 @@ stdout may be machine-read ([[-f json]]/[[-f bibtex]] in pipelines) and must
 stay pure.
 
 <<persist search to named session>>=
-from scholar.review import create_review_session, save_session
+from scholar.review import (
+    create_review_session, save_session, SessionFileError,
+)
 
-session = create_review_session(merged_results, query, session_name=name)
+try:
+    session = create_review_session(merged_results, query, session_name=name)
+except SessionFileError as error:
+    exit_on_unreadable_session(error)
 session_path = save_session(session)
 Console(stderr=True).print(
     f"[green]Saved session:[/green] {escape(str(session_path))} "
     f"({len(session.decisions)} papers, "
     f"{len(session.pending_papers())} pending)"
 )
+@
+
+Appending must never treat an unreadable session file as a missing one,
+or it would save a session rebuilt from the new results over every
+earlier decision (\cref{sec:session-integrity}).  [[create_review_session]]
+raises [[SessionFileError]] in that case, and every command that appends
+([[search -n]], [[search --review]], [[rq]]) stops with one line that
+names the file and where its previous version is, instead of a traceback.
+Nothing has been written at that point, so the file is still there to be
+repaired or restored.
+
+<<session error helpers>>=
+def exit_on_unreadable_session(error) -> NoReturn:
+    """Report an unreadable session file on stderr and exit with 1."""
+    from scholar.utils import backup_path
+
+    Console(stderr=True).print(
+        f"[red]{escape(str(error))}[/red]\n"
+        "Nothing was saved. Repair the file or restore its previous "
+        f"version from {escape(str(backup_path(error.path)))}."
+    )
+    raise typer.Exit(1)
 @
 
 Let's verify the flag actually persists: a fresh [[-n]] search creates a
@@ -896,6 +928,25 @@ class TestSearchSessionPersist:
         result = runner.invoke(app, ["search", "q", "-f", "json"])
         assert result.exit_code == 0
         assert list_sessions() == []
+
+    def test_unreadable_session_is_left_alone(self, tmp_path, monkeypatch):
+        """search -n on a corrupt session fails instead of replacing it."""
+        from scholar.review import _get_sessions_dir
+
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        self._mock_provider(monkeypatch, [
+            Paper(title="New", authors=["A"], doi="10.1/wp1-new"),
+        ])
+        path = _get_sessions_dir() / "corrupt.json"
+        path.write_text('{"query": "q", "decisions": [')
+
+        result = runner.invoke(
+            app, ["search", "q", "-n", "corrupt", "-f", "json"]
+        )
+        assert result.exit_code == 1
+        assert "Cannot read session file" in result.output
+        assert "Traceback" not in result.output
+        assert path.read_text() == '{"query": "q", "decisions": ['
 @
 
 \subsection{Testing the search command}
@@ -1371,7 +1422,12 @@ if name is None:
 @
 
 <<create rq session>>=
-session = create_review_session(results, rq_text, session_name=name)
+from scholar.review import SessionFileError
+
+try:
+    session = create_review_session(results, rq_text, session_name=name)
+except SessionFileError as error:
+    exit_on_unreadable_session(error)
 session.research_context = rq_text
 @
 
@@ -2281,6 +2337,60 @@ class TestEnrichCommand:
         mock_migrate.assert_called_once_with(
             "doi:10.1/bare", "doi:10.48550/arxiv.2401.1"
         )
+@
+
+Enrichment of a large session takes hours, and it saves the session it
+loaded at the start.  That is how two classified sessions lost all their
+decisions and their research context
+(\url{https://github.com/dbosk/scholar/issues/107},
+\cref{sec:session-integrity}): the research context was set and the papers
+classified while an enrichment ran, and the enrichment's save then wrote
+its stale copy over them.  We replay that sequence through the real
+command, with the classification happening inside the stubbed enrichment,
+and require both the classification and the enrichment to survive.
+
+<<test functions>>=
+def test_enrich_keeps_decisions_saved_while_it_ran(tmp_path, monkeypatch):
+    """A classification saved during `scholar enrich` is not undone."""
+    from dataclasses import replace
+    from scholar import Paper, SearchResult, isolated_registry
+    from scholar.review import (
+        DecisionStatus, create_review_session, load_session, save_session,
+    )
+
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+    papers = [
+        Paper(title=f"Paper {i}", authors=["a"], doi=f"10.1/wp1-enrich-{i}")
+        for i in range(2)
+    ]
+    save_session(create_review_session(
+        [SearchResult(query="q", provider="m", timestamp="t", papers=papers)],
+        "q", session_name="race",
+    ))
+
+    def classify_meanwhile(papers, **kwargs):
+        with isolated_registry():
+            other = load_session("race")
+            other.research_context = "Does X support Y?"
+            for decision in other.decisions:
+                decision.status = DecisionStatus.DISCARDED
+                decision.tags = ["off-topic"]
+            save_session(other)
+        return [replace(p, abstract="Enriched.") for p in papers]
+
+    with patch(
+        "scholar.enrich.enrich_papers", side_effect=classify_meanwhile
+    ), patch(
+        "scholar.crossref.annotate_papers", side_effect=lambda ps, **kw: ps
+    ):
+        result = runner.invoke(app, ["enrich", "race"])
+    assert result.exit_code == 0, result.stdout
+
+    with isolated_registry():
+        saved = load_session("race")
+    assert saved.research_context == "Does X support Y?"
+    assert [d.status for d in saved.decisions] == [DecisionStatus.DISCARDED] * 2
+    assert all(d.paper.abstract == "Enriched." for d in saved.decisions)
 @
 
 <<test functions>>=
@@ -9008,7 +9118,7 @@ class TestSubcommandRegistration:
 We collect the imports used throughout the module:
 
 <<cli imports>>=
-from typing import Optional
+from typing import NoReturn, Optional
 from typing_extensions import Annotated
 from pathlib import Path
 from dataclasses import dataclass
