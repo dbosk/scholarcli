@@ -33,6 +33,8 @@ Providers self-register via `register_provider()` at module load time.
 | `src/scholar/preprint.nw` | Literate source for the preprint fallback |
 | `src/scholar/ratelimit.py` | Persistent cross-session rate-limit/quota tracking |
 | `src/scholar/ratelimit.nw` | Literate source for rate-limit tracking |
+| `src/scholar/network.py` | Proxy route and User-Agent for every request |
+| `src/scholar/network.nw` | Literate source for the network settings |
 | `src/scholar/cli.py` | CLI commands and output formatters |
 | `src/scholar/cli.nw` | Literate programming source for CLI |
 | `src/scholar/tutorials/*.nw` | Literate sources of the interactive tutorials (tangle to `*.md`, weave to chapters) |
@@ -210,6 +212,44 @@ openalex.org/settings/api; ten times the metered daily budget). The
 provider hands it to `pyalex.config.api_key` (sent as a bearer token);
 the health probe sends it as the `api_key` query parameter; `conftest.py`
 unsets it too.
+
+### Network: proxy and User-Agent
+
+`network.py` (`network.nw`, chapter `ch:network`) owns the route and the
+identity of every outgoing request:
+
+- **Route**: global CLI option `--proxy URL` (stored by
+  `network.set_proxy`, called by the app callback on every invocation)
+  wins over `SCHOLAR_PROXY`; with neither, requests' own
+  `HTTP(S)_PROXY`/`ALL_PROXY`/`NO_PROXY` handling applies. The proxy is
+  passed per request (`proxies=`), because requests lets the environment
+  override a session's `proxies` attribute. The callback validates the
+  URL (scheme http/https/socks4/socks4a/socks5/socks5h, a host, PySocks
+  for SOCKS) and exits 2 on a bad one, since a broken proxy would
+  otherwise make every provider silently return nothing. Recommend
+  `socks5h://` (DNS at the proxy).
+- **Identity**: `scholar/<version> (+https://github.com/dbosk/scholar)`,
+  overridable by `SCHOLAR_USER_AGENT`. No email in it on purpose: the
+  UA goes to every host (publishers included); OpenAlex/Crossref/
+  Unpaywall get `SCHOLAR_EMAIL` via their own parameters. A
+  caller's own User-Agent header is kept (DBLP's `DBLP_USER_AGENT`,
+  arXiv's `arxiv.py/...`). Never imitate a browser: bot checks
+  (Cloudflare challenges, login pages) are a stopping point, not
+  something to work around.
+- **Applying**: `network.get(url, **kw)` wraps `requests.get` (so tests
+  that patch `requests.get` still intercept); `network.new_session(retry)`
+  returns a `ScholarSession` (S2, Crossref, Unpaywall, the arXiv client's
+  `_session`); `network.configure_pyalex()` sets pyalex's User-Agent and
+  wraps the private `pyalex.api._get_requests_session` (warns if a
+  pyalex release removes it while a proxy is set). Every provider uses
+  these except `DBLPProvider`, whose two `requests.get` calls are left
+  for the DBLP rewrite (#94) and so ignore `--proxy`/`SCHOLAR_PROXY`.
+- **Reporting**: `scholar providers check` prints `Route: direct` or
+  `Route: proxy <scheme://host:port> (<source>)` (credentials redacted)
+  above the table; `--show-ip` adds the exit IP from api.ipify.org (only
+  on request; skipped with `--offline`).
+- Not done: per-provider proxy selection (e.g. only Scopus and PDF
+  downloads through the tunnel).
 
 ### Open-Access Lookup (Unpaywall)
 
@@ -463,6 +503,18 @@ Key test files:
 - `tests/test_scholar.py` - Data model tests
 - `tests/test_cli.py` - CLI integration tests
 
+Unit tests are offline by construction (`tests/conftest.py`, tangled from
+`cache.nw`): the autouse `isolate_cache` fixture unsets every provider
+key/option variable (`S2_API_KEY`, `OPENALEX_API_KEY`, `IEEE_API_KEY`,
+`WOS_*API_KEY`, `SCOPUS_API_KEY`, `SCOPUS_INST_TOKEN`, `SCOPUS_VIEW`),
+the contact emails and the proxy/User-Agent variables, so a test that
+needs a key sets it explicitly; the autouse `block_network` fixture
+refuses DNS and connections to anything but loopback and **fails the
+test** naming the hosts (providers swallow errors, so a refusal alone
+would go unnoticed). Both exempt `@pytest.mark.integration` tests, which
+run only with `--run-live` and keep the developer's keys. No `env -u`
+prefix is needed to run the suite safely.
+
 ## Adding Features
 
 ### New Provider
@@ -538,20 +590,40 @@ requests/day and each `scholar` run is a fresh process.
   no-ops the pacing sleep; `test_ratelimit.py` controls time via the
   module's `_now`/`_sleep` seams.
 - OpenAlex meters requests in credits (a search is 10 credits, $0.001;
-  the keyed budget is 10000/day, reset at midnight UTC). `LIMITS` is
-  therefore empty and the state comes from OpenAlex: the health probe's
+  the keyed budget is 10000/day, reset at midnight UTC). `LIMITS`
+  therefore declares only the rate (`per_second=10.0`, shared by the
+  source-pinned providers through the quota group) and the budget state
+  comes from OpenAlex: the health probe's
   `X-RateLimit-Remaining`/`X-RateLimit-Reset` headers are synced via
   `record_response`, a keyed probe also reads `/rate-limit` for the
   detail column, and a search 429 with `X-RateLimit-Remaining-USD: 0`
   becomes a quota block until `X-RateLimit-Reset` (`_note_http_error`),
   logged with the reset time and a key hint.
-- Phase 2 (not done): migrate S2/OpenAlex/DBLP/arXiv in-process pacing
-  (and crossref/unpaywall) into the limiter; wire WoS/Scopus extended
-  methods (citations/references) through `acquire()`.
+- Pacing is the limiter's job: S2 (`LIMITS` anonymous 1/3 per second,
+  `KEYED_LIMITS` 1.0; `_acquire()` re-declares per request because a
+  rejected key changes the rate), OpenAlex and arXiv (a
+  `PacedArxivClient` subclass overrides the package's `_parse_feed`, with
+  `delay_seconds=0`) declare rates; no provider keeps its own timestamp.
+  `Limits.per_second` is a rate, not the old seconds-between-requests
+  `RATE_LIMIT` (those names are gone). Health probes pass `acquire()` too
+  and record their responses, so a probed 429 starts a cooldown.
+  The Crossref and Unpaywall clients declare `LIMITS` too (10/s;
+  Unpaywall also its 100000/day) and go through `acquire()` /
+  `record_response()`; `all_status()` lists every in-process limiter, so
+  `providers limits` shows them alongside the providers.
+  Every WoS request (searches, probe, and the extended methods: related,
+  citing, references, citation report, `_get_uid_for_doi`) goes through
+  `WebOfScienceProvider._get`; Scopus has no extended methods and all its
+  requests already go through `ScopusProvider._get`. IEEE, HAL and WoS
+  probes are counted too, and `pdf.resolve_doi_s2` uses the `s2` limiter.
+- Remaining (not done): DBLP still paces with its own retry loop (left
+  until the DBLP request loop rewrite of #94 lands); urllib3 `Retry`
+  back-off inside S2/Crossref/Unpaywall sessions is not counted by the
+  limiter (only the request that reaches it is).
 
 ## Dependencies
 
-- `requests` - HTTP client
+- `requests` - HTTP client (PySocks, optional, for `socks5h://` proxies)
 - `typer` - CLI framework
 - `rich` - Terminal formatting
 - `semanticscholar`, `pyalex` - Provider-specific clients

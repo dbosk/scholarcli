@@ -4,9 +4,8 @@
 Every provider API enforces rate limits, and some enforce hard quotas:
 IEEE Xplore, for instance, allows at most 10 requests per second and 200
 requests per day.
-The providers already pace and back off \emph{within} a process
-(\cref{providers-module}), but every [[scholar]] invocation is a fresh
-process---so a daily quota spent by this morning's search is invisible to
+Pacing requests \emph{within} a process is the easy part, but every
+[[scholar]] invocation is a fresh process---so a daily quota spent by this morning's search is invisible to
 this afternoon's, which then fires 200 doomed requests, gets blocked, and
 (until \cref{sec:cache-successful-only}) even freezes the empty responses
 into the cache.
@@ -16,11 +15,14 @@ back.
 
 The division of labour follows from what can be reconstructed where:
 \begin{description}
-\item[Per-second pacing] needs no persistence.
-  Two CLI invocations are always more than a fraction of a second apart,
-  so an in-process timestamp suffices---though we do persist the last
-  request time and consult it opportunistically, since the state file is
-  loaded anyway.
+\item[Per-second pacing] needs little persistence.
+  For a fast API two CLI invocations are always more than an interval
+  apart, so an in-process timestamp would suffice.
+  The slow ones are different: arXiv, and Semantic Scholar without a key,
+  ask for three seconds between requests, and a script can start the
+  next [[scholar]] well within that.
+  So we persist the last request time too and space against it---cheap,
+  since the state file is loaded anyway.
 \item[Daily quotas and cooldowns] cannot be reconstructed in-process.
   These are exactly what we persist: how many requests today's budget has
   absorbed, and until when a provider told us to go away.
@@ -1166,11 +1168,13 @@ class TestStatus:
 
 
 \section{The limiter registry}
+\label{sec:ratelimit-registry}
 
 Limiters must be shared: the seven OpenAlex source-pinned providers and
 the OpenAlex provider proper all draw on one API budget, so they must
-meet in one [[RateLimiter]] (this mirrors the module-level pacing
-timestamp they already share in \cref{providers-module}).
+meet in one [[RateLimiter]], which then also paces them as one client:
+a [[-p preprints]] search takes turns at OpenAlex's ten requests per
+second instead of firing one request per provider at once.
 The registry keys limiters by quota group and hands the same instance to
 every member.
 Because the provider protocol is structural, [[limiter_for]] validates
@@ -1211,6 +1215,42 @@ def limiter_for(provider) -> RateLimiter:
     return get_limiter(group, limits)
 @
 
+\subsection{Limits that change at run time}
+\label{sec:ratelimit-redeclare}
+
+A class attribute fits a provider with one allowance.
+Semantic Scholar has two: one request per second with a key, one every
+three seconds without---and a key the server rejects mid-session turns
+the first into the second (\cref{sec:semantic-scholar}).
+Such a provider assigns [[limiter.limits]] itself, immediately before
+each [[acquire()]].
+No method is needed for that: [[acquire]], [[check_available]] and
+[[status]] all read the attribute afresh on every call, so the new value
+governs the very next request, and [[Limits]] being frozen means a
+declaration can only be replaced whole, never half-edited.
+The assignment goes to the shared limiter, which is why it must be
+repeated per request rather than done once: [[get_limiter]] honours
+[[limits]] only on creation, and another provider object in the same
+quota group may have declared something else since.
+
+<<test functions>>=
+class TestRedeclaredLimits:
+    """Assigning `limits` changes the pacing of the next request."""
+
+    def test_new_rate_applies_to_next_request(self, clock):
+        limiter = get_limiter("s2", Limits(per_second=1.0))
+        limiter.acquire()
+        limiter.limits = Limits(per_second=1 / 3)
+        limiter.acquire()
+        assert clock["sleeps"] == [pytest.approx(3.0)]
+
+    def test_get_limiter_keeps_the_first_declaration(self, clock):
+        first = get_limiter("s2", Limits(per_second=1.0))
+        again = get_limiter("s2", Limits(per_second=5.0))
+        assert again is first
+        assert again.limits.per_second == 1.0
+@
+
 [[check_available]] by bare name serves callers that have no provider
 object at hand.
 It prefers the registered limiter (which knows the declared limits) and
@@ -1230,8 +1270,14 @@ def check_available(name: str) -> Availability:
 [[all_status]] drives the status table.
 It walks the provider registry (imported lazily---[[providers]] imports
 this module at load time, so a top-level import back would be a cycle)
-and deduplicates by quota group, then picks up any orphaned state files
-so usage recorded under a since-renamed provider still shows up.
+and deduplicates by quota group.
+Not every limited client is a search provider: the Crossref and
+Unpaywall clients (\cref{crossref-module,unpaywall-module}) declare
+limits too, so every limiter already created in this process is
+included as well---with its declared limits, which a limiter rebuilt
+from a state file alone would not know.
+Last come any orphaned state files, so usage recorded under a
+since-renamed provider still shows up.
 
 <<registry functions>>=
 def all_status() -> list[QuotaStatus]:
@@ -1243,11 +1289,25 @@ def all_status() -> list[QuotaStatus]:
         limiter = limiter_for(provider)
         if limiter.name not in statuses:
             statuses[limiter.name] = limiter.status()
+    for limiter in list(_LIMITERS.values()):
+        if limiter.name not in statuses:
+            statuses[limiter.name] = limiter.status()
     for state_file in get_state_dir().glob("*.json"):
         name = state_file.stem
         if name not in statuses:
             statuses[name] = get_limiter(name).status()
     return [statuses[name] for name in sorted(statuses)]
+@
+
+<<test functions>>=
+class TestAllStatus:
+    """The status table covers providers and other limited clients."""
+
+    def test_non_provider_limiter_is_listed_with_its_limits(self, clock):
+        get_limiter("unpaywall", Limits(per_second=10.0, daily=100_000))
+        rows = {status.name: status for status in all_status()}
+        assert rows["unpaywall"].limits.daily == 100_000
+        assert "s2" in rows
 @
 
 Finally, users need an escape hatch: the reset-time guess can be wrong in

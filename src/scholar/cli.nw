@@ -174,6 +174,15 @@ def callback(
             help="Decrease verbosity (can be repeated: -q, -qq, -qqq).",
         ),
     ] = 0,
+    proxy: Annotated[
+        Optional[str],
+        typer.Option(
+            "--proxy",
+            metavar="URL",
+            help="Send every request through this proxy, e.g. "
+            "socks5h://127.0.0.1:1080 (overrides SCHOLAR_PROXY).",
+        ),
+    ] = None,
 ) -> None:
     """
     Scholar: A tool for structured literature searches.
@@ -182,6 +191,71 @@ def callback(
     Use 'scholar rq' to start from a research question.
     """
     <<configure logging>>
+    <<configure the network route>>
+@
+
+\subsection{The network route}
+
+[[--proxy]] is a global option, given before the command
+([[scholar --proxy socks5h://127.0.0.1:1081 search ...]]), because the
+route is a property of the whole invocation: the searches, enrichment
+lookups and PDF downloads of one command should all leave from the same
+place.
+The network module (\cref{ch:network}) applies it to every request.
+
+The callback also validates the proxy, whether it came from the option
+or from [[SCHOLAR_PROXY]].
+A bad proxy URL---a typo in the scheme, or SOCKS without PySocks---would
+otherwise make every provider fail its requests and, as providers do,
+return nothing: a search that silently finds no papers.
+Failing here, as a usage error naming the setting, turns that into one
+clear message before any request is made.
+[[set_proxy]] is called even without the option, with [[None]], so a
+long-lived process that invokes the app twice (the test runner does)
+never keeps the previous invocation's proxy.
+
+<<configure the network route>>=
+from scholar import network
+
+try:
+    network.set_proxy(proxy)
+except network.ProxyConfigError as e:
+    raise typer.BadParameter(str(e), param_hint="'--proxy'")
+if proxy is None and network.proxy_url():
+    try:
+        network.validate_proxy(network.proxy_url())
+    except network.ProxyConfigError as e:
+        raise typer.BadParameter(str(e), param_hint=network.PROXY_VAR)
+@
+
+Let's verify that a valid proxy reaches the network module, and that
+an invalid one, from either source, stops the command before it runs.
+
+<<test functions>>=
+class TestProxyOption:
+    """The global --proxy option and SCHOLAR_PROXY validation."""
+
+    def test_proxy_option_sets_the_route(self):
+        result = runner.invoke(
+            app, ["--proxy", "http://proxy:3128", "providers", "check",
+                  "--offline"],
+        )
+        assert result.exit_code == 0, result.output
+        assert "proxy http://proxy:3128 (--proxy)" in result.output
+
+    def test_invalid_proxy_option_is_a_usage_error(self):
+        result = runner.invoke(
+            app, ["--proxy", "ftp://proxy:21", "providers", "check",
+                  "--offline"],
+        )
+        assert result.exit_code == 2
+        assert "Provider Health" not in result.output
+
+    def test_invalid_proxy_variable_is_a_usage_error(self, monkeypatch):
+        monkeypatch.setenv("SCHOLAR_PROXY", "socks9://proxy:1")
+        result = runner.invoke(app, ["providers", "check", "--offline"])
+        assert result.exit_code == 2
+        assert "Provider Health" not in result.output
 @
 
 \subsection{Logging Configuration}
@@ -2536,6 +2610,14 @@ def providers(
             " named provider, or for every provider with 'all'.",
         ),
     ] = None,
+    show_ip: Annotated[
+        bool,
+        typer.Option(
+            "--show-ip",
+            help="With check: also look up the exit IP address"
+            " (asks the third-party service api.ipify.org).",
+        ),
+    ] = False,
 ) -> None:
     """
     List available search providers and their configuration.
@@ -2582,6 +2664,20 @@ request against the spent budget.
 Nonzero thus means exactly \enquote{a provider you believe you have will
 silently contribute nothing}.
 
+Above the table the check states the route the probes took
+(\cref{ch:network}): direct, scholar's own proxy and where it was set,
+or a proxy [[requests]] picked up from the environment.
+A health table without it would answer \enquote{does it work?} without
+saying \emph{from where}, and that is often the whole question---an
+off-campus Scopus probe and an on-campus one see different views
+(\cref{sec:scopus-view}).
+The exit address is the stronger answer (did the tunnel land on campus?)
+but costs a request to a third party, so it comes only with
+[[--show-ip]]; with [[--offline]] it is skipped like every other
+request.
+Neither line affects the exit code: a failed address lookup says
+nothing about the providers.
+
 <<check provider health>>=
 from scholar.providers import (
     HEALTH_HTTP_ERROR,
@@ -2609,6 +2705,8 @@ failure_statuses = (
     HEALTH_HTTP_ERROR,
     HEALTH_NETWORK_ERROR,
 )
+
+<<report the network route>>
 
 table = Table(title="Provider Health", box=box.HORIZONTALS)
 table.add_column("Provider", style="cyan")
@@ -2642,6 +2740,61 @@ if failures:
     raise typer.Exit(1)
 @
 
+<<report the network route>>=
+import requests
+
+from scholar import network
+
+console.print(f"Route: {escape(network.describe_route())}")
+if show_ip:
+    if offline:
+        console.print("Exit IP: not checked (--offline)")
+    else:
+        try:
+            console.print(f"Exit IP: {escape(network.exit_ip())}")
+        except requests.RequestException as e:
+            console.print(
+                f"[yellow]Exit IP: lookup failed: {escape(str(e))}[/yellow]"
+            )
+@
+
+<<test functions>>=
+class TestCheckRoute:
+    """providers check reports the route, and the exit IP on request."""
+
+    def test_route_is_reported_without_contacting_anyone(self):
+        with patch("requests.get") as get:
+            result = runner.invoke(app, ["providers", "check", "--offline"])
+        assert result.exit_code == 0
+        assert "Route: direct" in result.output
+        assert "Exit IP" not in result.output
+        get.assert_not_called()
+
+    def test_show_ip_asks_ipify(self, monkeypatch):
+        from scholar import network
+        from scholar.providers import ProviderHealth
+
+        monkeypatch.setattr(
+            "scholar.providers.check_provider",
+            lambda provider, live=True: ProviderHealth(
+                provider.name, False, "not configured"
+            ),
+        )
+        reply = Mock(text="192.0.2.7")
+        with patch("requests.get", return_value=reply) as get:
+            result = runner.invoke(app, ["providers", "check", "--show-ip"])
+        assert "Exit IP: 192.0.2.7" in result.output
+        assert get.call_args.args[0] == network.EXIT_IP_URL
+
+    def test_show_ip_is_skipped_offline(self):
+        with patch("requests.get") as get:
+            result = runner.invoke(
+                app, ["providers", "check", "--offline", "--show-ip"]
+            )
+        assert "Exit IP: not checked (--offline)" in result.output
+        get.assert_not_called()
+@
+
 \subsection{Showing rate limits and quota usage}
 
 The limits action surfaces the persistent rate-limit bookkeeping of
@@ -2650,6 +2803,11 @@ provider has absorbed, and when a spent budget comes back.
 One row per \emph{quota group}, not per provider---the eight
 OpenAlex-backed providers share one budget and appear as one
 [[openalex]] row, which is the truthful unit of accounting.
+The Crossref and Unpaywall clients are rate-limited too
+(\cref{crossref-module,unpaywall-module}), but they are not providers,
+so [[all_status]] knows them only once their modules are loaded.
+We import both here, so their rows appear---with their declared
+limits---even in a process that has not used them yet.
 
 The [[--reset]] escape hatch deletes the persisted state.
 It exists because the bookkeeping is deliberately conservative: the
@@ -2658,7 +2816,7 @@ key starts a fresh budget the file knows nothing about.
 When the user \emph{knows} the quota is back, resetting beats waiting.
 
 <<display provider limits>>=
-from scholar import ratelimit
+from scholar import crossref, ratelimit, unpaywall  # noqa: F401 (limiters)
 
 console = Console()
 
@@ -3168,6 +3326,13 @@ class TestProvidersLimitsCommand:
         assert "ieee" in result.stdout
         assert "10/s" in result.stdout
         assert "200/day" in result.stdout
+
+    def test_limits_lists_the_non_provider_clients(self):
+        """Crossref and Unpaywall have rows although they are no providers."""
+        result = runner.invoke(app, ["providers", "limits"])
+        assert result.exit_code == 0
+        assert "crossref" in result.stdout
+        assert "unpaywall" in result.stdout
 
     def test_limits_shows_persisted_exhaustion(self):
         """A spent quota recorded in the state file shows as exhausted."""

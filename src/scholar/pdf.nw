@@ -102,6 +102,8 @@ import sys
 import platformdirs
 import requests
 
+from scholar import network
+from scholar.ratelimit import get_limiter, limiter_for
 from scholar.unpaywall import resolve_pdf_url
 
 logger = logging.getLogger(__name__)
@@ -375,6 +377,14 @@ def resolve_doi_unpaywall(
 
 Semantic Scholar also provides PDF links for many papers. We query their
 API using the DOI.
+That is a request against the same API as the [[s2]] search provider, so
+it goes through the provider's rate limiter (\cref{ch:ratelimit}): it is
+paced with the searches and enrichment lookups, counted in
+[[scholar providers limits]], and refused---quietly, the limiter has
+said why---while a remembered cooldown lasts.
+We take the limiter from the registered provider rather than by name,
+so that it carries the provider's declared rate even when no search has
+run in this process yet.
 
 <<doi resolution functions>>=
 S2_PAPER_API = "https://api.semanticscholar.org/graph/v1/paper/DOI:{doi}"
@@ -399,13 +409,16 @@ def resolve_doi_s2(
         progress_callback(f"Checking Semantic Scholar for {doi}...")
     
     try:
+        limiter = _s2_limiter()
+        limiter.acquire()
         url = S2_PAPER_API.format(doi=doi)
-        response = requests.get(
+        response = network.get(
             url,
             params={"fields": "openAccessPdf"},
             timeout=10,
         )
-        
+        limiter.record_response(response)
+
         if response.status_code != 200:
             logger.debug("Semantic Scholar returned status %d for DOI %s", 
                         response.status_code, doi)
@@ -423,6 +436,35 @@ def resolve_doi_s2(
     except Exception as e:
         logger.debug("Semantic Scholar request failed for DOI %s: %s", doi, e)
         return None
+
+
+def _s2_limiter():
+    """Return the Semantic Scholar provider's shared rate limiter."""
+    from scholar.providers import get_provider
+
+    provider = get_provider("s2")
+    if provider is None:
+        return get_limiter("s2")
+    return limiter_for(provider)
+@
+
+Let's verify that the lookup is counted on the provider's limiter and
+that a cooldown stops it before any request is sent.
+
+<<test functions>>=
+def test_resolve_doi_s2_passes_the_s2_limiter():
+    """The PDF lookup is an s2 request like any other."""
+    from scholar.ratelimit import get_limiter
+
+    response = Mock(status_code=404, headers={})
+    with patch("scholar.pdf.requests.get", return_value=response):
+        assert resolve_doi_s2("10.1234/test") is None
+    assert get_limiter("s2").status().day_count == 1
+
+    get_limiter("s2").record_limit_hit(reason="rate limited (HTTP 429)")
+    with patch("scholar.pdf.requests.get") as get:
+        assert resolve_doi_s2("10.1234/test") is None
+    get.assert_not_called()
 @
 
 \subsection{DOI Redirect Resolution}
@@ -481,7 +523,7 @@ def resolve_doi_landing(
         progress_callback("Checking the publisher's page...")
     response = None
     try:
-        response = requests.get(
+        response = network.get(
             DOI_RESOLVER_URL + doi,
             headers={"Accept": "text/html,application/pdf"},
             timeout=30,
@@ -744,6 +786,21 @@ The download function handles HTTP requests with proper error handling and
 content-type validation. We verify the response is actually a PDF before
 saving it.
 
+Every request in this module goes through [[network.get]]
+(\cref{ch:network}), for two reasons that matter more here than
+anywhere else.
+The route: a publisher that admits subscribers by address serves the
+PDF only to a request that leaves from the subscribing network, so
+[[--proxy]] or [[SCHOLAR_PROXY]] must reach the download, not just the
+searches.
+And the name: publishers that admit scripts at all turn away the
+[[python-requests]] default, which is why the downloads used to fail
+through a working campus tunnel while [[curl]] succeeded.
+Scholar's own User-Agent is honest about being a tool; where a publisher
+answers it with a Cloudflare challenge or a login page, the download
+fails with the content-type check below, and that is where it stops:
+we do not imitate a browser to get past a publisher's refusal.
+
 <<pdf download functions>>=
 class PDFDownloadError(Exception):
     """
@@ -784,7 +841,7 @@ def download_pdf(
         progress_callback(f"Downloading PDF from {url}...")
     
     try:
-        response = requests.get(url, timeout=30, stream=True)
+        response = network.get(url, timeout=30, stream=True)
         response.raise_for_status()
         
         # Validate content type
