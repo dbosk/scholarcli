@@ -287,10 +287,10 @@ also asks api.ipify.org for the exit address (a third-party request, so
 only on demand).
 
 Requests identify themselves as
-`scholar/<version> (+https://github.com/dbosk/scholar; mailto:<SCHOLAR_EMAIL>)`
-(the `mailto` part only when `SCHOLAR_EMAIL` is set; note that it is then
-sent to every host, publishers included). Set `SCHOLAR_USER_AGENT` to
-replace it. Scholar does not imitate a browser: a Cloudflare challenge
+`scholar/<version> (+https://github.com/dbosk/scholar)`. Your
+`SCHOLAR_EMAIL` is not in it, so publishers never see the address; only
+the services that ask for one (OpenAlex, Crossref, Unpaywall) get it,
+through their own parameters. Set `SCHOLAR_USER_AGENT` to replace it. Scholar does not imitate a browser: a Cloudflare challenge
 or a login page from a publisher means the PDF is not available to
 scripts, and scholar stops there.
 
