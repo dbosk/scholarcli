@@ -134,7 +134,9 @@ Implemented as `check_provider()`/`classify_check_response()` plus a
 per-provider optional `check()` method in `providers.py`.
 `classify_check_response(..., expect_json=True)` turns a 2xx body that is
 not JSON into `http error` "non-JSON response (HTTP 200, text/html)"
-(`non_json_reason()`); the DBLP and Scopus probes use it. Since Sep 2026
+(`non_json_reason()`); every JSON probe uses it (DBLP, Scopus, S2,
+OpenAlex and its preprint servers, HAL, IEEE, WoS), only arXiv's
+Atom probe does not. Since Sep 2026
 dblp.org and both mirrors (uni-trier, dagstuhl) serve an Anubis anti-bot
 HTML page with HTTP 200 to API clients; no header or mirror helps (#94),
 so `providers check` fails for dblp and DBLP searches record `failed`.

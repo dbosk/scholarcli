@@ -868,7 +868,12 @@ sessions run with a dead DBLP.  A probe whose endpoint speaks JSON
 therefore passes [[expect_json=True]], and a 2xx body that does not
 parse is an [[http error]] whose message names the status and the
 content type---[[non-JSON response (HTTP 200, text/html)]]---so
-[[providers check]] exits 1.  The search path uses the same wording
+[[providers check]] exits 1.  Every probe whose search parses JSON does
+so: DBLP, Scopus, Semantic Scholar, OpenAlex (with the preprint servers
+pinned on it), HAL, IEEE and Web of Science.  Any of them can sit behind
+a proxy, gateway or anti-bot layer that answers 200 with a page, and the
+search would then fail on [[response.json()]] while a status-only probe
+said ok.  Only arXiv's probe does not, since its Atom feed is XML.  The search path uses the same wording
 ([[non_json_reason]]), so the health check and the search record
 describe one failure the same way.
 
@@ -996,7 +1001,8 @@ Let's verify the cross-provider logic: unconfigured providers are never
 probed, offline mode skips the network entirely, and the classifier maps raw
 responses to the right statuses.  The stale-key case uses the real Semantic
 Scholar provider, since surfacing that exact failure is why this machinery
-exists:
+exists; and every probe that expects JSON, not only DBLP's, must fail on a
+200 that carries a page instead:
 
 <<test functions>>=
 class TestProviderHealth:
@@ -1106,6 +1112,41 @@ class TestProviderHealth:
 
         assert health.status == HEALTH_HTTP_ERROR
         assert health.message == "non-JSON response (HTTP 200, text/html)"
+
+    @pytest.mark.parametrize("make_provider", [
+        lambda: SemanticScholarProvider(api_key=None),
+        lambda: OpenAlexProvider(),
+        lambda: HALProvider(),
+        lambda: IEEEXploreProvider(api_key="test_key"),
+        lambda: WebOfScienceProvider(
+            starter_api_key=None, expanded_api_key="test_key"
+        ),
+    ], ids=["s2", "openalex", "hal", "ieee", "wos"])
+    def test_json_probes_reject_an_html_200(self, make_provider):
+        """Every JSON probe, not only DBLP's, fails on a page in a 200."""
+        provider = make_provider()
+        response = self._response(200)
+        response.headers = {"Content-Type": "text/html"}
+        response.json.side_effect = ValueError("Expecting value")
+
+        with patch("requests.get", return_value=response):
+            with patch("time.sleep"):
+                status, message = provider.check()
+
+        assert status == HEALTH_HTTP_ERROR
+        assert message == "non-JSON response (HTTP 200, text/html)"
+
+    def test_hal_error_body_still_wins(self):
+        """HAL's 200 with an `error` body keeps its own message."""
+        response = self._response(200)
+        response.headers = {"Content-Type": "application/json"}
+        response.json.return_value = {"error": {"msg": "bad query"}}
+
+        with patch("requests.get", return_value=response):
+            status, message = HALProvider().check()
+
+        assert status == HEALTH_HTTP_ERROR
+        assert message == "query rejected (error body in HTTP 200)"
 
     def test_non_json_ok_without_expect_json(self):
         """Only probes that expect JSON hold a 2xx body against it."""
@@ -1445,6 +1486,7 @@ def check(self) -> tuple[str, str]:
         response,
         authenticated=bool(self.api_key),
         key_hint="S2_API_KEY",
+        expect_json=True,
     )
 @
 
@@ -2570,7 +2612,7 @@ def _probe(self, params: dict) -> tuple[str, str]:
         )
     self._limiter.record_response(response)
     return classify_check_response(
-        response, authenticated=bool(self.api_key)
+        response, authenticated=bool(self.api_key), expect_json=True
     )
 <<openalex constants>>=
 OPENALEX_API_URL = "https://api.openalex.org/works"
@@ -5075,6 +5117,7 @@ def check(self) -> tuple[str, str]:
         response,
         authenticated=True,
         key_hint="WOS_EXPANDED_API_KEY or WOS_STARTER_API_KEY",
+        expect_json=True,
     )
 @
 
@@ -7362,7 +7405,10 @@ at [[IEEE_API_KEY]].
             timeout=30,
         )
         return classify_check_response(
-            response, authenticated=True, key_hint="IEEE_API_KEY"
+            response,
+            authenticated=True,
+            key_hint="IEEE_API_KEY",
+            expect_json=True,
         )
 @
 
@@ -9363,7 +9409,10 @@ One row, minimal field list, no retries: for a health probe the first
 answer \emph{is} the diagnosis.
 The probe additionally maps HAL's 200-with-[[error]]-body to an HTTP
 error status---without that, HAL's most characteristic failure mode
-would report as healthy.
+would report as healthy.  A body that is not JSON at all is left to the
+classifier's [[expect_json]], so it is reported in the same words as
+for every other provider, with the content type that tells an HTML
+error page from a truncated answer.
 
 <<hal check method>>=
 def check(self) -> tuple[str, str]:
@@ -9382,8 +9431,10 @@ def check(self) -> tuple[str, str]:
                     "query rejected (error body in HTTP 200)",
                 )
         except ValueError:
-            return HEALTH_HTTP_ERROR, "non-JSON response"
-    return classify_check_response(response, authenticated=False)
+            pass
+    return classify_check_response(
+        response, authenticated=False, expect_json=True
+    )
 @
 
 \subsubsection{Converting HAL documents}
