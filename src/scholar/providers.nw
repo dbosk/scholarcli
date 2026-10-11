@@ -4714,6 +4714,7 @@ class WebOfScienceProvider:
 
     <<wos init>>
     <<wos is available>>
+    <<wos request helper>>
     <<wos check method>>
     <<wos search>>
     <<wos convert starter hit>>
@@ -4812,6 +4813,67 @@ def is_available(self) -> bool:
     return bool(self._api_key)
 @
 
+\subsubsection{One request helper}
+
+Every WoS request has the same shape: a GET carrying the key in the
+[[X-ApiKey]] header, bracketed by the rate limiter (\cref{ch:ratelimit}).
+The searches used to write that bracket out at each call site, and the
+extended methods (citations, references, citation reports, the UID
+lookup) did without it---so an enrichment run that fetched the citations
+of a few hundred papers went entirely unpaced against a keyed API, and
+none of it showed in [[scholar providers limits]].
+One helper makes the bracket impossible to forget: a request that does
+not go through [[_get]] would have to spell out the key header itself.
+The helper raises [[RateLimited]] while the limiter refuses; each caller
+already sits in a [[try]] block and treats that as the quiet,
+already-logged failure it is.
+
+<<wos request helper>>=
+def _get(self, url: str, params: dict):
+    """One rate-limited GET with the API key; raises `RateLimited`."""
+    self._limiter.acquire()
+    response = requests.get(
+        url,
+        params=params,
+        headers={"X-ApiKey": self._api_key},
+        timeout=30,
+    )
+    self._limiter.record_response(response)
+    return response
+@
+
+Let's verify that the extended methods are now paced and counted: a
+citation lookup by DOI is two requests (the UID, then the citing
+articles), and both must reach the limiter.
+
+<<test functions>>=
+def test_wos_extended_requests_pass_the_limiter(monkeypatch):
+    """Citation lookups by DOI are counted, two requests each."""
+    monkeypatch.setenv("WOS_EXPANDED_API_KEY", "k")
+    provider = WebOfScienceProvider()
+    uid = Mock(status_code=200, headers={})
+    uid.json.return_value = {
+        "Data": {"Records": {"records": {"REC": [{"UID": "WOS:1"}]}}}
+    }
+    citing = Mock(status_code=200, headers={})
+    citing.json.return_value = {"Data": {"Records": {"records": {}}}}
+    with patch("requests.get", side_effect=[uid, citing]) as get:
+        provider.get_paper_citations("10.1/x")
+    assert get.call_count == 2
+    assert provider._limiter.status().day_count == 2
+
+
+def test_wos_extended_methods_respect_a_cooldown(monkeypatch):
+    """A remembered cooldown stops the request before it is sent."""
+    monkeypatch.setenv("WOS_EXPANDED_API_KEY", "k")
+    provider = WebOfScienceProvider()
+    provider._limiter.record_limit_hit(reason="rate limited (HTTP 429)")
+    with patch("requests.get") as get:
+        assert provider.get_citing_articles("WOS:1") == []
+        assert provider.search_for_citation_report("TS=(x)") is None
+    get.assert_not_called()
+@
+
 \subsubsection{Health check}
 
 The probe targets whichever API tier initialisation selected, mirroring that
@@ -4819,6 +4881,9 @@ tier's parameter format (the two APIs share nothing but the [[X-ApiKey]]
 header).  Since both tiers require a key, any 401/403 here means the key is
 the problem; the hint names both environment variables because either could
 be the one that was set.
+The probe goes through [[_get]], so it is paced and counted like any
+request; a refusal there (a race with [[check_provider]]'s own check) is
+reported, not raised.
 
 <<wos check method>>=
 def check(self) -> tuple[str, str]:
@@ -4832,12 +4897,10 @@ def check(self) -> tuple[str, str]:
         }
     else:
         params = {"q": "TS=(test)", "db": "WOS", "limit": 1, "page": 1}
-    response = requests.get(
-        self._api_url,
-        params=params,
-        headers={"X-ApiKey": self._api_key},
-        timeout=30,
-    )
+    try:
+        response = self._get(self._api_url, params)
+    except RateLimited as e:
+        return HEALTH_RATE_LIMITED, str(e)
     return classify_check_response(
         response,
         authenticated=True,
@@ -4855,12 +4918,9 @@ the former [[@cachedmethod]] decorator froze rate-limited and errored
 empty results into the persistent cache, so the tier implementations now
 report a [[cacheable]] flag alongside their papers and the wrapper
 stores only flagged answers.
-The tier implementations also bracket each request with the persistent
-rate limiter (\cref{ch:ratelimit}); WoS publishes no daily quota, so
-only the request rate is declared and enforced.
-(The extended methods for citations and references still make unpaced
-requests; migrating them onto the limiter is left with the other
-per-provider pacing consolidation.)
+The tier implementations send their requests through [[_get]], and so
+through the persistent rate limiter (\cref{ch:ratelimit}); WoS publishes
+no daily quota, so only the request rate is declared and enforced.
 
 <<wos search>>=
 def search(
@@ -4962,8 +5022,7 @@ def _search_starter(
             remaining = limit - len(all_papers)
             current_page_size = min(page_size, remaining)
 
-            self._limiter.acquire()
-            response = requests.get(
+            response = self._get(
                 WOS_STARTER_API_URL,
                 params={
                     "q": effective_query,
@@ -4971,10 +5030,7 @@ def _search_starter(
                     "limit": current_page_size,
                     "page": page,
                 },
-                headers={"X-ApiKey": self._api_key},
-                timeout=30,
             )
-            self._limiter.record_response(response)
             response.raise_for_status()
             data = response.json()
 
@@ -5036,8 +5092,7 @@ def _search_expanded(
             remaining = limit - len(all_papers)
             current_page_size = min(page_size, remaining)
 
-            self._limiter.acquire()
-            response = requests.get(
+            response = self._get(
                 WOS_EXPANDED_API_URL,
                 params={
                     "databaseId": "WOS",
@@ -5045,10 +5100,7 @@ def _search_expanded(
                     "count": current_page_size,
                     "firstRecord": first_record,
                 },
-                headers={"X-ApiKey": self._api_key},
-                timeout=30,
             )
-            self._limiter.record_response(response)
             response.raise_for_status()
             data = response.json()
 
@@ -5353,6 +5405,9 @@ The Expanded API provides additional operations for citation analysis that are
 not available in the Starter API.
 These methods raise [[NotImplementedError]] if called when only the Starter API
 is configured.
+Their requests go through [[_get]] like the searches, so they are paced
+and counted; a refusal by the limiter makes them return their empty
+answer without a warning of their own.
 
 <<wos extended methods>>=
 def _require_expanded_api(self, operation: str) -> None:
@@ -5380,7 +5435,7 @@ def get_related_records(self, uid: str, limit: int = 10) -> list[Paper]:
     self._require_expanded_api("get_related_records")
 
     try:
-        response = requests.get(
+        response = self._get(
             f"{WOS_EXPANDED_API_URL}/related",
             params={
                 "databaseId": "WOS",
@@ -5388,8 +5443,6 @@ def get_related_records(self, uid: str, limit: int = 10) -> list[Paper]:
                 "count": min(limit, 100),
                 "firstRecord": 1,
             },
-            headers={"X-ApiKey": self._api_key},
-            timeout=30,
         )
         response.raise_for_status()
         data = response.json()
@@ -5403,6 +5456,8 @@ def get_related_records(self, uid: str, limit: int = 10) -> list[Paper]:
         return [self._convert_expanded_hit(rec) for rec in records if isinstance(rec, dict)]
     except NotImplementedError:
         raise
+    except RateLimited:
+        return []  # the limiter already logged the reason once
     except Exception as e:
         logger.warning("wos: get_related_records failed: %s", e)
         return []
@@ -5432,7 +5487,7 @@ def get_citing_articles(self, uid: str, limit: int = 10) -> list[Paper]:
     logger.info(f"wos: Cache miss for citing articles of {uid}, fetching from API")
 
     try:
-        response = requests.get(
+        response = self._get(
             f"{WOS_EXPANDED_API_URL}/citing",
             params={
                 "databaseId": "WOS",
@@ -5440,8 +5495,6 @@ def get_citing_articles(self, uid: str, limit: int = 10) -> list[Paper]:
                 "count": min(limit, 100),
                 "firstRecord": 1,
             },
-            headers={"X-ApiKey": self._api_key},
-            timeout=30,
         )
         response.raise_for_status()
         data = response.json()
@@ -5457,6 +5510,8 @@ def get_citing_articles(self, uid: str, limit: int = 10) -> list[Paper]:
         return result
     except NotImplementedError:
         raise
+    except RateLimited:
+        return []  # the limiter already logged the reason once
     except Exception as e:
         logger.warning("wos: get_citing_articles failed: %s", e)
         return []
@@ -5493,7 +5548,7 @@ def get_cited_references(self, uid: str, limit: int = 10) -> list[dict]:
     logger.info(f"wos: Cache miss for references of {uid}, fetching from API")
 
     try:
-        response = requests.get(
+        response = self._get(
             f"{WOS_EXPANDED_API_URL}/references",
             params={
                 "databaseId": "WOS",
@@ -5501,8 +5556,6 @@ def get_cited_references(self, uid: str, limit: int = 10) -> list[dict]:
                 "count": min(limit, 100),
                 "firstRecord": 1,
             },
-            headers={"X-ApiKey": self._api_key},
-            timeout=30,
         )
         response.raise_for_status()
         data = response.json()
@@ -5529,6 +5582,8 @@ def get_cited_references(self, uid: str, limit: int = 10) -> list[dict]:
         return result
     except NotImplementedError:
         raise
+    except RateLimited:
+        return []  # the limiter already logged the reason once
     except Exception as e:
         logger.warning("wos: get_cited_references failed: %s", e)
         return []
@@ -5565,7 +5620,7 @@ def search_for_citation_report(
 
     try:
         # First, run a search to get a query ID
-        response = requests.get(
+        response = self._get(
             WOS_EXPANDED_API_URL,
             params={
                 "databaseId": "WOS",
@@ -5573,8 +5628,6 @@ def search_for_citation_report(
                 "count": min(limit, 100),
                 "firstRecord": 1,
             },
-            headers={"X-ApiKey": self._api_key},
-            timeout=30,
         )
         response.raise_for_status()
         data = response.json()
@@ -5587,11 +5640,9 @@ def search_for_citation_report(
             return None
 
         # Now fetch the citation report
-        report_response = requests.get(
+        report_response = self._get(
             f"{WOS_EXPANDED_API_URL}/citation-report/{query_id}",
             params={"reportLevel": "WOS"},
-            headers={"X-ApiKey": self._api_key},
-            timeout=30,
         )
         report_response.raise_for_status()
         report_data = report_response.json()
@@ -5602,6 +5653,8 @@ def search_for_citation_report(
         return None
     except NotImplementedError:
         raise
+    except RateLimited:
+        return None  # the limiter already logged the reason once
     except Exception as e:
         logger.warning("wos: search_for_citation_report failed: %s", e)
         return None
@@ -5659,7 +5712,7 @@ def _get_uid_for_doi(self, doi: str) -> str | None:
 
     try:
         if self._api_tier == "expanded":
-            response = requests.get(
+            response = self._get(
                 WOS_EXPANDED_API_URL,
                 params={
                     "databaseId": "WOS",
@@ -5667,8 +5720,6 @@ def _get_uid_for_doi(self, doi: str) -> str | None:
                     "count": 1,
                     "firstRecord": 1,
                 },
-                headers={"X-ApiKey": self._api_key},
-                timeout=30,
             )
             response.raise_for_status()
             data = response.json()
@@ -5683,15 +5734,13 @@ def _get_uid_for_doi(self, doi: str) -> str | None:
                 return records[0].get("UID")
         else:
             # Starter API - search and extract UID from response
-            response = requests.get(
+            response = self._get(
                 WOS_STARTER_API_URL,
                 params={
                     "q": query,
                     "limit": 1,
                     "page": 1,
                 },
-                headers={"X-ApiKey": self._api_key},
-                timeout=30,
             )
             response.raise_for_status()
             data = response.json()
@@ -5701,6 +5750,8 @@ def _get_uid_for_doi(self, doi: str) -> str | None:
                 return hits[0].get("uid")
 
         return None
+    except RateLimited:
+        return None  # the limiter already logged the reason once
     except Exception as e:
         logger.warning("wos: UID lookup failed for DOI %s: %s", doi, e)
         return None
@@ -7107,11 +7158,18 @@ budget.
 IEEE authenticates via the [[apikey]] request \emph{parameter} rather than a
 header, so the probe mirrors the search request exactly and any 401/403 points
 at [[IEEE_API_KEY]].
+With 200 requests a day, the probe is not free: it passes the limiter
+and is counted like a search request, so [[scholar providers limits]]
+does not overstate what is left.
 
 <<ieee provider>>=
 
     def check(self) -> tuple[str, str]:
         """Probe the search endpoint with a one-result query."""
+        try:
+            self._limiter.acquire()
+        except RateLimited as e:
+            return HEALTH_RATE_LIMITED, str(e)
         response = requests.get(
             IEEE_API_URL,
             params={
@@ -7122,6 +7180,7 @@ at [[IEEE_API_KEY]].
             },
             timeout=30,
         )
+        self._limiter.record_response(response)
         return classify_check_response(
             response, authenticated=True, key_hint="IEEE_API_KEY"
         )
@@ -9214,16 +9273,22 @@ answer \emph{is} the diagnosis.
 The probe additionally maps HAL's 200-with-[[error]]-body to an HTTP
 error status---without that, HAL's most characteristic failure mode
 would report as healthy.
+Like the searches, the probe passes the rate limiter and is counted.
 
 <<hal check method>>=
 def check(self) -> tuple[str, str]:
     """Probe the search endpoint with a one-row query."""
+    try:
+        self._limiter.acquire()
+    except RateLimited as e:
+        return HEALTH_RATE_LIMITED, str(e)
     response = requests.get(
         HAL_API_URL,
         params={"q": "test", "wt": "json", "rows": 1, "fl": "title_s"},
         headers={"User-Agent": HAL_USER_AGENT},
         timeout=30,
     )
+    self._limiter.record_response(response)
     if response.ok:
         try:
             if "error" in response.json():

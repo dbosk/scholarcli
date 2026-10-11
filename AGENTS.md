@@ -529,9 +529,15 @@ requests/day and each `scholar` run is a fresh process.
   Unpaywall also its 100000/day) and go through `acquire()` /
   `record_response()`; `all_status()` lists every in-process limiter, so
   `providers limits` shows them alongside the providers.
-- Phase 2 (not done): migrate DBLP's in-process pacing (its retry loop)
-  into the limiter; wire WoS/Scopus extended methods (citations/references)
-  through `acquire()`.
+  Every WoS request (searches, probe, and the extended methods: related,
+  citing, references, citation report, `_get_uid_for_doi`) goes through
+  `WebOfScienceProvider._get`; Scopus has no extended methods and all its
+  requests already go through `ScopusProvider._get`. IEEE, HAL and WoS
+  probes are counted too, and `pdf.resolve_doi_s2` uses the `s2` limiter.
+- Remaining (not done): DBLP still paces with its own retry loop (left
+  until the DBLP request loop rewrite of #94 lands); urllib3 `Retry`
+  back-off inside S2/Crossref/Unpaywall sessions is not counted by the
+  limiter (only the request that reaches it is).
 
 ## Dependencies
 
