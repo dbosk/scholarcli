@@ -860,6 +860,18 @@ rotate a perfectly good credential.
 The classifier therefore decodes [[X-Mashery-Error-Code]] \emph{before}
 the credential branch.
 
+A 2xx status is not enough for \enquote{ok} either.  Since September 2026
+DBLP has answered API requests with HTTP 200 and an HTML anti-bot page in
+place of JSON (\cref{sec:dblp-transient-failures}); every search failed,
+yet the probe reported [[ok]] and a pre-flight gate let four review
+sessions run with a dead DBLP.  A probe whose endpoint speaks JSON
+therefore passes [[expect_json=True]], and a 2xx body that does not
+parse is an [[http error]] whose message names the status and the
+content type---[[non-JSON response (HTTP 200, text/html)]]---so
+[[providers check]] exits 1.  The search path uses the same wording
+([[non_json_reason]]), so the health check and the search record
+describe one failure the same way.
+
 <<imports>>=
 import dataclasses
 @
@@ -885,11 +897,24 @@ class ProviderHealth:
     message: str = ""
 
 
+def non_json_reason(response) -> str:
+    """Describe a response whose body is not the JSON we asked for."""
+    headers = getattr(response, "headers", None) or {}
+    content_type = headers.get("Content-Type") if hasattr(
+        headers, "get"
+    ) else None
+    detail = f"HTTP {response.status_code}"
+    if isinstance(content_type, str) and content_type:
+        detail += f", {content_type.split(';')[0].strip()}"
+    return f"non-JSON response ({detail})"
+
+
 def classify_check_response(
     response,
     *,
     authenticated: bool,
     key_hint: str = "",
+    expect_json: bool = False,
 ) -> tuple[str, str]:
     """Classify a health-probe HTTP response into a (status, message) pair.
 
@@ -897,7 +922,8 @@ def classify_check_response(
     sent (`authenticated`); `key_hint` names the environment variable to
     check in that case.  Gateway quota rejections (Mashery's
     `X-Mashery-Error-Code`) are decoded first, since they also arrive
-    as 403.
+    as 403.  With `expect_json`, a 2xx body that does not parse as JSON
+    (an anti-bot page, say) is an HTTP error, not ok.
     """
     headers = getattr(response, "headers", None) or {}
     mashery_code = headers.get("X-Mashery-Error-Code", "")
@@ -917,6 +943,11 @@ def classify_check_response(
         )
     if response.status_code == 429:
         return HEALTH_RATE_LIMITED, "HTTP 429 (transient; try again later)"
+    if response.ok and expect_json:
+        try:
+            response.json()
+        except ValueError:
+            return HEALTH_HTTP_ERROR, non_json_reason(response)
     if response.ok:
         return HEALTH_OK, ""
     return HEALTH_HTTP_ERROR, f"HTTP {response.status_code}"
@@ -1057,6 +1088,31 @@ class TestProviderHealth:
             health = check_provider(provider)
 
         assert health.status == HEALTH_OK
+
+    def test_dblp_html_200_is_an_error(self):
+        """DBLP's anti-bot page (HTML with HTTP 200) fails the check.
+
+        This is the regression test for the false `ok` that let four
+        review sessions run with a DBLP that answered every search with
+        an HTML challenge page.
+        """
+        provider = DBLPProvider()
+        response = self._response(200)
+        response.headers = {"Content-Type": "text/html; charset=utf-8"}
+        response.json.side_effect = ValueError("Expecting value")
+
+        with patch("requests.get", return_value=response):
+            health = check_provider(provider)
+
+        assert health.status == HEALTH_HTTP_ERROR
+        assert health.message == "non-JSON response (HTTP 200, text/html)"
+
+    def test_non_json_ok_without_expect_json(self):
+        """Only probes that expect JSON hold a 2xx body against it."""
+        response = self._response(200)
+        response.json.side_effect = ValueError("Expecting value")
+        status, _ = classify_check_response(response, authenticated=False)
+        assert status == HEALTH_OK
 
     def test_network_error(self):
         """A connection failure reports a network error, not a crash."""
@@ -3623,6 +3679,30 @@ technique the Scopus provider uses for its identifier lists) and by separating
 raises [[_DBLPUnavailable]] and returns an uncached empty list, so a later call
 can retry, whereas a real zero-hit answer is cached normally.
 
+\paragraph{The anti-bot page.}
+The non-JSON body stopped being occasional in September 2026: every
+request got one (\url{https://github.com/dbosk/scholar/issues/94}).
+Probing by hand on 2026-10-11 showed what it is.  [[dblp.org]] and both
+official mirrors, [[dblp.uni-trier.de]] and [[dblp.dagstuhl.de]],
+answer [[/search/publ/api?...&format=json]] with HTTP 200, content type
+[[text/html]], and an Anubis proof-of-work page titled
+\enquote{Making sure you're not a bot!}, which a browser solves in
+JavaScript and an API client cannot.  Neither
+[[Accept: application/json]] nor the descriptive [[User-Agent]] we
+already send changes the answer, and the Dagstuhl mirror began
+answering 429 after a handful of probes.  So there is no header to add
+and no mirror to fall back to, and solving or evading the challenge is
+not something a well-behaved client does.
+
+What remains is to be honest about it.  The search records the failure
+as [[non-JSON response (HTTP 200, text/html)]] in [[last_error]], so
+the session says \enquote{failed} instead of 0
+(\cref{sec:search-result-error} in the core module), and the health
+check holds the probe's body to the same standard (\cref{sec:provider-health}),
+so [[providers check]] fails for DBLP while the page is up.  Should DBLP
+lift the challenge for API clients, or offer a key, both fixes stay
+correct and the provider works again unchanged.
+
 <<dblp provider>>=
 class _DBLPUnavailable(Exception):
     """Raised internally when a DBLP request fails transiently.
@@ -4020,9 +4100,7 @@ def _fetch_one_page(
         try:
             data = response.json()
         except ValueError as e:
-            raise _DBLPUnavailable(
-                f"non-JSON response (HTTP {response.status_code})"
-            ) from e
+            raise _DBLPUnavailable(non_json_reason(response)) from e
 
         hits = ensure_list(
             safe_get_nested(data, "result", "hits", "hit", default=[])
@@ -4078,7 +4156,9 @@ time.sleep(delay)
 Unlike [[_fetch_one_page]], the probe makes exactly one request with no 429
 retry loop: for a health check, a 429 \emph{is} the answer we want to report,
 not something to wait out.  We keep the descriptive [[User-Agent]] so the
-probe is throttled the same way real searches are.
+probe is throttled the same way real searches are, and we ask the
+classifier to insist on JSON, since a 200 carrying the anti-bot page is
+exactly the failure the probe used to miss.
 
 <<dblp check method>>=
 def check(self) -> tuple[str, str]:
@@ -4089,7 +4169,9 @@ def check(self) -> tuple[str, str]:
         headers={"User-Agent": DBLP_USER_AGENT},
         timeout=30,
     )
-    return classify_check_response(response, authenticated=False)
+    return classify_check_response(
+        response, authenticated=False, expect_json=True
+    )
 @
 
 \subsubsection{Applying filters}
@@ -4437,6 +4519,23 @@ class TestDBLPProvider:
             assert second[0].title == "Recovered Paper"
             assert mock_get.call_count == 2
             assert provider.last_error is None
+
+    def test_anti_bot_page_recorded_as_failure(self):
+        """DBLP's HTML challenge page is a recorded failure, not 0 hits."""
+        provider = DBLPProvider()
+
+        page = Mock()
+        page.status_code = 200
+        page.headers = {"Content-Type": "text/html; charset=utf-8"}
+        page.raise_for_status = Mock()
+        page.json.side_effect = ValueError("Expecting value")
+
+        with patch("requests.get", return_value=page):
+            assert provider.search("literate programming") == []
+
+        assert provider.last_error == (
+            "non-JSON response (HTTP 200, text/html)"
+        )
 
     def test_retries_on_rate_limit(self):
         """search() retries after an HTTP 429 before succeeding."""
@@ -10461,6 +10560,8 @@ it used to bypass: its requests are now counted and its quota headers
 recorded like any others.
 [[check_provider]] asks the limiter before it probes, so a refusal here
 is a rare race, but it must surface as a status, not as a traceback.
+Like the DBLP probe, it insists on a JSON body (\cref{sec:provider-health}):
+a gateway or challenge page served with HTTP 200 is not a working search.
 
 <<scopus provider>>=
 
@@ -10482,7 +10583,8 @@ is a rare race, but it must surface as a status, not as a traceback.
                 "institution's network or set SCOPUS_INST_TOKEN"
             )
         status, message = classify_check_response(
-            response, authenticated=True, key_hint="SCOPUS_API_KEY"
+            response, authenticated=True, key_hint="SCOPUS_API_KEY",
+            expect_json=True,
         )
         if status == HEALTH_OK and not message:
             message = (
