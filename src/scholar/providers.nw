@@ -1309,8 +1309,10 @@ paces and counts each request and refuses while a persistent cooldown
 is active, and [[record_response()]] turns a 429 that survived the
 session's own retries into such a cooldown---so the \emph{next}
 [[scholar]] invocation waits it out instead of rediscovering it.
-The [[RateLimited]] this can raise is contained by the same broad
-exception handling every caller already has for network failures.
+The [[RateLimited]] this can raise is contained where every caller
+already contains network failures; the search catches it ahead of its
+catch-all, though, since [[acquire]] has logged the refusal already
+(\cref{sec:openalex-refusal}).
 
 <<semantic scholar request helper>>=
 def _build_headers(self) -> dict:
@@ -1519,6 +1521,9 @@ def _search_uncached(
         self._limiter.record_limit_hit(
             reason="rate limited (HTTP 429) after retries"
         )
+        return all_papers, False
+    except RateLimited:
+        # The limiter already logged the reason once
         return all_papers, False
     except requests.exceptions.HTTPError as e:
         logger.warning("s2: HTTP error: %s", e)
@@ -2440,6 +2445,9 @@ class OpenAlexProvider:
             return self._cache[cache_key]
         try:
             papers = self._search_uncached(query, limit, filters)
+        except RateLimited:
+            # The limiter already logged the reason once; do not cache.
+            return []
         except requests.HTTPError as e:
             self._note_http_error(e)
             return []
@@ -2529,6 +2537,42 @@ def test_openalex_pages_pass_the_limiter_first():
         works.return_value.search.return_value.paginate = pages
         provider.search("paging order", limit=5)
     assert seen == [1, 2]
+@
+
+\label{sec:openalex-refusal}
+When the limiter refuses, [[acquire()]] has already said so: it logs
+one warning per process, naming the provider, and then raises
+[[RateLimited]].
+[[search()]] therefore catches that exception on its own, before the
+catch-all, and returns an uncached empty list without a word.
+The catch-all would have logged the exception a second time, and since
+the exception's message starts with the provider name too, the line read
+\enquote{openalex: openalex: \dots}.
+The source-pinned providers inherit [[search()]], and Semantic Scholar
+and arXiv, which pass the same limiter, catch it the same way.
+
+Let's verify that a refused search leaves exactly one warning, for all
+three.
+A cooldown recorded before the search makes the first [[acquire()]]
+refuse, so no request is attempted and no mock is needed.
+
+<<test functions>>=
+@pytest.mark.parametrize("provider_class", [
+    OpenAlexProvider, SemanticScholarProvider, ArxivProvider,
+])
+def test_refused_search_is_logged_once(provider_class, caplog):
+    """A limiter refusal is reported by the limiter alone."""
+    ratelimit._LIMITERS.pop(provider_class.name, None)
+    provider = provider_class()
+    provider._limiter.record_limit_hit(retry_after=3600, reason="cooldown")
+    with caplog.at_level(logging.WARNING):
+        assert provider.search("refused", limit=5) == []
+    warnings = [
+        r.getMessage() for r in caplog.records
+        if r.levelno >= logging.WARNING
+    ]
+    assert len(warnings) == 1, warnings
+    assert warnings[0].startswith(f"{provider.name}: cooldown")
 @
 
 \subsubsection{Health check}
@@ -8132,6 +8176,9 @@ The backoff starts at 3 seconds and doubles with each attempt.
 Importantly, we only cache successful results.
 If a request fails after all retries, we return an empty list without caching,
 allowing the user to retry immediately.
+A refusal by the rate limiter is not retried at all: a cooldown outlasts
+any backoff, and the limiter has already logged it, so the search returns
+quietly (\cref{sec:openalex-refusal}).
 
 <<arxiv search with retry>>=
 last_exception: Exception | None = None
@@ -8166,6 +8213,10 @@ for attempt in range(self.MAX_RETRIES):
                 "arxiv: %s (attempt %d/%d, giving up)",
                 e, attempt + 1, self.MAX_RETRIES
             )
+
+    except RateLimited:
+        # The limiter already logged the reason once
+        return []
 
     except Exception as e:
         # Non-retryable error
