@@ -33,6 +33,8 @@ Providers self-register via `register_provider()` at module load time.
 | `src/scholar/preprint.nw` | Literate source for the preprint fallback |
 | `src/scholar/ratelimit.py` | Persistent cross-session rate-limit/quota tracking |
 | `src/scholar/ratelimit.nw` | Literate source for rate-limit tracking |
+| `src/scholar/network.py` | Proxy route and User-Agent for every request |
+| `src/scholar/network.nw` | Literate source for the network settings |
 | `src/scholar/cli.py` | CLI commands and output formatters |
 | `src/scholar/cli.nw` | Literate programming source for CLI |
 | `src/scholar/tutorials/*.nw` | Literate sources of the interactive tutorials (tangle to `*.md`, weave to chapters) |
@@ -168,6 +170,42 @@ openalex.org/settings/api; ten times the metered daily budget). The
 provider hands it to `pyalex.config.api_key` (sent as a bearer token);
 the health probe sends it as the `api_key` query parameter; `conftest.py`
 unsets it too.
+
+### Network: proxy and User-Agent
+
+`network.py` (`network.nw`, chapter `ch:network`) owns the route and the
+identity of every outgoing request:
+
+- **Route**: global CLI option `--proxy URL` (stored by
+  `network.set_proxy`, called by the app callback on every invocation)
+  wins over `SCHOLAR_PROXY`; with neither, requests' own
+  `HTTP(S)_PROXY`/`ALL_PROXY`/`NO_PROXY` handling applies. The proxy is
+  passed per request (`proxies=`), because requests lets the environment
+  override a session's `proxies` attribute. The callback validates the
+  URL (scheme http/https/socks4/socks4a/socks5/socks5h, a host, PySocks
+  for SOCKS) and exits 2 on a bad one, since a broken proxy would
+  otherwise make every provider silently return nothing. Recommend
+  `socks5h://` (DNS at the proxy).
+- **Identity**: `scholar/<version> (+https://github.com/dbosk/scholar;
+  mailto:<SCHOLAR_EMAIL>)`, overridable by `SCHOLAR_USER_AGENT`. A
+  caller's own User-Agent header is kept (DBLP's `DBLP_USER_AGENT`,
+  arXiv's `arxiv.py/...`). Never imitate a browser: bot checks
+  (Cloudflare challenges, login pages) are a stopping point, not
+  something to work around.
+- **Applying**: `network.get(url, **kw)` wraps `requests.get` (so tests
+  that patch `requests.get` still intercept); `network.new_session(retry)`
+  returns a `ScholarSession` (S2, Crossref, Unpaywall, the arXiv client's
+  `_session`); `network.configure_pyalex()` sets pyalex's User-Agent and
+  wraps the private `pyalex.api._get_requests_session` (warns if a
+  pyalex release removes it while a proxy is set). Every provider uses
+  these except `DBLPProvider`, whose two `requests.get` calls are left
+  for the DBLP rewrite (#94) and so ignore `--proxy`/`SCHOLAR_PROXY`.
+- **Reporting**: `scholar providers check` prints `Route: direct` or
+  `Route: proxy <scheme://host:port> (<source>)` (credentials redacted)
+  above the table; `--show-ip` adds the exit IP from api.ipify.org (only
+  on request; skipped with `--offline`).
+- Not done: per-provider proxy selection (e.g. only Scopus and PDF
+  downloads through the tunnel).
 
 ### Open-Access Lookup (Unpaywall)
 
@@ -541,7 +579,7 @@ requests/day and each `scholar` run is a fresh process.
 
 ## Dependencies
 
-- `requests` - HTTP client
+- `requests` - HTTP client (PySocks, optional, for `socks5h://` proxies)
 - `typer` - CLI framework
 - `rich` - Terminal formatting
 - `semanticscholar`, `pyalex` - Provider-specific clients

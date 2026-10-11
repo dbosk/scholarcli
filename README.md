@@ -262,6 +262,38 @@ View provider status:
 scholar providers
 ```
 
+### Network: proxy and User-Agent
+
+To reach subscriber-only content from off campus (Scopus's COMPLETE
+view, a publisher that admits the institution's IP range), route
+scholar's requests through a proxy on that network, for example an SSH
+SOCKS tunnel:
+
+```bash
+ssh -D 127.0.0.1:1081 -N you@login.your-university.example &
+scholar --proxy socks5h://127.0.0.1:1081 search "..."
+export SCHOLAR_PROXY=socks5h://127.0.0.1:1081   # or for every command
+scholar providers check --show-ip                # route, exit IP, health
+```
+
+`--proxy URL` (a global option, before the command) wins over
+`SCHOLAR_PROXY`; with neither, the standard `HTTP(S)_PROXY`/`ALL_PROXY`
+variables apply as usual. Use `socks5h://` rather than `socks5://` so
+host names are resolved by the proxy, on the far side of the tunnel.
+SOCKS needs the PySocks package (`pipx inject scholarcli PySocks`);
+scholar refuses a SOCKS proxy without it rather than failing every
+request. `scholar providers check` always prints the route; `--show-ip`
+also asks api.ipify.org for the exit address (a third-party request, so
+only on demand).
+
+Requests identify themselves as
+`scholar/<version> (+https://github.com/dbosk/scholar; mailto:<SCHOLAR_EMAIL>)`
+(the `mailto` part only when `SCHOLAR_EMAIL` is set; note that it is then
+sent to every host, publishers included). Set `SCHOLAR_USER_AGENT` to
+replace it. Scholar does not imitate a browser: a Cloudflare challenge
+or a login page from a publisher means the PDF is not available to
+scripts, and scholar stops there.
+
 ## Usage Examples
 
 ### Basic Search
