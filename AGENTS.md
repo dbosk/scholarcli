@@ -315,13 +315,22 @@ report body builders (`build_review_provenance_latex`,
   literal `\textcite{key}`s, so `_synthesis_key_space` orders the key
   space as included kept papers (original order), then remaining kept,
   then discarded, deduplicated by paper id; suffixes are assigned in
-  iteration order, so kept keys never change. The report keeps its own
-  `surname{year}_{index}` scheme keyed by `id(decision)` (a loaded
-  session can hold one paper twice); builders take a `cite_key`
-  resolver so the two schemes never have to agree. Synthesis keys strip
-  only the characters biber rejects (apostrophes, quotes, braces,
-  delimiters), so `O'Brien` yields `obrien2024` while all other keys are
-  unchanged.
+  iteration order, so kept keys never change.
+- **One key scheme** (#85, `review.py`): `cite_key_base` = surname
+  (`author_surname`: before the comma in `Smith, John`, else the last
+  word) lower-cased and reduced to letters/digits (biber-safe; `O'Brien`
+  → `obrien`, `Smith-Jones` → `smithjones`, `Müller` kept) + year or
+  `nd`; `unknown` without author. `assign_cite_keys` suffixes clashes in
+  list order from `a` (`smith2024`, `smith2024a`, …, `z`, `aa`), so a
+  key depends only on the papers before it. Both `report_cite_keys`
+  (keyed by `id(decision)`: a loaded session can hold one paper twice,
+  and the report lists both) and the synthesis's
+  `_generate_all_citation_keys` (keyed by paper id after
+  `_unique_by_paper_id`) use it; the builders keep the `cite_key`
+  resolver because the two look keys up by different identities.
+  Changing the scheme requires a `SYNTHESIS_CACHE_VERSION` bump (now
+  `v5`: cached prose cites keys literally). `search -f bibtex`
+  (`cli._bibtex_key`) is a separate, older scheme.
 - `scholar sessions export -f table --lang en|sv --label L --track T
   --theme TAG=NAME -o base` writes `base.tex`, always a fragment: one
   row per *work* (`audit_work_key`: title and first-author surname

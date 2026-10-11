@@ -2617,7 +2617,7 @@ SYNTHESIS_SECTION_END = "===SECTION_END==="
 SYNTHESIS_SUMMARY_START = "===SUMMARY_START==="
 SYNTHESIS_SUMMARY_END = "===SUMMARY_END==="
 
-SYNTHESIS_CACHE_VERSION = "v4"
+SYNTHESIS_CACHE_VERSION = "v5"
 SYNTHESIS_THEME_CACHE = load_cache("llm_synthesis_theme")
 SYNTHESIS_CONCLUSION_CACHE = load_cache("llm_synthesis_conclusion")
 register_cache("llm_synthesis_theme", SYNTHESIS_THEME_CACHE)
@@ -2713,34 +2713,22 @@ For author-year citations, we generate keys like \enquote{[Smith, 2024]} or
 on the number of authors.
 
 For \LaTeX{} output, we also need BibTeX-style keys like [[smith2024]] for use
-with [[\cite{}]] commands. A key is built from the surname, so it inherits
-whatever the surname contains; biber's parser rejects an apostrophe (an
-\enquote{O'Brien} used to abort the whole bibliography) as well as
-whitespace, quotes, braces, parentheses and the BibTeX delimiters. Only
-those characters are stripped, so every key that compiled before is
-unchanged---which matters because cached prose cites keys literally.
+with [[\cite{}]] commands. These follow the review report's scheme
+(\cref{sec:cite-keys} in the review module): the surname reduced to letters
+and digits, the year or [[nd]], and a suffix from [[a]] on when two papers
+clash. One scheme for both documents means one rule for a reader looking a
+key up, and one place where biber safety is kept.
 
+The cached prose contains the keys literally, and the theme cache hashes the
+papers but not their keys, so a change to the scheme must also change
+[[SYNTHESIS_CACHE_VERSION]]; otherwise a cached section would cite keys the
+new bibliography no longer has. The version went from [[v4]] to [[v5]] when
+the schemes were unified, which costs every user one full re-run of their
+syntheses.
+
+<<llm review imports>>=
+from scholar.review import assign_cite_keys, author_surname, cite_key_base
 <<llm review synthesis>>=
-BIBTEX_KEY_UNSAFE = re.compile(r"""[\s,{}"'#%()=\\]""")
-
-
-def _get_author_surname(author: str) -> str:
-    """
-    Extract surname from author name.
-
-    Handles formats like "John Smith", "Smith, John", "J. Smith".
-    """
-    author = author.strip()
-    if "," in author:
-        # "Smith, John" format
-        return author.split(",")[0].strip()
-    parts = author.split()
-    if parts:
-        # "John Smith" or "J. Smith" - take last part
-        return parts[-1]
-    return author
-
-
 def _generate_citation_key(
     paper: Paper,
     output_format: str = "markdown",
@@ -2753,20 +2741,17 @@ def _generate_citation_key(
         output_format: "markdown" for [Author, Year] or "latex" for cite key
 
     Returns:
-        Tuple of (display_key, bibtex_key)
+        Tuple of (display_key, bibtex_key), before any collision suffix
         - display_key: "[Smith, 2024]" for markdown, "smith2024" for latex
         - bibtex_key: Always "smith2024" style for reference list
     """
-    # Get first author surname
     if paper.authors:
-        first_surname = _get_author_surname(paper.authors[0])
+        first_surname = author_surname(paper.authors[0] or "")
     else:
         first_surname = "Unknown"
 
     year = paper.year or "n.d."
-
-    # Generate BibTeX-style key (always needed for reference list)
-    bibtex_key = BIBTEX_KEY_UNSAFE.sub("", f"{first_surname.lower()}{year}")
+    bibtex_key = cite_key_base(paper)
 
     if output_format == "latex":
         display_key = bibtex_key
@@ -2775,14 +2760,23 @@ def _generate_citation_key(
         if len(paper.authors) == 1:
             display_key = f"[{first_surname}, {year}]"
         elif len(paper.authors) == 2:
-            second_surname = _get_author_surname(paper.authors[1])
+            second_surname = author_surname(paper.authors[1] or "")
             display_key = f"[{first_surname} \\& {second_surname}, {year}]"
         else:
             display_key = f"[{first_surname} et al., {year}]"
 
     return display_key, bibtex_key
+@
 
+All keys of one synthesis are assigned together, so that clashes get their
+suffixes. The decisions are first reduced to one per paper id, keeping the
+first occurrence, because the result is a map by paper id: a second record of
+the same paper used to take a suffixed key and overwrite the first one's
+entry, so the prose cited a key the deduplicated bibliography
+(\cref{sec:synthesis-key-space}) did not contain. The display key gets the
+same suffix as the BibTeX key.
 
+<<llm review synthesis>>=
 def _generate_all_citation_keys(
     decisions: list[ReviewDecision],
     output_format: str = "markdown",
@@ -2799,29 +2793,19 @@ def _generate_all_citation_keys(
     """
     from scholar.notes import get_paper_id
 
+    unique = _unique_by_paper_id(decisions)
+    assigned = assign_cite_keys([d.paper for d in unique])
     keys: dict[str, tuple[str, str]] = {}
-    seen_bibtex: dict[str, int] = {}
-
-    for decision in decisions:
-        paper_id = get_paper_id(decision.paper)
-        display_key, bibtex_key = _generate_citation_key(
+    for decision, bibtex_key in zip(unique, assigned):
+        display_key, base = _generate_citation_key(
             decision.paper, output_format
         )
-
-        # Handle duplicate BibTeX keys by adding suffix
-        if bibtex_key in seen_bibtex:
-            seen_bibtex[bibtex_key] += 1
-            suffix = chr(ord('a') + seen_bibtex[bibtex_key] - 1)
-            bibtex_key = f"{bibtex_key}{suffix}"
-            if output_format == "latex":
-                display_key = bibtex_key
-            else:
-                # Add suffix to display key too
-                display_key = display_key[:-1] + suffix + "]"
-        else:
-            seen_bibtex[bibtex_key] = 1
-
-        keys[paper_id] = (display_key, bibtex_key)
+        suffix = bibtex_key[len(base):]
+        if output_format == "latex":
+            display_key = bibtex_key
+        elif suffix:
+            display_key = display_key[:-1] + suffix + "]"
+        keys[get_paper_id(decision.paper)] = (display_key, bibtex_key)
 
     return keys
 @
@@ -2830,26 +2814,19 @@ def _generate_all_citation_keys(
 
 <<test functions>>=
 class TestSynthesisCitationKeys:
-    def test_generate_citation_key_strips_bibtex_unsafe_chars(self):
+    def test_generate_citation_key_follows_the_shared_scheme(self):
         from scholar.llm_review import _generate_citation_key
 
         paper = Paper(title="T", authors=["Ann O'Brien"], year=2024)
         _, key = _generate_citation_key(paper, "latex")
         assert key == "obrien2024"
         hyphen = Paper(title="T", authors=["Bo Smith-Jones"], year=2024)
-        assert _generate_citation_key(hyphen, "latex")[1] == "smith-jones2024"
-
-    def test_get_author_surname_simple(self):
-        from scholar.llm_review import _get_author_surname
-
-        assert _get_author_surname("John Smith") == "Smith"
-        assert _get_author_surname("Smith") == "Smith"
-
-    def test_get_author_surname_comma_format(self):
-        from scholar.llm_review import _get_author_surname
-
-        assert _get_author_surname("Smith, John") == "Smith"
-        assert _get_author_surname("van Gogh, Vincent") == "van Gogh"
+        assert _generate_citation_key(hyphen, "latex")[1] == "smithjones2024"
+        comma = Paper(title="T", authors=["Smith, John"], year=2024)
+        assert _generate_citation_key(comma, "latex")[1] == "smith2024"
+        undated = Paper(title="T", authors=["Smith, John"])
+        assert _generate_citation_key(undated, "markdown") \
+            == ("[Smith, n.d.]", "smithnd")
 
     def test_generate_citation_key_single_author(self):
         from scholar.llm_review import _generate_citation_key
@@ -2891,9 +2868,43 @@ class TestSynthesisCitationKeys:
         display, bibtex = _generate_citation_key(paper, "latex")
         assert display == "smith2024"
         assert bibtex == "smith2024"
+
+    def test_same_scheme_as_the_report(self):
+        from scholar.llm_review import _generate_all_citation_keys
+        from scholar.notes import get_paper_id
+        from scholar.review import report_cite_keys
+
+        decisions = [
+            ReviewDecision(
+                paper=Paper(title=t, authors=[a], year=2024, doi=f"10/{t}"),
+                provider="p", status=DecisionStatus.KEPT,
+            )
+            for t, a in [("x", "Smith, Ann"), ("y", "Bo Smith"),
+                         ("z", "Cy Jones")]
+        ]
+        synthesis = _generate_all_citation_keys(decisions, "markdown")
+        report = report_cite_keys(decisions)
+        for decision in decisions:
+            assert synthesis[get_paper_id(decision.paper)][1] \
+                == report[id(decision)]
+        assert synthesis[get_paper_id(decisions[1].paper)] \
+            == ("[Smith, 2024a]", "smith2024a")
+
+    def test_duplicate_record_does_not_take_a_suffixed_key(self):
+        from scholar.llm_review import _generate_all_citation_keys
+        from scholar.notes import get_paper_id
+
+        paper = Paper(title="Once", authors=["Ann Smith"], year=2024)
+        decisions = [
+            ReviewDecision(paper=paper, provider=p, status=DecisionStatus.KEPT)
+            for p in ("a", "b")
+        ]
+        keys = _generate_all_citation_keys(decisions, "latex")
+        assert keys == {get_paper_id(paper): ("smith2024", "smith2024")}
 @
 
 \subsubsection{Keys for the appendix}
+\label{sec:synthesis-key-space}
 
 The \LaTeX{} synthesis ends with the decision record, which
 [[\fullcite]]s every paper the review touched, so the bibliography must
@@ -2903,10 +2914,9 @@ space as the cited papers, and that space must be extended without
 disturbing what is already there: theme sections are cached under
 [[_theme_cache_key]], which hashes paper fingerprints but not the keys,
 and the cached prose contains the keys literally. The extension is safe
-because [[_generate_all_citation_keys]] assigns collision suffixes in
-iteration order---appending papers can suffix later entries, never
-earlier ones---provided the included kept papers come first, in their
-original order.
+because collision suffixes are assigned in iteration order---appending
+papers can suffix later entries, never earlier ones---provided the
+included kept papers come first, in their original order.
 
 The space is deduplicated by paper id. A session can hold the same paper
 twice (the loader derives arXiv DOIs from URLs, so two records saved as
@@ -2995,9 +3005,9 @@ class TestSynthesisKeySpace:
             pid = get_paper_id(decision.paper)
             assert full[pid] == kept_only[pid]
         assert kept_only[get_paper_id(kept[0].paper)][1] == "smith2024"
-        assert kept_only[get_paper_id(kept[1].paper)][1] == "smith2024b"
+        assert kept_only[get_paper_id(kept[1].paper)][1] == "smith2024a"
         dropped = session.discarded_papers()[0]
-        assert full[get_paper_id(dropped.paper)][1] == "smith2024c"
+        assert full[get_paper_id(dropped.paper)][1] == "smith2024b"
 
     def test_duplicate_paper_ids_collapse(self):
         from scholar.llm_review import _synthesis_key_space
@@ -4141,7 +4151,7 @@ class TestAssembleLatexSynthesis:
         text = _assemble(_latex_session(), bib_name="foo.bib")
         landmarks = [
             r"\begin{filecontents*}[overwrite]{foo.bib}",
-            "@article{smith2024c,",
+            "@article{smith2024b,",
             r"\documentclass{article}",
             r"\addbibresource{foo.bib}",
             r"\title{A \& B}",
@@ -4153,9 +4163,9 @@ class TestAssembleLatexSynthesis:
             r"\appendix",
             r"\begin{refsection}",
             r"\section{Kept Papers}",
-            r"\fullcite{smith2024b}",
+            r"\fullcite{smith2024a}",
             r"\section{Discarded Papers}",
-            r"\fullcite{smith2024c}",
+            r"\fullcite{smith2024b}",
             r"\end{refsection}",
             r"\end{document}",
         ]
