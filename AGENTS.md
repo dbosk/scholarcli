@@ -262,6 +262,38 @@ set when the status changed, mirroring the TUI.
 Together these let scripted/agent-driven systematic reviews produce the same
 session record and `sessions export` audit trail as TUI reviews.
 
+### Session Integrity
+
+Commands that load a session and save it much later (`scholar enrich`,
+`verify`, the TUI) used to overwrite whatever was saved in between. That
+is how two classified sessions lost every decision and their research
+context (#107). `review.save_session` now:
+
+- **merges**: it re-reads the file and does a three-way merge against
+  `session._baseline` (`SessionBaseline`, recorded by `read_session_file`
+  and after each save). Decision fields and `research_context` this
+  process did not change take the on-disk value. Papers, search records
+  and snowball rounds that only the file has are added. Paper metadata is
+  not merged (ours wins).
+- **guards**: `warn_if_decisions_dropped` logs a WARNING (session,
+  before/after decided counts, `.bak` path) when the save still leaves
+  fewer decided papers than the file has, beyond this process's own
+  resets to pending. It never refuses the save.
+- **writes atomically**: `utils.atomic_write_text` (temp file in the
+  same directory, fsync, `os.replace`), keeping the previous file as
+  `<name>.json.bak` (one generation).
+
+`load_session(..., strict=True)` raises `SessionFileError` for a file
+that exists but does not parse. `create_review_session` uses it, so
+`search -n`/`--review`/`rq` stop with one line instead of rebuilding over
+the file. Read-only callers still get `None` plus a warning.
+`sessions export` stages all its files with `utils.staged_outputs` and
+moves them into place only if every format succeeded (#83).
+`sessions list` warns on stderr about sessions with records but no
+decisions and no context (`needs_check` in the JSON). The paper registry
+is process-global, so tests that load sessions should use unique DOIs or
+`isolated_registry()`.
+
 ### Provenance Round-Trip
 
 The `bibtex+prov` export format wraps each entry in a provenance comment
