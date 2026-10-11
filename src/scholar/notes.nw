@@ -1265,7 +1265,10 @@ review state when repeating a search. Each query gets its own JSON file.
 Like the notes file, a decision file that exists but cannot be parsed
 raises [[NotesFileError]] rather than reading as \enquote{no previous
 decisions}, which would let the next save replace it; and it is written
-atomically with a [[.bak]].
+atomically with a [[.bak]].  Reading one file is a function of its own,
+[[read_search_decisions_file]], because [[migrate_paper_id]]
+(\cref{sec:notes-migrate-paper-id}) reads every file in the directory
+and must judge them by the same rule.
 
 <<search decisions functions>>=
 def load_search_decisions(query: str) -> SearchDecisions | None:
@@ -1286,7 +1289,16 @@ def load_search_decisions(query: str) -> SearchDecisions | None:
 
     if not decisions_file.exists():
         return None
+    return read_search_decisions_file(decisions_file)
 
+
+def read_search_decisions_file(decisions_file: Path) -> SearchDecisions:
+    """
+    Read one search-decisions file.
+
+    Raises:
+        NotesFileError: The file cannot be read or parsed.
+    """
     try:
         with open(decisions_file, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -1409,6 +1421,7 @@ def test_corrupt_decision_file_is_an_error(tmp_path, monkeypatch):
 @
 
 \subsection{Migrating a paper's identity}
+\label{sec:notes-migrate-paper-id}
 
 The legacy-hash migrations above handle one identity change---a paper
 gaining a DOI---lazily, at lookup time, because the old id is always
@@ -1428,6 +1441,30 @@ simplicity wins over indexing.  In both stores an existing record
 under the new id is left alone---the new identity's own data is
 fresher than what we would migrate onto it.
 
+\paragraph{An unreadable store is reported, not raised.}
+Elsewhere an unreadable notes or decision file raises
+[[NotesFileError]] (\cref{sec:notes-search-decisions}), and here it
+used to be skipped without a word, so the migration left the paper's
+records under its old id and nobody learnt of it
+(\url{https://github.com/dbosk/scholar/issues/121}).  Raising here too
+would be consistent, but it would cost the callers more than it saves.
+The loaders raise because their callers go on to write the file they
+read, and that write would destroy what could not be parsed.
+[[migrate_paper_id]] writes only the files it could read, so skipping a
+broken one leaves it byte-identical, which is all the
+\enquote{never overwrite} rule asks for.  Its callers, on the other
+hand, have done expensive work by the time they call it:
+[[scholar enrich]] calls it after the whole enrichment run and before
+saving the session, [[create_review_session]] in the middle of
+appending a search, the TUI in an enrichment thread.  An exception
+would discard the run or the append to protect an index entry in a file
+that nothing can read anyway.  So each unreadable file, the notes file
+included, gets a WARNING that names it and both ids, which is what the
+user needs to re-key the record by hand once the file is repaired, and
+the migration carries on with the other files.  Write errors still
+raise: they mean the data directory cannot be written at all, and the
+caller's own save is about to fail the same way.
+
 <<search decisions functions>>=
 def migrate_paper_id(old_id: str, new_id: str) -> None:
     """Move any note and search decisions from `old_id` to `new_id`.
@@ -1435,11 +1472,17 @@ def migrate_paper_id(old_id: str, new_id: str) -> None:
     Used when an entry's identity changes, e.g. when enrichment
     replaces a published paper with its preprint version. Records
     already present under `new_id` are kept and the old ones dropped.
+    A notes or decisions file that cannot be read is left untouched
+    and named in a warning; a failed write raises `NotesFileError`.
     """
     if old_id == new_id:
         return
 
-    notes = _load_all_notes()
+    try:
+        notes = _load_all_notes()
+    except NotesFileError as error:
+        _warn_not_migrated(error, old_id, new_id)
+        notes = {}
     if old_id in notes:
         note = notes.pop(old_id)
         if new_id not in notes:
@@ -1448,10 +1491,9 @@ def migrate_paper_id(old_id: str, new_id: str) -> None:
 
     for decision_file in get_decisions_dir().glob("*.json"):
         try:
-            with open(decision_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            search_decisions = SearchDecisions.from_dict(data)
-        except (json.JSONDecodeError, OSError, KeyError):
+            search_decisions = read_search_decisions_file(decision_file)
+        except NotesFileError as error:
+            _warn_not_migrated(error, old_id, new_id)
             continue
         if old_id not in search_decisions.decisions:
             continue
@@ -1461,6 +1503,18 @@ def migrate_paper_id(old_id: str, new_id: str) -> None:
         save_search_decisions(
             search_decisions.query, search_decisions.decisions
         )
+
+
+def _warn_not_migrated(error: NotesFileError, old_id: str,
+                       new_id: str) -> None:
+    logger.warning(
+        "%s; records of %s in it were not moved to %s",
+        error, old_id, new_id,
+    )
+<<notes imports>>=
+import logging
+<<notes constants>>=
+logger = logging.getLogger(__name__)
 @
 
 Let's verify both stores migrate and that existing records under the
@@ -1526,6 +1580,46 @@ class TestMigratePaperId:
     def test_same_id_is_a_no_op(self, tmp_path, monkeypatch):
         monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
         migrate_paper_id("doi:10.1/x", "doi:10.1/x")
+@
+
+An unreadable file is named in a warning and left as it was, and the
+readable files are migrated all the same.  That holds for a decision
+file and for the notes file:
+
+<<test functions>>=
+class TestMigratePaperIdUnreadableStores:
+    """migrate_paper_id reports unreadable files and carries on."""
+
+    @staticmethod
+    def readable_decision(monkeypatch, tmp_path):
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        invalidate_notes_cache()
+        record = ReviewDecisionRecord(status="kept", title="A")
+        save_search_decisions("readable", {"doi:10.1/old": record})
+
+    def test_unreadable_decision_file(self, tmp_path, monkeypatch, caplog):
+        self.readable_decision(monkeypatch, tmp_path)
+        broken = get_decisions_dir() / "broken.json"
+        broken.write_text("{")
+        with caplog.at_level("WARNING", logger="scholar.notes"):
+            migrate_paper_id("doi:10.1/old", "doi:10.1/new")
+        assert broken.read_text() == "{"
+        assert "broken.json" in caplog.text
+        assert "doi:10.1/old" in caplog.text
+        assert "doi:10.1/new" in caplog.text
+        moved = load_search_decisions("readable").decisions
+        assert list(moved) == ["doi:10.1/new"]
+
+    def test_unreadable_notes_file(self, tmp_path, monkeypatch, caplog):
+        self.readable_decision(monkeypatch, tmp_path)
+        notes_file = get_data_dir() / NOTES_FILE
+        notes_file.write_text("{")
+        with caplog.at_level("WARNING", logger="scholar.notes"):
+            migrate_paper_id("doi:10.1/old", "doi:10.1/new")
+        assert notes_file.read_text() == "{"
+        assert NOTES_FILE in caplog.text
+        moved = load_search_decisions("readable").decisions
+        assert list(moved) == ["doi:10.1/new"]
 @
 
 \subsection{Testing search decisions}
