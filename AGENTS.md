@@ -337,12 +337,17 @@ report body builders (`build_review_provenance_latex`,
   `duplicate-record-of-cited-source`, `extended-tech-report`, …) and
   theme tags (the rest; with `--theme` given, only the listed tags).
   *Cited* = kept by a human decision (source `human` or `llm_reviewed`)
-  with a theme tag or no tags; otherwise the first category tag, with
-  the confidence for unreviewed LLM rows; notes are appended in
-  parentheses, note-only rows are "other". An LLM keep is a candidate,
-  not a citation. Order: cited (0), `supports-claim` (1),
+  with a theme tag or no tags; otherwise the last category tag
+  (`audit_category`), with the confidence for unreviewed LLM rows; notes
+  are appended in parentheses, note-only rows are "other". An LLM keep
+  is a candidate, not a citation. Order: cited (0), `supports-claim` (1),
   `qualifies-claim` (2), `adjacent-subtopic` (3),
-  `off-topic-false-hit` (4), pending (5), other (6). The caption never
+  `off-topic-false-hit` (4), pending (5), other (6). The status wins
+  over the category (#89): a *discarded* row whose category is
+  `supports-claim`/`qualifies-claim` (`audit_excluded`) is never in
+  orders 0-2; it sorts as other (6) with reason "<category>, excluded"
+  and the caption counts it apart (`extra_excluded`), so
+  `--bearing-only` never lists a rejected hit. The caption never
   names the session (it is a `%` comment in the fragment) and ends with
   a full-name-first "Databases:" sentence built from the providers
   present. `--bearing-only` lists only orders 0-2 and states the other

@@ -4202,6 +4202,10 @@ AUDIT_STRINGS: dict[str, dict] = {
         "extra_other": (
             ", {other} duplicates or other versions of cited sources"
         ),
+        "extra_excluded": (
+            ", {excluded} excluded although classified as bearing on the "
+            "claim"
+        ),
         "databases": "Databases: {list}.",
         "openalex_note": "not open access",
         "title": "Title",
@@ -4214,6 +4218,7 @@ AUDIT_STRINGS: dict[str, dict] = {
         "adjacent-subtopic": "adjacent subtopic",
         "off-topic-false-hit": "other topic (false hit)",
         "pending": "pending, unclassified",
+        "excluded": "excluded",
         "continued": "(cont.)",
         "continued_next": "continued on next page",
         "notes": {
@@ -4254,6 +4259,10 @@ AUDIT_STRINGS: dict[str, dict] = {
         "extra_other": (
             ", {other} dubbletter eller andra versioner av citerade källor"
         ),
+        "extra_excluded": (
+            ", {excluded} uteslutna trots att de klassats som relevanta "
+            "för påståendet"
+        ),
         "databases": "Databaser: {list}.",
         "openalex_note": "inte open access",
         "title": "Titel",
@@ -4266,6 +4275,7 @@ AUDIT_STRINGS: dict[str, dict] = {
         "adjacent-subtopic": "angränsande delämne",
         "off-topic-false-hit": "annat ämne (felträff)",
         "pending": "ej klassad",
+        "excluded": "utesluten",
         "continued": "(forts.)",
         "continued_next": "forts.\\ på nästa sida",
         "notes": {
@@ -4321,6 +4331,7 @@ class AuditRow:
     status: DecisionStatus
     reason: str
     order: int
+    excluded: bool = False   # discarded despite a bearing category
 @
 
 Three facts about how decisions are recorded shape the cited rule.
@@ -4350,11 +4361,33 @@ decision owns the new label, so no confidence goes with it. Finally, a
 theme that merely repeats the word \enquote{cited} adds nothing and is
 not repeated.
 
-The confidence is shown only for decisions the LLM made and nobody has
-reviewed yet: once a human confirms or changes a decision it is a human
-decision, and the number would misrepresent it.
+The category is the classification, but the status is the decision,
+and the decision wins (issue~\#89). A row whose final status is
+discarded is never listed as cited, supporting or qualifying, whatever
+its category says: the reviewer, or the model, looked at the paper and
+excluded it, and counting it as evidence for the claim in a published
+appendix is exactly the mistake the issue reported. Such a row keeps
+its category in the reason, marked as excluded, but sorts among the
+\enquote{other} rows, so [[--bearing-only]] never lists it and the
+caption counts it separately. The adjacent and off-topic categories do
+not bear on the claim, so a discarded row there is simply what it says.
 
 <<review report generation>>=
+def audit_category(tags: list[str]) -> str | None:
+    """Return the deciding (last) audit category among `tags`, if any."""
+    return next((t for t in reversed(tags) if t in AUDIT_CATEGORIES), None)
+
+
+def audit_excluded(decision: ReviewDecision) -> bool:
+    """Tell whether a bearing category was overruled by a discard."""
+    category = audit_category(decision.tags)
+    return (
+        decision.status == DecisionStatus.DISCARDED
+        and category is not None
+        and AUDIT_CATEGORIES[category] <= AUDIT_ORDER_BEARING
+    )
+
+
 def audit_reason(
     decision: ReviewDecision,
     *,
@@ -4364,9 +4397,7 @@ def audit_reason(
     """Return the reason label and sort order for `decision`."""
     tags = list(decision.tags)
     notes = strings["notes"]
-    category = next(
-        (t for t in reversed(tags) if t in AUDIT_CATEGORIES), None
-    )
+    category = audit_category(tags)
     note_texts = [notes[t] for t in tags if t in notes]
     if theme_names:
         theme_tags = [t for t in tags if t in theme_names]
@@ -4399,6 +4430,9 @@ def audit_reason(
         order = AUDIT_ORDER_CITED
     elif kept and human_decision and not tags:
         label, order = f"\\emph{{{strings['cited']}}}", AUDIT_ORDER_CITED
+    elif audit_excluded(decision):
+        label = f"{strings[category]}{confidence}, {strings['excluded']}"
+        order = AUDIT_ORDER_OTHER
     elif category is not None:
         label = strings[category] + confidence
         order = AUDIT_CATEGORIES[category]
@@ -4468,7 +4502,7 @@ class TestAuditReason:
             "a cited source)"
         assert order == AUDIT_ORDER_CITED
         assert self._reason(
-            DecisionStatus.DISCARDED,
+            DecisionStatus.KEPT,
             ["supports-claim", "no-abstract-title-only"],
         ) == (
             "supports the claim (judged on title, no abstract available)", 1
@@ -4483,12 +4517,12 @@ class TestAuditReason:
 
     def test_categories_with_llm_confidence(self):
         label, order = self._reason(
-            DecisionStatus.DISCARDED, ["supports-claim"],
+            DecisionStatus.KEPT, ["supports-claim"],
             source=ReviewSource.LLM_UNREVIEWED, conf=0.93,
         )
         assert label == "supports the claim (0.93)"
         assert order == 1
-        assert self._reason(DecisionStatus.DISCARDED, ["qualifies-claim"]) \
+        assert self._reason(DecisionStatus.KEPT, ["qualifies-claim"]) \
             == ("qualifies or contradicts the claim", 2)
         assert self._reason(DecisionStatus.DISCARDED, ["adjacent-subtopic"]) \
             == ("adjacent subtopic", 3)
@@ -4498,14 +4532,14 @@ class TestAuditReason:
 
     def test_confirmed_llm_decision_keeps_confidence(self):
         label, _ = self._reason(
-            DecisionStatus.DISCARDED, ["supports-claim"],
+            DecisionStatus.KEPT, ["supports-claim"],
             source=ReviewSource.LLM_REVIEWED, conf=0.93,
         )
         assert label == "supports the claim (0.93)"
 
     def test_changed_llm_decision_hides_confidence(self):
         label, _ = self._reason(
-            DecisionStatus.DISCARDED, ["supports-claim"],
+            DecisionStatus.KEPT, ["supports-claim"],
             source=ReviewSource.LLM_REVIEWED, conf=0.93, is_example=True,
         )
         assert label == "supports the claim"
@@ -4517,6 +4551,17 @@ class TestAuditReason:
             source=ReviewSource.LLM_REVIEWED, conf=0.9, is_example=True,
         )
         assert (label, order) == ("other topic (false hit)", 4)
+
+    def test_discarded_status_wins_over_a_bearing_category(self):
+        assert self._reason(DecisionStatus.DISCARDED, ["supports-claim"]) \
+            == ("supports the claim, excluded", AUDIT_ORDER_OTHER)
+        assert self._reason(
+            DecisionStatus.DISCARDED, ["qualifies-claim"],
+            source=ReviewSource.LLM_UNREVIEWED, conf=0.5,
+        ) == ("qualifies or contradicts the claim (0.50), excluded",
+              AUDIT_ORDER_OTHER)
+        assert self._reason(DecisionStatus.DISCARDED, ["adjacent-subtopic"]) \
+            == ("adjacent subtopic", 3)
 
     def test_theme_equal_to_the_label_is_not_repeated(self):
         assert self._reason(DecisionStatus.KEPT, ["cited"]) \
@@ -4610,6 +4655,7 @@ def collect_audit_rows(
         reason, order = audit_reason(
             decision, theme_names=theme_names, strings=strings
         )
+        excluded = audit_excluded(decision)
         row = rows.get(key)
         if row is None:
             rows[key] = AuditRow(
@@ -4619,6 +4665,7 @@ def collect_audit_rows(
                 status=decision.status,
                 reason=reason,
                 order=order,
+                excluded=excluded,
             )
             continue
         for provider in providers:
@@ -4628,6 +4675,7 @@ def collect_audit_rows(
             row.year = year
         if order < row.order:
             row.status, row.reason, row.order = decision.status, reason, order
+            row.excluded = excluded
     return sorted(rows.values(), key=lambda r: (r.order, r.title.lower()))
 @
 
@@ -4654,7 +4702,7 @@ def _audit_session():
         ),
         ReviewDecision(
             paper=Paper(title="Supports \u2606", authors=["B"], year=2021),
-            provider="dblp", status=DecisionStatus.DISCARDED,
+            provider="dblp", status=DecisionStatus.KEPT,
             tags=["supports-claim"], source=llm, llm_confidence=0.93,
         ),
         ReviewDecision(
@@ -4816,6 +4864,12 @@ claim---cited, supporting, qualifying---and moves the adjacent,
 off-topic and unclassified records into the caption as counts, so the
 appendix still accounts for every record without printing it.
 
+The \enquote{other} rows are counted in two parts. Most of them are
+bookkeeping (duplicates, other versions of cited sources), and the
+caption says so; the rows excluded despite a bearing category are not,
+and calling them duplicates would misreport the review, so they get a
+count and a phrase of their own.
+
 <<review report generation>>=
 def build_audit_table_latex(
     session: ReviewSession,
@@ -4838,6 +4892,7 @@ def build_audit_table_latex(
     counts = {
         order: sum(1 for r in rows if r.order == order) for order in range(7)
     }
+    excluded = sum(1 for r in rows if r.excluded)
     databases = audit_databases_sentence(rows, strings)
     if bearing_only:
         template = strings["bearing"]
@@ -4855,8 +4910,12 @@ def build_audit_table_latex(
         extra += strings["extra_pending"].format(
             pending=counts[AUDIT_ORDER_PENDING]
         )
-    if counts[AUDIT_ORDER_OTHER]:
-        extra += strings["extra_other"].format(other=counts[AUDIT_ORDER_OTHER])
+    if counts[AUDIT_ORDER_OTHER] - excluded:
+        extra += strings["extra_other"].format(
+            other=counts[AUDIT_ORDER_OTHER] - excluded
+        )
+    if excluded:
+        extra += strings["extra_excluded"].format(excluded=excluded)
     caption = template.format(
         track=f", {escape_latex(track)}" if track else "",
         n=sum(counts.values()),
@@ -4980,6 +5039,27 @@ class TestAuditTable:
             _audit_session(), label="x", lang="sv", bearing_only=True
         ))
         assert "listas inte" in sv and ", 1 ej klassade" in sv
+
+    def test_bearing_only_never_lists_a_discarded_row(self):
+        session = _audit_session()
+        session.decisions.append(
+            ReviewDecision(
+                paper=Paper(title="Rejected", authors=["D"], year=2022),
+                provider="openalex", status=DecisionStatus.DISCARDED,
+                tags=["supports-claim"],
+            )
+        )
+        text = "\n".join(build_audit_table_latex(
+            session, label="x", bearing_only=True
+        ))
+        assert "Rejected" not in text
+        assert "(1 cited, 1 supporting and 0 qualifying" in text
+        assert "1 unclassified, 1 excluded although classified as bearing " \
+            "on the claim are not listed" in text
+        full = "\n".join(build_audit_table_latex(session, label="x"))
+        assert r"Rejected & 2022 & OA & supports the claim, excluded \\" \
+            in full
+        assert "duplicates" not in full
 
     def test_english_default_and_unknown_language(self):
         lines = build_audit_table_latex(_audit_session(), label="x")
