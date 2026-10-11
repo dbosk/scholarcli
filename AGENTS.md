@@ -256,7 +256,9 @@ confirmation goes to stderr so `-f json`/`-f bibtex` stdout stays pure.
 `--paper-id` takes) under its title, and `show -f json` carries `doi` and
 `paper_id`, so a decision never needs a CSV detour.
 `--source llm` stores the decision as an unreviewed LLM decision
-(agent-driven screening that the TUI still queues for confirmation); a
+(agent-driven screening that the TUI still queues for confirmation),
+with `--confidence/-c 0..1` in `llm_confidence` like `llm classify`
+(validated; ignored with a note for human decisions); a
 human `decide` on such a row marks it `llm_reviewed`, with `is_example`
 set when the status changed, mirroring the TUI.
 Together these let scripted/agent-driven systematic reviews produce the same
@@ -327,7 +329,9 @@ report body builders (`build_review_provenance_latex`,
   provider strings like `openalex; dblp` are split, mapped to codes and
   deduplicated; the best-placed decision wins). The *last* category tag
   is the decision (`decide -t` appends); confidence is shown for
-  unreviewed and human-confirmed LLM rows, not for changed ones. The
+  unreviewed and human-confirmed LLM rows, not for changed ones, and
+  such a row without one shows `AUDIT_STRINGS[lang]["no_confidence"]`
+  (`n/a`, `saknas`) because the caption promises a confidence. The
   escapers decode HTML entities, strip inline markup, repair
   cp1252/Latin-1 mojibake and turn `"` into `\textquotedbl{}` (babel
   shorthand). Titles are printed whole unless `--truncate-titles`
