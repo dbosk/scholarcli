@@ -232,8 +232,8 @@ identity of every outgoing request:
   overridable by `SCHOLAR_USER_AGENT`. No email in it on purpose: the
   UA goes to every host (publishers included); OpenAlex/Crossref/
   Unpaywall get `SCHOLAR_EMAIL` via their own parameters. A
-  caller's own User-Agent header is kept (DBLP's `DBLP_USER_AGENT`,
-  arXiv's `arxiv.py/...`). Never imitate a browser: bot checks
+  caller's own User-Agent header is kept (arXiv's `arxiv.py/...`;
+  DBLP's own `DBLP_USER_AGENT` is gone, #120). Never imitate a browser: bot checks
   (Cloudflare challenges, login pages) are a stopping point, not
   something to work around.
 - **Applying**: `network.get(url, **kw)` wraps `requests.get` (so tests
@@ -242,8 +242,8 @@ identity of every outgoing request:
   `_session`); `network.configure_pyalex()` sets pyalex's User-Agent and
   wraps the private `pyalex.api._get_requests_session` (warns if a
   pyalex release removes it while a proxy is set). Every provider uses
-  these except `DBLPProvider`, whose two `requests.get` calls are left
-  for the DBLP rewrite (#94) and so ignore `--proxy`/`SCHOLAR_PROXY`.
+  these, `DBLPProvider` included (search pages and probe call
+  `network.get`, #120).
 - **Reporting**: `scholar providers check` prints `Route: direct` or
   `Route: proxy <scheme://host:port> (<source>)` (credentials redacted)
   above the table; `--show-ip` adds the exit IP from api.ipify.org (only
@@ -603,7 +603,13 @@ requests/day and each `scholar` run is a fresh process.
   `KEYED_LIMITS` 1.0; `_acquire()` re-declares per request because a
   rejected key changes the rate), OpenAlex and arXiv (a
   `PacedArxivClient` subclass overrides the package's `_parse_feed`, with
-  `delay_seconds=0`) declare rates; no provider keeps its own timestamp.
+  `delay_seconds=0`) and DBLP (`per_second=0.5`: its FAQ says 1-2 s
+  between requests; DBLP never had pacing of its own, only its 429
+  back-off) declare rates; no provider keeps its own timestamp.
+  DBLP's 429 loop records only non-429 responses (a mid-loop 429 would
+  start a cooldown that refuses the retry) and, on giving up, a
+  cooldown of the last `Retry-After`; its back-off and zero-hit retry
+  waits use `ratelimit._sleep`.
   `Limits.per_second` is a rate, not the old seconds-between-requests
   `RATE_LIMIT` (those names are gone). Health probes pass `acquire()` too
   and record their responses, so a probed 429 starts a cooldown.
@@ -616,10 +622,9 @@ requests/day and each `scholar` run is a fresh process.
   `WebOfScienceProvider._get`; Scopus has no extended methods and all its
   requests already go through `ScopusProvider._get`. IEEE, HAL and WoS
   probes are counted too, and `pdf.resolve_doi_s2` uses the `s2` limiter.
-- Remaining (not done): DBLP still paces with its own retry loop (left
-  until the DBLP request loop rewrite of #94 lands); urllib3 `Retry`
-  back-off inside S2/Crossref/Unpaywall sessions is not counted by the
-  limiter (only the request that reaches it is).
+- Remaining (not done): urllib3 `Retry` back-off inside
+  S2/Crossref/Unpaywall sessions is not counted by the limiter (only
+  the request that reaches it is).
 
 ## Dependencies
 
