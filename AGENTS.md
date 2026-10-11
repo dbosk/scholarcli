@@ -471,7 +471,10 @@ refuses DNS and connections to anything but loopback and **fails the
 test** naming the hosts (providers swallow errors, so a refusal alone
 would go unnoticed). Both exempt `@pytest.mark.integration` tests, which
 run only with `--run-live` and keep the developer's keys. No `env -u`
-prefix is needed to run the suite safely.
+prefix is needed to run the suite safely. The autouse
+`fresh_paper_registry` fixture gives every test an empty `PaperRegistry`
+(`Paper.from_dict` returns the registered object for a known id, so a
+shared registry let one test's titles leak into the next).
 
 ## Adding Features
 
