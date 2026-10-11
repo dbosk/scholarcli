@@ -97,9 +97,8 @@ from scholar import Paper
 
 @pytest.fixture(autouse=True)
 def _clean_client():
-    """Reset the shared client's cache and rate-limit clock per test."""
+    """Reset the shared client's cache per test."""
     _client._cache.clear()
-    _client._last_request_time = 0.0
     yield
     _client._cache.clear()
 
@@ -120,7 +119,7 @@ def _mock_response(status=200, message=None):
 \section{The Crossref client}
 
 The client encapsulates the HTTP session, the polite-pool identity, the
-per-DOI cache, and proactive rate limiting.  We model it on
+per-DOI cache, and its rate limiter.  We model it on
 [[SemanticScholarProvider]] so that a reader who knows one knows the other; the
 shared [[load_cache]]/[[register_cache]] calls even let it reuse the same
 on-disk cache machinery.
@@ -137,11 +136,12 @@ class CrossrefClient:
     """Looks up retraction/currency metadata for DOIs via Crossref."""
 
     name = "crossref"
+    LIMITS = Limits(per_second=CROSSREF_REQUESTS_PER_SECOND)
 
     def __init__(self) -> None:
         self._cache: dict = load_cache(self.name)
         register_cache(self.name, self._cache)
-        self._last_request_time: float = 0.0
+        self._limiter = limiter_for(self)
         self._session = self._create_session()
         self._mailto = contact_email("CROSSREF_MAILTO")
 
@@ -167,23 +167,26 @@ def _create_session(self) -> requests.Session:
 @
 
 Crossref's public pool is lenient, but issuing one request per paper in a large
-session can still amount to a burst.  A short minimum interval keeps us a polite
+session can still amount to a burst.  A modest rate keeps us a polite
 neighbour without making verification of a few dozen papers feel slow.
-
-<<crossref client methods>>=
-def _wait_for_rate_limit(self) -> None:
-    """Ensure a minimum interval between Crossref requests."""
-    elapsed = time.time() - self._last_request_time
-    if elapsed < CROSSREF_MIN_INTERVAL:
-        time.sleep(CROSSREF_MIN_INTERVAL - elapsed)
-    self._last_request_time = time.time()
-@
+The pacing is the shared rate limiter's (\cref{ch:ratelimit}), the same one
+the search providers use: the client declares its rate as [[LIMITS]], like
+a provider, and brackets each request with [[acquire()]] and
+[[record_response()]].
+That replaced a private timestamp and buys what the timestamp could not:
+the requests are counted, and a 429 that outlasts the session's retries
+becomes a cooldown the \emph{next} [[scholar verify]] respects instead of
+rediscovering.
+The client is not a search provider, so [[scholar providers limits]]
+lists it once it has a recorded state (\cref{sec:ratelimit-registry}).
+The old constant was an interval, 0.1~seconds between requests; the
+declaration is its reciprocal, a rate of ten per second.
 
 <<constants>>=
 # Crossref REST endpoint for single-work lookups, and request tuning.
 CROSSREF_WORKS_URL = "https://api.crossref.org/works"
 CROSSREF_TIMEOUT = 30
-CROSSREF_MIN_INTERVAL = 0.1  # seconds between requests (polite pacing)
+CROSSREF_REQUESTS_PER_SECOND = 10.0  # polite pacing
 CROSSREF_USER_AGENT = "scholarcli (https://github.com/dbosk/scholar)"
 @
 
@@ -199,7 +202,9 @@ dictionary with [[updated_by]], [[newer_versions]], and [[preprints]] lists
 when Crossref served the record (HTTP~200), and [[None]] when it did not
 (missing DOI, 404, 429, or error).  A 404 is cached as [[None]] so an
 unregistered DOI is not retried every run; a 429 or transport error is left
-uncached so a later run can try again.
+uncached so a later run can try again.  While the limiter refuses (a
+remembered cooldown), the lookup is likewise undetermined; the limiter
+has already said so once, so we stay quiet rather than warn per DOI.
 
 The cache key carries an explicit schema version.  When the [[preprints]]
 key was added to the result dictionary, entries cached under the old
@@ -231,7 +236,7 @@ def fetch_currency(self, doi: str | None) -> dict | None:
         return self._cache[cache_key]
 
     try:
-        self._wait_for_rate_limit()
+        self._limiter.acquire()
         url = f"{CROSSREF_WORKS_URL}/{quote(doi, safe='')}"
         params = {"mailto": self._mailto} if self._mailto else {}
         response = self._session.get(
@@ -240,6 +245,7 @@ def fetch_currency(self, doi: str | None) -> dict | None:
             headers={"User-Agent": CROSSREF_USER_AGENT},
             timeout=CROSSREF_TIMEOUT,
         )
+        self._limiter.record_response(response)
 
         if response.status_code == 404:
             # DOI unknown to Crossref: cache the miss to avoid re-lookups.
@@ -259,6 +265,8 @@ def fetch_currency(self, doi: str | None) -> dict | None:
         self._cache[cache_key] = result
         return result
 
+    except RateLimited:
+        return None
     except requests.exceptions.HTTPError as e:
         logger.warning("crossref: lookup error for %s: %s", doi, e)
         return None
@@ -346,6 +354,24 @@ class TestFetchCurrency:
             _client._session, "get", side_effect=Exception("boom")
         ):
             assert fetch_currency("10.1/broken") is None
+
+    def test_rate_limit_is_remembered_quietly(self, monkeypatch, caplog):
+        """A 429 starts a cooldown that later lookups respect quietly.
+
+        The second lookup makes no request and adds no per-DOI warning;
+        the limiter has logged the cooldown once.
+        """
+        from scholar import ratelimit
+
+        with patch.object(
+            _client._session, "get", return_value=_mock_response(429)
+        ) as mock_get:
+            assert fetch_currency("10.1/busy") is None
+            caplog.clear()
+            assert fetch_currency("10.1/other") is None
+        assert mock_get.call_count == 1
+        assert "lookup failed" not in caplog.text
+        assert not ratelimit.check_available("crossref").ok
 
     def test_result_is_cached(self):
         """A second lookup of the same DOI does not hit the network."""
@@ -825,7 +851,6 @@ helpers, the contact-email resolver, [[replace]] for immutable annotation, and
 
 <<imports>>=
 import logging
-import time
 from dataclasses import replace
 from urllib.parse import quote
 
@@ -835,6 +860,7 @@ from urllib3.util.retry import Retry
 
 from scholar import Paper
 from scholar.cache import load_cache, register_cache
+from scholar.ratelimit import Limits, RateLimited, limiter_for
 from scholar.utils import contact_email
 
 logger = logging.getLogger(__name__)

@@ -525,9 +525,13 @@ requests/day and each `scholar` run is a fresh process.
   `Limits.per_second` is a rate, not the old seconds-between-requests
   `RATE_LIMIT` (those names are gone). Health probes pass `acquire()` too
   and record their responses, so a probed 429 starts a cooldown.
+  The Crossref and Unpaywall clients declare `LIMITS` too (10/s;
+  Unpaywall also its 100000/day) and go through `acquire()` /
+  `record_response()`; `all_status()` lists every in-process limiter, so
+  `providers limits` shows them alongside the providers.
 - Phase 2 (not done): migrate DBLP's in-process pacing (its retry loop)
   into the limiter; wire WoS/Scopus extended methods (citations/references)
-  through `acquire()`; crossref/unpaywall onto the limiter.
+  through `acquire()`.
 
 ## Dependencies
 
