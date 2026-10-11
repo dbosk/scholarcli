@@ -800,3 +800,290 @@ class TestContactEmail:
         monkeypatch.setenv("OPENALEX_EMAIL", "   ")
         assert contact_email("OPENALEX_EMAIL") == "generic@example.org"
 @
+
+
+\section{Writing files atomically}
+\label{sec:atomic-write}
+
+Scholar's most valuable files are its review sessions: a session is the
+audit record of a literature review, and its decisions often took hours of
+human and model work.  Writing such a file with a plain [[open(path, "w")]]
+truncates it first and fills it afterwards, so a crash, a full disk or a
+killed process in between leaves a half-written file, which the next
+command cannot read
+(\url{https://github.com/dbosk/scholar/issues/107}).  The same holds for
+exports that consist of several files (\cref{sec:sessions-export-atomic}):
+a failure half-way used to leave a new [[.csv]] next to a stale
+[[.tex]] (\url{https://github.com/dbosk/scholar/issues/83}).
+
+The standard remedy is to write the new content to a temporary file
+\emph{in the same directory} and then rename it over the target with
+[[os.replace]].  The rename is atomic on POSIX and Windows as long as both
+names are on the same file system, which is why the temporary file must sit
+next to the target rather than in [[/tmp]]: a reader sees either the old
+file or the new one, never a mixture.  Before renaming we [[fsync]] the
+temporary file, since otherwise a power loss could make the rename durable
+before the data it points to; afterwards we [[fsync]] the directory (where
+the platform allows it) so the rename itself survives.
+
+\subsection{One file, with an optional backup}
+
+[[atomic_write_text]] writes one file this way.  With [[backup=True]] it
+first copies the current file to [[<name>.bak]], keeping exactly one
+generation.  The copy is itself written to a temporary name and renamed
+into place, so the [[.bak]] is always a complete earlier version, and the
+target never disappears in between (moving the old file away and then
+moving the new one in would leave a moment with no file at all, which a
+concurrent reader would take for a missing session).  The new file takes
+over the permissions of the one it replaces; a first write gets the
+permissions an ordinary [[open]] would have given it, since [[mkstemp]]
+always creates its files private to the user.
+
+<<utils functions>>=
+import shutil
+import tempfile
+from contextlib import contextmanager
+from pathlib import Path
+from collections.abc import Iterator
+
+BACKUP_SUFFIX = ".bak"
+
+
+def backup_path(path: str | os.PathLike) -> Path:
+    """Return where `atomic_write_text(path, ..., backup=True)` keeps
+    the previous version: `path` with `.bak` appended."""
+    path = Path(path)
+    return path.with_name(path.name + BACKUP_SUFFIX)
+
+
+def atomic_write_text(
+    path: str | os.PathLike,
+    text: str,
+    *,
+    encoding: str = "utf-8",
+    backup: bool = False,
+) -> Path | None:
+    """Replace `path` with `text` so readers never see a partial file.
+
+    The text goes to a temporary file in the same directory, which is
+    flushed to disk and renamed over `path`. With `backup`, the current
+    file (if any) is first copied to `path` + `.bak`. Returns the backup
+    path when a backup was made, otherwise `None`. On error the target
+    is left as it was and the temporary file is removed.
+    """
+    path = Path(path)
+    tmp = _write_temp_beside(path, text.encode(encoding))
+    try:
+        bak = _keep_backup(path) if backup else None
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    _fsync_directory(path.parent)
+    return bak
+@
+
+The helpers below do the low-level work.  The temporary names start with a
+dot and the target's name, so a leftover from a killed process is both
+hidden and recognisable.
+
+<<utils functions>>=
+def _write_temp_beside(path: Path, data: bytes) -> Path:
+    """Write `data` to a new temporary file next to `path`, synced."""
+    fd, name = tempfile.mkstemp(
+        dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
+    )
+    tmp = Path(name)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        _copy_permissions(path, tmp)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    return tmp
+
+
+def _copy_permissions(target: Path, tmp: Path) -> None:
+    """Give `tmp` the mode of `target`, or the umask default if new."""
+    if target.exists():
+        shutil.copymode(target, tmp)
+    else:
+        umask = os.umask(0)
+        os.umask(umask)
+        os.chmod(tmp, 0o666 & ~umask)
+
+
+def _keep_backup(path: Path) -> Path | None:
+    """Copy `path` to its `.bak` atomically; `None` if there is no file."""
+    if not path.exists():
+        return None
+    bak = backup_path(path)
+    tmp = _write_temp_beside(bak, path.read_bytes())
+    try:
+        os.replace(tmp, bak)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    return bak
+
+
+def _fsync_directory(directory: Path) -> None:
+    """Make a rename in `directory` durable, where the OS supports it."""
+    try:
+        fd = os.open(directory, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+@
+
+Let's verify the contract: the content arrives, the backup holds the
+previous version and only one generation of it, the permissions of an
+existing file survive, and a failed write leaves the target untouched with
+no temporary file behind.
+
+<<test functions>>=
+class TestAtomicWriteText:
+    """Tests for atomic_write_text."""
+
+    @pytest.fixture
+    def out_dir(self, tmp_path):
+        """A directory of its own (conftest puts data dirs in tmp_path)."""
+        out = tmp_path / "out"
+        out.mkdir()
+        return out
+
+    def test_writes_new_file_without_backup(self, out_dir):
+        target = out_dir / "s.json"
+        assert atomic_write_text(target, "one", backup=True) is None
+        assert target.read_text() == "one"
+        assert not backup_path(target).exists()
+
+    def test_backup_keeps_one_previous_generation(self, out_dir):
+        target = out_dir / "s.json"
+        atomic_write_text(target, "one")
+        bak = atomic_write_text(target, "two", backup=True)
+        assert bak == out_dir / "s.json.bak"
+        assert bak.read_text() == "one"
+        atomic_write_text(target, "three", backup=True)
+        assert target.read_text() == "three"
+        assert bak.read_text() == "two"
+
+    def test_keeps_permissions_of_replaced_file(self, out_dir):
+        target = out_dir / "s.json"
+        target.write_text("old")
+        target.chmod(0o640)
+        atomic_write_text(target, "new")
+        assert target.stat().st_mode & 0o777 == 0o640
+
+    def test_failed_write_leaves_target_untouched(
+        self, out_dir, monkeypatch
+    ):
+        import scholar.utils as utils
+
+        target = out_dir / "s.json"
+        target.write_text("old")
+
+        def broken_replace(src, dst):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(utils.os, "replace", broken_replace)
+        with pytest.raises(OSError):
+            atomic_write_text(target, "new")
+        assert target.read_text() == "old"
+        assert [p.name for p in out_dir.iterdir()] == ["s.json"]
+@
+
+\subsection{Several files, all or nothing}
+
+An export that writes a [[.csv]], a [[.tex]] and a [[.bib]] must not leave
+some of them new and some old.  Renaming several files can never be one
+atomic step, but we can make the dangerous part, producing the
+content (where bugs and bad data strike), happen before anything
+is touched.  [[staged_outputs]] hands the caller an empty staging directory
+inside the target directory.  The caller's generators write their files
+there under their final names.  Only when the block finishes without an
+exception are the files synced and renamed into the target directory, one
+[[os.replace]] each.  If the block raises, the staging directory and
+everything in it is removed and the target directory is exactly as before.
+
+The staging directory sits inside the target directory for the same reason
+the temporary file does: the renames stay on one file system.  Generators
+that derive sibling names from their output path (the \LaTeX{} report
+writes [[<stem>.bib]] next to [[<stem>.tex]]) keep working unchanged, and
+any reference one file makes to another uses the bare file name, which is
+the same in both places.
+
+<<utils functions>>=
+@contextmanager
+def staged_outputs(directory: str | os.PathLike) -> Iterator[Path]:
+    """Stage files and move them into `directory` only if all succeed.
+
+    Yields a fresh staging directory inside `directory`. Write every
+    output there under its final file name. When the block completes,
+    each staged file is synced and renamed into `directory`; when it
+    raises, the staged files are discarded and `directory` is untouched.
+    """
+    directory = Path(directory)
+    staging = Path(
+        tempfile.mkdtemp(dir=directory, prefix=".scholar-staging-")
+    )
+    try:
+        yield staging
+        staged = sorted(p for p in staging.iterdir() if p.is_file())
+        for path in staged:
+            with open(path, "rb") as f:
+                os.fsync(f.fileno())
+        for path in staged:
+            os.replace(path, directory / path.name)
+        _fsync_directory(directory)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+@
+
+We check both outcomes: on success the files land under their own names and
+replace older ones; on failure the older files stay and no staging
+directory is left behind.
+
+<<test functions>>=
+class TestStagedOutputs:
+    """Tests for staged_outputs."""
+
+    @pytest.fixture
+    def out_dir(self, tmp_path):
+        """A directory of its own (conftest puts data dirs in tmp_path)."""
+        out = tmp_path / "out"
+        out.mkdir()
+        return out
+
+    def test_moves_all_files_on_success(self, out_dir):
+        (out_dir / "r.csv").write_text("old csv")
+        with staged_outputs(out_dir) as staging:
+            (staging / "r.csv").write_text("new csv")
+            (staging / "r.tex").write_text("new tex")
+        assert (out_dir / "r.csv").read_text() == "new csv"
+        assert (out_dir / "r.tex").read_text() == "new tex"
+        assert sorted(p.name for p in out_dir.iterdir()) == [
+            "r.csv", "r.tex",
+        ]
+
+    def test_failure_leaves_existing_files_untouched(self, out_dir):
+        (out_dir / "r.csv").write_text("old csv")
+        (out_dir / "r.tex").write_text("old tex")
+        with pytest.raises(RuntimeError):
+            with staged_outputs(out_dir) as staging:
+                (staging / "r.csv").write_text("new csv")
+                raise RuntimeError("latex step failed")
+        assert (out_dir / "r.csv").read_text() == "old csv"
+        assert (out_dir / "r.tex").read_text() == "old tex"
+        assert sorted(p.name for p in out_dir.iterdir()) == [
+            "r.csv", "r.tex",
+        ]
+@
