@@ -9837,6 +9837,22 @@ query alone, try again later, and if it lasts, give Elsevier's support
 the request id they ask for.
 
 <<scopus helpers>>=
+def scopus_result_entries(search_results: dict) -> list[dict]:
+    """The paper entries of a Scopus `search-results` object.
+
+    Drops the placeholder Scopus sends for an empty result set
+    (an entry with an `error` field, e.g. "Result set was empty", and
+    `@_fa` "true" or "false").
+    """
+    return [
+        entry
+        for entry in ensure_list(search_results.get("entry", []))
+        if isinstance(entry, dict)
+        and "error" not in entry
+        and entry.get("@_fa") != "false"
+    ]
+
+
 SCOPUS_UNTRANSLATABLE = "Error translating query"
 SCOPUS_SEARCH_REFUSED_HINT = (
     "Scopus answered HTTP 400 'Error translating query'{reqid}. When "
@@ -10024,9 +10040,32 @@ Authentication uses HTTP headers rather than query parameters---the
 carries the optional institutional token.
 
 The pagination loop uses 0-indexed [[start]] and [[count]] parameters.
-Scopus signals empty results by returning an entry with
-[[@_fa]] set to [["false"]] rather than an empty array, so we check
-for this sentinel.
+Scopus does not signal an empty result set with an empty array: it
+returns a single placeholder entry.  We used to recognise it by [[@_fa]]
+set to [["false"]], which is what our test fixture said, but the live
+service sends something else.  A search that matches nothing returned,
+on 2026-10-11,
+
+\begin{verbatim}
+"opensearch:totalResults": "0", ...
+"entry": [{"@_fa": "true", "error": "Result set was empty"}]
+\end{verbatim}
+
+\noindent so the check let the placeholder through and
+[[_convert_entry]] made an empty paper of it.  The search then printed
+\enquote{Results: 1}, and the empty record went into the session, into
+classification and into the exported hit lists, where someone had to
+notice it and delete it by hand
+(\url{https://github.com/dbosk/scholar/issues/106}).
+
+[[scopus_result_entries]] therefore drops any entry that carries an
+[[error]] field---whatever its [[@_fa]] says---as well as the
+[[@_fa = "false"]] form, and the loop stops at once when
+[[opensearch:totalResults]] is present and 0 (a response without it is
+paged by its entries, as before).  Either check alone would catch the
+response above; together they also hold if Elsevier changes one of the
+two.  The empty answer is a genuine zero, not a failure: it is returned
+as [[[]]] with [[last_error]] unset, and cached.
 
 Scopus enforces a request rate (9 per second for the Search API) and
 \emph{weekly} quotas per API key.
@@ -10154,26 +10193,16 @@ class ScopusProvider:
                 data = response.json()
 
                 results = data.get("search-results", {})
-                entries = results.get("entry", [])
-
-                if not entries or (
-                    len(entries) == 1
-                    and entries[0].get("@_fa") == "false"
-                ):
+                declared = results.get("opensearch:totalResults")
+                total = int(declared or 0)
+                entries = scopus_result_entries(results)
+                if (declared is not None and total == 0) or not entries:
                     break
 
                 all_papers.extend(
-                    self._convert_entry(entry)
-                    for entry in entries
-                    if entry.get("@_fa") != "false"
+                    self._convert_entry(entry) for entry in entries
                 )
                 start += len(entries)
-
-                total = int(
-                    results.get(
-                        "opensearch:totalResults", 0
-                    )
-                )
                 if start >= total:
                     break
 
@@ -10653,8 +10682,8 @@ fail to parse.
             )
             if response.status_code != 200:
                 return None
-            entries = response.json().get("search-results", {}).get(
-                "entry", []
+            entries = scopus_result_entries(
+                response.json().get("search-results", {})
             )
         except RateLimited:
             return None
@@ -10662,7 +10691,7 @@ fail to parse.
             logger.warning("scopus: DOI lookup failed for %s: %s", doi, e)
             return None
         for entry in entries:
-            if entry.get("@_fa") != "false" and entry.get("dc:title"):
+            if entry.get("dc:title"):
                 return self._convert_entry(entry)
         return None
 @
@@ -11165,6 +11194,43 @@ class TestScopusProvider:
             )
 
         assert papers == []
+
+    def test_live_empty_result_shape_is_zero_papers(self):
+        """The placeholder Scopus really sends is not a paper (#106).
+
+        Live responses mark the placeholder `@_fa: "true"`, which the old
+        check let through as one empty paper ("Results: 1").
+        """
+        provider = ScopusProvider(api_key="test_key", view="standard")
+
+        response = Mock(status_code=200, ok=True, headers={}, text="")
+        response.json.return_value = {"search-results": {
+            "opensearch:totalResults": "0",
+            "opensearch:startIndex": "0",
+            "opensearch:itemsPerPage": "0",
+            "entry": [{"@_fa": "true", "error": "Result set was empty"}],
+        }}
+
+        with patch("requests.get", return_value=response) as mock_get:
+            assert provider.search("zqxjvwk plorbnatz", limit=5) == []
+            assert provider.last_error is None
+            assert provider.search("zqxjvwk plorbnatz", limit=5) == []
+            assert mock_get.call_count == 1  # a genuine zero is cached
+
+    def test_zero_total_stops_before_converting(self):
+        """totalResults 0 means no papers, whatever the entries say."""
+        assert scopus_result_entries({"entry": [
+            {"@_fa": "true", "error": "Result set was empty"},
+        ]}) == []
+        assert scopus_result_entries({}) == []
+        provider = ScopusProvider(api_key="test_key", view="standard")
+        response = Mock(status_code=200, ok=True, headers={}, text="")
+        response.json.return_value = {"search-results": {
+            "opensearch:totalResults": "0",
+            "entry": [{"@_fa": "true", "dc:title": ""}],
+        }}
+        with patch("requests.get", return_value=response):
+            assert provider.search("q", limit=5) == []
 
     def test_server_error_recorded_and_not_cached(self):
         """An HTTP 500 is a recorded failure, and the next call asks again."""
