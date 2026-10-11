@@ -77,6 +77,17 @@ Providers self-register via `register_provider()` at module load time.
 | Preprints.org | `preprintsorg` | OpenAlex (`pyalex`), source-pinned | `SCHOLAR_EMAIL` (optional) |
 | IACR ePrint | `iacr` | OpenAlex (`pyalex`), source-pinned | `SCHOLAR_EMAIL` (optional) |
 
+**Key arguments.** The keyed constructors (`SemanticScholarProvider`,
+`OpenAlexProvider`, `IEEEXploreProvider`, `ScopusProvider`) treat
+`api_key=None` (or `""`) as "not given" and fall back to the environment
+variable: `ScopusProvider(api_key=None)` has a key when `SCOPUS_API_KEY`
+is set. The registry builds providers without arguments, so the
+environment is the normal key source. Tests wanting no key must
+`monkeypatch.delenv` the variable (or clear `provider.api_key` after
+construction). Exception: `WebOfScienceProvider` uses a sentinel, so an
+explicit `None` disables that tier (the legacy `WOS_API_KEY` still
+fills it).
+
 ### Preprint-Server Providers and Groups
 
 The seven source-pinned providers exist because their servers have no
