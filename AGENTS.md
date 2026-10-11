@@ -338,7 +338,7 @@ report body builders (`build_review_provenance_latex`,
 - `scholar sessions export -f table --lang en|sv --label L --track T
   --theme TAG=NAME -o base` writes `base.tex`, always a fragment: one
   row per *work* (`audit_work_key`: title and first-author surname
-  reduced to case-folded letters and digits, year ignored; joined
+  (`author_surname`; a blank author gives an empty surname) reduced to case-folded letters and digits, year ignored; joined
   provider strings like `openalex; dblp` are split, mapped to codes and
   deduplicated; the best-placed decision wins). The *last* category tag
   is the decision (`decide -t` appends); confidence is shown for
