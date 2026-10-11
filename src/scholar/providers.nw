@@ -1409,6 +1409,7 @@ results they want, and the provider handles the underlying paging.
 The loop terminates when we have fetched enough results, when the API returns
 no more data, or when we reach the total number of available results.
 
+\label{sec:s2-search-cacheable}
 As with DBLP, [[search]] caches only \emph{trustworthy} results.  A rate
 limit, a rejected key, or an HTTP/parse error can cut a search short, and the
 persistent pickle cache would otherwise freeze that partial or empty result for
@@ -1687,6 +1688,20 @@ Both endpoints return a list of objects with a [[citingPaper]] or
 [[citedPaper]] field containing the paper data.
 We request the same fields as the search API for consistency.
 
+The cache follows the search's rule (\cref{sec:s2-search-cacheable}):
+only a complete answer is stored.
+The fetch used to cache whatever it held when the loop ended, so a 429,
+a rejected key, an HTTP error or a malformed body froze an empty or
+truncated list into the never-expiring cache, and every later snowball
+from that paper found no citations without asking again.
+[[_fetch_related_pages]] therefore reports a [[cacheable]] flag beside
+its papers, and [[_get_related_papers]] stores the result only when the
+flag is true.
+A 404 counts as complete: the paper is unknown to Semantic Scholar,
+which is a definite answer, like a search with zero hits.
+The partial list is still returned, as the search returns its partial
+results.
+
 <<semantic scholar get citations and references>>=
 def get_paper_citations(
     self,
@@ -1754,6 +1769,24 @@ def _get_related_papers(
 
     logger.info(f"s2: Cache miss for {relation} of {paper_id}, fetching from API")
 
+    papers, cacheable = self._fetch_related_pages(paper_id, relation, limit)
+    logger.info("s2: Found %d %s for %s", len(papers), relation, paper_id)
+    if cacheable:
+        self._cache[cache_key] = papers
+    return papers
+
+def _fetch_related_pages(
+    self,
+    paper_id: str,
+    relation: str,
+    limit: int,
+) -> tuple[list[Paper], bool]:
+    """Page through citations or references, returning
+    ``(papers, cacheable)``.
+
+    ``cacheable`` is False when a rate limit, a rejected key, or an HTTP
+    or parse error cut the fetch short.
+    """
     all_papers: list[Paper] = []
     offset = 0
     page_size = min(limit, 100)
@@ -1778,12 +1811,12 @@ def _get_related_papers(
                 logger.warning(
                     "s2: Rate limited (429) during %s fetch", relation
                 )
-                break
+                return all_papers, False
 
             if response.status_code == 403:
                 # Key rejected and anonymous access also forbidden (logged
                 # by the helper). Stop with what we have.
-                break
+                return all_papers, False
 
             response.raise_for_status()
             data = response.json()
@@ -1812,18 +1845,58 @@ def _get_related_papers(
             offset += page_size
 
     except RateLimited:
-        # The limiter already logged the reason once; do not cache.
-        return all_papers
+        # The limiter already logged the reason once
+        return all_papers, False
     except requests.exceptions.HTTPError as e:
         logger.warning("s2: %s fetch error: %s", relation, e)
+        return all_papers, False
     except Exception as e:
         logger.warning("s2: %s fetch failed: %s", relation, e)
+        return all_papers, False
 
-    logger.info("s2: Found %d %s for %s", len(all_papers), relation, paper_id)
-    
-    # Cache the result
-    self._cache[cache_key] = all_papers
-    return all_papers
+    return all_papers, True
+@
+
+Let's verify that a failed fetch leaves nothing in the cache, so the next
+call asks again, while a complete answer and a 404 are cached.
+Each case makes two calls with the same arguments and counts the
+requests that reach the session.
+A 429 also puts Semantic Scholar on cooldown, which would keep the
+second call from asking for a reason of its own; the test lifts the
+cooldown between the calls, so that only the cache decides.
+
+<<test functions>>=
+def related_response(status_code, payload=None):
+    """A mocked Semantic Scholar response for the related-papers fetch."""
+    response = Mock(status_code=status_code, headers={})
+    response.json.return_value = payload or {}
+    if status_code >= 400:
+        response.raise_for_status.side_effect = requests.HTTPError(
+            f"{status_code} error", response=response
+        )
+    return response
+
+
+RELATED_PAGE = {"data": [{"citingPaper": {"title": "Citing paper"}}]}
+
+
+@pytest.mark.parametrize("first, cached", [
+    (related_response(429), False),
+    (related_response(500), False),
+    (related_response(200, {"data": "not a list"}), False),
+    (related_response(404), True),
+    (related_response(200, RELATED_PAGE), True),
+], ids=["429", "http-error", "malformed", "not-found", "complete"])
+def test_s2_related_papers_cache_only_complete_answers(first, cached):
+    """A fetch cut short is not cached; the next call asks again."""
+    provider = SemanticScholarProvider(api_key=None)
+    with patch.object(provider._session, "get",
+                      return_value=first) as get:
+        provider.get_paper_citations("10.1/related", limit=5)
+        ratelimit.reset_state(provider._limiter.name)
+        provider.get_paper_citations("10.1/related", limit=5)
+    assert get.call_count == (1 if cached else 2)
+    assert (("citations", "DOI:10.1/related", 5) in provider._cache) == cached
 @
 
 \subsubsection{Converting paper format}
