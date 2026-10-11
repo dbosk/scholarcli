@@ -180,6 +180,19 @@ rather than assumed: citation retrieval ([[get_paper_citations]],
 a provider without it still satisfies the protocol---it is simply reported as
 unchecked rather than broken.
 
+Two optional attributes are read the same tolerant way.  [[last_error]]
+is [[None]] after a search the provider answered and a short reason
+after one it could not complete; [[last_retries]] counts the repeats a
+provider made before accepting an answer.  Each bundled provider resets
+[[last_error]] as the first thing [[search()]] does---before the cache
+lookup, since a cached result is by construction an answered one---and
+sets it on every path that returns an uncached, untrustworthy list.
+[[Search.execute]] copies both onto the [[SearchResult]], so a failure
+is recorded as a failure instead of as zero hits (see the search-result
+section of the core module).  A third-party provider without the
+attributes simply always reads as having answered, which is what every
+provider read as before.
+
 <<provider protocol>>=
 class SearchProvider(Protocol):
     """Protocol for search providers."""
@@ -1160,6 +1173,26 @@ To see error messages, ensure logging is configured at WARNING level or above.
 The CLI's [[providers]] command helps diagnose configuration issues like
 missing API keys.
 
+A log line is not a record, though.  The empty list a failed provider
+returns looks exactly like a search that found nothing, and a review
+session used to store it as zero hits.  So, besides logging, a provider
+sets [[last_error]] whenever it returns an empty or truncated list
+because a request failed; [[Search.execute]] stores it on the
+[[SearchResult]], and every view of the hit counts then reads
+\enquote{failed} instead of 0.  The keyed REST providers already know
+when this happens: their [[_search_uncached]] returns a [[cacheable]]
+flag that is false exactly when a rate limit or an HTTP or parse error
+cut the search short (\cref{sec:cache-successful-only}), so the same
+branch that declines to cache the result also records the failure.
+A failed result is therefore never cached, and never mistaken for an
+answer.
+
+<<constants>>=
+SEARCH_CUT_SHORT = (
+    "rate limited or HTTP/parse error; the warnings above say which"
+)
+@
+
 \subsection{Provider implementation}
 
 <<semantic scholar provider>>=
@@ -1393,6 +1426,7 @@ def search(
     Automatically fetches multiple pages if the requested limit exceeds
     the API's per-request maximum (100 results per page).
     """
+    self.last_error = None
     cache_key = (query, limit, filters.cache_key() if filters else "")
     if cache_key in self._cache:
         return self._cache[cache_key]
@@ -1400,6 +1434,8 @@ def search(
     papers, cacheable = self._search_uncached(query, limit, filters)
     if cacheable:
         self._cache[cache_key] = papers
+    else:
+        self.last_error = SEARCH_CUT_SHORT
     return papers
 
 def _search_uncached(
@@ -2012,6 +2048,7 @@ class TestSemanticScholarProvider:
         ) as mock_get:
             first = provider.search("test")
             assert first == []
+            assert provider.last_error == SEARCH_CUT_SHORT
 
             later = ratelimit._now() + 2 * ratelimit.DEFAULT_COOLDOWN
             monkeypatch.setattr(ratelimit, "_now", lambda: later)
@@ -2020,6 +2057,7 @@ class TestSemanticScholarProvider:
             assert len(second) == 1
             assert second[0].title == "Recovered Paper"
             assert mock_get.call_count == 2  # not served from cache
+            assert provider.last_error is None
 
     def test_rate_limiting_with_api_key(self):
         """Provider uses faster rate limit when API key is set."""
@@ -2374,6 +2412,7 @@ class OpenAlexProvider:
         Automatically fetches multiple pages if the requested limit exceeds
         the API's per-request maximum (200 results per page).
         """
+        self.last_error = None
         cache_key = (
             self.CACHE_VERSION,
             query,
@@ -2386,9 +2425,12 @@ class OpenAlexProvider:
             papers = self._search_uncached(query, limit, filters)
         except requests.HTTPError as e:
             self._note_http_error(e)
+            status = getattr(e.response, "status_code", None)
+            self.last_error = f"HTTP {status}" if status else str(e)
             return []
         except Exception as e:
             logger.warning("%s: %s", self.name, e)
+            self.last_error = str(e) or type(e).__name__
             return []
         self._cache[cache_key] = papers
         return papers
@@ -3365,6 +3407,7 @@ class TestOpenAlexProvider:
         with patch("pyalex.Works") as mock_works:
             mock_works.return_value.search.side_effect = Exception("boom")
             assert provider.search("flaky query") == []
+        assert provider.last_error == "boom"
 
         with patch("pyalex.Works") as mock_works:
             mock_works.return_value.search.return_value.paginate.return_value = [
@@ -3373,6 +3416,7 @@ class TestOpenAlexProvider:
             results = provider.search("flaky query")
             assert len(results) == 1
             assert results[0].title == "Recovered"
+        assert provider.last_error is None
 
     def test_caches_successful_search(self):
         """A successful search is answered from cache on repetition."""
@@ -3631,7 +3675,9 @@ with what review sessions record as the query provenance.  The cached path
 warns again on purpose: a review pipeline that reruns the same command hits
 the cache and would otherwise never see why a query yields nothing.  The
 transient-failure path does \emph{not} warn---zero results there mean
-\enquote{DBLP was down}, not \enquote{query overconstrained}.
+\enquote{DBLP was down}, not \enquote{query overconstrained}.  It records
+the reason in [[last_error]] instead, so the search record says
+\enquote{failed} rather than 0.
 
 <<dblp search method>>=
 def search(
@@ -3649,6 +3695,7 @@ def search(
     Automatically fetches multiple pages if the requested limit exceeds
     the API's per-request maximum (1000 results per page).
     """
+    self.last_error = None
     sanitized = self._sanitize_query(query)
     cache_key = (query, limit, filters.cache_key() if filters else "")
     if cache_key in self._cache:
@@ -3665,14 +3712,16 @@ def search(
 
     try:
         papers = self._fetch_pages(sanitized, limit, filters)
-    except RateLimited:
+    except RateLimited as e:
         # A persistent cooldown is active; the limiter already logged it.
+        self.last_error = str(e)
         return []
     except Exception as e:
         # Transient API failure (throttling, malformed body, HTTP error) or
         # an unexpected parsing error: return empty but do NOT cache, so a
         # later call can retry instead of replaying a frozen empty result.
         logger.warning("dblp: %s", e)
+        self.last_error = str(e) or type(e).__name__
         return []
 
     self._warn_if_overconstrained(sanitized, papers)
@@ -4381,11 +4430,13 @@ class TestDBLPProvider:
         ) as mock_get:
             first = provider.search("test")
             assert first == []
+            assert "non-JSON response" in provider.last_error
 
             second = provider.search("test")
             assert len(second) == 1
             assert second[0].title == "Recovered Paper"
             assert mock_get.call_count == 2
+            assert provider.last_error is None
 
     def test_retries_on_rate_limit(self):
         """search() retries after an HTTP 429 before succeeding."""
@@ -4800,12 +4851,15 @@ def search(
     filters: SearchFilters | None = None,
 ) -> list[Paper]:
     """Search Web of Science for papers matching the query."""
+    self.last_error = None
     cache_key = (query, limit, filters.cache_key() if filters else "")
     if cache_key in self._cache:
         return self._cache[cache_key]
     papers, cacheable = self._search_uncached(query, limit, filters)
     if cacheable:
         self._cache[cache_key] = papers
+    else:
+        self.last_error = SEARCH_CUT_SHORT
     return papers
 
 def _search_uncached(
@@ -6848,12 +6902,15 @@ def search(
     Automatically fetches multiple pages if the requested limit exceeds
     the API's per-request maximum (200 results per page).
     """
+    self.last_error = None
     cache_key = (query, limit, filters.cache_key() if filters else "")
     if cache_key in self._cache:
         return self._cache[cache_key]
     papers, cacheable = self._search_uncached(query, limit, filters)
     if cacheable:
         self._cache[cache_key] = papers
+    else:
+        self.last_error = SEARCH_CUT_SHORT
     return papers
 
 def _search_uncached(
@@ -7787,6 +7844,7 @@ class ArxivProvider:
         Only caches successful results. Failed requests are not cached,
         allowing immediate retry.
         """
+        self.last_error = None
         # Check cache first
         cache_key = (query, limit, filters.cache_key() if filters else "")
         if cache_key in self._cache:
@@ -7942,9 +8000,11 @@ for attempt in range(self.MAX_RETRIES):
     except Exception as e:
         # Non-retryable error
         logger.warning("arxiv: %s", e)
+        self.last_error = str(e) or type(e).__name__
         return []
 
 # All retries exhausted
+self.last_error = f"{last_exception} (after {self.MAX_RETRIES} attempts)"
 return []
 @
 
@@ -8218,6 +8278,7 @@ class TestArxivProvider:
         with patch.object(provider._client, "results", side_effect=Exception("API error")):
             results1 = provider.search("test query")
             assert results1 == []
+            assert provider.last_error == "API error"
 
         # Create mock success result
         mock_result = Mock()
@@ -8235,6 +8296,7 @@ class TestArxivProvider:
             results2 = provider.search("test query")
             assert len(results2) == 1
             assert results2[0].title == "Success Paper"
+            assert provider.last_error is None
 
     def test_handles_missing_fields(self):
         """search() handles results with missing optional fields."""
@@ -8850,19 +8912,22 @@ def search(
     Automatically fetches multiple pages if the requested limit
     exceeds the page size.
     """
+    self.last_error = None
     cache_key = (query, limit, filters.cache_key() if filters else "")
     if cache_key in self._cache:
         return self._cache[cache_key]
 
     try:
         papers = self._fetch_pages(query, limit, filters)
-    except RateLimited:
+    except RateLimited as e:
         # The limiter already logged the reason once; do not cache.
+        self.last_error = str(e)
         return []
     except Exception as e:
         # Rejected query or transient failure: return empty but do NOT
         # cache, so a later (possibly corrected) call gets a fresh answer.
         logger.warning("hal: %s", e)
+        self.last_error = str(e) or type(e).__name__
         return []
 
     self._cache[cache_key] = papers
@@ -9776,6 +9841,7 @@ class ScopusProvider:
         Fetches multiple pages when the requested limit
         exceeds the per-request maximum of 25 results.
         """
+        self.last_error = None
         standard_key = (
             query,
             limit,
@@ -9804,6 +9870,7 @@ class ScopusProvider:
         a partial or empty result into the cache.
         """
         if not self.api_key:
+            self.last_error = "SCOPUS_API_KEY not set"
             return [], False
 
         logger.debug(
@@ -9863,13 +9930,17 @@ class ScopusProvider:
                 len(all_papers),
             )
             return all_papers, True
-        except RateLimited:
+        except RateLimited as e:
             # The limiter already logged the reason once
+            self.last_error = str(e)
             return all_papers, False
-        except requests.exceptions.HTTPError:
+        except requests.exceptions.HTTPError as e:
+            status = getattr(e.response, "status_code", None)
+            self.last_error = f"HTTP {status}" if status else str(e)
             return all_papers, False
         except Exception as e:
             logger.warning("scopus: %s", e)
+            self.last_error = str(e) or type(e).__name__
             return all_papers, False
 @
 
@@ -10839,6 +10910,26 @@ class TestScopusProvider:
             )
 
         assert papers == []
+
+    def test_server_error_recorded_and_not_cached(self):
+        """An HTTP 500 is a recorded failure, and the next call asks again."""
+        provider = ScopusProvider(api_key="test_key", view="standard")
+
+        failed = Mock(status_code=500, ok=False, headers={}, text="oops")
+        failed.raise_for_status.side_effect = requests.HTTPError(
+            response=failed
+        )
+        answered = Mock(status_code=200, ok=True, headers={}, text="")
+        answered.json.return_value = {"search-results": {
+            "opensearch:totalResults": "1",
+            "entry": [{"dc:title": "T", "dc:creator": "Fares E."}],
+        }}
+
+        with patch("requests.get", side_effect=[failed, answered]):
+            assert provider.search("q", limit=5) == []
+            assert provider.last_error == "HTTP 500"
+            assert len(provider.search("q", limit=5)) == 1
+            assert provider.last_error is None
 @
 
 <<test functions>>=

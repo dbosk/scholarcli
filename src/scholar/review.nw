@@ -107,6 +107,7 @@ import unicodedata
 from cachetools import cachedmethod
 
 from scholar.scholar import Paper, SearchFilters, merge_version_of
+from scholar.scholar import hits_label, result_outcome
 from scholar.notes import (
     get_paper_id, get_query_hash, get_data_dir,
     load_search_decisions, save_search_decisions as notes_save_decisions,
@@ -379,19 +380,37 @@ session-level filter set would misattribute one search's constraints to
 another.  We therefore record one [[SearchRecord]] per [[(query, provider)]]
 search.
 
+A record must also say what the search \emph{returned}, or a session
+cannot tell a query that matched nothing from one the provider never
+answered---the gap that let a blocked DBLP leave zero hits across four
+review sessions.  So the record keeps the outcome of the search as well:
+[[hits]] is the number of papers it produced, [[error]] the reason it
+failed (\cref{sec:search-result-error}), and [[retries]] how often it was
+repeated before the answer was accepted.  Records written before these
+fields existed load with [[hits]] unknown ([[None]]), no error and no
+retries: we cannot reconstruct what an old search returned, and claiming
+\enquote{answered} for it is no worse than what such a record has always
+claimed.
+
 <<review data structures>>=
 @dataclass
 class SearchRecord:
-    """One provider search: its query, filters, and limit.
+    """One provider search: its query, filters, limit, and outcome.
 
     ``filters`` is the dict form of the ``SearchFilters`` that were applied
     (``None`` when none were, or when the record predates filter
-    persistence); ``limit`` is the per-provider result cap.
+    persistence); ``limit`` is the per-provider result cap.  ``hits`` is
+    the number of papers the search produced (``None`` for records that
+    predate it), ``error`` why the provider failed (``None`` when it
+    answered), and ``retries`` how often the search was repeated.
     """
     query: str
     provider: str
     filters: dict | None = None
     limit: int | None = None
+    hits: int | None = None
+    error: str | None = None
+    retries: int = 0
 @
 
 
@@ -620,6 +639,10 @@ def add_query_provider_pair(
     provider: str,
     filters: dict | None = None,
     limit: int | None = None,
+    *,
+    hits: int | None = None,
+    error: str | None = None,
+    retries: int = 0,
 ) -> None:
     """
     Record a search if its query-provider pair is not already present.
@@ -627,11 +650,15 @@ def add_query_provider_pair(
     This tracks which query was used with which provider, enabling
     different queries for different providers (e.g., natural language
     for OpenAlex, Boolean syntax for Web of Science), together with the
-    filters and limit applied so the search can be reproduced exactly.
+    filters and limit applied so the search can be reproduced exactly,
+    and its outcome (hits, error, retries).
     """
     if (query, provider) not in self.query_provider_pairs:
         self.search_records.append(
-            SearchRecord(query, provider, filters, limit)
+            SearchRecord(
+                query, provider, filters, limit,
+                hits=hits, error=error, retries=retries,
+            )
         )
 
 @property
@@ -1208,17 +1235,21 @@ def create_review_session(
     if previous_session and previous_session.research_context:
         session.research_context = previous_session.research_context
     
-    # Build search records (query, provider, filters, limit) from results
+    # Build search records (query, provider, filters, limit, outcome)
     for result in results:
+        error, retries = result_outcome(result)
         session.add_query_provider_pair(
-            result.query, result.provider, result.filters, result.limit
+            result.query, result.provider, result.filters, result.limit,
+            hits=len(result.papers), error=error, retries=retries,
         )
 
     # Merge with previous session's searches (if any), preserving their filters
     if previous_session:
         for record in previous_session.search_records:
+            <<keep an earlier answer over a failed re-run>>
             session.add_query_provider_pair(
-                record.query, record.provider, record.filters, record.limit
+                record.query, record.provider, record.filters, record.limit,
+                hits=record.hits, error=record.error, retries=record.retries,
             )
     
     # Collect paper IDs from current search results
@@ -1238,6 +1269,81 @@ def create_review_session(
                len(session.decisions), len(session.kept_papers()),
                len(session.discarded_papers()), len(session.pending_papers()))
     return session
+@
+
+When the same query is searched again on the same provider, the new
+record wins: [[add_query_provider_pair]] keeps the first record of a
+pair, and the current results are added before the previous session's.
+That is right when the re-run answered---it is the newer answer---but
+wrong when it failed.  Re-running a query while a provider is down would
+otherwise overwrite \enquote{12 hits} with \enquote{failed}, although the
+twelve papers from the earlier run are still in the session.  So an
+earlier record that answered replaces a failed re-run of the same pair.
+The failure itself is not lost from view: it was reported when it
+happened, and the session keeps the answer that its papers came from.
+
+<<keep an earlier answer over a failed re-run>>=
+for i, current in enumerate(session.search_records):
+    same_search = (
+        (current.query, current.provider)
+        == (record.query, record.provider)
+    )
+    if same_search and current.error and not record.error:
+        session.search_records[i] = record
+@
+
+Let's verify both halves: a failed search is recorded as failed, with
+its retries, and a failed re-run does not erase an earlier answer---while
+an answered re-run does replace it:
+
+<<test functions>>=
+class TestSearchRecordOutcome:
+    """create_review_session records what each search returned."""
+
+    @staticmethod
+    def _result(provider, papers, error=None, retries=0):
+        from scholar.scholar import SearchResult
+        return SearchResult(
+            query="q", provider=provider, timestamp="t", papers=papers,
+            error=error, retries=retries,
+        )
+
+    def test_failure_recorded(self):
+        paper = Paper(title="P", authors=["A"], sources=["openalex"])
+        session = create_review_session([
+            self._result("dblp", [], error="non-JSON response", retries=2),
+            self._result("openalex", [paper]),
+        ], "q", session_name="outcome")
+        dblp = session.search_record_for("dblp")
+        assert (dblp.hits, dblp.error, dblp.retries) == (
+            0, "non-JSON response", 2
+        )
+        assert session.search_record_for("openalex").hits == 1
+
+    def test_failed_rerun_keeps_earlier_answer(self):
+        paper = Paper(title="P", authors=["A"], sources=["dblp"])
+        save_session(create_review_session(
+            [self._result("dblp", [paper])], "q", session_name="rerun"
+        ))
+        session = create_review_session(
+            [self._result("dblp", [], error="HTTP 503")],
+            "q", session_name="rerun",
+        )
+        record = session.search_record_for("dblp")
+        assert (record.hits, record.error) == (1, None)
+        assert len(session.decisions) == 1
+
+    def test_answered_rerun_replaces_earlier_failure(self):
+        save_session(create_review_session(
+            [self._result("dblp", [], error="HTTP 503")],
+            "q", session_name="recovered",
+        ))
+        paper = Paper(title="P", authors=["A"], sources=["dblp"])
+        session = create_review_session(
+            [self._result("dblp", [paper])], "q", session_name="recovered",
+        )
+        record = session.search_record_for("dblp")
+        assert (record.hits, record.error) == (1, None)
 @
 
 Papers from the previous session that do not appear in the current search
@@ -1559,7 +1665,8 @@ def create_notes_session() -> ReviewSession:
 
 Sessions can be saved and loaded for interrupted workflows. The session file
 includes [[search_records]] to track which query, filters, and limit were used
-with which provider. Loading walks a backward-compatibility ladder: newest files
+with which provider, and what each search returned (hits, error, retries;
+absent in older files, which load as unknown hits and no error). Loading walks a backward-compatibility ladder: newest files
 carry [[search_records]]; files from before filters were persisted carry only a
 [[query_provider_pairs]] list, which we load with empty filters; and the oldest
 files carry neither, so we reconstruct one record per provider by pairing the
@@ -1615,6 +1722,9 @@ def save_session(session: ReviewSession) -> Path:
                 "provider": r.provider,
                 "filters": r.filters,
                 "limit": r.limit,
+                "hits": r.hits,
+                "error": r.error,
+                "retries": r.retries,
             }
             for r in session.search_records
         ],
@@ -1698,6 +1808,9 @@ def load_session(name_or_query: str) -> ReviewSession | None:
                     provider=rec["provider"],
                     filters=rec.get("filters"),
                     limit=rec.get("limit"),
+                    hits=rec.get("hits"),
+                    error=rec.get("error"),
+                    retries=rec.get("retries") or 0,
                 )
                 for rec in data["search_records"]
             ]
@@ -1841,6 +1954,56 @@ class TestQueryProviderPairsPersistence:
         assert loaded.query_provider_pairs == [("natural language", "openalex")]
         record = loaded.search_record_for("openalex")
         assert record is not None and record.filters is None
+
+    def test_save_and_load_search_outcome(self, tmp_path, monkeypatch):
+        """Hits, error and retries survive a save/load round-trip."""
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+
+        session = ReviewSession(
+            query="q", providers=["dblp", "openalex"],
+            timestamp=datetime.now(), name="outcome-session",
+        )
+        session.add_query_provider_pair(
+            "q", "dblp", hits=0, error="non-JSON response", retries=2,
+        )
+        session.add_query_provider_pair("q", "openalex", hits=12)
+
+        save_session(session)
+        loaded = load_session("outcome-session")
+
+        dblp = loaded.search_record_for("dblp")
+        assert (dblp.hits, dblp.error, dblp.retries) == (
+            0, "non-JSON response", 2
+        )
+        openalex = loaded.search_record_for("openalex")
+        assert (openalex.hits, openalex.error, openalex.retries) == (
+            12, None, 0
+        )
+
+    def test_records_without_outcome_load_unknown(
+        self, tmp_path, monkeypatch
+    ):
+        """A record from before outcomes were stored has unknown hits."""
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        sessions_dir = tmp_path / "review_sessions"
+        sessions_dir.mkdir(parents=True)
+        (sessions_dir / "older.json").write_text(
+            json.dumps({
+                "query": "q",
+                "name": "older",
+                "providers": ["dblp"],
+                "timestamp": datetime.now().isoformat(),
+                "search_records": [{
+                    "query": "q", "provider": "dblp",
+                    "filters": None, "limit": 40,
+                }],
+                "decisions": [],
+            }),
+            encoding="utf-8",
+        )
+
+        record = load_session("older").search_record_for("dblp")
+        assert (record.hits, record.error, record.retries) == (None, None, 0)
 
     def test_save_and_load_references_citations(self, tmp_path, monkeypatch):
         """References and citations are persisted with the session."""
@@ -3162,12 +3325,40 @@ def provider_queries_differ(session: ReviewSession) -> bool:
     return any(query != session.query for query, _ in pairs)
 @
 
+A report built on a session where a provider failed must not let the
+reader assume that provider was searched.  [[search_outcomes]] pairs
+each query and provider with the label of what the search returned
+([[hits_label]], \cref{sec:search-result-error}): a count, or
+\enquote{failed} with the reason.  Records from before outcomes were
+stored---and sessions so old that they have no records at all---get an
+empty label, since we do not know.  The provider table then appears
+also when every provider ran the base query but one of them failed, and
+it gains a hits column whenever at least one outcome is known; a report
+built from an old session therefore looks exactly as it did.
+
+<<review report generation>>=
+def search_outcomes(session: ReviewSession) -> list[tuple[str, str, str]]:
+    """Return `(query, provider, outcome label)` for each recorded search."""
+    if not session.search_records:
+        return [(q, p, "") for q, p in get_query_provider_pairs(session)]
+    return [
+        (r.query, r.provider, hits_label(r.hits, r.error, r.retries))
+        for r in session.search_records
+    ]
+
+
+def any_search_failed(session: ReviewSession) -> bool:
+    """Whether any recorded search failed."""
+    return any(r.error for r in session.search_records)
+@
+
 The research context and the search parameters exist in a Markdown and a
 \LaTeX{} flavour because the synthesis offers both output formats. The
 \LaTeX{} builders take the heading command as a parameter for the reason
 given above; the provider table only appears when at least one provider
 ran a query different from the base query, since otherwise it would
-repeat the base query once per provider.
+repeat the base query once per provider---or when a search failed,
+since the failure must be visible either way.
 
 <<review report generation>>=
 def build_research_context_markdown(
@@ -3203,16 +3394,20 @@ def build_search_parameters_markdown(
         "",
     ]
 
-    if provider_queries_differ(session):
+    if provider_queries_differ(session) or any_search_failed(session):
         heading2 = "#" * (heading_level + 1)
+        outcomes = search_outcomes(session)
+        with_hits = any(label for _, _, label in outcomes)
         lines.extend([
             f"{heading2} Provider-specific queries",
             "",
-            "| Provider | Query |",
-            "| --- | --- |",
+            "| Provider | Query | Hits |" if with_hits
+            else "| Provider | Query |",
+            "| --- | --- | --- |" if with_hits else "| --- | --- |",
         ])
-        for query, provider in get_query_provider_pairs(session):
-            lines.append(f"| {provider} | {query} |")
+        for query, provider, label in outcomes:
+            hits_cell = f" {label} |" if with_hits else ""
+            lines.append(f"| {provider} | {query} |{hits_cell}")
         lines.append("")
 
     return lines
@@ -3250,19 +3445,25 @@ def build_search_parameters_latex(
         ]
     )
 
-    if provider_queries_differ(session):
+    if provider_queries_differ(session) or any_search_failed(session):
+        outcomes = search_outcomes(session)
+        with_hits = any(label for _, _, label in outcomes)
         lines.extend(
             [
                 f"{sub_heading(heading_command)}{{Provider-specific queries}}",
-                r"\begin{longtable}{lp{10cm}}",
+                r"\begin{longtable}{lp{8cm}p{3.5cm}}" if with_hits
+                else r"\begin{longtable}{lp{10cm}}",
                 r"\toprule",
-                r"Provider & Query \\",
+                r"Provider & Query & Hits \\" if with_hits
+                else r"Provider & Query \\",
                 r"\midrule",
             ]
         )
-        for query, provider in get_query_provider_pairs(session):
+        for query, provider, label in outcomes:
+            hits_cell = f" & {escape_latex(label)}" if with_hits else ""
             lines.append(
-                f"{escape_latex(provider)} & {escape_latex(query)} \\\\"
+                f"{escape_latex(provider)} & {escape_latex(query)}"
+                f"{hits_cell} \\\\"
             )
         lines.extend(
             [
@@ -3292,6 +3493,40 @@ class TestSearchParametersHeadings:
         )
         assert r"\subsection{Search Parameters}" in lines
         assert r"\subsubsection{Provider-specific queries}" in lines
+@
+
+A failed provider must reach the report even when every provider ran
+the base query, which alone would hide the table; an old session
+without outcomes keeps the two-column table:
+
+<<test functions>>=
+class TestSearchParametersOutcomes:
+    def test_failure_shown_although_queries_agree(self):
+        session = ReviewSession(
+            query="a", providers=["openalex", "dblp"],
+            timestamp=datetime.now(),
+        )
+        session.add_query_provider_pair("a", "openalex", hits=12)
+        session.add_query_provider_pair(
+            "a", "dblp", hits=0, error="non-JSON response",
+        )
+        markdown = build_search_parameters_markdown(session)
+        assert "| Provider | Query | Hits |" in markdown
+        assert "| dblp | a | failed (non-JSON response) |" in markdown
+        assert "| openalex | a | 12 |" in markdown
+        latex = "\n".join(build_search_parameters_latex(session))
+        assert r"dblp & a & failed (non-JSON response) \\" in latex
+
+    def test_old_session_keeps_two_columns(self):
+        session = ReviewSession(
+            query="a", providers=["openalex", "dblp"],
+            timestamp=datetime.now(),
+        )
+        session.add_query_provider_pair("a", "openalex")
+        session.add_query_provider_pair("b", "dblp")
+        markdown = build_search_parameters_markdown(session)
+        assert "| Provider | Query |" in markdown
+        assert "| dblp | b |" in markdown
 @
 
 \subsection{Standalone documents and fragments}
