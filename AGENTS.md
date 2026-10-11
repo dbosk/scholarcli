@@ -508,16 +508,26 @@ requests/day and each `scholar` run is a fresh process.
   no-ops the pacing sleep; `test_ratelimit.py` controls time via the
   module's `_now`/`_sleep` seams.
 - OpenAlex meters requests in credits (a search is 10 credits, $0.001;
-  the keyed budget is 10000/day, reset at midnight UTC). `LIMITS` is
-  therefore empty and the state comes from OpenAlex: the health probe's
+  the keyed budget is 10000/day, reset at midnight UTC). `LIMITS`
+  therefore declares only the rate (`per_second=10.0`, shared by the
+  source-pinned providers through the quota group) and the budget state
+  comes from OpenAlex: the health probe's
   `X-RateLimit-Remaining`/`X-RateLimit-Reset` headers are synced via
   `record_response`, a keyed probe also reads `/rate-limit` for the
   detail column, and a search 429 with `X-RateLimit-Remaining-USD: 0`
   becomes a quota block until `X-RateLimit-Reset` (`_note_http_error`),
   logged with the reset time and a key hint.
-- Phase 2 (not done): migrate S2/OpenAlex/DBLP/arXiv in-process pacing
-  (and crossref/unpaywall) into the limiter; wire WoS/Scopus extended
-  methods (citations/references) through `acquire()`.
+- Pacing is the limiter's job: S2 (`LIMITS` anonymous 1/3 per second,
+  `KEYED_LIMITS` 1.0; `_acquire()` re-declares per request because a
+  rejected key changes the rate), OpenAlex and arXiv (a
+  `PacedArxivClient` subclass overrides the package's `_parse_feed`, with
+  `delay_seconds=0`) declare rates; no provider keeps its own timestamp.
+  `Limits.per_second` is a rate, not the old seconds-between-requests
+  `RATE_LIMIT` (those names are gone). Health probes pass `acquire()` too
+  and record their responses, so a probed 429 starts a cooldown.
+- Phase 2 (not done): migrate DBLP's in-process pacing (its retry loop)
+  into the limiter; wire WoS/Scopus extended methods (citations/references)
+  through `acquire()`; crossref/unpaywall onto the limiter.
 
 ## Dependencies
 

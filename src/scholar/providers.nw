@@ -110,6 +110,7 @@ itself with the provider registry on import.
 <<dblp provider>>
 <<wos provider>>
 <<ieee provider>>
+<<paced arxiv client>>
 <<arxiv provider>>
 <<preprint source provider>>
 <<hal provider>>
@@ -1131,13 +1132,15 @@ This gives us full control over rate limiting and error handling.
 The API endpoint is [[https://api.semanticscholar.org/graph/v1/paper/search]].
 An optional API key ([[S2_API_KEY]]) increases rate limits:
 \begin{description}
-\item[Without key] 100 requests per 5 minutes (we space requests 3 seconds apart)
+\item[Without key] 100 requests per 5 minutes (we space requests 3 seconds
+  apart, a rate of $1/3$ request per second)
 \item[With key] 1 request per second sustained rate
 \end{description}
 
 We implement:
 \begin{itemize}
-\item Adaptive rate limiting based on API key presence
+\item Adaptive rate limiting based on API key presence, through the shared
+  rate limiter (\cref{ch:ratelimit})
 \item Exponential back-off retry on server errors (429, 5xx)
 \item Clear error messages explaining rate limits
 \end{itemize}
@@ -1169,8 +1172,8 @@ class SemanticScholarProvider:
     name = "s2"
     MAX_LIMIT: int | None = None   # No documented maximum
     API_URL = "https://api.semanticscholar.org/graph/v1/paper/search"
-    RATE_LIMIT_WITH_KEY = 1.0      # 1 second between requests
-    RATE_LIMIT_WITHOUT_KEY = 3.0   # 3 seconds (100 req/5min = 0.33/sec)
+    LIMITS = Limits(per_second=1 / 3)      # anonymous: 100 requests/5 min
+    KEYED_LIMITS = Limits(per_second=1.0)  # with S2_API_KEY
     MAX_RETRIES = 3                # retries after the initial attempt
 
     def __init__(self, api_key: str | None = None):
@@ -1184,10 +1187,10 @@ class SemanticScholarProvider:
         self.api_key = api_key or os.environ.get("S2_API_KEY")
         self._cache: dict = load_cache(self.name)
         register_cache(self.name, self._cache)
-        self._last_request_time: float = 0.0
         self._key_rejected: bool = False
         self._session = self._create_session()
         self._limiter = limiter_for(self)
+        self._limiter.limits = self._current_limits()
 
     def is_available(self) -> bool:
         """Semantic Scholar is always available (API key is optional)."""
@@ -1205,14 +1208,40 @@ class SemanticScholarProvider:
 \subsubsection{Rate limiting and retry}
 
 We implement two layers of rate limiting:
-\begin{enumerate}
-\item \textbf{Proactive rate limiting}: We track the time of the last request
-  and wait if necessary before making a new one.
-  The interval depends on whether we have an API key.
-\item \textbf{Exponential back-off}: If we still hit rate limits (HTTP 429) or
+\begin{description}
+\item[Proactive pacing] Every request first passes the shared limiter's
+  [[acquire()]] (\cref{ch:ratelimit}), which spaces requests to the
+  declared rate, counts them, and refuses while a remembered cooldown is
+  active.
+  The rate depends on whether we have a working API key.
+\item[Exponential back-off] If we still hit rate limits (HTTP 429) or
   server errors (5xx), we retry with increasing delays, up to
   [[MAX_RETRIES]] times.
-\end{enumerate}
+\end{description}
+
+The provider used to pace itself with an instance timestamp and two
+intervals in \emph{seconds between requests}
+([[RATE_LIMIT_WITH_KEY = 1.0]], [[RATE_LIMIT_WITHOUT_KEY = 3.0]]).
+[[Limits.per_second]] is the reciprocal, a \emph{rate}, which is why the
+old names are gone rather than reused: [[per_second=3.0]] would have
+tripled the anonymous rate instead of honouring the three-second gap.
+The anonymous rate is therefore [[1 / 3]], spelled as the fraction it is.
+
+Unlike the other providers, Semantic Scholar has two rates, so a single
+class attribute cannot declare it.
+[[LIMITS]] is the anonymous rate---the one [[limiter_for]] sees when it
+creates the shared [[s2]] limiter, and the safe default---and
+[[KEYED_LIMITS]] the rate a key buys.
+[[_current_limits]] picks between them, and [[_acquire]] hands the choice
+to the limiter immediately before each request
+(\cref{sec:ratelimit-redeclare}).
+Re-declaring per request rather than once at construction matters
+because the answer changes mid-session, when the server rejects the key
+(next section), and because the limiter is shared: two provider objects
+with different keys would otherwise pace at whichever rate was declared
+last.
+The constructor declares it once too, so that
+[[scholar providers limits]] shows the rate actually in force.
 
 [[MAX_RETRIES]] is a named constant rather than a literal inside the [[Retry]]
 because the number is also \emph{reported}: when the retries are exhausted we
@@ -1221,12 +1250,19 @@ the actual configuration would send them chasing the wrong thing.  Both
 readings come from the one constant, so they cannot drift apart.
 
 <<semantic scholar rate limiting>>=
-@property
-def _min_request_interval(self) -> float:
-    """Return minimum interval based on whether API key is set."""
+def _current_limits(self) -> Limits:
+    """Return the rate our credential allows: keyed or anonymous."""
     if self.api_key and not self._key_rejected:
-        return self.RATE_LIMIT_WITH_KEY
-    return self.RATE_LIMIT_WITHOUT_KEY
+        return self.KEYED_LIMITS
+    return self.LIMITS
+
+def _acquire(self) -> None:
+    """Pace and count one request at the current credential's rate.
+
+    Raises `RateLimited` while a persistent cooldown is active.
+    """
+    self._limiter.limits = self._current_limits()
+    self._limiter.acquire()
 
 def _create_session(self) -> requests.Session:
     """Create a session with exponential back-off retry logic."""
@@ -1240,19 +1276,12 @@ def _create_session(self) -> requests.Session:
     adapter = HTTPAdapter(max_retries=retry)
     session.mount("https://", adapter)
     return session
-
-def _wait_for_rate_limit(self) -> None:
-    """Ensure minimum interval between requests."""
-    elapsed = time.time() - self._last_request_time
-    if elapsed < self._min_request_interval:
-        time.sleep(self._min_request_interval - elapsed)
-    self._last_request_time = time.time()
 @
 
 \subsubsection{Requests and the stale-key fallback}
 
 All three endpoints (search, DOI lookup, citations/references) share the same
-request preamble: wait for the rate limit, then attach the API key as an
+request preamble: pass the rate limiter, then attach the API key as an
 [[x-api-key]] header.  We centralise that here so the three call sites do not
 drift apart, and so a single place owns the policy for a \emph{rejected} key.
 
@@ -1265,7 +1294,8 @@ recovery is not back-off but \emph{dropping the key}: on the first 403 we warn
 once, set [[_key_rejected]], and re-issue the very same request without the
 header so the caller still gets data on this call.  [[_build_headers]] then
 omits the key for the rest of the session, which also shifts us to the slower
-anonymous rate limit (see [[_min_request_interval]] above).
+anonymous rate (see [[_current_limits]] above); the anonymous retry is a
+request of its own, so it passes [[_acquire]] again, at that slower rate.
 
 If the anonymous retry \emph{also} returns 403 something more unusual is wrong
 (an IP block, an outage).  We cannot recover, but we must not crash the user's
@@ -1273,10 +1303,9 @@ search either, so we log at [[error]] level and hand the 403 response back to
 the caller, which treats it as an empty result.
 
 Being the single chokepoint also makes [[_request]] the natural place to
-feed the persistent rate limiter (\cref{ch:ratelimit}): [[acquire()]]
-counts each request (no rate is declared here, so the in-process pacing
-above stays authoritative) and refuses while a persistent cooldown is
-active, and [[record_response()]] turns a 429 that survived the
+feed the persistent rate limiter (\cref{ch:ratelimit}): [[_acquire]]
+paces and counts each request and refuses while a persistent cooldown
+is active, and [[record_response()]] turns a 429 that survived the
 session's own retries into such a cooldown---so the \emph{next}
 [[scholar]] invocation waits it out instead of rediscovering it.
 The [[RateLimited]] this can raise is contained by the same broad
@@ -1299,8 +1328,7 @@ def _request(self, url: str, params: dict) -> requests.Response:
     so the caller degrades to an empty result rather than raising.
     Raises `RateLimited` while a persistent cooldown is active.
     """
-    self._limiter.acquire()
-    self._wait_for_rate_limit()
+    self._acquire()
     headers = self._build_headers()
     response = self._session.get(url, params=params, headers=headers, timeout=30)
 
@@ -1310,7 +1338,7 @@ def _request(self, url: str, params: dict) -> requests.Response:
             "falling back to anonymous access"
         )
         self._key_rejected = True
-        self._wait_for_rate_limit()
+        self._acquire()
         response = self._session.get(
             url, params=params, headers=self._build_headers(), timeout=30
         )
@@ -1336,6 +1364,11 @@ as a network error.  So the
 probe issues one raw [[requests.get]] with the configured key attached and
 lets [[classify_check_response]] read the raw status code
 (\cref{sec:provider-health}).
+The probe still passes the limiter, though: it is a request like any
+other, so it is paced and counted, and its response is recorded.
+[[check_provider]] consults the limiter before probing, so a refusal
+here is a rare race; it is reported as the status it is rather than
+raised.
 
 <<semantic scholar check method>>=
 def check(self) -> tuple[str, str]:
@@ -1344,7 +1377,10 @@ def check(self) -> tuple[str, str]:
     Sends the configured API key (if any) so a stale key is surfaced
     rather than silently dropped.
     """
-    self._wait_for_rate_limit()
+    try:
+        self._acquire()
+    except RateLimited as e:
+        return HEALTH_RATE_LIMITED, str(e)
     headers = {"x-api-key": self.api_key} if self.api_key else {}
     response = requests.get(
         self.API_URL,
@@ -1352,6 +1388,7 @@ def check(self) -> tuple[str, str]:
         headers=headers,
         timeout=30,
     )
+    self._limiter.record_response(response)
     return classify_check_response(
         response,
         authenticated=bool(self.api_key),
@@ -2022,20 +2059,45 @@ class TestSemanticScholarProvider:
             assert mock_get.call_count == 2  # not served from cache
 
     def test_rate_limiting_with_api_key(self):
-        """Provider uses faster rate limit when API key is set."""
+        """A key declares one request per second to the limiter."""
         provider = SemanticScholarProvider(api_key="test-key")
-        assert provider._min_request_interval == 1.0
+        assert provider._limiter.limits.per_second == 1.0
 
     def test_rate_limiting_without_api_key(self):
-        """Provider uses slower rate limit without API key."""
-        with patch.dict(os.environ, {}, clear=True):
-            # Ensure no S2_API_KEY in environment
-            if "S2_API_KEY" in os.environ:
-                del os.environ["S2_API_KEY"]
-            provider = SemanticScholarProvider(api_key=None)
-            # Force api_key to None even if env var exists
-            provider.api_key = None
-            assert provider._min_request_interval == 3.0
+        """Anonymous access is paced 3 s apart (a rate of 1/3)."""
+        provider = SemanticScholarProvider(api_key=None)
+        assert provider._limiter.limits.per_second == pytest.approx(1 / 3)
+
+    def test_requests_are_paced_by_the_limiter(self, monkeypatch):
+        """Consecutive requests sleep out the declared interval.
+
+        The provider has no pacing of its own any more: the gap between
+        two anonymous requests must come from the limiter's sleep seam.
+        """
+        sleeps = []
+        monkeypatch.setattr(ratelimit, "_sleep", sleeps.append)
+        monkeypatch.setattr(ratelimit, "_now", lambda: 1_700_000_000.0)
+        ratelimit._LIMITERS.pop("s2", None)
+        provider = SemanticScholarProvider(api_key=None)
+        ok = Mock(status_code=200)
+        ok.json.return_value = {"total": 0, "data": []}
+        with patch.object(provider._session, "get", return_value=ok):
+            provider.search("first")
+            provider.search("second")
+        assert sleeps == [pytest.approx(3.0)]
+
+    def test_rejected_key_falls_back_to_anonymous_rate(self):
+        """After a 403 the limiter paces at the anonymous rate."""
+        provider = SemanticScholarProvider(api_key="stale")
+        forbidden = Mock(status_code=403)
+        ok = Mock(status_code=200)
+        ok.json.return_value = {"total": 0, "data": []}
+        with patch.object(
+            provider._session, "get", side_effect=[forbidden, ok]
+        ):
+            provider.search("test")
+        assert provider._limiter.limits == provider.LIMITS
+        assert provider._limiter.status().day_count == 2
 
 
 class TestSemanticScholarGetPaperByDoi:
@@ -2263,22 +2325,19 @@ The address comes from the shared [[contact_email]] resolver
 \subsection{Rate Limiting and Pagination}
 
 OpenAlex allows up to 10 requests per second.
-We implement proactive rate limiting by tracking the time of the last request
-and waiting if necessary before making a new one.
-This ensures we stay well within limits even during batch operations like
-paper enrichment.
+We declare that rate to the shared rate limiter (\cref{ch:ratelimit}) and
+pass its [[acquire()]] before every request, so even batch operations
+like paper enrichment stay within it.
 
-The timestamp lives at module level, not on the provider instance.
-The request budget belongs to the \emph{client} as seen by OpenAlex, and
-several provider objects speak to that one API: this class plus every
+The rate belongs to the \emph{client} as seen by OpenAlex, and several
+provider objects speak to that one API: this class plus every
 source-pinned subclass (\cref{sec:preprint-sources}).
-Per-instance timestamps would each start at zero, letting a
-[[-p preprints]] search fire one immediate request per provider; the shared
-timestamp makes them take turns.
-
-<<openalex constants>>=
-_openalex_last_request: float = 0.0
-@
+Their common [[QUOTA_GROUP]] gives them one limiter, so they also share
+one pacing clock: a [[-p preprints]] search takes turns instead of
+firing one immediate request per provider.
+That used to take a module-level timestamp of its own, next to the
+limiter that was already shared for counting; now one mechanism does
+both.
 
 The [[pyalex]] library provides a convenient [[paginate()]] method that
 automatically handles pagination.
@@ -2307,13 +2366,14 @@ zero-hit answer is still cached (it is a real answer), a failure never is.
 The provider declares its limits for the persistent tracker of
 \cref{ch:ratelimit}: the [[QUOTA_GROUP]] makes the seven source-pinned
 subclasses (\cref{sec:preprint-sources}) and this base class
-meet in \emph{one} shared budget---the same rationale as the
-module-level pacing timestamp above, since they all hit the same API
+meet in \emph{one} shared limiter, since they all hit the same API
 with the same credentials.
-Only the daily quota (100\,000 requests, far beyond normal use) is
-declared; per-second pacing stays with [[_wait_for_rate_limit]] for
-now, so [[acquire()]] merely counts requests and would refuse only if
-the daily budget were ever spent.
+Only the rate is declared.
+The daily budget is metered in credits, not requests, and OpenAlex
+reports it itself (\cref{sec:openalex-budget}), so a request count of
+ours would only be a worse guess at a number we are told.
+The old [[RATE_LIMIT = 0.1]] was the interval in seconds; the declared
+[[per_second=10.0]] is its reciprocal, a rate.
 
 <<openalex provider>>=
 class OpenAlexProvider:
@@ -2321,10 +2381,9 @@ class OpenAlexProvider:
 
     name = "openalex"
     MAX_LIMIT: int | None = None   # No documented maximum
-    RATE_LIMIT = 0.1               # 10 requests/second = 0.1 seconds between requests
     CACHE_VERSION = 2              # Invalidate persisted caches when changing parsing
     QUOTA_GROUP = "openalex"       # All source-pinned subclasses share this budget
-    LIMITS = Limits()              # Budget is credits, reported by OpenAlex
+    LIMITS = Limits(per_second=10.0)  # Daily budget: credits, reported by OpenAlex
 
     def __init__(
         self, email: str | None = None, api_key: str | None = None
@@ -2353,14 +2412,6 @@ class OpenAlexProvider:
     def is_available(self) -> bool:
         """OpenAlex is always available (email is optional)."""
         return True
-
-    def _wait_for_rate_limit(self) -> None:
-        """Ensure minimum interval between OpenAlex requests."""
-        global _openalex_last_request
-        elapsed = time.time() - _openalex_last_request
-        if elapsed < self.RATE_LIMIT:
-            time.sleep(self.RATE_LIMIT - elapsed)
-        _openalex_last_request = time.time()
 
     def search(
         self,
@@ -2404,22 +2455,13 @@ class OpenAlexProvider:
         page_size = min(limit, 200)  # OpenAlex returns max 200 per page
 
         logger.debug(f"{self.name}: Searching for '{query}' with limit={limit}")
-        self._wait_for_rate_limit()
         works = self._base_query(query)
         self._warn_about_filters(filters)
 
         # Apply filters (OpenAlex supports most filters natively)
         <<openalex apply filters>>
 
-        # Use pagination to fetch all results up to the limit
-        for page in works.paginate(per_page=page_size):
-            self._wait_for_rate_limit()
-            self._limiter.acquire()
-            for work in page:
-                all_papers.append(self._convert_work(work))
-                if len(all_papers) >= limit:
-                    logger.debug(f"{self.name}: Retrieved {len(all_papers)} papers")
-                    return all_papers
+        <<fetch openalex pages through the limiter>>
 
         logger.debug(f"{self.name}: Retrieved {len(all_papers)} papers")
         return all_papers
@@ -2430,6 +2472,58 @@ class OpenAlexProvider:
     <<openalex get paper by doi>>
     <<openalex preprint lookups>>
     <<convert openalex work>>
+@
+
+\subsubsection{Paging through the limiter}
+
+[[paginate()]] is lazy: it returns an iterator, and each step of the
+iteration is one HTTP request for the next page.
+The natural loop, [[for page in works.paginate(...)]] with the limiter
+called inside it, therefore passes the limiter \emph{after} each
+request: the first page went out unpaced and uncounted, and every later
+check came one request late.
+Pulling the pages by hand puts [[acquire()]] where it belongs, before
+the request it gates.
+The price is one extra count when the results run out before the limit:
+the step that discovers the end may not make a request at all, but we
+cannot know that before asking.
+A count one too high errs on the safe side, and it only costs a pause
+of a tenth of a second.
+
+<<fetch openalex pages through the limiter>>=
+pages = iter(works.paginate(per_page=page_size))
+while True:
+    self._limiter.acquire()
+    page = next(pages, None)
+    if page is None:
+        break
+    for work in page:
+        all_papers.append(self._convert_work(work))
+        if len(all_papers) >= limit:
+            logger.debug(f"{self.name}: Retrieved {len(all_papers)} papers")
+            return all_papers
+@
+
+Let's verify the order: when a page is fetched, the limiter has already
+counted it.
+The fake paginator records the limiter's count at the moment each page
+is requested.
+
+<<test functions>>=
+def test_openalex_pages_pass_the_limiter_first():
+    """Each page request is preceded by its acquire()."""
+    provider = OpenAlexProvider(api_key=None)
+    seen = []
+
+    def pages(per_page):
+        for page in ([{"id": "W1"}], [{"id": "W2"}]):
+            seen.append(provider._limiter.status().day_count)
+            yield page
+
+    with patch("pyalex.Works") as works:
+        works.return_value.search.return_value.paginate = pages
+        provider.search("paging order", limit=5)
+    assert seen == [1, 2]
 @
 
 \subsubsection{Health check}
@@ -2449,6 +2543,9 @@ providers (\cref{sec:preprint-sources}) as [[_probe]]: a probe that
 forgot the key once ran keyless, met the spent keyless budget, and its
 [[Retry-After]]---the daily reset---put the whole shared quota group on
 cooldown for the rest of the day.
+The probe passes the limiter like any request; a refusal there is a race
+with [[check_provider]]'s own availability check and is reported as a
+status, not raised.
 
 <<openalex check method>>=
 def check(self) -> tuple[str, str]:
@@ -2460,7 +2557,10 @@ def check(self) -> tuple[str, str]:
 
 def _probe(self, params: dict) -> tuple[str, str]:
     """Send one probe with the key and email, recording its rate limits."""
-    self._wait_for_rate_limit()
+    try:
+        self._limiter.acquire()
+    except RateLimited as e:
+        return HEALTH_RATE_LIMITED, str(e)
     params = dict(params)
     params.update(self._auth_params())
     response = requests.get(OPENALEX_API_URL, params=params, timeout=30)
@@ -2481,6 +2581,7 @@ OPENALEX_API_KEY_VAR = "OPENALEX_API_KEY"
 @
 
 \subsubsection{Budget reporting}
+\label{sec:openalex-budget}
 
 The rate-limit endpoint answers only to a key.  It returns the day's
 budget in dollars, what is left, and the seconds until the reset; the
@@ -2503,8 +2604,8 @@ def budget(self) -> dict | None:
     """Return OpenAlex's rate-limit report for the key, or `None`."""
     if not self.api_key:
         return None
-    self._wait_for_rate_limit()
     try:
+        self._limiter.acquire()
         response = requests.get(
             OPENALEX_RATE_LIMIT_URL, params=self._auth_params(),
             timeout=30,
@@ -2512,7 +2613,7 @@ def budget(self) -> dict | None:
         if not response.ok:
             return None
         return response.json().get("rate_limit")
-    except (requests.RequestException, ValueError):
+    except (RateLimited, requests.RequestException, ValueError):
         return None
 
 def _budget_message(self) -> str:
@@ -2949,7 +3050,7 @@ def get_paper_by_doi(self, doi: str | None) -> Paper | None:
     logger.info(f"openalex: Cache miss for DOI {doi}, fetching from API")
 
     try:
-        self._wait_for_rate_limit()
+        self._limiter.acquire()
 
         # OpenAlex uses full DOI URL as identifier
         doi_url = f"https://doi.org/{doi}"
@@ -3017,7 +3118,7 @@ def get_preprint_locations(self, doi: str | None) -> list[dict]:
         return self._cache[cache_key]
 
     try:
-        self._wait_for_rate_limit()
+        self._limiter.acquire()
         doi_url = f"https://doi.org/{doi}"
         work = pyalex.Works()[doi_url]
     except requests.exceptions.HTTPError as e:
@@ -3128,7 +3229,7 @@ def search_preprints_by_title(
         return self._cache[cache_key]
 
     try:
-        self._wait_for_rate_limit()
+        self._limiter.acquire()
         works = (
             pyalex.Works()
             .filter(title={"search": normalized}, type="preprint")
@@ -7687,8 +7788,9 @@ With over 2 million papers, it is the largest preprint server in the world.
 
 We use the [[arxiv]] Python package, which provides a clean interface to the
 arXiv API.
-Like [[pyalex]] for OpenAlex, this package handles pagination and rate limiting
-internally, simplifying our implementation.
+Like [[pyalex]] for OpenAlex, this package handles pagination
+internally, simplifying our implementation; its rate limiting we replace
+with our own (below).
 
 \subsection{Authentication}
 
@@ -7698,8 +7800,89 @@ This makes the provider always available.
 \subsection{Rate Limiting and Retry}
 
 arXiv's terms of use request no more than one request every three seconds.
-The [[arxiv]] package respects this limit by default with its
-[[delay_seconds]] parameter.
+The [[arxiv]] package can enforce this itself ([[delay_seconds=3.0]]), but
+only within one [[Client]] object and one process, and invisibly: its
+requests were never counted, so [[scholar providers limits]] showed arXiv
+as unused however hard it was queried, and a 429 was forgotten as soon
+as the process ended.
+We therefore declare the rate to the shared rate limiter
+(\cref{ch:ratelimit})---[[per_second=1 / 3]], the reciprocal of the
+three-second gap---and switch the package's own delay off, so the two
+pacers cannot stack.
+
+The package gives us no hook around its requests, but every one of them,
+each page and each retry, goes through the client's [[_parse_feed]]
+method, so a small subclass can pass the limiter there.
+That method is private to the package, which is the price of the
+approach: should a release rename it, the override would silently stop
+being called and arXiv would go unpaced.
+The test below fails in that case, because it drives the inherited
+request path and counts what reaches the limiter.
+The package's retries recurse into [[_parse_feed]]; only the outermost
+call ([[_try_index == 0]]) sees the final failure, so that is where a
+429 that outlasted them is recorded as a cooldown.
+
+<<paced arxiv client>>=
+class PacedArxivClient(arxiv.Client):
+    """An `arxiv.Client` paced and counted by scholar's rate limiter."""
+
+    def __init__(self, limiter, **kwargs):
+        super().__init__(delay_seconds=0.0, **kwargs)
+        self._limiter = limiter
+
+    def _parse_feed(self, url, first_page=True, _try_index=0):
+        self._limiter.acquire()
+        try:
+            return super()._parse_feed(
+                url, first_page=first_page, _try_index=_try_index
+            )
+        except arxiv.HTTPError as e:
+            if _try_index == 0 and e.status == 429:
+                self._limiter.record_limit_hit(
+                    reason="rate limited (HTTP 429)"
+                )
+            raise
+@
+
+Let's verify that each page request is paced at the declared rate and
+counted, and that a final 429 puts arXiv on cooldown.
+We stub the package's network step, [[_Client__try_parse_feed]], so
+that the real [[_parse_feed]] of the installed package runs.
+
+<<test functions>>=
+class TestPacedArxivClient:
+    """The arXiv client goes through scholar's rate limiter."""
+
+    def test_page_requests_are_paced_and_counted(self, monkeypatch):
+        sleeps = []
+        monkeypatch.setattr(ratelimit, "_sleep", sleeps.append)
+        monkeypatch.setattr(ratelimit, "_now", lambda: 1_700_000_000.0)
+        ratelimit._LIMITERS.pop("arxiv", None)
+        provider = ArxivProvider()
+        monkeypatch.setattr(
+            arxiv.Client, "_Client__try_parse_feed",
+            lambda self, url, first_page, try_index: "feed",
+        )
+        client = provider._client
+        assert client._parse_feed("https://export.arxiv.org/x") == "feed"
+        client._parse_feed("https://export.arxiv.org/y")
+        assert sleeps == [pytest.approx(3.0)]
+        assert provider._limiter.status().day_count == 2
+
+    def test_final_429_starts_a_cooldown(self, monkeypatch):
+        ratelimit._LIMITERS.pop("arxiv", None)
+        provider = ArxivProvider()
+
+        def throttled(self, url, first_page, try_index):
+            raise arxiv.HTTPError(url, try_index, 429)
+
+        monkeypatch.setattr(
+            arxiv.Client, "_Client__try_parse_feed", throttled
+        )
+        with pytest.raises(arxiv.HTTPError):
+            provider._client._parse_feed("https://export.arxiv.org/x")
+        assert not provider._limiter.check_available().ok
+@
 
 However, the arXiv API occasionally returns HTTP 500 errors.
 We implement our own retry logic with exponential backoff to handle transient
@@ -7723,6 +7906,7 @@ class ArxivProvider:
 
     name = "arxiv"
     MAX_LIMIT: int | None = None  # No documented maximum
+    LIMITS = Limits(per_second=1 / 3)  # one request every three seconds
     MAX_RETRIES = 5
     INITIAL_BACKOFF = 3.0  # seconds
 
@@ -7730,11 +7914,11 @@ class ArxivProvider:
         """Initialize the arXiv provider."""
         self._cache: dict = load_cache(self.name)
         register_cache(self.name, self._cache)
-        # arxiv.Client handles rate limiting internally
+        self._limiter = limiter_for(self)
         # We set num_retries=0 since we implement our own retry logic
-        self._client = arxiv.Client(
+        self._client = PacedArxivClient(
+            self._limiter,
             page_size=100,
-            delay_seconds=3.0,
             num_retries=0,
         )
 
@@ -7788,15 +7972,22 @@ The [[arxiv]] package hides HTTP status codes behind retries and its own
 exception types, so---as with OpenAlex---the probe bypasses the package and
 queries the Atom endpoint directly.  arXiv has no credentials at all, hence
 [[authenticated=False]].
+Bypassing the package does not mean bypassing the limiter: the probe is
+paced, counted and recorded like the requests the package makes.
 
 <<arxiv check method>>=
 def check(self) -> tuple[str, str]:
     """Probe the Atom query endpoint with a one-result query."""
+    try:
+        self._limiter.acquire()
+    except RateLimited as e:
+        return HEALTH_RATE_LIMITED, str(e)
     response = requests.get(
         ARXIV_API_URL,
         params={"search_query": "all:test", "max_results": 1},
         timeout=30,
     )
+    self._limiter.record_response(response)
     return classify_check_response(response, authenticated=False)
 <<arxiv constants>>=
 ARXIV_API_URL = "https://export.arxiv.org/api/query"
@@ -8282,7 +8473,11 @@ class TestArxivProvider:
         assert "arXiv does not provide reference data" in str(exc_info.value)
 
     def test_check_classifies_statuses(self):
-        """check() maps probe responses to health statuses."""
+        """check() maps probe responses to health statuses.
+
+        The 429 comes last: the probe records it, and the cooldown it
+        starts refuses the next probe before it is sent.
+        """
         provider = ArxivProvider()
 
         def response(status_code):
@@ -8293,10 +8488,13 @@ class TestArxivProvider:
 
         with patch("requests.get", return_value=response(200)):
             assert provider.check()[0] == HEALTH_OK
-        with patch("requests.get", return_value=response(429)):
-            assert provider.check()[0] == HEALTH_RATE_LIMITED
         with patch("requests.get", return_value=response(500)):
             assert provider.check()[0] == HEALTH_HTTP_ERROR
+        with patch("requests.get", return_value=response(429)):
+            assert provider.check()[0] == HEALTH_RATE_LIMITED
+        with patch("requests.get") as not_sent:
+            assert provider.check()[0] == HEALTH_RATE_LIMITED
+            not_sent.assert_not_called()
 
 
 class TestArxivIntegration:
