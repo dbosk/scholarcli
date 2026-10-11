@@ -411,6 +411,7 @@ class TestAutoPersistence:
 
 
 \section{Test Configuration}
+\label{sec:test-configuration}
 
 The provider tests use caching, which can cause test pollution---cached results
 from one test may be returned in another test, causing mock assertions to fail.
@@ -422,6 +423,31 @@ requests when an email is configured, so a developer who has
 [[SCHOLAR_EMAIL]] set in their shell would otherwise turn offline unit tests
 into live API calls.  Tests that need an email set it explicitly.
 
+The provider API keys need the same treatment, for the same reason.
+A provider constructed without an explicit key falls back to its
+environment variable ([[ScopusProvider(api_key=None)]] reads
+[[SCOPUS_API_KEY]]), so a test that means \enquote{no key} silently
+becomes \enquote{the developer's key} on the developer's machine, and an
+unmocked code path then spends a real quota---IEEE's is 200 requests a
+day.
+We therefore unset every variable a provider reads its credentials or
+options from.
+The list is explicit rather than a pattern such as [[*_API_KEY]] because
+only scholar's own variables are ours to touch: the [[llm]] plugins'
+keys belong to another tool, and the language-model tests substitute a
+fake model anyway.
+The network settings go too---scholar's proxy and User-Agent variables
+and the standard proxy variables that [[requests]] honours---so that
+every test sees the defaults (direct route, default User-Agent) whatever
+the developer's shell exports.
+
+The exception is the live integration tests (\cref{sec:live-tests}):
+their whole point is to exercise the real API with the developer's real
+credentials, and they read the keys from the environment to decide
+whether to skip.
+For them we keep the keys (and [[SCOPUS_VIEW]]); the contact email
+stays unset for them as before, since no live test depends on it.
+
 The fixture isolates the data directory ([[SCHOLAR_DATA_DIR]]) as well.
 The data directory holds state that must survive [[scholar cache clear]],
 such as the rate-limit bookkeeping of \cref{ch:ratelimit}---and that
@@ -432,21 +458,48 @@ own [[scholar]] runs skip that provider for the rest of the day.
 
 <<[[conftest.py]]>>=
 """Pytest configuration and fixtures for Scholar tests."""
+import ipaddress
+import socket
+
 import pytest
 
 CONTACT_EMAIL_VARS = ("SCHOLAR_EMAIL", "OPENALEX_EMAIL", "CROSSREF_MAILTO")
+PROVIDER_CREDENTIAL_VARS = (
+    "S2_API_KEY",
+    "OPENALEX_API_KEY",
+    "IEEE_API_KEY",
+    "WOS_API_KEY",
+    "WOS_STARTER_API_KEY",
+    "WOS_EXPANDED_API_KEY",
+    "SCOPUS_API_KEY",
+    "SCOPUS_INST_TOKEN",
+    "SCOPUS_VIEW",
+)
+NETWORK_SETTING_VARS = (
+    "SCHOLAR_PROXY",
+    "SCHOLAR_USER_AGENT",
+    "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+    "http_proxy", "https_proxy", "all_proxy", "no_proxy",
+)
+
+
+def is_live_test(request):
+    """Return whether the requesting test is a live integration test."""
+    return request.node.get_closest_marker("integration") is not None
 
 
 @pytest.fixture(autouse=True)
-def isolate_cache(tmp_path, monkeypatch):
+def isolate_cache(tmp_path, monkeypatch, request):
     """Isolate each test from the developer's cache, data directory,
-    and contact email.
+    contact email, API keys and network settings.
 
     Applied automatically to all tests: every test starts with an empty
-    cache directory, an empty data directory, and no contact email
-    configured, so tests neither interfere with each other nor make live
-    API calls by accident---nor leak persistent state (rate-limit
-    bookkeeping, enrichment data) into the developer's real directories.
+    cache directory, an empty data directory, no contact email, no
+    provider key and no proxy configured, so tests neither interfere
+    with each other nor make live API calls by accident---nor leak
+    persistent state (rate-limit bookkeeping, enrichment data) into the
+    developer's real directories.  Live integration tests keep the
+    provider keys, which they need.
     """
     cache_dir = tmp_path / "scholar_cache"
     cache_dir.mkdir()
@@ -454,10 +507,133 @@ def isolate_cache(tmp_path, monkeypatch):
     data_dir = tmp_path / "scholar_data"
     data_dir.mkdir()
     monkeypatch.setenv("SCHOLAR_DATA_DIR", str(data_dir))
-    for var in CONTACT_EMAIL_VARS:
+    for var in CONTACT_EMAIL_VARS + NETWORK_SETTING_VARS:
         monkeypatch.delenv(var, raising=False)
-    monkeypatch.delenv("OPENALEX_API_KEY", raising=False)
-    monkeypatch.delenv("SCOPUS_VIEW", raising=False)
+    if not is_live_test(request):
+        for var in PROVIDER_CREDENTIAL_VARS:
+            monkeypatch.delenv(var, raising=False)
+@
+
+Unsetting variables removes the known ways a test reaches the network,
+but not the unknown ones.
+Three keyless providers (OpenAlex, arXiv and anonymous Semantic Scholar)
+answer without any configuration, so a test that forgets one mock still
+goes online---as [[TestEnrichmentCache]] did, through the enrichment
+lookups of every reference it \enquote{fetched}.
+And because providers swallow their errors and return an empty list,
+such a leak never fails a test: it only
+makes it slow, flaky and expensive.
+
+So the suite enforces the rule instead of hoping for it.
+For every test except the live ones, the [[block_network]] fixture
+replaces name resolution and [[socket.connect]] with versions that refuse
+anything but the loopback interface and Unix sockets, and records each
+refused destination.
+Refusing alone would be swallowed like any other error, so the fixture
+also fails the test at teardown when anything was refused, naming the
+hosts.
+Loopback stays open because nothing on it is a real service (the TUI's
+event loop, for one, uses a local socket pair).
+A test that probes the guard itself requests the fixture and empties the
+returned list once it has checked it.
+
+<<[[conftest.py]]>>=
+
+
+def is_local_address(address):
+    """Return whether a socket address is a Unix socket or loopback."""
+    if isinstance(address, (str, bytes)):
+        return True
+    host = address[0]
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+@pytest.fixture(autouse=True)
+def block_network(request, monkeypatch):
+    """Refuse and report network access outside the loopback interface.
+
+    Yields the list of refused destinations; the test fails at teardown
+    unless the list is empty by then.  Live integration tests are exempt.
+    """
+    refused = []
+    if is_live_test(request):
+        yield refused
+        return
+    real_connect = socket.socket.connect
+    real_connect_ex = socket.socket.connect_ex
+    real_getaddrinfo = socket.getaddrinfo
+
+    def refuse(destination):
+        refused.append(destination)
+        return OSError(f"unit tests may not reach the network: {destination}")
+
+    def connect(self, address):
+        if not is_local_address(address):
+            raise refuse(address)
+        return real_connect(self, address)
+
+    def connect_ex(self, address):
+        if not is_local_address(address):
+            refuse(address)
+            return 111  # ECONNREFUSED
+        return real_connect_ex(self, address)
+
+    def getaddrinfo(host, *args, **kwargs):
+        if host is not None and not is_local_address((host,)):
+            raise refuse(host)
+        return real_getaddrinfo(host, *args, **kwargs)
+
+    monkeypatch.setattr(socket.socket, "connect", connect)
+    monkeypatch.setattr(socket.socket, "connect_ex", connect_ex)
+    monkeypatch.setattr(socket, "getaddrinfo", getaddrinfo)
+    yield refused
+    if refused:
+        pytest.fail(
+            "test tried to reach the network (mock it): "
+            + ", ".join(sorted({str(dest) for dest in refused}))
+        )
+@
+
+Let's check that the guard refuses a real host, lets loopback through,
+and reports what it refused.
+
+<<test functions>>=
+def test_unit_tests_cannot_reach_the_network(block_network):
+    """A connection to a real host is refused and recorded."""
+    import socket
+
+    with pytest.raises(OSError):
+        socket.create_connection(("example.org", 80), timeout=1)
+    assert "example.org" in block_network
+    block_network.clear()
+
+
+def test_loopback_stays_reachable(block_network):
+    """Local sockets are not network access."""
+    import socket
+
+    server = socket.socket()
+    server.bind(("127.0.0.1", 0))
+    server.listen(1)
+    try:
+        client = socket.create_connection(server.getsockname(), timeout=1)
+        client.close()
+    finally:
+        server.close()
+    assert block_network == []
+
+
+def test_provider_keys_are_unset():
+    """No developer key is visible to a unit test."""
+    for var in ("S2_API_KEY", "IEEE_API_KEY", "SCOPUS_API_KEY",
+                "WOS_API_KEY", "WOS_STARTER_API_KEY",
+                "WOS_EXPANDED_API_KEY", "OPENALEX_API_KEY"):
+        assert var not in os.environ
 @
 
 Rate-limit pacing must not slow the test suite down: once providers
@@ -480,6 +656,7 @@ def no_rate_limit_sleep(monkeypatch):
 @
 
 \subsection{Gating live API tests}
+\label{sec:live-tests}
 
 Each provider ships an [[@pytest.mark.integration]] test that hits the real
 API.  These are invaluable for catching breakage that mocks cannot---an expired

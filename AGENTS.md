@@ -421,6 +421,18 @@ Key test files:
 - `tests/test_scholar.py` - Data model tests
 - `tests/test_cli.py` - CLI integration tests
 
+Unit tests are offline by construction (`tests/conftest.py`, tangled from
+`cache.nw`): the autouse `isolate_cache` fixture unsets every provider
+key/option variable (`S2_API_KEY`, `OPENALEX_API_KEY`, `IEEE_API_KEY`,
+`WOS_*API_KEY`, `SCOPUS_API_KEY`, `SCOPUS_INST_TOKEN`, `SCOPUS_VIEW`),
+the contact emails and the proxy/User-Agent variables, so a test that
+needs a key sets it explicitly; the autouse `block_network` fixture
+refuses DNS and connections to anything but loopback and **fails the
+test** naming the hosts (providers swallow errors, so a refusal alone
+would go unnoticed). Both exempt `@pytest.mark.integration` tests, which
+run only with `--run-live` and keep the developer's keys. No `env -u`
+prefix is needed to run the suite safely.
+
 ## Adding Features
 
 ### New Provider
