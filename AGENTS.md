@@ -474,7 +474,12 @@ run only with `--run-live` and keep the developer's keys. No `env -u`
 prefix is needed to run the suite safely. The autouse
 `fresh_paper_registry` fixture gives every test an empty `PaperRegistry`
 (`Paper.from_dict` returns the registered object for a known id, so a
-shared registry let one test's titles leak into the next).
+shared registry let one test's titles leak into the next), and
+`fresh_rate_limiters` returns the limiter registry to its import-time
+state after every test (test-created limiters dropped, the others'
+limits, last request and warning flag reset). It restores rather than
+empties: `providers limits` lists Crossref/Unpaywall only because their
+import registered limiters. No test needs to pop `ratelimit._LIMITERS`.
 
 ## Adding Features
 
@@ -547,7 +552,8 @@ requests/day and each `scholar` run is a fresh process.
 - CLI: `scholar providers limits` shows usage/remaining/reset per
   quota group; `--reset <name|all>` clears state (use after a key
   rotation or when the real quota is known to have rolled over).
-- Tests: `tests/conftest.py` isolates `SCHOLAR_DATA_DIR` per test and
+- Tests: `tests/conftest.py` isolates `SCHOLAR_DATA_DIR` per test,
+  resets the in-memory limiters (`fresh_rate_limiters`) and
   no-ops the pacing sleep; `test_ratelimit.py` controls time via the
   module's `_now`/`_sleep` seams.
 - OpenAlex meters requests in credits (a search is 10 credits, $0.001;
