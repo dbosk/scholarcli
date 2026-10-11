@@ -156,10 +156,12 @@ that survives is recorded (and cached) as 0, not as failed (#82).
 
 DBLP author names carry homonym numbers (`Wei Wang 0001`); `_convert_hit`
 drops a trailing space + exactly four digits
-(`strip_dblp_homonym_number`), else the number becomes the surname in
-cite keys, `audit_work_key` and the legacy hash id (#120). No session
-reconciliation for hash ids recorded with the number; cached DBLP
-results keep it until `scholar cache clear`.
+(`utils.strip_dblp_homonym_number`), else the number becomes the
+surname in cite keys, `audit_work_key` and the legacy hash id (#120).
+At session append `review.py` strips it from incoming papers too
+(cached DBLP results still carry it) and reconciles entries stored with
+it like Scopus's surname-first ones (`homonym_free_id()` +
+`migrate_paper_id`, keeping decisions and notes).
 
 ### Scopus Empty Results
 
