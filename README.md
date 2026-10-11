@@ -120,7 +120,8 @@ Search results are cached to avoid redundant API calls:
 
 ```bash
 scholar cache info    # Show cache statistics
-scholar cache clear   # Delete cached results
+scholar cache clear   # Delete cached results (keeps paid LLM output;
+                      # add --include-llm to delete that too)
 scholar cache path    # Print cache directory
 ```
 

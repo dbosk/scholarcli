@@ -263,7 +263,46 @@ class TestLoadSaveCache:
 \section{Cache management}
 
 Users need ways to inspect and clear the cache.
-We provide functions to get statistics and clear all cached data.
+We provide functions to get statistics and clear cached data.
+
+\subsection{Keeping paid model output}
+
+Not every file in the cache directory is a search result.
+The literature synthesis of [[scholar llm synthesize]] caches the
+language model's prose per theme and for the conclusion
+([[llm_synthesis_theme.pkl]], [[llm_synthesis_conclusion.pkl]]), so that
+regenerating a report does not pay for the same text twice.
+Those entries differ from search results in two ways that matter here.
+They cost money to recreate, and they never go stale: their keys hash the
+model, the prompt context and the papers, so new input already misses the
+cache, whereas a search entry is cleared exactly because the database may
+have changed since.
+A user who clears the cache to get fresh search results would therefore
+throw away paid output for nothing.
+
+[[clear_cache]] thus keeps the LLM caches unless asked to include them.
+We recognise them by the [[llm_]] file-name prefix rather than by listing
+the two synthesis files: any future cache of model output should be
+protected the same way, and naming it [[llm_...]] is then all it takes.
+
+<<constants>>=
+LLM_CACHE_PREFIX = "llm_"
+<<cache management functions>>=
+def is_llm_cache(name: str) -> bool:
+    """Return whether the cache `name` holds language-model output."""
+    return name.startswith(LLM_CACHE_PREFIX)
+
+
+def llm_cache_files() -> list[Path]:
+    """Return the LLM cache files in the cache directory."""
+    return sorted(
+        cache_file
+        for cache_file in get_cache_dir().glob("*.pkl")
+        if is_llm_cache(cache_file.stem)
+    )
+@
+
+\subsection{Clearing the cache}
 
 Deleting the files is not enough on its own.
 Some caches are loaded when their module is imported---the Crossref
@@ -280,9 +319,12 @@ owning provider's reference valid: the exit hook then writes an empty
 cache, which is what the user asked for.
 
 <<cache management functions>>=
-def clear_cache() -> int:
+def clear_cache(include_llm: bool = False) -> int:
     """
     Clear all cached search results.
+
+    The LLM caches (see `is_llm_cache`) hold paid model output and are
+    kept unless `include_llm` is true.
 
     Also empties the in-memory copy of every deleted cache that is
     registered for saving at exit, so the exit hook cannot write the
@@ -294,6 +336,8 @@ def clear_cache() -> int:
     count = 0
     logger.info("Clearing all cache files")
     for cache_file in cache_dir.glob("*.pkl"):
+        if is_llm_cache(cache_file.stem) and not include_llm:
+            continue
         try:
             cache_file.unlink()
             count += 1
@@ -308,6 +352,15 @@ def clear_cache() -> int:
     return count
 @
 
+\subsection{Cache statistics}
+
+The statistics report the LLM caches apart from the search caches.
+Since [[clear_cache]] treats the two kinds differently, a user deciding
+whether to clear needs to see which entries a plain clear would remove
+and which it would keep.
+The totals still cover every file, because they answer a different
+question: how much the cache directory holds.
+
 <<cache management functions>>=
 def get_cache_stats() -> dict[str, Any]:
     """
@@ -316,26 +369,31 @@ def get_cache_stats() -> dict[str, Any]:
     Returns a dictionary with:
     - cache_dir: Path to the cache directory
     - providers: Dict mapping provider names to entry counts
-    - total_entries: Total number of cached queries
-    - total_size_bytes: Total size of cache files
+      (search and lookup caches, which `clear_cache` removes)
+    - llm_caches: Dict mapping LLM cache names to entry counts
+      (kept by `clear_cache` unless `include_llm` is true)
+    - total_entries: Total number of cached entries in all files
+    - total_size_bytes: Total size of all cache files
     """
     cache_dir = get_cache_dir()
     providers: dict[str, int] = {}
+    llm_caches: dict[str, int] = {}
     total_size = 0
 
     for cache_file in cache_dir.glob("*.pkl"):
-        provider_name = cache_file.stem
+        name = cache_file.stem
         total_size += cache_file.stat().st_size
+        counts = llm_caches if is_llm_cache(name) else providers
         try:
-            cache = load_cache(provider_name)
-            providers[provider_name] = len(cache)
+            counts[name] = len(load_cache(name))
         except Exception:
-            providers[provider_name] = 0
+            counts[name] = 0
 
     return {
         "cache_dir": str(cache_dir),
         "providers": providers,
-        "total_entries": sum(providers.values()),
+        "llm_caches": llm_caches,
+        "total_entries": sum(providers.values()) + sum(llm_caches.values()),
         "total_size_bytes": total_size,
     }
 @
@@ -368,6 +426,43 @@ class TestCacheManagement:
         clear_cache()
         save_all_caches()
         assert load_cache("crossref") == {}
+
+    def test_clear_cache_keeps_llm_caches(self, tmp_path, monkeypatch):
+        """clear_cache keeps paid LLM output unless asked not to."""
+        monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path))
+        save_cache("openalex", {("q", 100): []})
+        save_cache("llm_synthesis_theme", {"key": "prose"})
+        save_cache("llm_synthesis_conclusion", {"key": "prose"})
+        assert clear_cache() == 1
+        assert [f.name for f in llm_cache_files()] == [
+            "llm_synthesis_conclusion.pkl",
+            "llm_synthesis_theme.pkl",
+        ]
+        assert load_cache("llm_synthesis_theme") == {"key": "prose"}
+        assert clear_cache(include_llm=True) == 2
+        assert list(tmp_path.glob("*.pkl")) == []
+
+    def test_clear_cache_keeps_registered_llm_cache(
+        self, tmp_path, monkeypatch
+    ):
+        """A kept LLM cache keeps its in-memory contents too."""
+        monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path))
+        monkeypatch.setattr("scholar.cache.CACHE_REGISTRY", {})
+        save_cache("llm_synthesis_theme", {"key": "prose"})
+        register_cache("llm_synthesis_theme", load_cache("llm_synthesis_theme"))
+        clear_cache()
+        save_all_caches()
+        assert load_cache("llm_synthesis_theme") == {"key": "prose"}
+
+    def test_get_cache_stats_separates_llm_caches(self, tmp_path, monkeypatch):
+        """LLM caches are reported apart from the provider caches."""
+        monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path))
+        save_cache("openalex", {("q", 100): []})
+        save_cache("llm_synthesis_theme", {"a": "x", "b": "y"})
+        stats = get_cache_stats()
+        assert stats["providers"] == {"openalex": 1}
+        assert stats["llm_caches"] == {"llm_synthesis_theme": 2}
+        assert stats["total_entries"] == 3
 
     def test_get_cache_stats(self, tmp_path, monkeypatch):
         """get_cache_stats returns accurate information."""

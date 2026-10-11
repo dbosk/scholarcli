@@ -451,9 +451,17 @@ Search results are cached to avoid redundant API calls:
 CLI commands:
 ```bash
 scholar cache info   # Show cache statistics
-scholar cache clear  # Delete all cached results
+scholar cache clear  # Delete cached results (keeps LLM caches)
+scholar cache clear --include-llm  # ... and the LLM synthesis caches
 scholar cache path   # Print cache directory
 ```
+
+`cache clear` keeps the `llm_*.pkl` caches (`cache.is_llm_cache`: the
+synthesis prose of `scholar llm synthesize`, paid model output that
+never goes stale) and says how many it kept; `cache info` lists them on
+their own line. `clear_cache()` also empties the in-memory copy of each
+deleted cache in `CACHE_REGISTRY`, else the exit hook would write it
+back (the CLI loads `crossref.pkl` at import).
 
 Environment variable: `SCHOLAR_CACHE_DIR` to override cache location.
 
