@@ -292,7 +292,13 @@ rules (#114). A file that exists but does not parse raises
 `notes.NotesFileError` instead of reading as empty, which used to make
 the next save erase every other note. Writes are atomic with a `.bak`,
 and write errors raise instead of being swallowed. `cli.main()` turns
-the error into one line and exit 1.
+the error into one line and exit 1. Two deliberate exceptions (#121):
+the TUI catches it, shows it as a notification (and in red on the
+detail screen), hides note markers and refuses note editing, but keeps
+reviewing; and `migrate_paper_id` logs a WARNING naming each unreadable
+store file and both ids and skips it (raising would discard the
+caller's enrichment run or search append), raising only on write
+errors. `notes export` also writes atomically (no `.bak`).
 `sessions export` stages all its files with `utils.staged_outputs` and
 moves them into place only if every format succeeded (#83).
 `sessions list` warns on stderr about sessions with records but no
