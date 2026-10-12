@@ -165,6 +165,9 @@ class LLMDecision:
         confidence: LLM's confidence in the decision (0.0-1.0)
         reasoning: Brief explanation of the classification
         dropped_tags: Tags the model proposed outside the vocabulary
+        category_problem: Why the tags break the one-category rule
+            (empty when they do not, or when the session has no
+            category tags)
     """
     paper_id: str
     status: str  # "kept" or "discarded"
@@ -172,6 +175,7 @@ class LLMDecision:
     confidence: float
     reasoning: str
     dropped_tags: list[str] = field(default_factory=list)
+    category_problem: str = ""
 @
 
 
@@ -192,12 +196,16 @@ class LLMBatchResult:
         timestamp: When the classification was performed
         prompt_tokens: Optional token count for the prompt
         completion_tokens: Optional token count for the response
+        withheld: Decisions not applied because they broke the
+            one-category rule even after the retry; their papers stay
+            pending
     """
     decisions: list[LLMDecision]
     model_id: str
     timestamp: str
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
+    withheld: list[LLMDecision] = field(default_factory=list)
 @
 
 
@@ -597,7 +605,8 @@ def _format_paper_for_prompt(
             abstract = abstract[:1000] + "..."
         lines.append(f"Abstract: {abstract}")
 
-    lines.append(f"Tags: {', '.join(decision.tags)}")
+    tags = [t for t in decision.tags if t.casefold() not in NOTE_TAGS]
+    lines.append(f"Tags: {', '.join(tags)}")
 
     return "\n".join(lines)
 
@@ -694,6 +703,7 @@ def build_classification_prompt(
     paper_quotes: list[list] | None = None,
     extra_tags: set[str] | None = None,
     allow_new_tags: bool = False,
+    category_tags: set[str] | None = None,
 ) -> str:
     """
     Construct the LLM prompt for paper classification.
@@ -712,6 +722,8 @@ def build_classification_prompt(
             themes and motivations already in use
         allow_new_tags: Tell the model to prefer the listed tags but let
             it add one when none fits, instead of forbidding new tags
+        category_tags: Audit categories, of which every paper must get
+            exactly one; listed apart from the optional theme tags
 
     Returns:
         Complete prompt string for the LLM
@@ -730,6 +742,7 @@ def build_classification_prompt(
         sections.append(f"\n## Research Context\n\n{research_context}")
 
     # Available tags
+    <<prompt section for category tags>>
     if available_themes:
         themes_list = ", ".join(sorted(available_themes))
         sections.append(
@@ -749,7 +762,10 @@ def build_classification_prompt(
             f"\n## Allowed Tags (kept or discarded)\n\n{extra_list}"
         )
 
-    if available_themes or available_motivations or extra_tags:
+    if (
+        available_themes or available_motivations or extra_tags
+        or category_tags
+    ):
         if allow_new_tags:
             sections.append(
                 "\nPrefer tags from the lists above, exactly as written; "
@@ -949,16 +965,24 @@ to handle potential parsing errors gracefully.
 
 <<llm review llm interaction>>=
 def _restrict_tags(
-    tags: list, allowed: set[str] | None
+    tags: list,
+    allowed: set[str] | None,
+    excluded: set[str] | frozenset[str] = frozenset(),
 ) -> tuple[list[str], list[str]]:
-    """Split `tags` into vocabulary tags (canonical spelling) and the rest."""
-    if not allowed:
-        return [str(t) for t in tags], []
-    canonical = {t.casefold(): t for t in allowed}
+    """Split `tags` into vocabulary tags (canonical spelling) and the rest.
+
+    Tags in `excluded` are dropped even when `allowed` is `None` (any tag).
+    """
+    banned = {t.casefold() for t in excluded}
+    canonical = {t.casefold(): t for t in allowed or ()}
     kept: list[str] = []
     dropped: list[str] = []
     for tag in tags:
-        match = canonical.get(str(tag).strip().casefold())
+        folded = str(tag).strip().casefold()
+        if folded in banned:
+            dropped.append(str(tag))
+            continue
+        match = canonical.get(folded) if allowed else str(tag)
         if match is None:
             dropped.append(str(tag))
         elif match not in kept:
@@ -970,6 +994,8 @@ def parse_llm_response(
     response_text: str,
     papers: list[ReviewDecision],
     allowed_tags: set[str] | None = None,
+    excluded_tags: set[str] | frozenset[str] = frozenset(),
+    category_tags: set[str] | None = None,
 ) -> list[LLMDecision]:
     """
     Parse JSON response from LLM into decisions.
@@ -980,6 +1006,11 @@ def parse_llm_response(
         allowed_tags: When given, tags outside this vocabulary are
             dropped (case-insensitively matched) and recorded in
             `LLMDecision.dropped_tags`
+        excluded_tags: Tags dropped the same way even when any tag is
+            allowed (the note tags, which only a human may set)
+        category_tags: When given, every paper must end up with exactly
+            one of these; a paper that does not gets
+            `LLMDecision.category_problem`
 
     Returns:
         List of LLMDecision objects
@@ -1033,12 +1064,15 @@ def parse_llm_response(
         tags = item.get("tags", [])
         if not isinstance(tags, list):
             tags = [str(tags)]
-        tags, dropped = _restrict_tags(tags, allowed_tags)
+        tags, dropped = _restrict_tags(tags, allowed_tags, excluded_tags)
         if dropped:
             logger.warning(
                 "Paper %d: dropped tags outside the vocabulary: %s",
                 paper_index, ", ".join(dropped),
             )
+        tags, problem = _check_one_category(tags, category_tags)
+        if problem:
+            logger.warning("Paper %d: %s", paper_index, problem)
 
         # Validate confidence
         confidence = item.get("confidence", 0.5)
@@ -1055,6 +1089,7 @@ def parse_llm_response(
                 tags=tags,
                 confidence=confidence,
                 dropped_tags=dropped,
+                category_problem=problem,
                 reasoning=item.get("reasoning", ""),
             )
         )
@@ -1235,8 +1270,7 @@ def classify_papers_with_llm(
             to_classify, session.research_context, max_quotes
         )
 
-    # Collect available tags
-    themes, motivations = _collect_available_tags(session)
+    <<sort the vocabulary into categories, notes and themes>>
 
     # Build prompt
     prompt = build_classification_prompt(
@@ -1244,11 +1278,12 @@ def classify_papers_with_llm(
         kept_examples=kept_examples,
         discarded_examples=discarded_examples,
         research_context=session.research_context,
-        available_themes=themes,
-        available_motivations=motivations,
+        available_themes=themes - set_apart,
+        available_motivations=motivations - set_apart,
         paper_quotes=paper_quotes,
-        extra_tags=vocabulary,
+        extra_tags=set(vocabulary or ()) - set_apart,
         allow_new_tags=allow_new_tags,
+        category_tags=categories,
     )
 
     if dry_run:
@@ -1291,25 +1326,27 @@ def classify_papers_with_llm(
 
     # Parse response, keeping the model inside the vocabulary unless new
     # tags are welcome
-    known = themes | motivations | set(vocabulary or ())
     allowed = None if allow_new_tags else (known or None)
-    decisions = parse_llm_response(
-        response_text, to_classify, allowed_tags=allowed
-    )
-    if allowed and any(d.dropped_tags and not d.tags for d in decisions):
+
+    def parse(text: str) -> list[LLMDecision]:
+        return parse_llm_response(
+            text, to_classify, allowed_tags=allowed,
+            excluded_tags=NOTE_TAGS, category_tags=categories,
+        )
+
+    decisions = parse(response_text)
+    if _needs_retry(decisions, allowed):
         logger.warning(
-            "Some papers were left without tags; retrying once with the "
-            "vocabulary spelled out"
+            "Some papers were left without tags or without exactly one "
+            "category; retrying once with the vocabulary spelled out"
         )
-        reminder = (
-            "\n\nIMPORTANT: use only these tags, exactly as written: "
-            + ", ".join(sorted(known))
+        response = model.prompt(
+            prompt + _retry_reminder(allowed, categories)
         )
-        response = model.prompt(prompt + reminder)
         response_text = response.text()
-        decisions = parse_llm_response(
-            response_text, to_classify, allowed_tags=allowed
-        )
+        decisions = parse(response_text)
+
+    <<withhold decisions that still break the category rule>>
 
     return LLMBatchResult(
         decisions=decisions,
@@ -1317,6 +1354,7 @@ def classify_papers_with_llm(
         timestamp=datetime.now().isoformat(),
         prompt_tokens=getattr(response, "prompt_tokens", None),
         completion_tokens=getattr(response, "completion_tokens", None),
+        withheld=withheld,
     )
 @
 
@@ -1336,11 +1374,13 @@ imposes nothing, so the first round is free to propose themes---unless
 the caller seeds the vocabulary: [[vocabulary]] (the [[--tag]] option)
 adds tags that count as known from the first batch on, which is how a
 two-sided claim review constrains a fresh session to its four
-categories. The opposite is sometimes wanted too: with
-[[allow_new_tags]] (the [[--allow-new-tags]] option) the prompt asks
-the model to prefer the listed tags but to add one when none fits, and
-nothing is dropped or retried, so an exploratory first pass can grow
-the vocabulary.
+categories (\cref{sec:classifier-categories}). The opposite is
+sometimes wanted too: with [[allow_new_tags]] (the
+[[--allow-new-tags]] option) the prompt asks the model to prefer the
+listed tags but to add one when none fits, and no tag is dropped for
+being new, so an exploratory first pass can grow the vocabulary; only
+the rules for note and category tags in the next subsection still
+apply.
 
 <<test functions>>=
 class TestClassifierVocabulary:
@@ -1491,7 +1531,7 @@ class TestClassifierVocabulary:
             vocabulary={"supports-claim", "off-topic-false-hit"},
         )
         assert len(fake_model.prompts) == 1
-        assert "## Allowed Tags" in fake_model.prompts[0]
+        assert "## Category (exactly one per paper)" in fake_model.prompts[0]
         assert "do not invent new tags" in fake_model.prompts[0]
         assert result.decisions[0].tags == ["supports-claim"]
 
@@ -1512,6 +1552,329 @@ class TestClassifierVocabulary:
         assert "Prefer tags from the lists above" in fake_model.prompts[0]
         assert result.decisions[0].tags == ["novel-theme"]
         assert result.decisions[0].dropped_tags == []
+@
+
+
+\subsection{Category, theme and note tags}
+\label{sec:classifier-categories}
+
+The vocabulary check above makes sure every tag the model returns is
+one the session knows, but not that it is the right \emph{kind} of tag.
+A two-sided claim review uses three kinds side by side: exactly one
+audit \emph{category} per paper (supports the claim, qualifies it,
+adjacent subtopic, false hit), optional \emph{theme} tags on the papers
+that get cited, and \emph{note} tags such as
+\enquote{duplicate-record-of-cited-source} that a human sets on a record
+deliberately not cited (see the audit table in the review module).
+Offered all of them as one flat list, a model returned exactly the
+mixtures one would fear (issue~\#91): rows with only a theme and no
+category, rows with two categories, and note tags copied onto unrelated
+rows. Every one of those rows passes the vocabulary check and is then
+misfiled by the audit table, and [[--bearing-only]] silently hides the
+ones without a category.
+
+The fix keeps each kind in its place. Note tags record a judgement
+about a \emph{record}---this is a reprint, that one a duplicate---which
+the model cannot make from an abstract, so they are human annotations:
+they are never offered (not in the lists and not on the examples' tag
+lines, where the model would learn to copy them) and are dropped like
+any out-of-vocabulary tag if the model returns one anyway, whatever the
+language of the table they are named for. The audit categories, when
+the session uses any, are presented apart as a choice of exactly one,
+with the theme lists as optional extras. The categories are the audit
+table's own [[AUDIT_CATEGORIES]], so the classifier and the table cannot
+drift apart. A session whose vocabulary holds no category tag is
+classified as before.
+
+<<llm review imports>>=
+from scholar.review import AUDIT_CATEGORIES, AUDIT_STRINGS
+<<llm review constants>>=
+NOTE_TAGS: frozenset[str] = frozenset(
+    tag for strings in AUDIT_STRINGS.values() for tag in strings["notes"]
+)
+<<sort the vocabulary into categories, notes and themes>>=
+themes, motivations = _collect_available_tags(session)
+known = themes | motivations | set(vocabulary or ())
+notes = {t for t in known if t.casefold() in NOTE_TAGS}
+categories = {t for t in known if t in AUDIT_CATEGORIES}
+set_apart = notes | categories
+known -= notes
+@
+
+The categories come first in the prompt, in the audit table's order,
+because choosing one is the decision itself; the theme lists that
+follow refine it.
+
+<<prompt section for category tags>>=
+if category_tags:
+    category_list = ", ".join(
+        sorted(category_tags, key=lambda t: AUDIT_CATEGORIES.get(t, 0))
+    )
+    sections.append(
+        f"\n## Category (exactly one per paper)\n\n{category_list}\n\n"
+        "Every paper, kept or discarded, MUST carry exactly one of these "
+        "category tags. The tags in the lists below are optional "
+        "extras, never a replacement for the category."
+    )
+@
+
+Asking is not enough, so the answer is checked after the tags have been
+mapped onto the vocabulary. The check also maps a category spelled in
+another case onto the session's spelling, because with
+[[--allow-new-tags]] nothing else does, and \enquote{Supports-Claim}
+must not count as a second category beside \enquote{supports-claim}.
+
+<<llm review llm interaction>>=
+def _check_one_category(
+    tags: list[str], categories: set[str] | None
+) -> tuple[list[str], str]:
+    """Return `tags` with categories canonicalised, and what is wrong.
+
+    The second element is empty when `tags` holds exactly one of
+    `categories`, or when there are no categories to choose from.
+    """
+    if not categories:
+        return tags, ""
+    canonical = {c.casefold(): c for c in categories}
+    checked: list[str] = []
+    for tag in tags:
+        tag = canonical.get(tag.casefold(), tag)
+        if tag not in checked:
+            checked.append(tag)
+    found = [t for t in checked if t in categories]
+    if len(found) == 1:
+        return checked, ""
+    if not found:
+        return checked, "no category tag"
+    return checked, "several category tags: " + ", ".join(found)
+@
+
+A paper that breaks the rule goes through the same single retry as a
+paper left without tags, with the rule spelled out next to the
+vocabulary. The retry's answer replaces the first one for the whole
+batch, as it always has.
+
+<<llm review llm interaction>>=
+def _needs_retry(
+    decisions: list[LLMDecision], allowed: set[str] | None
+) -> bool:
+    """Tell whether a paper lost all its tags or broke the category rule."""
+    return any(
+        (allowed and d.dropped_tags and not d.tags) or d.category_problem
+        for d in decisions
+    )
+
+
+def _retry_reminder(
+    allowed: set[str] | None, categories: set[str] | None
+) -> str:
+    """Spell out the vocabulary and the category rule for the retry."""
+    lines = []
+    if allowed:
+        lines.append(
+            "IMPORTANT: use only these tags, exactly as written: "
+            + ", ".join(sorted(allowed))
+        )
+    if categories:
+        ordered = sorted(categories, key=lambda t: AUDIT_CATEGORIES.get(t, 0))
+        lines.append(
+            "IMPORTANT: give every paper exactly one of these category "
+            "tags: " + ", ".join(ordered)
+            + "; any other tag is an optional extra."
+        )
+    return "\n\n" + "\n".join(lines)
+@
+
+A paper that still has no single category after the retry gets no
+decision at all. Recording it anyway would put a row into the audit
+table under the wrong heading, or hide it from [[--bearing-only]],
+which is the failure we set out to remove; left pending, it is counted
+as unclassified in the caption and comes up again in the next batch or
+for a human. The withheld decisions travel in the batch result so that
+[[scholar llm classify]] can name them at the end of the run.
+
+<<withhold decisions that still break the category rule>>=
+withheld = [d for d in decisions if d.category_problem]
+decisions = [d for d in decisions if not d.category_problem]
+if withheld:
+    logger.warning(
+        "%d paper(s) left pending: still not exactly one category tag "
+        "after the retry",
+        len(withheld),
+    )
+@
+
+Let's check the three shapes from the issue in one batch. The session
+uses three categories, a theme and a note, and [[vocabulary]] seeds the
+fourth category. The model first answers with a theme only, with two
+categories, and with a category plus a copied note tag; on the retry it
+fixes the first paper but not the second. The note is never offered,
+not even on an example's tag line; it is dropped from the third paper,
+whose category stands; the first paper is classified; the second stays
+pending and is reported as withheld.
+
+<<test functions>>=
+class TestClassifierCategories:
+    <<classifier category test methods>>
+
+<<classifier category test methods>>=
+def _session(self):
+    session = ReviewSession(
+        query="q", providers=["p"], timestamp=datetime.now(),
+        research_context="Does the claim hold?",
+    )
+    human = [
+        ("Cited", DecisionStatus.KEPT, ["supports-claim", "generality"]),
+        ("Far", DecisionStatus.DISCARDED, ["off-topic-false-hit"]),
+        ("Near", DecisionStatus.DISCARDED,
+          ["adjacent-subtopic", "duplicate-record-of-cited-source"]),
+    ]
+    session.decisions = [
+        ReviewDecision(
+            paper=Paper(title=title, authors=["A"], abstract="a"),
+            provider="p", status=status, tags=tags,
+        )
+        for title, status, tags in human
+    ] + [
+        ReviewDecision(
+            paper=Paper(title=f"New {i}", authors=["B"], abstract="b"),
+            provider="p",
+        )
+        for i in range(3)
+    ]
+    return session
+
+def _fake_llm(self, monkeypatch, rounds):
+    class FakeResponse:
+        def __init__(self, text):
+            self._text = text
+
+        def text(self):
+            return self._text
+
+    class FakeModel:
+        model_id = "fake"
+
+        def __init__(self):
+            self.prompts = []
+
+        def prompt(self, prompt):
+            self.prompts.append(prompt)
+            answer = rounds[min(len(self.prompts), len(rounds)) - 1]
+            return FakeResponse(json.dumps({"classifications": [
+                {"paper_index": i, "decision": "kept", "tags": tags,
+                  "confidence": 0.8, "reasoning": "r"}
+                for i, tags in enumerate(answer)
+            ]}))
+
+    fake_model = FakeModel()
+
+    class FakeLLMModule:
+        def get_model(self, _model_id=None):
+            return fake_model
+
+    import scholar.llm_review as llm_review
+
+    monkeypatch.setattr(llm_review, "llm", FakeLLMModule(), raising=False)
+    return fake_model
+
+def test_three_bad_shapes(self, monkeypatch):
+    from scholar.notes import get_paper_id
+
+    note = "duplicate-record-of-cited-source"
+    fake_model = self._fake_llm(monkeypatch, [
+        [["generality"], ["supports-claim", "qualifies-claim"],
+          ["Adjacent-Subtopic", note]],
+        [["supports-claim", "generality"],
+          ["supports-claim", "qualifies-claim"],
+          ["adjacent-subtopic", note]],
+    ])
+    session = self._session()
+    result = classify_papers_with_llm(
+        session, model_id="fake", enrich_missing=False,
+        vocabulary={"qualifies-claim"},
+    )
+    first = fake_model.prompts[0]
+    assert "## Category (exactly one per paper)\n\nsupports-claim, " \
+        "qualifies-claim, adjacent-subtopic, off-topic-false-hit" in first
+    assert "## Available Themes (for kept papers)\n\ngenerality\n" in first
+    assert "Available Motivations" not in first
+    assert "Title: Near" in first and note not in first
+    assert len(fake_model.prompts) == 2
+    assert "exactly one of these category tags" in fake_model.prompts[1]
+    assert note not in fake_model.prompts[1]
+
+    by_title = {d.paper.title: d for d in session.decisions}
+    title_of = {
+        get_paper_id(d.paper): d.paper.title for d in session.decisions
+    }
+    applied = {title_of[d.paper_id]: d for d in result.decisions}
+    assert applied["New 0"].tags == ["supports-claim", "generality"]
+    assert applied["New 2"].tags == ["adjacent-subtopic"]
+    assert applied["New 2"].dropped_tags == [note]
+    assert [title_of[d.paper_id] for d in result.withheld] == ["New 1"]
+    assert result.withheld[0].category_problem == \
+        "several category tags: supports-claim, qualifies-claim"
+
+    apply_llm_decisions(session, result)
+    assert by_title["New 0"].status == DecisionStatus.KEPT
+    assert by_title["New 1"].status == DecisionStatus.PENDING
+    assert by_title["New 1"].tags == []
+@
+
+A paper that names only a theme on both attempts gets no decision; the
+case of the category is forgiven; a note tag is dropped even when new
+tags are welcome; and a session whose vocabulary holds no category is
+classified as before, without a category section and without a retry:
+
+<<classifier category test methods>>=
+def test_theme_only_twice_stays_pending(self, monkeypatch):
+    fake_model = self._fake_llm(monkeypatch, [[["generality"]]])
+    result = classify_papers_with_llm(
+        self._session(), count=1, model_id="fake", enrich_missing=False,
+        require_examples=False,
+    )
+    assert len(fake_model.prompts) == 2
+    assert result.decisions == []
+    assert result.withheld[0].category_problem == "no category tag"
+
+def test_category_case_is_canonicalised(self):
+    from scholar.llm_review import _check_one_category
+
+    tags, problem = _check_one_category(
+        ["Supports-Claim", "supports-claim", "ml"], {"supports-claim"}
+    )
+    assert (tags, problem) == (["supports-claim", "ml"], "")
+    assert _check_one_category(["ml"], None) == (["ml"], "")
+
+def test_note_tags_dropped_even_when_new_tags_are_allowed(self):
+    decision = ReviewDecision(
+        paper=Paper(title="P", authors=["A"]), provider="p",
+    )
+    response = json.dumps({"classifications": [{
+        "paper_index": 0, "decision": "kept", "confidence": 0.9,
+        "tags": ["novel", "Recorded-Not-Cited"], "reasoning": "r",
+    }]})
+    parsed = parse_llm_response(
+        response, [decision], None, excluded_tags=NOTE_TAGS
+    )
+    assert parsed[0].tags == ["novel"]
+    assert parsed[0].dropped_tags == ["Recorded-Not-Cited"]
+    assert parsed[0].category_problem == ""
+
+def test_session_without_categories_is_unchanged(self, monkeypatch):
+    fake_model = self._fake_llm(monkeypatch, [[["ml"]]])
+    session = self._session()
+    for decision in session.decisions[:3]:
+        decision.tags = ["ml"]
+    result = classify_papers_with_llm(
+        session, count=1, model_id="fake", enrich_missing=False,
+        require_examples=False,
+    )
+    assert len(fake_model.prompts) == 1
+    assert "## Category" not in fake_model.prompts[0]
+    assert result.decisions[0].tags == ["ml"]
+    assert result.withheld == []
 @
 
 
@@ -2254,7 +2617,7 @@ SYNTHESIS_SECTION_END = "===SECTION_END==="
 SYNTHESIS_SUMMARY_START = "===SUMMARY_START==="
 SYNTHESIS_SUMMARY_END = "===SUMMARY_END==="
 
-SYNTHESIS_CACHE_VERSION = "v4"
+SYNTHESIS_CACHE_VERSION = "v5"
 SYNTHESIS_THEME_CACHE = load_cache("llm_synthesis_theme")
 SYNTHESIS_CONCLUSION_CACHE = load_cache("llm_synthesis_conclusion")
 register_cache("llm_synthesis_theme", SYNTHESIS_THEME_CACHE)
@@ -2350,34 +2713,22 @@ For author-year citations, we generate keys like \enquote{[Smith, 2024]} or
 on the number of authors.
 
 For \LaTeX{} output, we also need BibTeX-style keys like [[smith2024]] for use
-with [[\cite{}]] commands. A key is built from the surname, so it inherits
-whatever the surname contains; biber's parser rejects an apostrophe (an
-\enquote{O'Brien} used to abort the whole bibliography) as well as
-whitespace, quotes, braces, parentheses and the BibTeX delimiters. Only
-those characters are stripped, so every key that compiled before is
-unchanged---which matters because cached prose cites keys literally.
+with [[\cite{}]] commands. These follow the review report's scheme
+(\cref{sec:cite-keys} in the review module): the surname reduced to letters
+and digits, the year or [[nd]], and a suffix from [[a]] on when two papers
+clash. One scheme for both documents means one rule for a reader looking a
+key up, and one place where biber safety is kept.
 
+The cached prose contains the keys literally, and the theme cache hashes the
+papers but not their keys, so a change to the scheme must also change
+[[SYNTHESIS_CACHE_VERSION]]; otherwise a cached section would cite keys the
+new bibliography no longer has. The version went from [[v4]] to [[v5]] when
+the schemes were unified, which costs every user one full re-run of their
+syntheses.
+
+<<llm review imports>>=
+from scholar.review import assign_cite_keys, author_surname, cite_key_base
 <<llm review synthesis>>=
-BIBTEX_KEY_UNSAFE = re.compile(r"""[\s,{}"'#%()=\\]""")
-
-
-def _get_author_surname(author: str) -> str:
-    """
-    Extract surname from author name.
-
-    Handles formats like "John Smith", "Smith, John", "J. Smith".
-    """
-    author = author.strip()
-    if "," in author:
-        # "Smith, John" format
-        return author.split(",")[0].strip()
-    parts = author.split()
-    if parts:
-        # "John Smith" or "J. Smith" - take last part
-        return parts[-1]
-    return author
-
-
 def _generate_citation_key(
     paper: Paper,
     output_format: str = "markdown",
@@ -2390,20 +2741,17 @@ def _generate_citation_key(
         output_format: "markdown" for [Author, Year] or "latex" for cite key
 
     Returns:
-        Tuple of (display_key, bibtex_key)
+        Tuple of (display_key, bibtex_key), before any collision suffix
         - display_key: "[Smith, 2024]" for markdown, "smith2024" for latex
         - bibtex_key: Always "smith2024" style for reference list
     """
-    # Get first author surname
     if paper.authors:
-        first_surname = _get_author_surname(paper.authors[0])
+        first_surname = author_surname(paper.authors[0] or "")
     else:
         first_surname = "Unknown"
 
     year = paper.year or "n.d."
-
-    # Generate BibTeX-style key (always needed for reference list)
-    bibtex_key = BIBTEX_KEY_UNSAFE.sub("", f"{first_surname.lower()}{year}")
+    bibtex_key = cite_key_base(paper)
 
     if output_format == "latex":
         display_key = bibtex_key
@@ -2412,14 +2760,23 @@ def _generate_citation_key(
         if len(paper.authors) == 1:
             display_key = f"[{first_surname}, {year}]"
         elif len(paper.authors) == 2:
-            second_surname = _get_author_surname(paper.authors[1])
+            second_surname = author_surname(paper.authors[1] or "")
             display_key = f"[{first_surname} \\& {second_surname}, {year}]"
         else:
             display_key = f"[{first_surname} et al., {year}]"
 
     return display_key, bibtex_key
+@
 
+All keys of one synthesis are assigned together, so that clashes get their
+suffixes. The decisions are first reduced to one per paper id, keeping the
+first occurrence, because the result is a map by paper id: a second record of
+the same paper used to take a suffixed key and overwrite the first one's
+entry, so the prose cited a key the deduplicated bibliography
+(\cref{sec:synthesis-key-space}) did not contain. The display key gets the
+same suffix as the BibTeX key.
 
+<<llm review synthesis>>=
 def _generate_all_citation_keys(
     decisions: list[ReviewDecision],
     output_format: str = "markdown",
@@ -2436,29 +2793,19 @@ def _generate_all_citation_keys(
     """
     from scholar.notes import get_paper_id
 
+    unique = _unique_by_paper_id(decisions)
+    assigned = assign_cite_keys([d.paper for d in unique])
     keys: dict[str, tuple[str, str]] = {}
-    seen_bibtex: dict[str, int] = {}
-
-    for decision in decisions:
-        paper_id = get_paper_id(decision.paper)
-        display_key, bibtex_key = _generate_citation_key(
+    for decision, bibtex_key in zip(unique, assigned):
+        display_key, base = _generate_citation_key(
             decision.paper, output_format
         )
-
-        # Handle duplicate BibTeX keys by adding suffix
-        if bibtex_key in seen_bibtex:
-            seen_bibtex[bibtex_key] += 1
-            suffix = chr(ord('a') + seen_bibtex[bibtex_key] - 1)
-            bibtex_key = f"{bibtex_key}{suffix}"
-            if output_format == "latex":
-                display_key = bibtex_key
-            else:
-                # Add suffix to display key too
-                display_key = display_key[:-1] + suffix + "]"
-        else:
-            seen_bibtex[bibtex_key] = 1
-
-        keys[paper_id] = (display_key, bibtex_key)
+        suffix = bibtex_key[len(base):]
+        if output_format == "latex":
+            display_key = bibtex_key
+        elif suffix:
+            display_key = display_key[:-1] + suffix + "]"
+        keys[get_paper_id(decision.paper)] = (display_key, bibtex_key)
 
     return keys
 @
@@ -2467,26 +2814,19 @@ def _generate_all_citation_keys(
 
 <<test functions>>=
 class TestSynthesisCitationKeys:
-    def test_generate_citation_key_strips_bibtex_unsafe_chars(self):
+    def test_generate_citation_key_follows_the_shared_scheme(self):
         from scholar.llm_review import _generate_citation_key
 
         paper = Paper(title="T", authors=["Ann O'Brien"], year=2024)
         _, key = _generate_citation_key(paper, "latex")
         assert key == "obrien2024"
         hyphen = Paper(title="T", authors=["Bo Smith-Jones"], year=2024)
-        assert _generate_citation_key(hyphen, "latex")[1] == "smith-jones2024"
-
-    def test_get_author_surname_simple(self):
-        from scholar.llm_review import _get_author_surname
-
-        assert _get_author_surname("John Smith") == "Smith"
-        assert _get_author_surname("Smith") == "Smith"
-
-    def test_get_author_surname_comma_format(self):
-        from scholar.llm_review import _get_author_surname
-
-        assert _get_author_surname("Smith, John") == "Smith"
-        assert _get_author_surname("van Gogh, Vincent") == "van Gogh"
+        assert _generate_citation_key(hyphen, "latex")[1] == "smithjones2024"
+        comma = Paper(title="T", authors=["Smith, John"], year=2024)
+        assert _generate_citation_key(comma, "latex")[1] == "smith2024"
+        undated = Paper(title="T", authors=["Smith, John"])
+        assert _generate_citation_key(undated, "markdown") \
+            == ("[Smith, n.d.]", "smithnd")
 
     def test_generate_citation_key_single_author(self):
         from scholar.llm_review import _generate_citation_key
@@ -2528,9 +2868,43 @@ class TestSynthesisCitationKeys:
         display, bibtex = _generate_citation_key(paper, "latex")
         assert display == "smith2024"
         assert bibtex == "smith2024"
+
+    def test_same_scheme_as_the_report(self):
+        from scholar.llm_review import _generate_all_citation_keys
+        from scholar.notes import get_paper_id
+        from scholar.review import report_cite_keys
+
+        decisions = [
+            ReviewDecision(
+                paper=Paper(title=t, authors=[a], year=2024, doi=f"10/{t}"),
+                provider="p", status=DecisionStatus.KEPT,
+            )
+            for t, a in [("x", "Smith, Ann"), ("y", "Bo Smith"),
+                         ("z", "Cy Jones")]
+        ]
+        synthesis = _generate_all_citation_keys(decisions, "markdown")
+        report = report_cite_keys(decisions)
+        for decision in decisions:
+            assert synthesis[get_paper_id(decision.paper)][1] \
+                == report[id(decision)]
+        assert synthesis[get_paper_id(decisions[1].paper)] \
+            == ("[Smith, 2024a]", "smith2024a")
+
+    def test_duplicate_record_does_not_take_a_suffixed_key(self):
+        from scholar.llm_review import _generate_all_citation_keys
+        from scholar.notes import get_paper_id
+
+        paper = Paper(title="Once", authors=["Ann Smith"], year=2024)
+        decisions = [
+            ReviewDecision(paper=paper, provider=p, status=DecisionStatus.KEPT)
+            for p in ("a", "b")
+        ]
+        keys = _generate_all_citation_keys(decisions, "latex")
+        assert keys == {get_paper_id(paper): ("smith2024", "smith2024")}
 @
 
 \subsubsection{Keys for the appendix}
+\label{sec:synthesis-key-space}
 
 The \LaTeX{} synthesis ends with the decision record, which
 [[\fullcite]]s every paper the review touched, so the bibliography must
@@ -2540,10 +2914,9 @@ space as the cited papers, and that space must be extended without
 disturbing what is already there: theme sections are cached under
 [[_theme_cache_key]], which hashes paper fingerprints but not the keys,
 and the cached prose contains the keys literally. The extension is safe
-because [[_generate_all_citation_keys]] assigns collision suffixes in
-iteration order---appending papers can suffix later entries, never
-earlier ones---provided the included kept papers come first, in their
-original order.
+because collision suffixes are assigned in iteration order---appending
+papers can suffix later entries, never earlier ones---provided the
+included kept papers come first, in their original order.
 
 The space is deduplicated by paper id. A session can hold the same paper
 twice (the loader derives arXiv DOIs from URLs, so two records saved as
@@ -2632,9 +3005,9 @@ class TestSynthesisKeySpace:
             pid = get_paper_id(decision.paper)
             assert full[pid] == kept_only[pid]
         assert kept_only[get_paper_id(kept[0].paper)][1] == "smith2024"
-        assert kept_only[get_paper_id(kept[1].paper)][1] == "smith2024b"
+        assert kept_only[get_paper_id(kept[1].paper)][1] == "smith2024a"
         dropped = session.discarded_papers()[0]
-        assert full[get_paper_id(dropped.paper)][1] == "smith2024c"
+        assert full[get_paper_id(dropped.paper)][1] == "smith2024b"
 
     def test_duplicate_paper_ids_collapse(self):
         from scholar.llm_review import _synthesis_key_space
@@ -3778,7 +4151,7 @@ class TestAssembleLatexSynthesis:
         text = _assemble(_latex_session(), bib_name="foo.bib")
         landmarks = [
             r"\begin{filecontents*}[overwrite]{foo.bib}",
-            "@article{smith2024c,",
+            "@article{smith2024b,",
             r"\documentclass{article}",
             r"\addbibresource{foo.bib}",
             r"\title{A \& B}",
@@ -3790,9 +4163,9 @@ class TestAssembleLatexSynthesis:
             r"\appendix",
             r"\begin{refsection}",
             r"\section{Kept Papers}",
-            r"\fullcite{smith2024b}",
+            r"\fullcite{smith2024a}",
             r"\section{Discarded Papers}",
-            r"\fullcite{smith2024c}",
+            r"\fullcite{smith2024b}",
             r"\end{refsection}",
             r"\end{document}",
         ]

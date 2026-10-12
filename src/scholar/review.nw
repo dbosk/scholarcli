@@ -107,6 +107,7 @@ import unicodedata
 from cachetools import cachedmethod
 
 from scholar.scholar import Paper, SearchFilters, merge_version_of
+from scholar.scholar import hits_label, result_outcome
 from scholar.notes import (
     get_paper_id, get_query_hash, get_data_dir,
     load_search_decisions, save_search_decisions as notes_save_decisions,
@@ -117,6 +118,7 @@ from scholar.notes import (
 from scholar.utils import (
     clean_metadata_text, clean_paper_text, derive_arxiv_doi,
     given_name_first, legacy_hash_paper_id,
+    atomic_write_text, backup_path, file_lock,
 )
 
 logger = logging.getLogger(__name__)
@@ -379,19 +381,37 @@ session-level filter set would misattribute one search's constraints to
 another.  We therefore record one [[SearchRecord]] per [[(query, provider)]]
 search.
 
+A record must also say what the search \emph{returned}, or a session
+cannot tell a query that matched nothing from one the provider never
+answered---the gap that let a blocked DBLP leave zero hits across four
+review sessions.  So the record keeps the outcome of the search as well:
+[[hits]] is the number of papers it produced, [[error]] the reason it
+failed (\cref{sec:search-result-error}), and [[retries]] how often it was
+repeated before the answer was accepted.  Records written before these
+fields existed load with [[hits]] unknown ([[None]]), no error and no
+retries: we cannot reconstruct what an old search returned, and claiming
+\enquote{answered} for it is no worse than what such a record has always
+claimed.
+
 <<review data structures>>=
 @dataclass
 class SearchRecord:
-    """One provider search: its query, filters, and limit.
+    """One provider search: its query, filters, limit, and outcome.
 
     ``filters`` is the dict form of the ``SearchFilters`` that were applied
     (``None`` when none were, or when the record predates filter
-    persistence); ``limit`` is the per-provider result cap.
+    persistence); ``limit`` is the per-provider result cap.  ``hits`` is
+    the number of papers the search produced (``None`` for records that
+    predate it), ``error`` why the provider failed (``None`` when it
+    answered), and ``retries`` how often the search was repeated.
     """
     query: str
     provider: str
     filters: dict | None = None
     limit: int | None = None
+    hits: int | None = None
+    error: str | None = None
+    retries: int = 0
 @
 
 
@@ -432,6 +452,12 @@ The cache is automatically cleared by [[_invalidate_cache()]], which must be
 called whenever the decisions list or individual decision statuses change.
 The [[sort_by]] method calls this since sorting changes the list structure.
 
+The [[_baseline]] field is not persisted either.  It remembers the
+decisions and research context as they were when the session was loaded
+or last saved, so that saving can tell this process's own changes apart
+from changes another process saved meanwhile
+(\cref{sec:session-integrity}).
+
 <<review data structures>>=
 @dataclass
 class ReviewSession:
@@ -458,6 +484,10 @@ class ReviewSession:
     snowball_rounds: list[SnowballRound] = field(default_factory=list)
     # Internal cache for computed properties (not persisted)
     _cache: dict = field(default_factory=dict, repr=False, compare=False)
+    # State as loaded or last saved, for merging on save (not persisted)
+    _baseline: "SessionBaseline | None" = field(
+        default=None, repr=False, compare=False
+    )
 
     def _invalidate_cache(self) -> None:
         """Clear cached computed properties.
@@ -620,6 +650,10 @@ def add_query_provider_pair(
     provider: str,
     filters: dict | None = None,
     limit: int | None = None,
+    *,
+    hits: int | None = None,
+    error: str | None = None,
+    retries: int = 0,
 ) -> None:
     """
     Record a search if its query-provider pair is not already present.
@@ -627,11 +661,15 @@ def add_query_provider_pair(
     This tracks which query was used with which provider, enabling
     different queries for different providers (e.g., natural language
     for OpenAlex, Boolean syntax for Web of Science), together with the
-    filters and limit applied so the search can be reproduced exactly.
+    filters and limit applied so the search can be reproduced exactly,
+    and its outcome (hits, error, retries).
     """
     if (query, provider) not in self.query_provider_pairs:
         self.search_records.append(
-            SearchRecord(query, provider, filters, limit)
+            SearchRecord(
+                query, provider, filters, limit,
+                hits=hits, error=error, retries=retries,
+            )
         )
 
 @property
@@ -1118,6 +1156,7 @@ search results. This allows different queries to be used with different
 providers across multiple searches.
 
 \subsubsection{Preserving Decision Data When Merging}
+\label{sec:review-create-strict}
 
 When adding new search results to an existing session, we must preserve all
 decision data from the previous session---not just the keep/discard status, but
@@ -1129,6 +1168,18 @@ We use the saved session file ([[load_session]]) as the primary source of
 previous decisions because it contains complete [[ReviewDecision]] objects with
 all fields. The notes module ([[load_search_decisions]]) serves as a fallback
 for older sessions that predate the session persistence feature.
+
+That fallback is only right when there is \emph{no} session file.  A
+session file that exists but cannot be read (truncated by a crash, say)
+used to look exactly like a missing one: [[load_session]] returned
+[[None]], the append built a session from the new results alone, and
+saving it replaced the unreadable file and every decision in it.  We
+therefore load with [[strict=True]], which raises [[SessionFileError]]
+naming the file instead (\cref{sec:session-integrity}); the command fails
+and the file stays as it is, to be repaired or restored from its
+[[.bak]].  The new session also inherits the loaded session's baseline,
+so that saving it merges what other processes saved in the meantime just
+as saving the loaded session itself would.
 
 <<review session functions>>=
 def _normalize_paper_identifiers(paper: Paper) -> Paper:
@@ -1178,8 +1229,8 @@ def create_review_session(
     persistence_key = session_name if session_name else query
     
     # Load previous session (primary source - has complete decision data)
-    previous_session = load_session(persistence_key)
-    
+    previous_session = load_session(persistence_key, strict=True)
+
     # Build lookup for efficient merging
     prev_decision_lookup = _build_previous_decision_lookup(previous_session)
     if prev_decision_lookup:
@@ -1207,18 +1258,24 @@ def create_review_session(
     # Preserve research context from previous session
     if previous_session and previous_session.research_context:
         session.research_context = previous_session.research_context
-    
-    # Build search records (query, provider, filters, limit) from results
+    if previous_session:
+        session._baseline = previous_session._baseline
+
+    # Build search records (query, provider, filters, limit, outcome)
     for result in results:
+        error, retries = result_outcome(result)
         session.add_query_provider_pair(
-            result.query, result.provider, result.filters, result.limit
+            result.query, result.provider, result.filters, result.limit,
+            hits=len(result.papers), error=error, retries=retries,
         )
 
     # Merge with previous session's searches (if any), preserving their filters
     if previous_session:
         for record in previous_session.search_records:
+            <<keep an earlier answer over a failed re-run>>
             session.add_query_provider_pair(
-                record.query, record.provider, record.filters, record.limit
+                record.query, record.provider, record.filters, record.limit,
+                hits=record.hits, error=record.error, retries=record.retries,
             )
     
     # Collect paper IDs from current search results
@@ -1238,6 +1295,81 @@ def create_review_session(
                len(session.decisions), len(session.kept_papers()),
                len(session.discarded_papers()), len(session.pending_papers()))
     return session
+@
+
+When the same query is searched again on the same provider, the new
+record wins: [[add_query_provider_pair]] keeps the first record of a
+pair, and the current results are added before the previous session's.
+That is right when the re-run answered---it is the newer answer---but
+wrong when it failed.  Re-running a query while a provider is down would
+otherwise overwrite \enquote{12 hits} with \enquote{failed}, although the
+twelve papers from the earlier run are still in the session.  So an
+earlier record that answered replaces a failed re-run of the same pair.
+The failure itself is not lost from view: it was reported when it
+happened, and the session keeps the answer that its papers came from.
+
+<<keep an earlier answer over a failed re-run>>=
+for i, current in enumerate(session.search_records):
+    same_search = (
+        (current.query, current.provider)
+        == (record.query, record.provider)
+    )
+    if same_search and current.error and not record.error:
+        session.search_records[i] = record
+@
+
+Let's verify both halves: a failed search is recorded as failed, with
+its retries, and a failed re-run does not erase an earlier answer---while
+an answered re-run does replace it:
+
+<<test functions>>=
+class TestSearchRecordOutcome:
+    """create_review_session records what each search returned."""
+
+    @staticmethod
+    def _result(provider, papers, error=None, retries=0):
+        from scholar.scholar import SearchResult
+        return SearchResult(
+            query="q", provider=provider, timestamp="t", papers=papers,
+            error=error, retries=retries,
+        )
+
+    def test_failure_recorded(self):
+        paper = Paper(title="P", authors=["A"], sources=["openalex"])
+        session = create_review_session([
+            self._result("dblp", [], error="non-JSON response", retries=2),
+            self._result("openalex", [paper]),
+        ], "q", session_name="outcome")
+        dblp = session.search_record_for("dblp")
+        assert (dblp.hits, dblp.error, dblp.retries) == (
+            0, "non-JSON response", 2
+        )
+        assert session.search_record_for("openalex").hits == 1
+
+    def test_failed_rerun_keeps_earlier_answer(self):
+        paper = Paper(title="P", authors=["A"], sources=["dblp"])
+        save_session(create_review_session(
+            [self._result("dblp", [paper])], "q", session_name="rerun"
+        ))
+        session = create_review_session(
+            [self._result("dblp", [], error="HTTP 503")],
+            "q", session_name="rerun",
+        )
+        record = session.search_record_for("dblp")
+        assert (record.hits, record.error) == (1, None)
+        assert len(session.decisions) == 1
+
+    def test_answered_rerun_replaces_earlier_failure(self):
+        save_session(create_review_session(
+            [self._result("dblp", [], error="HTTP 503")],
+            "q", session_name="recovered",
+        ))
+        paper = Paper(title="P", authors=["A"], sources=["dblp"])
+        session = create_review_session(
+            [self._result("dblp", [paper])], "q", session_name="recovered",
+        )
+        record = session.search_record_for("dblp")
+        assert (record.hits, record.error) == (1, None)
 @
 
 Papers from the previous session that do not appear in the current search
@@ -1559,11 +1691,19 @@ def create_notes_session() -> ReviewSession:
 
 Sessions can be saved and loaded for interrupted workflows. The session file
 includes [[search_records]] to track which query, filters, and limit were used
-with which provider. Loading walks a backward-compatibility ladder: newest files
+with which provider, and what each search returned (hits, error, retries;
+absent in older files, which load as unknown hits and no error). Loading walks a backward-compatibility ladder: newest files
 carry [[search_records]]; files from before filters were persisted carry only a
 [[query_provider_pairs]] list, which we load with empty filters; and the oldest
 files carry neither, so we reconstruct one record per provider by pairing the
 single [[query]] with each provider in [[providers]].
+
+Saving is where a session can lose its decisions, so [[save_session]] does
+more than serialise: it merges what other processes saved since this one
+loaded the session, warns when the save would still drop decisions, keeps
+the previous file as [[<name>.json.bak]] and replaces the file
+atomically.  \Cref{sec:session-integrity}, after the two functions,
+explains why each safeguard is needed.
 
 <<review session functions>>=
 def _get_sessions_dir() -> Path:
@@ -1586,10 +1726,15 @@ avoiding expensive re-fetching from APIs.
 def save_session(session: ReviewSession) -> Path:
     """
     Save a review session to disk.
-    
+
+    Decisions and research context that another process saved since
+    `session` was loaded are merged in first (the changes made through
+    `session` win). The previous file is kept as `<name>.json.bak`, and
+    the file is replaced atomically.
+
     Args:
         session: The ReviewSession to save.
-    
+
     Returns:
         Path to the saved session file.
     """
@@ -1598,83 +1743,67 @@ def save_session(session: ReviewSession) -> Path:
         filename = f"{session.name}.json"
     else:
         filename = f"{get_query_hash(session.query)}.json"
-    
+
     session_path = _get_sessions_dir() / filename
     logger.info("Saving session to %s", session_path)
-    
-    # Convert to serializable format
-    data = {
-        "query": session.query,
-        "name": session.name,
-        "providers": session.providers,
-        "timestamp": session.timestamp.isoformat(),
-        "research_context": session.research_context,
-        "search_records": [
-            {
-                "query": r.query,
-                "provider": r.provider,
-                "filters": r.filters,
-                "limit": r.limit,
-            }
-            for r in session.search_records
-        ],
-        "snowball_rounds": [
-            {
-                "timestamp": r.timestamp.isoformat(),
-                "source_papers": r.source_papers,
-                "direction": r.direction,
-                "papers_added": r.papers_added,
-            }
-            for r in session.snowball_rounds
-        ],
-        "decisions": [
-            {
-                "paper_id": get_paper_id(d.paper),
-                "provider": d.provider,
-                "status": d.status.value,
-                "tags": d.tags,
-                "source": d.source.value,
-                "is_example": d.is_example,
-                "llm_confidence": d.llm_confidence,
-                "paper": d.paper.to_dict(include_refs_cites=True),
-            }
-            for d in session.decisions
-        ],
-    }
-    
-    with open(session_path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-    
+
+    with file_lock(session_path):
+        <<merge changes other processes saved>>
+        <<write the session file>>
+    session._baseline = SessionBaseline.of(session)
+
     logger.debug("Saved %d decisions (%d kept, %d discarded, %d pending)",
                 len(session.decisions), len(session.kept_papers()),
                 len(session.discarded_papers()), len(session.pending_papers()))
     return session_path
 
 
-def load_session(name_or_query: str) -> ReviewSession | None:
+def load_session(
+    name_or_query: str, *, strict: bool = False
+) -> ReviewSession | None:
     """
     Load a review session from disk.
-    
+
     Args:
         name_or_query: Session name or query string.
-    
+        strict: Raise `SessionFileError` when the session file exists
+            but cannot be read, instead of logging a warning and
+            returning None.
+
     Returns:
-        The loaded ReviewSession, or None if not found.
+        The loaded ReviewSession, or None if not found (or, unless
+        `strict`, unreadable).
     """
     logger.debug("Loading session: %s", name_or_query)
     sessions_dir = _get_sessions_dir()
-    
+
     # Try exact name first
     session_path = sessions_dir / f"{name_or_query}.json"
     if not session_path.exists():
         # Try query hash
         session_path = sessions_dir / f"{get_query_hash(name_or_query)}.json"
-    
+
     if not session_path.exists():
         logger.debug("Session not found: %s", name_or_query)
         return None
-    
+
     logger.debug("Found session file: %s", session_path)
+    try:
+        return read_session_file(session_path)
+    except SessionFileError as error:
+        if strict:
+            raise
+        logger.warning("%s", error)
+        return None
+
+
+def read_session_file(session_path: Path) -> ReviewSession:
+    """
+    Read one session file, recording its state as the session's baseline.
+
+    Raises:
+        SessionFileError: The file cannot be read or parsed.
+    """
     try:
         with open(session_path, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -1698,6 +1827,9 @@ def load_session(name_or_query: str) -> ReviewSession | None:
                     provider=rec["provider"],
                     filters=rec.get("filters"),
                     limit=rec.get("limit"),
+                    hits=rec.get("hits"),
+                    error=rec.get("error"),
+                    retries=rec.get("retries") or 0,
                 )
                 for rec in data["search_records"]
             ]
@@ -1753,10 +1885,561 @@ def load_session(name_or_query: str) -> ReviewSession | None:
             )
         
         logger.info("Loaded session with %d papers", len(session.decisions))
+    except (json.JSONDecodeError, KeyError, OSError, ValueError,
+            TypeError) as e:
+        raise SessionFileError(session_path, e) from e
+    session._baseline = SessionBaseline.of(session)
+    return session
+@
+
+The file is re-read, merged and replaced under [[file_lock]]
+(\cref{sec:file-lock}), so that two processes saving one session at
+the same moment take turns: the second re-reads only after the first
+has written, and merges against what the first wrote.  The lock covers
+only those milliseconds, never the time between loading a session and
+saving it, which may be hours of enrichment or a whole TUI session; the
+merge is what reconciles that.  The write itself serialises the merged
+session:
+
+<<write the session file>>=
+# Convert to serializable format
+data = {
+    "query": session.query,
+    "name": session.name,
+    "providers": session.providers,
+    "timestamp": session.timestamp.isoformat(),
+    "research_context": session.research_context,
+    "search_records": [
+        {
+            "query": r.query,
+            "provider": r.provider,
+            "filters": r.filters,
+            "limit": r.limit,
+            "hits": r.hits,
+            "error": r.error,
+            "retries": r.retries,
+        }
+        for r in session.search_records
+    ],
+    "snowball_rounds": [
+        {
+            "timestamp": r.timestamp.isoformat(),
+            "source_papers": r.source_papers,
+            "direction": r.direction,
+            "papers_added": r.papers_added,
+        }
+        for r in session.snowball_rounds
+    ],
+    "decisions": [
+        {
+            "paper_id": get_paper_id(d.paper),
+            "provider": d.provider,
+            "status": d.status.value,
+            "tags": d.tags,
+            "source": d.source.value,
+            "is_example": d.is_example,
+            "llm_confidence": d.llm_confidence,
+            "paper": d.paper.to_dict(include_refs_cites=True),
+        }
+        for d in session.decisions
+    ],
+}
+
+<<warn if the save drops decisions>>
+atomic_write_text(
+    session_path,
+    json.dumps(data, indent=2, ensure_ascii=False),
+    backup=True,
+)
+@
+
+The test makes the race happen on purpose.  Process~A's merge starts
+process~B's save in a thread and gives it half a second.  Without the
+lock, B writes its decision in that half second and A then replaces the
+file with a merge of what it read before, so B's decision is gone.
+With the lock, B waits, re-reads A's file and merges, and both
+decisions survive.
+
+<<test functions>>=
+def test_simultaneous_saves_keep_both(tmp_path, monkeypatch):
+    import threading
+    import scholar.review as review
+
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+    TestConcurrentSaves()._create()
+    first = load_session("race")
+    second = load_session("race")
+    first.decisions[0].status = DecisionStatus.KEPT
+    second.decisions[1].status = DecisionStatus.KEPT
+    merge = review.merge_concurrent_changes
+    threads = []
+
+    def slow_merge(session, on_disk):
+        if not threads:
+            threads.append(threading.Thread(
+                target=save_session, args=(second,)
+            ))
+            threads[0].start()
+            threads[0].join(0.5)
+        merge(session, on_disk)
+
+    monkeypatch.setattr(review, "merge_concurrent_changes", slow_merge)
+    save_session(first)
+    threads[0].join(5)
+    final = {d.paper.title: d.status for d in load_session("race").decisions}
+    assert final["Paper 0"] == DecisionStatus.KEPT
+    assert final["Paper 1"] == DecisionStatus.KEPT
+@
+
+\subsubsection{Session integrity}
+\label{sec:session-integrity}
+
+A session is the audit record of a review, so losing its decisions is the
+worst failure this module can have.  It happened
+(\url{https://github.com/dbosk/scholar/issues/107}): two sessions,
+classified by an agent-driven workflow on 2026-09-03--06, were later found
+with every decision back to pending and their research context gone,
+while a third session from the same workflow was intact.  The files gave
+the culprit away:
+\begin{description}
+\item[What survived] The session's query, creation timestamp and all
+  82 (and 197) accumulated search records.  An append through
+  [[create_review_session]] would have stamped a new timestamp and query,
+  so neither an append nor a failed load followed by a rebuild did this.
+\item[What was reset] Every decision had exactly the defaults of a
+  freshly built [[ReviewDecision]] (pending, source human, no tags, no
+  confidence), and the research context was [[None]], as on the day the
+  sessions were created.  Paper identifiers were unchanged, so no id
+  migration was involved.
+\item[What was added] Most papers carried open-access status and a
+  Crossref currency check (\cref{unpaywall-module,crossref-module}),
+  which only enrichment writes, and one session had about two hundred
+  more abstracts than its classification report counted.  The intact
+  session carried no enrichment at all.
+\end{description}
+The decisions were therefore lost by the oldest bug in persistence, the
+\emph{lost update}.  [[scholar enrich <session>]] loads a session, spends
+a long time enriching every paper (with rate limits, hours for 1\,500
+papers), and then saves the session object it loaded.  The workflow set
+the research context and classified the papers while the enrichment ran,
+and the enrichment's save replaced all of that with its stale copy from
+before.  The TUI ([[run_review]]) and [[scholar verify]] follow the same
+load-early, save-late pattern, and two agents appending to one session
+can collide the same way.
+
+We cannot make every command short, and locking a session for the hours
+an enrichment runs would block the very classification the user wants to
+do meanwhile.  Instead [[save_session]] merges: before writing, it reads
+the file as it is on disk now and keeps whatever another process changed
+there that this process did not.  To tell the two apart it needs a third
+version, the \emph{baseline}: the decisions and research context as this
+process loaded (or last saved) them.  For each field the rule is the one
+of a three-way merge:
+\begin{description}
+\item[Changed here] This process's value differs from the baseline, so
+  it is a deliberate change (a TUI decision, [[sessions decide]], an
+  [[llm classify]] batch, a new research context) and is written.
+\item[Changed only on disk] This process's value still equals the
+  baseline but the file's does not, so another process changed it; the
+  file's value is kept.  This is the case that the enrichment above got
+  wrong.
+\item[New on disk] A paper that is on disk but neither in this process's
+  session nor in its baseline was added by another process (a concurrent
+  [[search -n]]) and is kept.  A paper that \emph{is} in the baseline but
+  no longer in this session was removed or re-keyed here (preprint
+  adoption, \cref{preprint-module}; surname-first repair,
+  \cref{sec:review-surname-first}) and stays removed.
+\item[Changed on both sides] Both processes decided the same paper, and
+  differently.  No rule can know which decision the user meant, so we
+  keep this process's (the one being saved now, hence the more recent)
+  and log a warning naming the session, the paper and both decisions.
+  The other decision is still in the [[.bak]], so nothing is lost
+  silently.
+\end{description}
+Paper metadata is not merged: this process's copy of a paper it holds
+wins, so a concurrent enrichment may still lose its \emph{metadata} to a
+later save, but never a decision.  (Reading the file could not even show
+us the other process's metadata: the paper registry hands
+[[Paper.from_dict]] the [[Paper]] objects this process already holds for
+the same ids.)  Search records and snowball rounds only
+ever accumulate, so we add any that only the file has.
+
+The baseline keeps one comparable state per paper id.  We compare the
+whole decision state rather than the status alone, because a change of
+tags or source (an LLM decision confirmed in the TUI) is as deliberate as
+a change of status.
+
+<<review data structures>>=
+def decision_state(decision: ReviewDecision) -> tuple:
+    """Return the persisted decision fields of `decision`, comparably."""
+    return (
+        decision.status,
+        tuple(decision.tags),
+        decision.source,
+        decision.is_example,
+        decision.llm_confidence,
+    )
+
+
+@dataclass
+class SessionBaseline:
+    """A session's decisions and research context as loaded or saved.
+
+    `save_session` compares against it to tell the changes made in this
+    process from the changes another process saved meanwhile.
+    """
+    decisions: dict[str, tuple]
+    research_context: str | None
+
+    @classmethod
+    def of(cls, session: "ReviewSession") -> "SessionBaseline":
+        """Record the current state of `session`."""
+        return cls(
+            decisions={
+                get_paper_id(d.paper): decision_state(d)
+                for d in session.decisions
+            },
+            research_context=session.research_context,
+        )
+@
+
+The merge itself applies the three rules.  A session that was never
+loaded (constructed in code, or created by an append to a session that did
+not exist yet) has no baseline; then nothing of its own counts as
+unchanged, and only papers new on disk are added.  The research context
+gets one extra rule for this case: an empty context never replaces a
+non-empty one, since there is no way to clear a context by accident that
+we would want to honour.
+
+<<review session functions>>=
+def merge_concurrent_changes(
+    session: ReviewSession, on_disk: ReviewSession
+) -> None:
+    """Merge into `session` what another process saved in `on_disk`.
+
+    Decisions and research context that `session` still has as loaded
+    (its baseline) take the on-disk value; papers and search records
+    that only the file has are added. Changes made through `session`
+    are kept.
+    """
+    base = session._baseline
+    base_states = base.decisions if base else {}
+    disk_decisions = {get_paper_id(d.paper): d for d in on_disk.decisions}
+
+    own_ids = set()
+    for decision in session.decisions:
+        paper_id = get_paper_id(decision.paper)
+        own_ids.add(paper_id)
+        theirs = disk_decisions.get(paper_id)
+        if theirs is None or paper_id not in base_states:
+            continue
+        mine, base_state = decision_state(decision), base_states[paper_id]
+        if decision_state(theirs) in (base_state, mine):
+            continue
+        if mine == base_state:
+            decision.status = theirs.status
+            decision.tags = list(theirs.tags)
+            decision.source = theirs.source
+            decision.is_example = theirs.is_example
+            decision.llm_confidence = theirs.llm_confidence
+        else:
+            <<warn that both processes decided the paper>>
+
+    for paper_id, theirs in disk_decisions.items():
+        if paper_id not in own_ids and paper_id not in base_states:
+            session.decisions.append(theirs)
+
+    <<merge research context from disk>>
+
+    for record in on_disk.search_records:
+        if (record.query, record.provider) not in session.query_provider_pairs:
+            session.search_records.append(record)
+    own_rounds = {r.timestamp for r in session.snowball_rounds}
+    for snowball_round in on_disk.snowball_rounds:
+        if snowball_round.timestamp not in own_rounds:
+            session.snowball_rounds.append(snowball_round)
+
+    session._invalidate_cache()
+<<merge research context from disk>>=
+theirs_context = on_disk.research_context
+if base is not None:
+    if (session.research_context == base.research_context
+            and theirs_context != base.research_context):
+        session.research_context = theirs_context
+elif not session.research_context and theirs_context:
+    session.research_context = theirs_context
+<<warn that both processes decided the paper>>=
+logger.warning(
+    "Session %s: %s was decided by another process meanwhile "
+    "(%s %s); keeping this process's decision (%s %s)",
+    session.name or session.query, paper_id,
+    theirs.status.value, theirs.tags, decision.status.value, decision.tags,
+)
+@
+
+[[save_session]] reads the file just before writing.  When there is no
+file there is nothing to merge; when the file cannot be read we cannot
+merge either, and we say so, because the save is about to replace that
+file (its unreadable content survives in the [[.bak]]).
+
+<<merge changes other processes saved>>=
+on_disk = None
+if session_path.exists():
+    try:
+        on_disk = read_session_file(session_path)
+    except SessionFileError as error:
+        logger.warning(
+            "%s; replacing it, the unreadable version is kept as %s",
+            error, backup_path(session_path),
+        )
+if on_disk is not None:
+    merge_concurrent_changes(session, on_disk)
+@
+
+The window that remains, between reading the file and replacing it, is
+milliseconds instead of hours, and [[save_session]] closes it by holding
+[[file_lock]] across both.
+
+Now the regression test for the incident.  Process~A (the enrichment)
+loads the session; process~B sets the research context and classifies,
+and saves; then A, having changed only paper metadata, saves.  B's work
+must survive, and so must A's.  The second test checks the other
+direction: a change A made itself is kept even though the file differs,
+the conflict is logged, and a paper B added is kept.
+
+<<test functions>>=
+class TestConcurrentSaves:
+    """Saving a stale session object must not undo another process's work."""
+
+    def _create(self):
+        session = ReviewSession(
+            query="q", providers=["openalex"], timestamp=datetime(2026, 9, 3),
+            name="race",
+        )
+        session.add_query_provider_pair("q", "openalex")
+        session.decisions = [
+            ReviewDecision(
+                paper=Paper(title=f"Paper {i}", authors=["A"],
+                            doi=f"10.5555/wp1-race-{i}"),
+                provider="openalex",
+            )
+            for i in range(3)
+        ]
+        save_session(session)
+
+    def test_stale_save_keeps_decisions_and_context(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        self._create()
+
+        enrich = load_session("race")            # process A starts
+
+        classify = load_session("race")          # process B, meanwhile
+        classify.research_context = "Does X support Y?"
+        classify.decisions[0].status = DecisionStatus.KEPT
+        classify.decisions[0].tags = ["supports-claim"]
+        classify.decisions[1].status = DecisionStatus.DISCARDED
+        classify.decisions[1].tags = ["off-topic"]
+        classify.decisions[1].source = ReviewSource.LLM_UNREVIEWED
+        classify.decisions[1].llm_confidence = 0.9
+        save_session(classify)
+
+        for d in enrich.decisions:               # A finishes and saves
+            d.paper.abstract = "Enriched."
+        save_session(enrich)
+
+        final = load_session("race")
+        assert final.research_context == "Does X support Y?"
+        by_title = {d.paper.title: d for d in final.decisions}
+        assert by_title["Paper 0"].status == DecisionStatus.KEPT
+        assert by_title["Paper 0"].tags == ["supports-claim"]
+        assert by_title["Paper 1"].status == DecisionStatus.DISCARDED
+        assert by_title["Paper 1"].source == ReviewSource.LLM_UNREVIEWED
+        assert by_title["Paper 1"].llm_confidence == 0.9
+        assert by_title["Paper 2"].status == DecisionStatus.PENDING
+        assert all(d.paper.abstract == "Enriched." for d in final.decisions)
+
+    def test_own_changes_win_and_new_papers_are_kept(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        self._create()
+
+        ours = load_session("race")
+        theirs = load_session("race")
+        theirs.decisions[0].status = DecisionStatus.DISCARDED
+        theirs.decisions[0].tags = ["wrong"]
+        theirs.decisions.append(ReviewDecision(
+            paper=Paper(title="Found later", authors=["B"],
+                        doi="10.5555/wp1-race-new"),
+            provider="dblp",
+        ))
+        theirs.add_query_provider_pair("q2", "dblp")
+        save_session(theirs)
+
+        ours.decisions[0].status = DecisionStatus.KEPT
+        ours.decisions[0].tags = ["right"]
+        with caplog.at_level("WARNING", logger="scholar.review"):
+            save_session(ours)
+        assert "decided by another process meanwhile" in caplog.text
+        assert "doi:10.5555/wp1-race-0" in caplog.text
+
+        final = load_session("race")
+        by_title = {d.paper.title: d for d in final.decisions}
+        assert by_title["Paper 0"].status == DecisionStatus.KEPT
+        assert by_title["Paper 0"].tags == ["right"]
+        assert "Found later" in by_title
+        assert ("q2", "dblp") in final.query_provider_pairs
+@
+
+\paragraph{A warning when a save still drops decisions.}
+The merge covers every session that was loaded, but not a session object
+built without a baseline and saved over an existing file, nor a bug in a
+future command.  As a last line of defence [[save_session]] compares the
+number of decided (non-pending) papers on disk with the number it is about
+to write.  A drop is legitimate only when this process itself reset
+decisions to pending (the TUI can undo a decision), and those resets are
+exactly the decisions whose baseline was decided and whose state is now
+pending.  Any drop beyond them is logged as a warning that names the
+session, the two counts and the [[.bak]] that still holds the previous
+version.  We warn rather than refuse: refusing would also throw away this
+process's own work, and the [[.bak]] makes the loss recoverable.
+
+<<review session functions>>=
+def count_decided(decisions: list[ReviewDecision]) -> int:
+    """Return how many of `decisions` are kept or discarded."""
+    return sum(1 for d in decisions if d.is_decided)
+
+
+def warn_if_decisions_dropped(
+    session: ReviewSession, on_disk: ReviewSession | None, backup: Path
+) -> None:
+    """Warn when saving `session` would leave fewer decided papers than
+    `on_disk` has, beyond the ones this process reset to pending."""
+    if on_disk is None:
+        return
+    before = count_decided(on_disk.decisions)
+    after = count_decided(session.decisions)
+    base_states = session._baseline.decisions if session._baseline else {}
+    reset_here = sum(
+        1 for d in session.decisions
+        if not d.is_decided
+        and base_states.get(get_paper_id(d.paper), (DecisionStatus.PENDING,))[0]
+        != DecisionStatus.PENDING
+    )
+    if after + reset_here < before:
+        logger.warning(
+            "Session %s: this save reduces the decided papers from %d to %d "
+            "although no decision command reset them; the previous version "
+            "is kept in %s",
+            session.name or session.query, before, after, backup,
+        )
+<<warn if the save drops decisions>>=
+warn_if_decisions_dropped(session, on_disk, backup_path(session_path))
+@
+
+We check both sides: a session built from scratch over a classified file
+triggers the warning (and the [[.bak]] still has the decisions), while an
+explicit reset to pending in a loaded session does not.
+
+<<test functions>>=
+class TestDecisionDropWarning:
+    """save_session warns about decisions lost without a decision command."""
+
+    def _classified(self):
+        session = ReviewSession(
+            query="q", providers=["openalex"], timestamp=datetime(2026, 9, 3),
+            name="guard",
+        )
+        session.decisions = [
+            ReviewDecision(
+                paper=Paper(title="Kept", authors=["A"],
+                            doi="10.5555/wp1-kept"),
+                provider="openalex", status=DecisionStatus.KEPT,
+            ),
+        ]
+        save_session(session)
         return session
-    except (json.JSONDecodeError, KeyError, OSError) as e:
-        logger.warning("Failed to load session %s: %s", name_or_query, e)
-        return None
+
+    def test_warns_and_keeps_backup(self, tmp_path, monkeypatch, caplog):
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        self._classified()
+        fresh = ReviewSession(
+            query="q", providers=["openalex"], timestamp=datetime(2026, 9, 3),
+            name="guard",
+        )
+        fresh.decisions = [
+            ReviewDecision(
+                paper=Paper(title="Kept", authors=["A"],
+                            doi="10.5555/wp1-kept"),
+                provider="openalex",
+            ),
+        ]
+        with caplog.at_level("WARNING", logger="scholar.review"):
+            path = save_session(fresh)
+        assert "from 1 to 0" in caplog.text
+        assert "guard.json.bak" in caplog.text
+        backup = json.loads(path.with_name("guard.json.bak").read_text())
+        assert backup["decisions"][0]["status"] == "kept"
+
+    def test_explicit_reset_is_silent(self, tmp_path, monkeypatch, caplog):
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        self._classified()
+        session = load_session("guard")
+        session.decisions[0].status = DecisionStatus.PENDING
+        with caplog.at_level("WARNING", logger="scholar.review"):
+            save_session(session)
+        assert "reduces the decided papers" not in caplog.text
+@
+
+\paragraph{Unreadable session files.}
+[[read_session_file]] turns every way a file can fail to parse into one
+exception that names the file.  Callers that only read ([[sessions
+show]], [[llm status]], \dots) keep the old behaviour through
+[[load_session]]: a warning and \enquote{session not found}.  Callers that
+would \emph{write} the session afterwards must not treat it as missing,
+so they pass [[strict=True]] and let the error stop them
+(\cref{sec:review-create-strict}).
+
+<<review data structures>>=
+class SessionFileError(Exception):
+    """A session file exists but cannot be read or parsed."""
+
+    def __init__(self, path: Path, cause: Exception):
+        self.path = path
+        self.cause = cause
+        super().__init__(f"Cannot read session file {path}: {cause}")
+@
+
+<<test functions>>=
+def test_unreadable_session_is_not_a_missing_one(tmp_path, monkeypatch):
+    """A truncated session file stops an append instead of being replaced."""
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+    path = save_session(ReviewSession(
+        query="q", providers=["openalex"], timestamp=datetime(2026, 9, 3),
+        name="broken",
+        decisions=[ReviewDecision(
+            paper=Paper(title="Kept", authors=["A"], doi="10.5555/wp1-kept"),
+            provider="openalex", status=DecisionStatus.KEPT,
+        )],
+    ))
+    truncated = path.read_text()[:200]
+    path.write_text(truncated)
+
+    assert load_session("broken") is None
+    with pytest.raises(SessionFileError, match="broken.json"):
+        load_session("broken", strict=True)
+
+    result = Mock()
+    result.provider = "openalex"
+    result.query = "q"
+    result.filters = None
+    result.limit = None
+    result.papers = [Paper(title="New", authors=["B"], doi="10.5555/wp1-new")]
+    with pytest.raises(SessionFileError):
+        create_review_session([result], "q", "broken")
+    assert path.read_text() == truncated
 @
 
 \subsubsection{Persisting Query-Provider Pairs}
@@ -1841,6 +2524,56 @@ class TestQueryProviderPairsPersistence:
         assert loaded.query_provider_pairs == [("natural language", "openalex")]
         record = loaded.search_record_for("openalex")
         assert record is not None and record.filters is None
+
+    def test_save_and_load_search_outcome(self, tmp_path, monkeypatch):
+        """Hits, error and retries survive a save/load round-trip."""
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+
+        session = ReviewSession(
+            query="q", providers=["dblp", "openalex"],
+            timestamp=datetime.now(), name="outcome-session",
+        )
+        session.add_query_provider_pair(
+            "q", "dblp", hits=0, error="non-JSON response", retries=2,
+        )
+        session.add_query_provider_pair("q", "openalex", hits=12)
+
+        save_session(session)
+        loaded = load_session("outcome-session")
+
+        dblp = loaded.search_record_for("dblp")
+        assert (dblp.hits, dblp.error, dblp.retries) == (
+            0, "non-JSON response", 2
+        )
+        openalex = loaded.search_record_for("openalex")
+        assert (openalex.hits, openalex.error, openalex.retries) == (
+            12, None, 0
+        )
+
+    def test_records_without_outcome_load_unknown(
+        self, tmp_path, monkeypatch
+    ):
+        """A record from before outcomes were stored has unknown hits."""
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        sessions_dir = tmp_path / "review_sessions"
+        sessions_dir.mkdir(parents=True)
+        (sessions_dir / "older.json").write_text(
+            json.dumps({
+                "query": "q",
+                "name": "older",
+                "providers": ["dblp"],
+                "timestamp": datetime.now().isoformat(),
+                "search_records": [{
+                    "query": "q", "provider": "dblp",
+                    "filters": None, "limit": 40,
+                }],
+                "decisions": [],
+            }),
+            encoding="utf-8",
+        )
+
+        record = load_session("older").search_record_for("dblp")
+        assert (record.hits, record.error, record.retries) == (None, None, 0)
 
     def test_save_and_load_references_citations(self, tmp_path, monkeypatch):
         """References and citations are persisted with the session."""
@@ -2018,6 +2751,21 @@ def test_load_session_backward_compatibility(tmp_path, monkeypatch):
     assert ("old query", "wos") in loaded.query_provider_pairs
 @
 
+\subsubsection{Listing sessions}
+
+[[list_sessions]] reads only the counts it shows, not whole sessions.  It
+also flags a session that has search records but not a single decision and
+no research context ([[needs_check]]).  That is how a session looks
+before anyone has screened it, but it is also exactly how the two
+sessions of \url{https://github.com/dbosk/scholar/issues/107} looked after
+they had lost their classification, which nobody noticed until a table
+had to be regenerated weeks later.  The data cannot tell the two cases
+apart, so [[sessions list]] only points the flagged sessions out and
+leaves the judgement to the user, who knows whether they were screened.
+For the same reason a session file that cannot be parsed is reported with
+a warning instead of being left out silently: a session that quietly
+disappears from the list is a loss nobody notices.
+
 <<review session functions>>=
 def list_sessions() -> list[dict[str, Any]]:
     """
@@ -2036,6 +2784,8 @@ def list_sessions() -> list[dict[str, Any]]:
         - discarded: Number of discarded papers
         - pending: Number of pending papers
         - path: Path to session file
+        - needs_check: True if the session has search records but no
+          decisions and no research context (unscreened, or reset)
     """
     sessions_dir = _get_sessions_dir()
     logger.debug("Listing sessions from %s", sessions_dir)
@@ -2058,7 +2808,10 @@ def list_sessions() -> list[dict[str, Any]]:
             kept = sum(1 for d in decisions if d.get("status") == "kept")
             discarded = sum(1 for d in decisions if d.get("status") == "discarded")
             pending = sum(1 for d in decisions if d.get("status") == "pending")
-            
+            records = (data.get("search_records")
+                       or data.get("query_provider_pairs") or [])
+            context = (data.get("research_context") or "").strip()
+
             sessions.append({
                 "name": data.get("name") or data.get("query"),
                 "query": data.get("query"),
@@ -2067,14 +2820,50 @@ def list_sessions() -> list[dict[str, Any]]:
                 "discarded": discarded,
                 "pending": pending,
                 "path": session_file,
+                "needs_check": bool(records) and kept + discarded == 0
+                               and not context,
             })
         except (json.JSONDecodeError, OSError) as e:
-            logger.debug("Failed to read session file %s: %s", session_file, e)
+            logger.warning("Cannot read session file %s: %s", session_file, e)
     
     logger.debug("Found %d sessions", len(sessions))
     return sorted(sessions, key=lambda s: s.get("timestamp", datetime.min))
+@
 
+The flag needs all three conditions: a session with a decision, or with a
+research context, or without any search yet is not flagged.
 
+<<test functions>>=
+def test_list_sessions_flags_records_without_decisions(tmp_path, monkeypatch):
+    """needs_check marks searched sessions with no decisions or context."""
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+
+    def make(name, *, decided=False, context=None, searched=True):
+        session = ReviewSession(
+            query="q", providers=["openalex"], timestamp=datetime.now(),
+            name=name, research_context=context,
+        )
+        if searched:
+            session.add_query_provider_pair("q", "openalex")
+        session.decisions = [ReviewDecision(
+            paper=Paper(title=name, authors=["A"], doi=f"10.1/wp1-{name}"),
+            provider="openalex",
+            status=DecisionStatus.KEPT if decided else DecisionStatus.PENDING,
+        )]
+        save_session(session)
+
+    make("reset")
+    make("decided", decided=True)
+    make("context", context="Why?")
+    make("unsearched", searched=False)
+    flags = {s["name"]: s["needs_check"] for s in list_sessions()}
+    assert flags == {
+        "reset": True, "decided": False, "context": False,
+        "unsearched": False,
+    }
+@
+
+<<review session functions>>=
 def save_search_decisions(query: str, decisions: list[ReviewDecision]) -> None:
     """
     Save decisions for a search query (compatible with notes module).
@@ -3162,12 +3951,40 @@ def provider_queries_differ(session: ReviewSession) -> bool:
     return any(query != session.query for query, _ in pairs)
 @
 
+A report built on a session where a provider failed must not let the
+reader assume that provider was searched.  [[search_outcomes]] pairs
+each query and provider with the label of what the search returned
+([[hits_label]], \cref{sec:search-result-error}): a count, or
+\enquote{failed} with the reason.  Records from before outcomes were
+stored---and sessions so old that they have no records at all---get an
+empty label, since we do not know.  The provider table then appears
+also when every provider ran the base query but one of them failed, and
+it gains a hits column whenever at least one outcome is known; a report
+built from an old session therefore looks exactly as it did.
+
+<<review report generation>>=
+def search_outcomes(session: ReviewSession) -> list[tuple[str, str, str]]:
+    """Return `(query, provider, outcome label)` for each recorded search."""
+    if not session.search_records:
+        return [(q, p, "") for q, p in get_query_provider_pairs(session)]
+    return [
+        (r.query, r.provider, hits_label(r.hits, r.error, r.retries))
+        for r in session.search_records
+    ]
+
+
+def any_search_failed(session: ReviewSession) -> bool:
+    """Whether any recorded search failed."""
+    return any(r.error for r in session.search_records)
+@
+
 The research context and the search parameters exist in a Markdown and a
 \LaTeX{} flavour because the synthesis offers both output formats. The
 \LaTeX{} builders take the heading command as a parameter for the reason
 given above; the provider table only appears when at least one provider
 ran a query different from the base query, since otherwise it would
-repeat the base query once per provider.
+repeat the base query once per provider---or when a search failed,
+since the failure must be visible either way.
 
 <<review report generation>>=
 def build_research_context_markdown(
@@ -3203,16 +4020,20 @@ def build_search_parameters_markdown(
         "",
     ]
 
-    if provider_queries_differ(session):
+    if provider_queries_differ(session) or any_search_failed(session):
         heading2 = "#" * (heading_level + 1)
+        outcomes = search_outcomes(session)
+        with_hits = any(label for _, _, label in outcomes)
         lines.extend([
             f"{heading2} Provider-specific queries",
             "",
-            "| Provider | Query |",
-            "| --- | --- |",
+            "| Provider | Query | Hits |" if with_hits
+            else "| Provider | Query |",
+            "| --- | --- | --- |" if with_hits else "| --- | --- |",
         ])
-        for query, provider in get_query_provider_pairs(session):
-            lines.append(f"| {provider} | {query} |")
+        for query, provider, label in outcomes:
+            hits_cell = f" {label} |" if with_hits else ""
+            lines.append(f"| {provider} | {query} |{hits_cell}")
         lines.append("")
 
     return lines
@@ -3250,19 +4071,25 @@ def build_search_parameters_latex(
         ]
     )
 
-    if provider_queries_differ(session):
+    if provider_queries_differ(session) or any_search_failed(session):
+        outcomes = search_outcomes(session)
+        with_hits = any(label for _, _, label in outcomes)
         lines.extend(
             [
                 f"{sub_heading(heading_command)}{{Provider-specific queries}}",
-                r"\begin{longtable}{lp{10cm}}",
+                r"\begin{longtable}{lp{8cm}p{3.5cm}}" if with_hits
+                else r"\begin{longtable}{lp{10cm}}",
                 r"\toprule",
-                r"Provider & Query \\",
+                r"Provider & Query & Hits \\" if with_hits
+                else r"Provider & Query \\",
                 r"\midrule",
             ]
         )
-        for query, provider in get_query_provider_pairs(session):
+        for query, provider, label in outcomes:
+            hits_cell = f" & {escape_latex(label)}" if with_hits else ""
             lines.append(
-                f"{escape_latex(provider)} & {escape_latex(query)} \\\\"
+                f"{escape_latex(provider)} & {escape_latex(query)}"
+                f"{hits_cell} \\\\"
             )
         lines.extend(
             [
@@ -3292,6 +4119,40 @@ class TestSearchParametersHeadings:
         )
         assert r"\subsection{Search Parameters}" in lines
         assert r"\subsubsection{Provider-specific queries}" in lines
+@
+
+A failed provider must reach the report even when every provider ran
+the base query, which alone would hide the table; an old session
+without outcomes keeps the two-column table:
+
+<<test functions>>=
+class TestSearchParametersOutcomes:
+    def test_failure_shown_although_queries_agree(self):
+        session = ReviewSession(
+            query="a", providers=["openalex", "dblp"],
+            timestamp=datetime.now(),
+        )
+        session.add_query_provider_pair("a", "openalex", hits=12)
+        session.add_query_provider_pair(
+            "a", "dblp", hits=0, error="non-JSON response",
+        )
+        markdown = build_search_parameters_markdown(session)
+        assert "| Provider | Query | Hits |" in markdown
+        assert "| dblp | a | failed (non-JSON response) |" in markdown
+        assert "| openalex | a | 12 |" in markdown
+        latex = "\n".join(build_search_parameters_latex(session))
+        assert r"dblp & a & failed (non-JSON response) \\" in latex
+
+    def test_old_session_keeps_two_columns(self):
+        session = ReviewSession(
+            query="a", providers=["openalex", "dblp"],
+            timestamp=datetime.now(),
+        )
+        session.add_query_provider_pair("a", "openalex")
+        session.add_query_provider_pair("b", "dblp")
+        markdown = build_search_parameters_markdown(session)
+        assert "| Provider | Query |" in markdown
+        assert "| dblp | b |" in markdown
 @
 
 \subsection{Standalone documents and fragments}
@@ -3491,43 +4352,151 @@ class TestLatexSkeleton:
         ]
 @
 
-\subsection{Citation keys for the report}
+\subsection{Citation keys}
+\label{sec:cite-keys}
 
-The report keeps its own key scheme, [[surname{year}_{index}]], and keys
-the map by [[id(decision)]] rather than by paper id. Both are deliberate.
-The index suffix makes keys unique by construction, which matters because
+The report and the \LaTeX{} synthesis both write a [[.bib]] file and
+cite into it, and they used to build their keys in two different ways:
+the report as [[surname{year}_{index}]], taking the last word of the
+first author's name, so that \enquote{Smith, John} came out as
+[[john2024_0]]; the synthesis as [[surname{year}]] with a letter suffix
+from [[b]] on and [[n.d.]] for a missing year. Both now use the one
+scheme in this section (issue~\#85), which also gives a reader one rule
+to look a key up by.
+
+A key is the first author's surname, lower-cased and reduced to letters
+and digits, followed by the year, or [[nd]] when the year is unknown.
+The surname is the part before the comma in \enquote{Smith, John} and
+the last word otherwise, which is how both forms occur in provider
+data. Reducing to letters and digits is what keeps a key safe for
+biber, whose parser rejects apostrophes, whitespace, quotes, braces and
+the BibTeX delimiters (an \enquote{O'Brien} once aborted a whole
+bibliography); a letter outside ASCII, as in \enquote{Müller}, is kept,
+since biber reads UTF-8 keys. A paper without authors, or with a
+surname that has no letters or digits at all, is filed under
+[[unknown]].
+
+<<review report generation>>=
+def author_surname(author: str) -> str:
+    """Return the surname in `author` ("John Smith" or "Smith, John")."""
+    author = author.strip()
+    if "," in author:
+        return author.split(",")[0].strip()
+    parts = author.split()
+    return parts[-1] if parts else author
+
+
+def cite_key_base(paper: Paper) -> str:
+    """Return the citation key of `paper` before any collision suffix."""
+    surname = author_surname(paper.authors[0] or "") if paper.authors else ""
+    surname = "".join(c for c in surname.lower() if c.isalnum())
+    year = "".join(c for c in str(paper.year or "") if c.isalnum())
+    return f"{surname or 'unknown'}{year or 'nd'}"
+@
+
+Two papers by different Smiths in the same year need different keys.
+The first one keeps the plain key and later ones get a letter suffix,
+[[a]] for the first clash, then [[b]], and after [[z]] two letters, so
+the suffix never runs into the characters after [[z]] that biber would
+reject. Suffixes are assigned in list order, and a key depends only on
+the papers before it: appending papers can suffix the new ones but
+never changes a key already handed out. The synthesis relies on that
+to extend its key space without invalidating cached prose
+(\cref{sec:synthesis-key-space} in the LLM review module). Should a
+suffixed key happen to equal a key some other paper produced plainly,
+the next suffix is taken.
+
+<<review report generation>>=
+def collision_suffix(clash: int) -> str:
+    """Return the suffix for the `clash`th clash: a, ..., z, aa, ab, ..."""
+    letters = ""
+    while clash > 0:
+        clash, rest = divmod(clash - 1, 26)
+        letters = chr(ord("a") + rest) + letters
+    return letters
+
+
+def assign_cite_keys(papers: list[Paper]) -> list[str]:
+    """Return a unique citation key for each of `papers`, in order."""
+    keys: list[str] = []
+    used: set[str] = set()
+    clashes: dict[str, int] = {}
+    for paper in papers:
+        base = key = cite_key_base(paper)
+        while key in used:
+            clashes[base] = clashes.get(base, 0) + 1
+            key = base + collision_suffix(clashes[base])
+        used.add(key)
+        keys.append(key)
+    return keys
+@
+
+Let's check the surname forms, the sanitiser and the fallbacks, and
+that suffixes start at [[a]] and leave earlier keys alone:
+
+<<test functions>>=
+class TestCiteKeys:
+    def test_author_surname(self):
+        assert author_surname("John Smith") == "Smith"
+        assert author_surname("Smith") == "Smith"
+        assert author_surname("Smith, John") == "Smith"
+        assert author_surname("van Gogh, Vincent") == "van Gogh"
+        assert author_surname("  ") == ""
+
+    def test_key_base(self):
+        def key(authors, year=2024):
+            return cite_key_base(Paper(title="T", authors=authors, year=year))
+
+        assert key(["Smith, John"]) == "smith2024"
+        assert key(["Ann O'Brien"]) == "obrien2024"
+        assert key(["Bo Smith-Jones"]) == "smithjones2024"
+        assert key(["van Gogh, Vincent"]) == "vangogh2024"
+        assert key(["Jörg Müller"]) == "müller2024"
+        assert key(["Smith"], year=None) == "smithnd"
+        assert key([]) == "unknown2024"
+        assert key([""]) == "unknown2024"
+
+    def test_suffixes_start_at_a_and_are_stable(self):
+        smiths = [
+            Paper(title=str(i), authors=[f"A{i} Smith"], year=2024)
+            for i in range(29)
+        ]
+        keys = assign_cite_keys(smiths)
+        assert keys[:3] == ["smith2024", "smith2024a", "smith2024b"]
+        assert keys[26:] == ["smith2024z", "smith2024aa", "smith2024ab"]
+        assert assign_cite_keys(smiths[:2]) == keys[:2]
+        assert len(set(keys)) == len(keys)
+@
+
+The report keys its map by [[id(decision)]] rather than by paper id.
 [[load_session]] can hand back two decisions that resolve to the same
 paper id (it derives arXiv DOIs from URLs at load time, so two entries
-that were distinct when saved may coincide afterwards); keying by object
-identity keeps both, whereas a paper-id map would silently drop one and
-biber would then reject the duplicate entry key. The scheme is not shared
-with the synthesis because the synthesis caches LLM prose that contains
-its keys literally; changing either scheme to match the other would make
-cached prose cite keys that no longer exist.
+that were distinct when saved may coincide afterwards), and the report
+lists both; keyed by object identity they get two keys and two entries,
+whereas a paper-id map would silently drop one and biber would then
+reject the duplicate entry key.
 
 <<review report generation>>=
 def report_cite_keys(decisions: list[ReviewDecision]) -> dict[int, str]:
     """Map `id(decision)` to a unique citation key for each decision."""
-    keys: dict[int, str] = {}
-    for index, decision in enumerate(decisions):
-        paper = decision.paper
-        if paper.authors:
-            first_author = paper.authors[0].split()[-1].lower()
-            first_author = ''.join(c for c in first_author if c.isalnum())
-        else:
-            first_author = "unknown"
-        year = paper.year or "nd"
-        keys[id(decision)] = f"{first_author}{year}_{index}"
-    return keys
+    keys = assign_cite_keys([d.paper for d in decisions])
+    return {id(d): key for d, key in zip(decisions, keys)}
 @
 
+The synthesis resolves the other way, by paper id, after collapsing
+such duplicates onto their first occurrence, because its cached prose
+cites a paper, not a record. The two callers therefore share the
+scheme but not the identity a key is looked up by, and that is why the
+shared \LaTeX{} builders below still take a [[cite_key]] resolver
+instead of a key map.
+
 Keying by object identity is what keeps two decisions for one paper
-apart:
+apart, and a comma-form author now yields the surname:
 
 <<test functions>>=
 class TestReportCiteKeys:
     def test_same_paper_twice_gets_distinct_keys(self):
-        paper = Paper(title="Twice", authors=["Ann Smith"], year=2024)
+        paper = Paper(title="Twice", authors=["Smith, Ann"], year=2024)
         decisions = [
             ReviewDecision(paper=paper, provider="a",
                            status=DecisionStatus.KEPT),
@@ -3535,8 +4504,8 @@ class TestReportCiteKeys:
                            status=DecisionStatus.DISCARDED),
         ]
         keys = report_cite_keys(decisions)
-        assert len(set(keys.values())) == 2
-        assert keys[id(decisions[0])] == "smith2024_0"
+        assert keys[id(decisions[0])] == "smith2024"
+        assert keys[id(decisions[1])] == "smith2024a"
 @
 
 \subsection{BibTeX entries}
@@ -3546,12 +4515,12 @@ distinguish entry types reliably, and biblatex renders an article with
 missing fields gracefully. The formatter is shared with the synthesis,
 which used to carry a byte-for-byte copy.
 
-The venue is coerced to a string before escaping. Some DBLP proceedings
-records carry a two-element venue list (series and volume title), which
-survives into the session file; the escaper then died on the list after
-the CSV had already been written, leaving a half-finished export. The
-provider should normalise this at ingest, but the exporter must not be
-the place where a stray list turns into a traceback.
+The venue needs no guard here.  Some DBLP proceedings records carry a
+two-element venue list (series and volume title), and the escaper once
+died on it after the CSV had already been written, leaving a
+half-finished export.  [[Paper]] now enforces [[venue: str | None]]
+itself (\cref{sec:paper-venue-invariant}), also for sessions stored
+with a list, so the exporter can rely on the declared type.
 
 <<review report generation>>=
 def format_bibtex_entry(paper: Paper, cite_key: str) -> str:
@@ -3563,11 +4532,8 @@ def format_bibtex_entry(paper: Paper, cite_key: str) -> str:
         lines.append(f"  author = {{{escape_bibtex(authors)}}},")
     if paper.year:
         lines.append(f"  year = {{{paper.year}}},")
-    venue = paper.venue
-    if isinstance(venue, (list, tuple)):
-        venue = "; ".join(str(v) for v in venue)
-    if venue:
-        lines.append(f"  journal = {{{escape_bibtex(venue)}}},")
+    if paper.venue:
+        lines.append(f"  journal = {{{escape_bibtex(paper.venue)}}},")
     if paper.doi:
         lines.append(f"  doi = {{{paper.doi}}},")
     if paper.url:
@@ -4202,8 +5168,16 @@ AUDIT_STRINGS: dict[str, dict] = {
         "extra_other": (
             ", {other} duplicates or other versions of cited sources"
         ),
+        "extra_excluded": (
+            ", {excluded} excluded although classified as bearing on the "
+            "claim"
+        ),
         "databases": "Databases: {list}.",
         "openalex_note": "not open access",
+        "search_failed": "failed for {n} of {total} {queries}",
+        "search_incomplete": "incomplete for {n} of {total} {queries}",
+        "query": "query",
+        "queries": "queries",
         "title": "Title",
         "year": "Year",
         "provider": "Provider",
@@ -4214,6 +5188,8 @@ AUDIT_STRINGS: dict[str, dict] = {
         "adjacent-subtopic": "adjacent subtopic",
         "off-topic-false-hit": "other topic (false hit)",
         "pending": "pending, unclassified",
+        "excluded": "excluded",
+        "no_confidence": "n/a",
         "continued": "(cont.)",
         "continued_next": "continued on next page",
         "notes": {
@@ -4254,8 +5230,16 @@ AUDIT_STRINGS: dict[str, dict] = {
         "extra_other": (
             ", {other} dubbletter eller andra versioner av citerade källor"
         ),
+        "extra_excluded": (
+            ", {excluded} uteslutna trots att de klassats som relevanta "
+            "för påståendet"
+        ),
         "databases": "Databaser: {list}.",
         "openalex_note": "inte open access",
+        "search_failed": "misslyckades för {n} av {total} {queries}",
+        "search_incomplete": "ofullständig för {n} av {total} {queries}",
+        "query": "sökfråga",
+        "queries": "sökfrågor",
         "title": "Titel",
         "year": "År",
         "provider": "Leverantör",
@@ -4266,6 +5250,8 @@ AUDIT_STRINGS: dict[str, dict] = {
         "adjacent-subtopic": "angränsande delämne",
         "off-topic-false-hit": "annat ämne (felträff)",
         "pending": "ej klassad",
+        "excluded": "utesluten",
+        "no_confidence": "saknas",
         "continued": "(forts.)",
         "continued_next": "forts.\\ på nästa sida",
         "notes": {
@@ -4296,6 +5282,13 @@ PROVIDER_SHORT_NAMES: dict[str, str] = {   # in caption order
     "s2": "S2",
     "arxiv": "arXiv",
     "hal": "HAL",
+    "ssrn": "SSRN",
+    "biorxiv": "bioRxiv",
+    "medrxiv": "medRxiv",
+    "chemrxiv": "ChemRxiv",
+    "researchsquare": "RSq",
+    "preprintsorg": "Preprints",
+    "iacr": "IACR",
 }
 PROVIDER_SEPARATORS = re.compile(r"[;,|]")
 
@@ -4308,6 +5301,13 @@ PROVIDER_FULL_NAMES: dict[str, str] = {
     "s2": "Semantic Scholar",
     "arxiv": "arXiv",
     "hal": "HAL",
+    "ssrn": "SSRN",
+    "biorxiv": "bioRxiv",
+    "medrxiv": "medRxiv",
+    "chemrxiv": "ChemRxiv",
+    "researchsquare": "Research Square",
+    "preprintsorg": "Preprints.org",
+    "iacr": "IACR Cryptology ePrint Archive",
 }
 
 
@@ -4321,6 +5321,7 @@ class AuditRow:
     status: DecisionStatus
     reason: str
     order: int
+    excluded: bool = False   # discarded despite a bearing category
 @
 
 Three facts about how decisions are recorded shape the cited rule.
@@ -4350,11 +5351,40 @@ decision owns the new label, so no confidence goes with it. Finally, a
 theme that merely repeats the word \enquote{cited} adds nothing and is
 not repeated.
 
-The confidence is shown only for decisions the LLM made and nobody has
-reviewed yet: once a human confirms or changes a decision it is a human
-decision, and the number would misrepresent it.
+The caption promises a confidence for every machine-classified row, so
+such a row recorded without one---[[sessions decide --source llm]]
+without [[--confidence]], or a session from before the classifier
+stored it---says so with a localised \enquote{n/a} instead of looking
+like a human row. An empty cell would be read as \enquote{nobody
+asked}, which is exactly what the reader cannot check.
+
+The category is the classification, but the status is the decision,
+and the decision wins (issue~\#89). A row whose final status is
+discarded is never listed as cited, supporting or qualifying, whatever
+its category says: the reviewer, or the model, looked at the paper and
+excluded it, and counting it as evidence for the claim in a published
+appendix is exactly the mistake the issue reported. Such a row keeps
+its category in the reason, marked as excluded, but sorts among the
+\enquote{other} rows, so [[--bearing-only]] never lists it and the
+caption counts it separately. The adjacent and off-topic categories do
+not bear on the claim, so a discarded row there is simply what it says.
 
 <<review report generation>>=
+def audit_category(tags: list[str]) -> str | None:
+    """Return the deciding (last) audit category among `tags`, if any."""
+    return next((t for t in reversed(tags) if t in AUDIT_CATEGORIES), None)
+
+
+def audit_excluded(decision: ReviewDecision) -> bool:
+    """Tell whether a bearing category was overruled by a discard."""
+    category = audit_category(decision.tags)
+    return (
+        decision.status == DecisionStatus.DISCARDED
+        and category is not None
+        and AUDIT_CATEGORIES[category] <= AUDIT_ORDER_BEARING
+    )
+
+
 def audit_reason(
     decision: ReviewDecision,
     *,
@@ -4364,9 +5394,7 @@ def audit_reason(
     """Return the reason label and sort order for `decision`."""
     tags = list(decision.tags)
     notes = strings["notes"]
-    category = next(
-        (t for t in reversed(tags) if t in AUDIT_CATEGORIES), None
-    )
+    category = audit_category(tags)
     note_texts = [notes[t] for t in tags if t in notes]
     if theme_names:
         theme_tags = [t for t in tags if t in theme_names]
@@ -4388,6 +5416,8 @@ def audit_reason(
     confidence = ""
     if machine_label and decision.llm_confidence is not None:
         confidence = f" ({decision.llm_confidence:.2f})"
+    elif machine_label:
+        confidence = f" ({strings['no_confidence']})"
 
     if decision.status == DecisionStatus.PENDING:
         return strings["pending"], AUDIT_ORDER_PENDING
@@ -4399,6 +5429,9 @@ def audit_reason(
         order = AUDIT_ORDER_CITED
     elif kept and human_decision and not tags:
         label, order = f"\\emph{{{strings['cited']}}}", AUDIT_ORDER_CITED
+    elif audit_excluded(decision):
+        label = f"{strings[category]}{confidence}, {strings['excluded']}"
+        order = AUDIT_ORDER_OTHER
     elif category is not None:
         label = strings[category] + confidence
         order = AUDIT_CATEGORIES[category]
@@ -4468,7 +5501,7 @@ class TestAuditReason:
             "a cited source)"
         assert order == AUDIT_ORDER_CITED
         assert self._reason(
-            DecisionStatus.DISCARDED,
+            DecisionStatus.KEPT,
             ["supports-claim", "no-abstract-title-only"],
         ) == (
             "supports the claim (judged on title, no abstract available)", 1
@@ -4483,12 +5516,12 @@ class TestAuditReason:
 
     def test_categories_with_llm_confidence(self):
         label, order = self._reason(
-            DecisionStatus.DISCARDED, ["supports-claim"],
+            DecisionStatus.KEPT, ["supports-claim"],
             source=ReviewSource.LLM_UNREVIEWED, conf=0.93,
         )
         assert label == "supports the claim (0.93)"
         assert order == 1
-        assert self._reason(DecisionStatus.DISCARDED, ["qualifies-claim"]) \
+        assert self._reason(DecisionStatus.KEPT, ["qualifies-claim"]) \
             == ("qualifies or contradicts the claim", 2)
         assert self._reason(DecisionStatus.DISCARDED, ["adjacent-subtopic"]) \
             == ("adjacent subtopic", 3)
@@ -4498,14 +5531,14 @@ class TestAuditReason:
 
     def test_confirmed_llm_decision_keeps_confidence(self):
         label, _ = self._reason(
-            DecisionStatus.DISCARDED, ["supports-claim"],
+            DecisionStatus.KEPT, ["supports-claim"],
             source=ReviewSource.LLM_REVIEWED, conf=0.93,
         )
         assert label == "supports the claim (0.93)"
 
     def test_changed_llm_decision_hides_confidence(self):
         label, _ = self._reason(
-            DecisionStatus.DISCARDED, ["supports-claim"],
+            DecisionStatus.KEPT, ["supports-claim"],
             source=ReviewSource.LLM_REVIEWED, conf=0.93, is_example=True,
         )
         assert label == "supports the claim"
@@ -4517,6 +5550,35 @@ class TestAuditReason:
             source=ReviewSource.LLM_REVIEWED, conf=0.9, is_example=True,
         )
         assert (label, order) == ("other topic (false hit)", 4)
+
+    def test_discarded_status_wins_over_a_bearing_category(self):
+        assert self._reason(DecisionStatus.DISCARDED, ["supports-claim"]) \
+            == ("supports the claim, excluded", AUDIT_ORDER_OTHER)
+        assert self._reason(
+            DecisionStatus.DISCARDED, ["qualifies-claim"],
+            source=ReviewSource.LLM_UNREVIEWED, conf=0.5,
+        ) == ("qualifies or contradicts the claim (0.50), excluded",
+              AUDIT_ORDER_OTHER)
+        assert self._reason(DecisionStatus.DISCARDED, ["adjacent-subtopic"]) \
+            == ("adjacent subtopic", 3)
+
+    def test_machine_row_without_confidence_says_so(self):
+        llm = ReviewSource.LLM_UNREVIEWED
+        assert self._reason(DecisionStatus.KEPT, ["supports-claim"],
+                            source=llm) \
+            == ("supports the claim (n/a)", 1)
+        assert self._reason(DecisionStatus.KEPT, ["ml"], source=llm) \
+            == ("ml (n/a)", AUDIT_ORDER_OTHER)
+        assert self._reason(DecisionStatus.KEPT, ["supports-claim"]) \
+            == ("supports the claim", 1)
+        decision = ReviewDecision(
+            paper=Paper(title="P", authors=["A"], year=2024),
+            provider="p", status=DecisionStatus.DISCARDED,
+            tags=["off-topic-false-hit"], source=llm,
+        )
+        assert audit_reason(
+            decision, theme_names={}, strings=AUDIT_STRINGS["sv"]
+        ) == ("annat ämne (felträff) (saknas)", 4)
 
     def test_theme_equal_to_the_label_is_not_repeated(self):
         assert self._reason(DecisionStatus.KEPT, ["cited"]) \
@@ -4542,7 +5604,13 @@ and capitalisation differ between providers for the same work, and the
 year is left out on purpose: a preprint and its journal article, or
 OpenAlex's DOI-registration year against the publication year, are the
 same work to a reader of the appendix, and counting them twice inflated
-the numbers the appendices quoted.
+the numbers the appendices quoted. The surname is found by
+[[author_surname]], the rule the citation keys use
+(\cref{sec:cite-keys}). The key used to split the name itself, and a
+first author that is blank or only whitespace, which some provider
+records have, split to no words at all and raised an [[IndexError]]
+that aborted the whole table (issue~\#122); [[author_surname]] returns
+an empty surname instead, so such a record merges on its title alone.
 
 Titles are kept whole by default: the table exists so a reader can look
 a hit up, and a title cut at 180 characters is one that cannot be
@@ -4554,7 +5622,13 @@ A decision's [[provider]] is itself a joined string when the session
 merged records at search time (\enquote{openalex; dblp}), so providers
 are split on the separators the session uses, mapped to their codes
 and deduplicated before they are joined again for the cell; an
-unmapped name is kept as written.
+unmapped name is kept as written.  Every registered provider has a
+code and a full name, the source-pinned preprint servers included, so
+that case only arises for a provider string from outside Scholar.  The
+servers are named as they style themselves (\enquote{bioRxiv},
+\enquote{Preprints.org}); without entries the appendix would print the
+registry's lower-case key, \enquote{researchsquare}, which no reader
+can look up.
 
 <<review report generation>>=
 def provider_short_names(provider: str | None) -> list[str]:
@@ -4577,11 +5651,8 @@ def audit_work_key(paper: Paper) -> tuple[str, str]:
         folded = unicodedata.normalize("NFKD", cleaned).casefold()
         return "".join(c for c in folded if c.isalnum())
 
-    surname = ""
-    if paper.authors:
-        first = paper.authors[0] or ""
-        surname = first.split(",")[0] if "," in first else first.split()[-1]
-    return letters(paper.title), letters(surname)
+    first = (paper.authors[0] or "") if paper.authors else ""
+    return letters(paper.title), letters(author_surname(first))
 
 
 def shorten_title(title: str, limit: int | None) -> str:
@@ -4610,6 +5681,7 @@ def collect_audit_rows(
         reason, order = audit_reason(
             decision, theme_names=theme_names, strings=strings
         )
+        excluded = audit_excluded(decision)
         row = rows.get(key)
         if row is None:
             rows[key] = AuditRow(
@@ -4619,6 +5691,7 @@ def collect_audit_rows(
                 status=decision.status,
                 reason=reason,
                 order=order,
+                excluded=excluded,
             )
             continue
         for provider in providers:
@@ -4628,6 +5701,7 @@ def collect_audit_rows(
             row.year = year
         if order < row.order:
             row.status, row.reason, row.order = decision.status, reason, order
+            row.excluded = excluded
     return sorted(rows.values(), key=lambda r: (r.order, r.title.lower()))
 @
 
@@ -4654,7 +5728,7 @@ def _audit_session():
         ),
         ReviewDecision(
             paper=Paper(title="Supports \u2606", authors=["B"], year=2021),
-            provider="dblp", status=DecisionStatus.DISCARDED,
+            provider="dblp", status=DecisionStatus.KEPT,
             tags=["supports-claim"], source=llm, llm_confidence=0.93,
         ),
         ReviewDecision(
@@ -4671,6 +5745,25 @@ class TestCollectAuditRows:
             == ["OA", "DBLP", "WoS", "IEEE"]
         assert provider_short_names("mylib") == ["mylib"]
         assert provider_short_names(None) == []
+
+    def test_every_registered_provider_has_names(self):
+        from scholar.providers import get_all_providers
+
+        for provider in get_all_providers():
+            assert provider.name in PROVIDER_SHORT_NAMES
+            assert provider.name in PROVIDER_FULL_NAMES
+
+    def test_preprint_servers_are_named(self):
+        rows = [
+            AuditRow("t", "2024",
+                     provider_short_names("researchsquare; ssrn|iacr"),
+                     DecisionStatus.KEPT, "r", 0),
+        ]
+        assert rows[0].providers == ["RSq", "SSRN", "IACR"]
+        assert audit_databases_sentence(rows, AUDIT_STRINGS["en"]) == (
+            "Databases: SSRN, Research Square (RSq), "
+            "IACR Cryptology ePrint Archive (IACR)."
+        )
 
     def test_same_work_merges_across_providers_and_years(self):
         session = ReviewSession(
@@ -4722,6 +5815,15 @@ class TestCollectAuditRows:
         assert rows[0].providers == ["OA", "DBLP", "Scopus"]
         assert rows[0].order == AUDIT_ORDER_CITED
 
+    def test_blank_first_author_does_not_raise(self):
+        def key(authors):
+            return audit_work_key(Paper(title="A Title", authors=authors))
+
+        assert key(["  "]) == ("atitle", "")
+        assert key([""]) == key([]) == ("atitle", "")
+        assert key(["Smith, John"]) == key(["John Smith"]) \
+            == ("atitle", "smith")
+
     def test_databases_sentence_is_ordered_and_deduplicated(self):
         rows = [
             AuditRow("t", "2020", ["Scopus", "WoS"], DecisionStatus.KEPT,
@@ -4772,34 +5874,223 @@ class TestCollectAuditRows:
 
 The caption closes by naming the databases behind the provider codes,
 full name first, because the code \enquote{OA} reads as \enquote{open
-access} to anyone who has not met OpenAlex; the sentence is built from
-the providers that actually occur in the rows, so a session that never
-asked Scopus does not claim to have.
+access} to anyone who has not met OpenAlex.  The sentence is the
+appendix's coverage statement, so it names the databases the session
+actually searched: those in its search records that answered at least
+one query, and those that occur in the rows.  A session that never
+asked Scopus does not claim to have, and a database that answered every
+query with zero hits is still named---it was searched, and its empty
+answer is part of what the appendix reports.  Building the sentence from
+the rows alone would leave such a database out and understate the
+search.  A session from before search records were kept has only its
+rows to go by, and its sentence is built from them as before.
 
 <<review report generation>>=
-def audit_databases_sentence(rows: list[AuditRow], strings: dict) -> str:
-    """Name the databases behind the provider codes used in `rows`."""
+def audit_databases_sentence(
+    rows: list[AuditRow],
+    strings: dict,
+    records: list[SearchRecord] | None = None,
+) -> str:
+    """Name the databases searched: those in `rows` and `records`.
+
+    A database from `records` is named when it answered at least one
+    query, also with zero hits.  A database whose searches failed or
+    ended incomplete is marked with how many of its queries did.
+    """
+    shortfalls = audit_search_shortfalls(records or [])
+
+    def named(name: str, short: str, notes: list[str]) -> str:
+        notes = notes + audit_search_notes(shortfalls.get(short), strings)
+        return f"{name} ({'; '.join(notes)})" if notes else name
+
     used: list[str] = []
     for row in rows:
         for provider in row.providers:
             if provider not in used:
                 used.append(provider)
+    for short, (failed, _, total) in shortfalls.items():
+        if failed < total and short not in used:
+            used.append(short)
     names: list[str] = []
     for key, short in PROVIDER_SHORT_NAMES.items():
         if short not in used:
             continue
         full = PROVIDER_FULL_NAMES[key]
+        notes = [] if full == short else [short]
         if key == "openalex":
-            names.append(f"{full} ({short}; {strings['openalex_note']})")
-        elif full == short:
-            names.append(full)
-        else:
-            names.append(f"{full} ({short})")
+            notes.append(strings["openalex_note"])
+        names.append(named(full, short, notes))
         used.remove(short)
-    names.extend(escape_latex(p) for p in used)
+    names.extend(named(escape_latex(p), p, []) for p in used)
     if not names:
         return ""
     return strings["databases"].format(list=", ".join(names))
+@
+
+Having been searched is not the same as having been searched for
+every query.  Since the session records failures
+([[SearchRecord.error]]), we know that a named provider may still have
+failed for some of the session's queries---DBLP answering one query and
+returning an anti-bot page for the next four, say.  Naming it plainly
+would let the appendix claim that all five queries covered DBLP.  Leaving it out would be
+wrong too: it did answer one query, and its code may be in the Provider
+column, which needs expanding.  So such a database is named with a short note
+of how many of its queries failed: \enquote{DBLP (failed for 4 of 5
+queries)}.
+
+The note keeps the two kinds of failure that [[hits_label]] tells apart
+(\cref{sec:search-result-error}).  A search that failed outright gave
+nothing; one that broke off part-way, \enquote{incomplete}, gave some
+records, so calling it failed would understate what the table does
+contain.  A database where every query failed outright answered none
+of them and never reaches the rows---no record, and the session keeps
+an earlier answer over a failed re-run---so the sentence does not name
+it at all, which is what the reader should conclude: that database was
+not searched.  The
+search parameters of the report state those failures; the audit table
+is about the records.
+
+The counts are per code, because rows and records both pass through
+[[provider_short_names]], so a record's [[ssrn]] and a row's code
+[[SSRN]] are one database.  A record from before outcomes were stored
+has no error to count, so it counts as answered.
+
+<<review report generation>>=
+def audit_search_shortfalls(
+    records: list[SearchRecord],
+) -> dict[str, tuple[int, int, int]]:
+    """Count failed, incomplete and all searches per provider code."""
+    counts: dict[str, list[int]] = {}
+    for record in records:
+        for short in provider_short_names(record.provider):
+            tally = counts.setdefault(short, [0, 0, 0])
+            tally[2] += 1
+            if record.error and record.hits:
+                tally[1] += 1
+            elif record.error:
+                tally[0] += 1
+    return {short: tuple(tally) for short, tally in counts.items()}
+
+
+def audit_search_notes(
+    shortfall: tuple[int, int, int] | None, strings: dict
+) -> list[str]:
+    """Localised notes on a database's failed and incomplete searches."""
+    if not shortfall:
+        return []
+    failed, incomplete, total = shortfall
+    queries = strings["query"] if total == 1 else strings["queries"]
+    notes = []
+    for count, template in (
+        (failed, strings["search_failed"]),
+        (incomplete, strings["search_incomplete"]),
+    ):
+        if count:
+            notes.append(
+                template.format(n=count, total=total, queries=queries)
+            )
+    return notes
+@
+
+Let's verify the notes in both languages: a database that failed for
+some queries, one whose only query was cut short, one that answered
+every query, and one that failed everywhere and so is not named; then
+that a database answering with zero hits is named, and that without
+records the sentence comes from the rows alone.
+
+<<test functions>>=
+class TestAuditDatabasesFailures:
+    def _rows(self):
+        return [
+            AuditRow("t", "2020", ["DBLP", "OA"], DecisionStatus.KEPT,
+                     "r", 0),
+            AuditRow("u", "2021", ["Scopus", "SSRN"], DecisionStatus.KEPT,
+                     "r", 0),
+        ]
+
+    def _records(self):
+        return [
+            SearchRecord("q1", "dblp", hits=3),
+            SearchRecord("q2", "dblp", hits=0, error="non-JSON response"),
+            SearchRecord("q3", "dblp", hits=0, error="non-JSON response"),
+            SearchRecord("q1", "openalex", hits=10),
+            SearchRecord("q2", "openalex", hits=4),
+            SearchRecord("q1", "scopus", hits=25, error="rate limited"),
+            SearchRecord("q1", "ssrn", hits=1),
+            SearchRecord("q2", "ssrn", error="HTTP 503"),
+            SearchRecord("q1", "ieee", hits=0, error="HTTP 403"),
+        ]
+
+    def test_english_notes(self):
+        assert audit_databases_sentence(
+            self._rows(), AUDIT_STRINGS["en"], self._records()
+        ) == (
+            "Databases: OpenAlex (OA; not open access), "
+            "DBLP (failed for 2 of 3 queries), "
+            "Scopus (incomplete for 1 of 1 query), "
+            "SSRN (failed for 1 of 2 queries)."
+        )
+
+    def test_swedish_notes(self):
+        assert audit_databases_sentence(
+            self._rows(), AUDIT_STRINGS["sv"], self._records()
+        ) == (
+            "Databaser: OpenAlex (OA; inte open access), "
+            "DBLP (misslyckades för 2 av 3 sökfrågor), "
+            "Scopus (ofullständig för 1 av 1 sökfråga), "
+            "SSRN (misslyckades för 1 av 2 sökfrågor)."
+        )
+
+    def test_both_kinds_share_one_parenthesis(self):
+        records = [
+            SearchRecord("q1", "ieee", hits=0, error="HTTP 403"),
+            SearchRecord("q2", "ieee", hits=7, error="rate limited"),
+            SearchRecord("q3", "ieee", hits=2),
+        ]
+        rows = [AuditRow("t", "2020", ["IEEE"], DecisionStatus.KEPT, "r", 0)]
+        assert audit_databases_sentence(
+            rows, AUDIT_STRINGS["en"], records
+        ) == (
+            "Databases: IEEE Xplore (IEEE; failed for 1 of 3 queries; "
+            "incomplete for 1 of 3 queries)."
+        )
+
+    def test_zero_hit_answer_is_named(self):
+        records = self._records() + [SearchRecord("q1", "wos", hits=0)]
+        assert "Web of Science (WoS), Scopus (incomplete" in (
+            audit_databases_sentence(
+                self._rows(), AUDIT_STRINGS["en"], records
+            )
+        )
+        assert "Web of Science (WoS), Scopus (ofullständig" in (
+            audit_databases_sentence(
+                self._rows(), AUDIT_STRINGS["sv"], records
+            )
+        )
+
+    def test_rows_alone_without_records(self):
+        assert audit_databases_sentence(self._rows(), AUDIT_STRINGS["en"]) \
+            == "Databases: OpenAlex (OA; not open access), DBLP, Scopus, " \
+               "SSRN."
+
+    def test_table_caption_uses_session_records(self):
+        session = _audit_session()
+        session.search_records = [
+            SearchRecord("q", "openalex", hits=2),
+            SearchRecord("q", "dblp", hits=2),
+            SearchRecord("q2", "dblp", hits=0, error="non-JSON response"),
+            SearchRecord("q", "hal", hits=0),
+        ]
+        for lang, expected in (
+            ("en", "Databases: OpenAlex (OA; not open access), "
+                   "DBLP (failed for 1 of 2 queries), HAL."),
+            ("sv", "Databaser: OpenAlex (OA; inte open access), "
+                   "DBLP (misslyckades för 1 av 2 sökfrågor), HAL."),
+        ):
+            text = "\n".join(
+                build_audit_table_latex(session, label="x", lang=lang)
+            )
+            assert expected in text
 @
 
 The table itself follows the conventions of the appendix it is meant for:
@@ -4815,6 +6106,12 @@ over.  [[bearing_only]] therefore lists only the rows that bear on the
 claim---cited, supporting, qualifying---and moves the adjacent,
 off-topic and unclassified records into the caption as counts, so the
 appendix still accounts for every record without printing it.
+
+The \enquote{other} rows are counted in two parts. Most of them are
+bookkeeping (duplicates, other versions of cited sources), and the
+caption says so; the rows excluded despite a bearing category are not,
+and calling them duplicates would misreport the review, so they get a
+count and a phrase of their own.
 
 <<review report generation>>=
 def build_audit_table_latex(
@@ -4838,7 +6135,10 @@ def build_audit_table_latex(
     counts = {
         order: sum(1 for r in rows if r.order == order) for order in range(7)
     }
-    databases = audit_databases_sentence(rows, strings)
+    excluded = sum(1 for r in rows if r.excluded)
+    databases = audit_databases_sentence(
+        rows, strings, session.search_records
+    )
     if bearing_only:
         template = strings["bearing"]
         rows = [r for r in rows if r.order <= AUDIT_ORDER_BEARING]
@@ -4855,8 +6155,12 @@ def build_audit_table_latex(
         extra += strings["extra_pending"].format(
             pending=counts[AUDIT_ORDER_PENDING]
         )
-    if counts[AUDIT_ORDER_OTHER]:
-        extra += strings["extra_other"].format(other=counts[AUDIT_ORDER_OTHER])
+    if counts[AUDIT_ORDER_OTHER] - excluded:
+        extra += strings["extra_other"].format(
+            other=counts[AUDIT_ORDER_OTHER] - excluded
+        )
+    if excluded:
+        extra += strings["extra_excluded"].format(excluded=excluded)
     caption = template.format(
         track=f", {escape_latex(track)}" if track else "",
         n=sum(counts.values()),
@@ -4980,6 +6284,27 @@ class TestAuditTable:
             _audit_session(), label="x", lang="sv", bearing_only=True
         ))
         assert "listas inte" in sv and ", 1 ej klassade" in sv
+
+    def test_bearing_only_never_lists_a_discarded_row(self):
+        session = _audit_session()
+        session.decisions.append(
+            ReviewDecision(
+                paper=Paper(title="Rejected", authors=["D"], year=2022),
+                provider="openalex", status=DecisionStatus.DISCARDED,
+                tags=["supports-claim"],
+            )
+        )
+        text = "\n".join(build_audit_table_latex(
+            session, label="x", bearing_only=True
+        ))
+        assert "Rejected" not in text
+        assert "(1 cited, 1 supporting and 0 qualifying" in text
+        assert "1 unclassified, 1 excluded although classified as bearing " \
+            "on the claim are not listed" in text
+        full = "\n".join(build_audit_table_latex(session, label="x"))
+        assert r"Rejected & 2022 & OA & supports the claim, excluded \\" \
+            in full
+        assert "duplicates" not in full
 
     def test_english_default_and_unknown_language(self):
         lines = build_audit_table_latex(_audit_session(), label="x")
