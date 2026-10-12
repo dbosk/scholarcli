@@ -77,9 +77,15 @@ from .scholar import Search, SearchResult, Paper, SearchFilters
 from .scholar import search, filter_papers, deduplicate_papers
 from .scholar import deduplicate_versions, merge_version_of
 from .scholar import get_registry, isolated_registry
+from .scholar import hits_label, provider_outcome, result_outcome
+from .scholar import normalize_venue
 from .utils import safe_get_nested, ensure_list
 
 __all__ = [
+    "hits_label",
+    "provider_outcome",
+    "result_outcome",
+    "normalize_venue",
     "Search",
     "SearchResult",
     "Paper",
@@ -654,15 +660,49 @@ OpenAlex also returns [[null]] for [[title]] (e.g.\ journal issues and
 editorials).  We coerce that to an empty string here so that string
 operations such as slicing and [[.lower()]] never crash.
 
+\paragraph{A single venue string.}
+\label{sec:paper-venue-invariant}
+The venue gets the same treatment for a different reason.  [[venue]] is
+declared [[str | None]], but some DBLP proceedings records carry a
+two-element list---the volume's title and its series, say
+[[['IIH-MSP', 'Smart Innovation, Systems and Technologies']]]---and that
+list used to travel unchanged into session files, where every consumer
+(BibTeX, CSV, the TUI, the venue filter) had to guard against it and the
+BibTeX exporter once crashed on it.  Normalising in each consumer is the
+wrong end: one forgotten guard is a traceback.  Enforcing the declared
+type here, the one place every [[Paper]] passes through, means no
+provider can reintroduce the list and a session saved with one is
+repaired on load, since [[from_dict]] constructs through
+[[__post_init__]] too.
+
+We join the parts with [[; ]] rather than keep the first: which part is
+the venue proper and which is the series differs between records, and
+joining loses neither.  A list with no usable part becomes [[None]], the
+type's own word for \enquote{no venue}.
+
 <<paper methods>>=
 def __post_init__(self):
-    """Coerce None list fields to empty lists and None title to ''."""
+    """Coerce None list fields to empty lists, None title to '', and a
+    list-valued venue to one string."""
     if self.title is None:
         self.title = ""
     if self.authors is None:
         self.authors = []
     if self.sources is None:
         self.sources = []
+    self.venue = normalize_venue(self.venue)
+<<functions>>=
+def normalize_venue(venue) -> str | None:
+    """Return `venue` as `str | None`.
+
+    A list or tuple (as DBLP sends for some proceedings) becomes its
+    non-empty string parts joined with "; ", or None when it has none.
+    Strings and None pass through unchanged.
+    """
+    if isinstance(venue, (list, tuple)):
+        parts = [str(part).strip() for part in venue if part]
+        return "; ".join(part for part in parts if part) or None
+    return venue
 @
 
 OpenAlex regularly returns works with [[null]] titles (journal issues,
@@ -691,6 +731,34 @@ class TestPaperPostInit:
         with isolated_registry():
             p = Paper(title="T", authors=[], sources=None)
             assert p.sources == []
+@
+
+The venue invariant needs three checks: the DBLP shape is joined, a list
+with nothing usable in it becomes [[None]], and a session file stored
+before the invariant existed is repaired when it is loaded:
+
+<<test functions>>=
+    def test_list_venue_joined(self):
+        """A list-valued venue becomes one '; '-joined string."""
+        with isolated_registry():
+            p = Paper(title="T", authors=[],
+                      venue=["IIH-MSP", "Smart Innovation"])
+            assert p.venue == "IIH-MSP; Smart Innovation"
+
+    def test_empty_list_venue_becomes_none(self):
+        """A list without usable parts is no venue at all."""
+        with isolated_registry():
+            assert Paper(title="T", authors=[], venue=["", None]).venue is None
+            assert Paper(title="T", authors=[], venue="V").venue == "V"
+
+    def test_list_venue_repaired_on_load(self):
+        """A session stored with a list venue loads with a string."""
+        with isolated_registry():
+            p = Paper.from_dict({
+                "title": "T", "authors": ["A"],
+                "venue": ["IIH-MSP", "Smart Innovation"],
+            })
+            assert p.venue == "IIH-MSP; Smart Innovation"
 @
 
 We use a dataclass for simplicity.
@@ -2178,6 +2246,8 @@ class SearchResult:
     papers: list[Paper]
     filters: dict | None = None
     limit: int | None = None
+    error: str | None = None
+    retries: int = 0
 
     <<search result methods>>
 @
@@ -2187,6 +2257,140 @@ ranges, document types, etc.) that were applied.  The [[limit]] records the
 per-provider result cap that was in effect, alongside the filters, so that
 provenance tooling can reconstruct the exact [[--limit]] of the original
 search and not just its query.
+
+\subsubsection{A failure is not zero hits}
+\label{sec:search-result-error}
+
+Providers return an empty list when a request fails, so that one broken
+provider cannot sink a multi-provider search (the providers chapter
+explains the policy).  But an empty list alone cannot tell
+\enquote{the provider found nothing} from \enquote{the provider never
+answered}, and review sessions recorded the second as the first.  This
+cost whole literature reviews: when DBLP began serving an anti-bot page
+in place of JSON, four review sessions recorded zero DBLP hits for every
+query, and only a later audit could tell that those cells meant
+\enquote{provider down} rather than \enquote{nothing published}.
+
+[[error]] carries the difference.  It is [[None]] when the provider
+answered---with or without papers---and otherwise a short reason such
+as [[non-JSON response (HTTP 200, text/html)]].  A failed search may
+still carry papers: a paged search cut short after its first page holds
+some, but not all, of the answer, so it is \emph{incomplete} rather than
+\emph{failed} (see [[hits_label]] below).
+
+[[retries]] records how many times the search was repeated before its
+answer was accepted.  DBLP repeats a multi-term query that returned zero
+hits, because its throttling looks exactly like a genuine empty answer
+(\cref{sec:dblp-zero-hit-retry}); a provenance reader should be able to
+see that the zero, or the hits, came only on a later attempt.
+
+The protocol stays as it is: [[search()]] returns a list and raises
+nothing.  A provider reports a failure through an optional attribute,
+[[last_error]], which it resets when [[search()]] begins and sets when
+the request fails; a provider that retries also sets [[last_retries]].
+[[provider_outcome]] reads both defensively, so third-party providers
+without them---and the [[Mock]] providers in our tests, whose every
+attribute is another [[Mock]]---read as \enquote{answered, no retries}.
+
+<<functions>>=
+def _read_outcome(obj, error_attr: str, retries_attr: str):
+    """Read an `(error, retries)` pair, ignoring values of the wrong type."""
+    error = getattr(obj, error_attr, None)
+    retries = getattr(obj, retries_attr, 0)
+    if not isinstance(error, str) or not error:
+        error = None
+    if not isinstance(retries, int) or isinstance(retries, bool):
+        retries = 0
+    return error, retries
+
+
+def provider_outcome(provider) -> tuple[str | None, int]:
+    """Return `(error, retries)` for the provider's last search.
+
+    Reads the optional `last_error` and `last_retries` attributes;
+    anything other than a non-empty string error or an integer count
+    reads as "no error" and "no retries".
+    """
+    return _read_outcome(provider, "last_error", "last_retries")
+@
+
+The session code meets the same problem one step later: it is handed
+search results, and its tests hand it [[Mock]]s standing in for them.
+[[result_outcome]] reads a result's [[error]] and [[retries]] with the
+same tolerance.
+
+<<functions>>=
+def result_outcome(result) -> tuple[str | None, int]:
+    """Return `(error, retries)` of a `SearchResult`-like object."""
+    return _read_outcome(result, "error", "retries")
+@
+
+Every view that shows how many hits a search produced must show a
+failure as a failure.  [[hits_label]] is the one place that decides the
+wording, so the search output, the session listing and the report agree:
+a plain count when the provider answered, \enquote{failed} with the
+reason when it returned nothing, and the count marked
+\enquote{incomplete} when it failed part-way.  The retries are
+mentioned only when there were any.
+
+<<functions>>=
+def hits_label(
+    hits: int | None,
+    error: str | None = None,
+    retries: int = 0,
+) -> str:
+    """Describe a search outcome for display: a count, or a failure.
+
+    Returns "" when nothing is known (`hits` is None and no error).
+    """
+    if error and not hits:
+        label = f"failed ({error})"
+    elif error:
+        label = f"{hits}, incomplete ({error})"
+    elif hits is None:
+        return ""
+    else:
+        label = str(hits)
+    if retries:
+        noun = "retry" if retries == 1 else "retries"
+        label += f" after {retries} {noun}"
+    return label
+@
+
+Let's pin down both helpers: a provider without the attributes, one
+whose attributes are [[Mock]]s, and one that reports a failure; then
+the shapes of the label.
+
+<<test functions>>=
+class TestSearchOutcome:
+    """Tests for provider_outcome and hits_label."""
+
+    def test_provider_without_attributes_answered(self):
+        """A provider lacking last_error reads as answered."""
+        class Plain:
+            name = "plain"
+        assert provider_outcome(Plain()) == (None, 0)
+
+    def test_mock_attributes_ignored(self):
+        """A Mock's auto-attributes are not mistaken for an error."""
+        assert provider_outcome(Mock()) == (None, 0)
+
+    def test_failure_read(self):
+        """A string error and an int retry count are read."""
+        provider = Mock(last_error="HTTP 503", last_retries=2)
+        assert provider_outcome(provider) == ("HTTP 503", 2)
+
+    def test_labels(self):
+        """Counts, failures and incomplete results read differently."""
+        assert hits_label(0) == "0"
+        assert hits_label(12) == "12"
+        assert hits_label(None) == ""
+        assert hits_label(0, "HTTP 503") == "failed (HTTP 503)"
+        assert hits_label(None, "HTTP 503") == "failed (HTTP 503)"
+        assert hits_label(25, "HTTP 429") == "25, incomplete (HTTP 429)"
+        assert hits_label(3, retries=1) == "3 after 1 retry"
+        assert hits_label(0, retries=2) == "0 after 2 retries"
+@
 
 \subsubsection{Consolidating a list of papers}
 
@@ -2506,7 +2710,21 @@ This mirrors the query field, which records each input's query; keeping the
 filters and limit lets provenance tooling rebuild the original command rather
 than just its query.
 
+A failure must survive the merge, or the default multi-provider search
+would launder a dead DBLP into an ordinary count.  The merged result
+names \emph{which} provider failed: each input's error is prefixed with
+its provider, unless the input is itself a merge (its provider string
+lists several, joined by a comma) and so already carries the prefixes.
+Retries add up, since each was a request someone waited for.
+
 <<search result methods>>=
+def _labelled_error(self) -> str | None:
+    """This result's error, prefixed with its provider if not merged."""
+    if not self.error or "," in self.provider:
+        return self.error
+    return f"{self.provider}: {self.error}"
+
+
 def merge(self, other: "SearchResult") -> "SearchResult":
     """Merge two search results, deduplicating and consolidating papers."""
     logger.debug(
@@ -2527,6 +2745,10 @@ def merge(self, other: "SearchResult") -> "SearchResult":
         papers=deduped,
         filters=self.filters if self.filters == other.filters else None,
         limit=self.limit if self.limit == other.limit else None,
+        error="; ".join(
+            e for e in (self._labelled_error(), other._labelled_error()) if e
+        ) or None,
+        retries=self.retries + other.retries,
     )
 @
 
@@ -2538,8 +2760,8 @@ when its results are paginated.
 the search command can guarantee a duplicate-free list even when only one
 provider responded (\cref{sec:doi-normalization}).
 Because a single-provider search is routed through this method, the copy
-preserves the result's [[filters]] and [[limit]] so that the search metadata
-survives for provenance reconstruction.
+preserves the result's [[filters]], [[limit]], [[error]] and [[retries]]
+so that the search metadata survives for provenance reconstruction.
 
 <<search result methods>>=
 def deduplicate(self) -> "SearchResult":
@@ -2557,6 +2779,8 @@ def deduplicate(self) -> "SearchResult":
         papers=deduped,
         filters=self.filters,
         limit=self.limit,
+        error=self.error,
+        retries=self.retries,
     )
 @
 
@@ -2732,6 +2956,39 @@ common search shape would silently lose its filters and limit for provenance:
             assert deduped.limit == 50
 @
 
+A failure must survive both operations, and a merge must say which
+provider failed---also when the merge is itself merged again, as
+[[reduce]] does over three providers:
+
+<<test functions>>=
+    def test_merge_keeps_failures_by_provider(self):
+        """A merged result names each failed provider once."""
+        with isolated_registry():
+            ok = SearchResult(query="q", provider="s2", timestamp="t",
+                              papers=[Paper(title="A", authors=["X"])])
+            dblp = SearchResult(query="q", provider="dblp", timestamp="t",
+                                papers=[], error="non-JSON response",
+                                retries=2)
+            scopus = SearchResult(query="q", provider="scopus",
+                                  timestamp="t", papers=[],
+                                  error="HTTP 500")
+            merged = ok.merge(dblp).merge(scopus)
+            assert merged.error == (
+                "dblp: non-JSON response; scopus: HTTP 500"
+            )
+            assert merged.retries == 2
+            assert ok.merge(ok).error is None
+
+    def test_deduplicate_keeps_failure(self):
+        """Deduplicating a failed result keeps its error and retries."""
+        with isolated_registry():
+            result = SearchResult(query="q", provider="dblp", timestamp="t",
+                                  papers=[], error="HTTP 503", retries=1)
+            deduped = result.deduplicate()
+            assert deduped.error == "HTTP 503"
+            assert deduped.retries == 1
+@
+
 
 \subsection{Search abstraction}
 
@@ -2829,6 +3086,14 @@ zero-paper result would read as \enquote{the provider found nothing} in
 a review session's audit trail, which is precisely the wrong record for
 a provider that was never asked.
 
+A provider that \emph{was} asked but did not answer is the opposite
+case: the attempt belongs in the record, as an attempt that failed.
+Right after [[search()]] returns, [[provider_outcome]] reads the
+provider's [[last_error]] and [[last_retries]]
+(\cref{sec:search-result-error}) onto the [[SearchResult]].  Reading
+them immediately matters: the provider objects are shared singletons,
+and the next search through the same provider resets them.
+
 <<search methods>>=
 def execute(
     self,
@@ -2888,9 +3153,12 @@ def execute(
             continue
         logger.debug(f"Querying {provider.name} with limit={limit}")
         papers = provider.search(self.query, limit=limit, filters=filters)
+        error, retries = provider_outcome(provider)
         for paper in papers:
             clean_paper_text(paper)
-        logger.info(f"{provider.name}: Retrieved {len(papers)} papers")
+        logger.info(
+            f"{provider.name}: {hits_label(len(papers), error, retries)}"
+        )
         result = SearchResult(
             query=self.query,
             provider=provider.name,
@@ -2898,6 +3166,8 @@ def execute(
             papers=papers,
             filters=filters.as_dict() if filters else None,
             limit=limit,
+            error=error,
+            retries=retries,
         )
         self.results.append(result)
 
@@ -2983,6 +3253,37 @@ value is what later reconstructs the [[--limit]] of the original search:
 
             results = Search("test").execute(providers=["mock"], limit=42)
             assert results[0].limit == 42
+@
+
+A provider that reports a failure must produce a result that says so,
+while one that answered (here a [[Mock]] whose attributes are
+[[Mock]]s) must not:
+
+<<test functions>>=
+    def test_execute_records_provider_failure(self, monkeypatch):
+        """A provider's last_error and last_retries reach the result."""
+        with isolated_registry():
+            from scholar import providers
+
+            failing = Mock()
+            failing.name = "failing"
+            failing.search.return_value = []
+            failing.last_error = "non-JSON response (HTTP 200)"
+            failing.last_retries = 2
+            answering = Mock()
+            answering.name = "answering"
+            answering.search.return_value = []
+            monkeypatch.setattr(providers, "PROVIDERS", {
+                "failing": failing, "answering": answering,
+            })
+
+            results = Search("q").execute(
+                providers=["failing", "answering"]
+            )
+            assert results[0].error == "non-JSON response (HTTP 200)"
+            assert results[0].retries == 2
+            assert results[1].error is None
+            assert results[1].retries == 0
 @
 
 A provider whose persisted quota is spent must be skipped visibly but

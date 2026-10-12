@@ -67,6 +67,7 @@ across bibliographic databases.
 <<output formatters>>
 <<typer application>>
 <<completion functions>>
+<<session error helpers>>
 <<search command>>
 <<rq command>>
 <<currency reporting helpers>>
@@ -746,14 +747,18 @@ logger.debug(f"Retrieved {len(results)} result sets")
 # If review mode, launch TUI instead of displaying results
 if review:
     from scholar.tui import run_review
+    from scholar.review import SessionFileError
     session_name = name if name else query
-    run_review(
-        merged_results,
-        query,
-        session_name,
-        prompt_report=report,
-        search_filters=filters,
-    )
+    try:
+        run_review(
+            merged_results,
+            query,
+            session_name,
+            prompt_report=report,
+            search_filters=filters,
+        )
+    except SessionFileError as error:
+        exit_on_unreadable_session(error)
     return
 
 # An explicit -n without --review still records the search
@@ -794,15 +799,42 @@ stdout may be machine-read ([[-f json]]/[[-f bibtex]] in pipelines) and must
 stay pure.
 
 <<persist search to named session>>=
-from scholar.review import create_review_session, save_session
+from scholar.review import (
+    create_review_session, save_session, SessionFileError,
+)
 
-session = create_review_session(merged_results, query, session_name=name)
+try:
+    session = create_review_session(merged_results, query, session_name=name)
+except SessionFileError as error:
+    exit_on_unreadable_session(error)
 session_path = save_session(session)
 Console(stderr=True).print(
     f"[green]Saved session:[/green] {escape(str(session_path))} "
     f"({len(session.decisions)} papers, "
     f"{len(session.pending_papers())} pending)"
 )
+@
+
+Appending must never treat an unreadable session file as a missing one,
+or it would save a session rebuilt from the new results over every
+earlier decision (\cref{sec:session-integrity}).  [[create_review_session]]
+raises [[SessionFileError]] in that case, and every command that appends
+([[search -n]], [[search --review]], [[rq]]) stops with one line that
+names the file and where its previous version is, instead of a traceback.
+Nothing has been written at that point, so the file is still there to be
+repaired or restored.
+
+<<session error helpers>>=
+def exit_on_unreadable_session(error) -> NoReturn:
+    """Report an unreadable session file on stderr and exit with 1."""
+    from scholar.utils import backup_path
+
+    Console(stderr=True).print(
+        f"[red]{escape(str(error))}[/red]\n"
+        "Nothing was saved. Repair the file or restore its previous "
+        f"version from {escape(str(backup_path(error.path)))}."
+    )
+    raise typer.Exit(1)
 @
 
 Let's verify the flag actually persists: a fresh [[-n]] search creates a
@@ -896,6 +928,81 @@ class TestSearchSessionPersist:
         result = runner.invoke(app, ["search", "q", "-f", "json"])
         assert result.exit_code == 0
         assert list_sessions() == []
+
+    def test_unreadable_session_is_left_alone(self, tmp_path, monkeypatch):
+        """search -n on a corrupt session fails instead of replacing it."""
+        from scholar.review import _get_sessions_dir
+
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        self._mock_provider(monkeypatch, [
+            Paper(title="New", authors=["A"], doi="10.1/wp1-new"),
+        ])
+        path = _get_sessions_dir() / "corrupt.json"
+        path.write_text('{"query": "q", "decisions": [')
+
+        result = runner.invoke(
+            app, ["search", "q", "-n", "corrupt", "-f", "json"]
+        )
+        assert result.exit_code == 1
+        assert "Cannot read session file" in result.output
+        assert "Traceback" not in result.output
+        assert path.read_text() == '{"query": "q", "decisions": ['
+@
+
+The point of the failure marker (\cref{sec:search-result-error}) is the
+whole path from a provider that did not answer to the views a reviewer
+reads.  So we follow it end to end: a provider reporting a failure
+yields [[failed]] in the CSV count line, in the session record, and
+under \enquote{Queries by provider:} in [[sessions show]]---never a 0:
+
+<<test functions>>=
+class TestSearchFailureRecorded:
+    """A provider failure reads as failed, not as zero hits."""
+
+    def _failing_provider(self, monkeypatch):
+        from scholar import providers
+
+        mock_provider = Mock()
+        mock_provider.name = "mock"
+        mock_provider.MAX_LIMIT = None
+        mock_provider.search.return_value = []
+        mock_provider.last_error = "non-JSON response (HTTP 200, text/html)"
+        mock_provider.last_retries = 0
+        monkeypatch.setattr(
+            providers, "PROVIDERS", {"mock": mock_provider}
+        )
+
+    def test_csv_count_says_failed(self, monkeypatch):
+        self._failing_provider(monkeypatch)
+        result = runner.invoke(app, ["search", "q", "-f", "csv"])
+        assert result.exit_code == 0
+        assert (
+            "# Results: failed (non-JSON response (HTTP 200, text/html))"
+            in result.stdout
+        )
+
+    def test_json_carries_error(self, monkeypatch):
+        import json as _json
+
+        self._failing_provider(monkeypatch)
+        result = runner.invoke(app, ["search", "q", "-f", "json"])
+        data = _json.loads(result.stdout)
+        assert data[0]["error"].startswith("non-JSON response")
+        assert data[0]["retries"] == 0
+
+    def test_session_records_and_shows_failure(self, tmp_path, monkeypatch):
+        from scholar.review import load_session
+
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        self._failing_provider(monkeypatch)
+        runner.invoke(app, ["search", "q", "-n", "dead", "-f", "json"])
+
+        record = load_session("dead").search_records[0]
+        assert record.error.startswith("non-JSON response")
+        assert record.hits == 0
+
+        shown = runner.invoke(app, ["sessions", "show", "dead"])
+        assert "failed (non-JSON response" in shown.stdout
 @
 
 \subsection{Testing the search command}
@@ -1121,14 +1228,17 @@ if enrich and merged_results:
                 progress_callback=update_progress,
                 preprint_search=preprint_search,
             )
-            merged_results[i] = SearchResult(
-                query=result.query,
-                provider=result.provider,
-                timestamp=result.timestamp,
-                papers=enriched,
-                filters=result.filters,
-                limit=result.limit,
-            )
+            merged_results[i] = dataclasses.replace(result, papers=enriched)
+@
+
+Enrichment changes the papers and nothing else, so the result is copied
+with [[dataclasses.replace]] rather than rebuilt field by field: a
+rebuilt result silently dropped every field added later---which is how a
+failed provider's [[error]] would have vanished from [[search --enrich
+-n]] sessions.
+
+<<cli imports>>=
+import dataclasses
 @
 
 
@@ -1269,7 +1379,7 @@ from scholar.providers import (
     get_provider,
     expand_provider_names,
 )
-from scholar.scholar import SearchResult
+from scholar.scholar import SearchResult, provider_outcome
 from scholar.review import create_review_session, save_session
 from scholar.llm_review import (
     classify_papers_with_llm,
@@ -1346,6 +1456,7 @@ for pname in provider_names:
 
     q = provider_queries.get(pname, rq_text)
     papers = p.search(q, limit=effective_limit, filters=filters)
+    error, retries = provider_outcome(p)
     results.append(
         SearchResult(
             query=q,
@@ -1354,6 +1465,8 @@ for pname in provider_names:
             papers=papers,
             filters=filters.as_dict() if filters else None,
             limit=effective_limit,
+            error=error,
+            retries=retries,
         )
     )
 
@@ -1371,7 +1484,12 @@ if name is None:
 @
 
 <<create rq session>>=
-session = create_review_session(results, rq_text, session_name=name)
+from scholar.review import SessionFileError
+
+try:
+    session = create_review_session(results, rq_text, session_name=name)
+except SessionFileError as error:
+    exit_on_unreadable_session(error)
 session.research_context = rq_text
 @
 
@@ -2281,6 +2399,60 @@ class TestEnrichCommand:
         mock_migrate.assert_called_once_with(
             "doi:10.1/bare", "doi:10.48550/arxiv.2401.1"
         )
+@
+
+Enrichment of a large session takes hours, and it saves the session it
+loaded at the start.  That is how two classified sessions lost all their
+decisions and their research context
+(\url{https://github.com/dbosk/scholar/issues/107},
+\cref{sec:session-integrity}): the research context was set and the papers
+classified while an enrichment ran, and the enrichment's save then wrote
+its stale copy over them.  We replay that sequence through the real
+command, with the classification happening inside the stubbed enrichment,
+and require both the classification and the enrichment to survive.
+
+<<test functions>>=
+def test_enrich_keeps_decisions_saved_while_it_ran(tmp_path, monkeypatch):
+    """A classification saved during `scholar enrich` is not undone."""
+    from dataclasses import replace
+    from scholar import Paper, SearchResult, isolated_registry
+    from scholar.review import (
+        DecisionStatus, create_review_session, load_session, save_session,
+    )
+
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+    papers = [
+        Paper(title=f"Paper {i}", authors=["a"], doi=f"10.1/wp1-enrich-{i}")
+        for i in range(2)
+    ]
+    save_session(create_review_session(
+        [SearchResult(query="q", provider="m", timestamp="t", papers=papers)],
+        "q", session_name="race",
+    ))
+
+    def classify_meanwhile(papers, **kwargs):
+        with isolated_registry():
+            other = load_session("race")
+            other.research_context = "Does X support Y?"
+            for decision in other.decisions:
+                decision.status = DecisionStatus.DISCARDED
+                decision.tags = ["off-topic"]
+            save_session(other)
+        return [replace(p, abstract="Enriched.") for p in papers]
+
+    with patch(
+        "scholar.enrich.enrich_papers", side_effect=classify_meanwhile
+    ), patch(
+        "scholar.crossref.annotate_papers", side_effect=lambda ps, **kw: ps
+    ):
+        result = runner.invoke(app, ["enrich", "race"])
+    assert result.exit_code == 0, result.stdout
+
+    with isolated_registry():
+        saved = load_session("race")
+    assert saved.research_context == "Does X support Y?"
+    assert [d.status for d in saved.decisions] == [DecisionStatus.DISCARDED] * 2
+    assert all(d.paper.abstract == "Enriched." for d in saved.decisions)
 @
 
 <<test functions>>=
@@ -3998,7 +4170,16 @@ def notes_show(
     console.print(f"[red]No notes found for paper ID: {escape(paper_id)}[/red]")
     raise typer.Exit(1)
 
+@
 
+\subsection{Exporting and clearing}
+
+[[notes export]] writes its file atomically (\cref{notes-module}), so a
+failed write leaves an earlier export of the same name complete.  We
+say so in one line instead of a traceback, since that earlier export is
+probably the user's backup and they will want to know it survived.
+
+<<notes command>>=
 @notes_app.command("export")
 def notes_export(
     output: Annotated[
@@ -4014,12 +4195,43 @@ def notes_export(
     from scholar.notes import export_notes
 
     console = Console()
-    count = export_notes(output)
+    try:
+        count = export_notes(output)
+    except OSError as error:
+        console.print(
+            f"[red]Cannot write {escape(str(output))}: "
+            f"{escape(str(error))}[/red]\n"
+            "An earlier file of that name, if any, is unchanged."
+        )
+        raise typer.Exit(1)
     console.print(
         f"[green]Exported {count} note(s) to {escape(str(output))}[/green]"
     )
+@
 
+The test makes the write fail and checks the line and the earlier
+export, which must be byte-identical:
 
+<<test functions>>=
+def test_failed_notes_export_is_one_line(tmp_path, monkeypatch):
+    """notes export reports a failed write and keeps the old file."""
+    import scholar.notes as notes
+
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+    output = tmp_path / "export.json"
+    output.write_text("previous export")
+
+    def failing_write(*args, **kwargs):
+        raise OSError("No space left on device")
+
+    monkeypatch.setattr(notes, "atomic_write_text", failing_write)
+    result = CliRunner().invoke(app, ["notes", "export", str(output)])
+    assert result.exit_code == 1
+    output_text = " ".join(result.output.split())
+    assert "No space left on device" in output_text
+    assert "is unchanged" in output_text
+    assert output.read_text() == "previous export"
+<<notes command>>=
 @notes_app.command("import")
 def notes_import(
     input_file: Annotated[
@@ -4056,7 +4268,13 @@ def notes_import(
         f"{escape(str(input_file))}[/green]"
     )
 
+@
 
+[[notes clear]] deletes the file that the notes module reads, so it
+takes the name from the same constant, [[NOTES_FILE]], rather than
+spelling it out a second time where a rename would silently miss it.
+
+<<notes command>>=
 @notes_app.command("clear")
 def notes_clear(
     force: Annotated[
@@ -4072,8 +4290,9 @@ def notes_clear(
 
     Requires --force flag to confirm deletion.
     """
-    from scholar.notes import list_papers_with_notes, get_data_dir
-    import shutil
+    from scholar.notes import (
+        NOTES_FILE, get_data_dir, list_papers_with_notes,
+    )
 
     console = Console()
     notes = list_papers_with_notes()
@@ -4088,11 +4307,34 @@ def notes_clear(
         raise typer.Exit(1)
 
     # Delete the notes file
-    notes_file = get_data_dir() / "paper_notes.json"
+    notes_file = get_data_dir() / NOTES_FILE
     if notes_file.exists():
         notes_file.unlink()
 
     console.print(f"[green]Deleted {len(notes)} note(s).[/green]")
+@
+
+The test renames the file through the constant, so a clear that spelt
+out the old name would leave the notes in place:
+
+<<test functions>>=
+def test_notes_clear_deletes_the_notes_file(tmp_path, monkeypatch):
+    """notes clear deletes the file NOTES_FILE names."""
+    import scholar.notes as notes
+    from scholar.notes import get_data_dir, invalidate_notes_cache
+    from scholar.notes import save_note
+
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(notes, "NOTES_FILE", "renamed_notes.json")
+    invalidate_notes_cache()
+    save_note(Paper(title="T", authors=["A"], doi="10.1/t"), "Note.")
+    notes_file = get_data_dir() / "renamed_notes.json"
+    assert notes_file.exists()
+
+    result = CliRunner().invoke(app, ["notes", "clear", "--force"])
+    assert result.exit_code == 0
+    assert not notes_file.exists()
+    invalidate_notes_cache()
 @
 
 
@@ -4521,6 +4763,61 @@ def sessions_list(
 
         console.print(table)
         console.print(f"\n[dim]Total: {len(sessions)} session(s)[/dim]")
+
+    <<warn about sessions without decisions>>
+@
+
+A session with search records but no decisions and no research context is
+either not screened yet or has lost its screening, as two sessions did in
+\url{https://github.com/dbosk/scholar/issues/107}
+([[needs_check]], \cref{sec:session-integrity}).  We name such sessions
+in a warning after the table rather than in a column: the table and the
+JSON on stdout keep their shape for scripts (the JSON gains the
+[[needs_check]] field), and the warning goes to stderr, where it reaches
+the user in both formats.
+
+<<warn about sessions without decisions>>=
+flagged = [str(s["name"]) for s in sessions if s.get("needs_check")]
+if flagged:
+    Console(stderr=True).print(
+        f"[yellow]Warning:[/yellow] {len(flagged)} session(s) have search "
+        f"records but no decisions and no research context: "
+        f"{escape(', '.join(flagged))}. If they were screened before, "
+        "their decisions were lost; restore from <name>.json.bak in "
+        "the sessions directory or from an export."
+    )
+@
+
+<<test functions>>=
+def test_sessions_list_warns_about_unscreened_sessions(
+    tmp_path, monkeypatch
+):
+    """sessions list names sessions with records but no decisions."""
+    import json as _json
+    from datetime import datetime
+    from scholar import review
+    from scholar.scholar import Paper
+
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+    session = review.ReviewSession(
+        query="q", providers=["openalex"], timestamp=datetime(2026, 9, 3),
+        name="variables-kiss",
+    )
+    session.add_query_provider_pair("q", "openalex")
+    session.decisions = [review.ReviewDecision(
+        paper=Paper(title="P", authors=["A"], doi="10.1/wp1-list"),
+        provider="openalex",
+    )]
+    review.save_session(session)
+
+    result = runner.invoke(app, ["sessions", "list"])
+    assert result.exit_code == 0
+    assert "no decisions and no research context: variables-kiss" in (
+        " ".join(result.output.split())
+    )
+
+    result = runner.invoke(app, ["sessions", "list", "-f", "json"])
+    assert _json.loads(result.stdout)[0]["needs_check"] is True
 @
 
 \paragraph{The [[sessions show]] command}
@@ -4551,7 +4848,24 @@ We print [[Paper.id]] rather than the bare DOI: it is exactly the string
 The three decision groups print the same line, so one helper builds it;
 only the tags differ, and a pending paper simply has none.
 
+Each line under \enquote{Queries by provider:} also says what the search
+returned, as recorded in the session (\cref{sec:search-result-error}):
+the hit count, or a highlighted \enquote{failed} with the reason.  This
+listing is where someone auditing a review reads the query--provider
+grid, so it is where a dead provider has to stand out.  Records from
+before outcomes were stored show nothing, since nothing is known.
+
 <<sessions command>>=
+def _record_outcome_markup(record) -> str:
+    """Rich markup for a search record's outcome, or "" if unknown."""
+    label = hits_label(record.hits, record.error, record.retries)
+    if not label:
+        return ""
+    if record.error:
+        return f" [yellow]— {escape(label)}[/yellow]"
+    return f"[dim] — hits: {escape(label)}[/dim]"
+
+
 def session_paper_line(decision) -> str:
     """Return the Rich markup `sessions show` prints for one paper.
 
@@ -4614,6 +4928,9 @@ def sessions_show(
                     "provider": r.provider,
                     "filters": r.filters,
                     "limit": r.limit,
+                    "hits": r.hits,
+                    "error": r.error,
+                    "retries": r.retries,
                 }
                 for r in session.search_records
             ],
@@ -4653,6 +4970,7 @@ def sessions_show(
                     con.print(
                         f"[dim]  {record.provider}: "
                         f"{escape(record.query + suffix)}[/dim]"
+                        + _record_outcome_markup(record)
                     )
             else:
                 # Fallback: show providers with session query
@@ -4857,36 +5175,7 @@ def sessions_export(
         )
         output = f"review_{safe_name}"
 
-    files_created = []
-
-    if format_type in ("csv", "all"):
-        csv_path = Path(f"{output}.csv")
-        generate_csv_report(session, csv_path)
-        files_created.append(csv_path)
-
-    if format_type in ("latex", "all"):
-        tex_path = Path(f"{output}.tex")
-        generate_latex_report(session, tex_path, standalone=standalone)
-        files_created.append(tex_path)
-        files_created.append(tex_path.with_suffix(".bib"))
-
-    if format_type == "table":
-        table_path = Path(f"{output}.tex")
-        default_label = "".join(
-            c if c.isalnum() or c in "-_" else "_"
-            for c in (session.name or session.query)[:30]
-        )
-        generate_audit_table(
-            session,
-            table_path,
-            label=label or default_label,
-            lang=lang,
-            track=track,
-            theme_names=theme_names,
-            bearing_only=bearing_only,
-            truncate_titles=truncate_titles,
-        )
-        files_created.append(table_path)
+    <<write the export files all or nothing>>
 
     console.print("[green]Exported:[/green]")
     for f in files_created:
@@ -4954,6 +5243,124 @@ def _print_fragment_hint(console: Console, bib_name: str) -> None:
         f"\\addbibresource{{{escape(bib_name)}}} and the packages listed "
         "in its header to the preamble, and compile with biber.[/dim]"
     )
+@
+
+\paragraph{Writing the export all or nothing.}
+\label{sec:sessions-export-atomic}
+An export of several files is only useful as a set: the [[.tex]] cites
+keys from the [[.bib]], and a [[.csv]] next to them is expected to list the
+same decisions.  [[sessions export -f all]] used to write the [[.csv]]
+first and the [[.bib]] and [[.tex]] afterwards, so when the \LaTeX{} step
+crashed (once on a list-valued venue) the user was left with a fresh
+[[.csv]] beside a stale [[.tex]] that still compiled, and a traceback that
+had scrolled past (\url{https://github.com/dbosk/scholar/issues/83}).
+A partial export is worse than none.
+
+So the generators now write into a staging directory next to the targets
+([[staged_outputs]], \cref{sec:atomic-write}), and the files are moved
+into place only when every format has been built.  The generators need no
+change: each receives a path in the staging directory under the final
+file name, and the \LaTeX{} report derives its [[.bib]] from that path as
+before.  Any failure, a bug in a generator as much as a missing output
+directory, ends in one error line and exit code~1, with the previous
+outputs untouched.  The traceback goes to the debug log, where
+[[--verbose]] shows it.
+
+<<write the export files all or nothing>>=
+from scholar.utils import staged_outputs
+
+out_base = Path(output)
+files_created = []
+tex_path = Path(f"{output}.tex")
+try:
+    with staged_outputs(out_base.parent) as staging:
+        staged = staging / out_base.name
+
+        if format_type in ("csv", "all"):
+            generate_csv_report(session, Path(f"{staged}.csv"))
+            files_created.append(Path(f"{output}.csv"))
+
+        if format_type in ("latex", "all"):
+            generate_latex_report(
+                session, Path(f"{staged}.tex"), standalone=standalone
+            )
+            files_created.append(tex_path)
+            files_created.append(tex_path.with_suffix(".bib"))
+
+        if format_type == "table":
+            default_label = "".join(
+                c if c.isalnum() or c in "-_" else "_"
+                for c in (session.name or session.query)[:30]
+            )
+            generate_audit_table(
+                session,
+                Path(f"{staged}.tex"),
+                label=label or default_label,
+                lang=lang,
+                track=track,
+                theme_names=theme_names,
+                bearing_only=bearing_only,
+                truncate_titles=truncate_titles,
+            )
+            files_created.append(tex_path)
+except Exception as error:
+    logger.debug("Export of %s failed", name, exc_info=True)
+    console.print(
+        f"[red]Export failed, no files were written or changed: "
+        f"{escape(type(error).__name__)}: {escape(str(error))}[/red]"
+    )
+    raise typer.Exit(1)
+@
+
+The regression test makes the \LaTeX{} step fail after it has already
+written its [[.bib]], over an earlier complete export.  The earlier
+[[.csv]], [[.bib]] and [[.tex]] must survive byte for byte, no staging
+directory may be left behind, and the user gets one line, not a
+traceback.
+
+<<test functions>>=
+def test_failed_export_leaves_previous_outputs(tmp_path, monkeypatch):
+    """A failing LaTeX step must not leave a half-new export (#83)."""
+    from datetime import datetime
+    from scholar import review
+    from scholar.scholar import Paper
+
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+    session = review.ReviewSession(
+        query="q", providers=["openalex"], timestamp=datetime(2026, 1, 1),
+        name="atomic",
+    )
+    session.decisions = [review.ReviewDecision(
+        paper=Paper(title="Kept", authors=["A"], year=2024,
+                    doi="10.1/wp1-export"),
+        provider="openalex", status=review.DecisionStatus.KEPT,
+    )]
+    review.save_session(session)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    out = out_dir / "rep"
+    result = runner.invoke(
+        app, ["sessions", "export", "atomic", "-f", "all", "-o", str(out)]
+    )
+    assert result.exit_code == 0, result.output
+    before = {p.name: p.read_bytes() for p in out_dir.iterdir()}
+    assert set(before) == {"rep.csv", "rep.tex", "rep.bib"}
+
+    def failing_latex(session, output_path, *, standalone=True):
+        output_path.with_suffix(".bib").write_text("half-new bib")
+        raise AttributeError("'list' object has no attribute 'replace'")
+
+    session.decisions[0].tags = ["changed"]
+    review.save_session(session)
+    monkeypatch.setattr(review, "generate_latex_report", failing_latex)
+    result = runner.invoke(
+        app, ["sessions", "export", "atomic", "-f", "all", "-o", str(out)]
+    )
+    assert result.exit_code == 1
+    assert "Export failed" in result.output
+    assert "Traceback" not in result.output
+    after = {p.name: p.read_bytes() for p in out_dir.iterdir()}
+    assert after == before
 @
 
 The export command is exercised end to end through the CLI runner with a
@@ -7465,7 +7872,14 @@ def display_results(results: list, output_format: str = "table") -> None:
 \subsection{Table formatter}
 
 The table formatter uses Rich to create visually appealing output.
-We show the query and provider as context, then list papers with key metadata:
+We show the query and provider as context, then list papers with key metadata.
+Below an empty table it used to say \enquote{No results found.} whatever
+the reason; a provider that failed (\cref{sec:search-result-error}) now
+gets its own line with the reason, worded by [[hits_label]] as in every
+other view, and so does one that answered only in part.
+
+<<cli imports>>=
+from scholar.scholar import hits_label
 
 <<formatter classes>>=
 class TableFormatter:
@@ -7504,7 +7918,12 @@ class TableFormatter:
 
             self.console.print(table)
 
-            if not result.papers:
+            if result.error:
+                label = hits_label(len(result.papers), result.error)
+                self.console.print(
+                    f"[yellow]Results: {escape(label)}[/yellow]"
+                )
+            elif not result.papers:
                 self.console.print("[dim]No results found.[/dim]")
 @
 
@@ -7546,7 +7965,13 @@ Let's verify the table formatter produces correct output:
 
 For scripting and shell pipelines, we provide a tab-separated CSV format.
 This is especially useful when output is piped to other commands.
-We include metadata as a comment header so consumers know the search context:
+We include metadata as a comment header so consumers know the search context.
+The [[# Results:]] line is the count a script records per query and
+provider, so it is where a failure must show: it reads
+[[failed (reason)]] instead of 0 (or [[N, incomplete (reason)]]),
+deliberately not a number, so a script that parses it stops instead of
+recording a zero.  Retries get a line of their own, which keeps the
+count of an answered search a plain number:
 
 <<formatter classes>>=
 class CSVFormatter:
@@ -7559,7 +7984,9 @@ class CSVFormatter:
             print(f"# Query: {result.query}")
             print(f"# Provider: {result.provider}")
             print(f"# Timestamp: {result.timestamp}")
-            print(f"# Results: {len(result.papers)}")
+            print(f"# Results: {hits_label(len(result.papers), result.error)}")
+            if result.retries:
+                print(f"# Retries: {result.retries}")
             print()
 
             # Header row
@@ -7603,7 +8030,9 @@ We also surface the [[filters]] and [[limit]] that were applied, so a consumer
 reading the JSON has the same provenance the [[bibtex+prov]] export
 reconstructs --- the search is fully described by its query, providers,
 filters, and limit, and JSON is the natural place to expose all four to a
-machine reader.
+machine reader.  The [[error]] and [[retries]] of the result go along
+for the same reason: a consumer counting papers must be able to tell a
+failed provider from an empty answer.
 
 <<formatter classes>>=
 class JSONFormatter:
@@ -7619,6 +8048,8 @@ class JSONFormatter:
                 "timestamp": result.timestamp,
                 "filters": result.filters,
                 "limit": result.limit,
+                "error": result.error,
+                "retries": result.retries,
                 "papers": [
                     {
                         "title": p.title,
@@ -9178,15 +9609,57 @@ def register_submodules() -> None:
 
 
 \section{Entry Point}
+\label{sec:cli-main}
 
 The main entry point registers any available submodules and then runs the
-Typer application:
+Typer application.
+
+Many commands read or write notes and per-query decisions, from the
+[[notes]] commands to the TUI.  When that file is unreadable, or a write
+fails, the notes module raises [[NotesFileError]] instead of carrying on
+with an empty store and overwriting the file
+(\url{https://github.com/dbosk/scholar/issues/114}).  Rather than catch it
+in every command, we catch it once here and turn it into one line that
+names the file and points to its [[.bak]], with exit code~1.
 
 <<main entry point>>=
 def main() -> None:
     """Main entry point for the Scholar CLI."""
+    from scholar.notes import NotesFileError
+    from scholar.utils import backup_path
+
     register_submodules()
-    app()
+    try:
+        app()
+    except NotesFileError as error:
+        Console(stderr=True).print(
+            f"[red]{escape(str(error))}[/red]\n"
+            "Nothing was overwritten. Repair the file or restore its "
+            f"previous version from {escape(str(backup_path(error.path)))}."
+        )
+        sys.exit(1)
+@
+
+A corrupt notes file therefore ends [[scholar notes list]] with that line
+and exit code~1, and the file is left as it was:
+
+<<test functions>>=
+def test_main_reports_unreadable_notes_file(tmp_path, monkeypatch, capsys):
+    """main() turns NotesFileError into one line and exit code 1."""
+    from scholar.notes import NOTES_FILE, get_data_dir, invalidate_notes_cache
+
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+    invalidate_notes_cache()
+    notes_file = get_data_dir() / NOTES_FILE
+    notes_file.write_text('{"doi:10.1/x": ')
+    monkeypatch.setattr(sys, "argv", ["scholar", "notes", "list"])
+    with pytest.raises(SystemExit) as exit_info:
+        main()
+    assert exit_info.value.code == 1
+    err = capsys.readouterr().err
+    assert "Cannot read notes file" in " ".join(err.split())
+    assert "paper_notes.json.bak" in "".join(err.split())
+    assert notes_file.read_text() == '{"doi:10.1/x": '
 @
 
 \subsection{Testing the CLI application}
@@ -9285,7 +9758,7 @@ class TestSubcommandRegistration:
 We collect the imports used throughout the module:
 
 <<cli imports>>=
-from typing import Optional
+from typing import NoReturn, Optional
 from typing_extensions import Annotated
 from pathlib import Path
 from dataclasses import dataclass

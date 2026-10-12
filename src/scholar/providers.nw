@@ -180,6 +180,19 @@ rather than assumed: citation retrieval ([[get_paper_citations]],
 a provider without it still satisfies the protocol---it is simply reported as
 unchecked rather than broken.
 
+Two optional attributes are read the same tolerant way.  [[last_error]]
+is [[None]] after a search the provider answered and a short reason
+after one it could not complete; [[last_retries]] counts the repeats a
+provider made before accepting an answer.  Each bundled provider resets
+[[last_error]] as the first thing [[search()]] does---before the cache
+lookup, since a cached result is by construction an answered one---and
+sets it on every path that returns an uncached, untrustworthy list.
+[[Search.execute]] copies both onto the [[SearchResult]], so a failure
+is recorded as a failure instead of as zero hits (see the search-result
+section of the core module).  A third-party provider without the
+attributes simply always reads as having answered, which is what every
+provider read as before.
+
 <<provider protocol>>=
 class SearchProvider(Protocol):
     """Protocol for search providers."""
@@ -847,6 +860,23 @@ rotate a perfectly good credential.
 The classifier therefore decodes [[X-Mashery-Error-Code]] \emph{before}
 the credential branch.
 
+A 2xx status is not enough for \enquote{ok} either.  Since September 2026
+DBLP has answered API requests with HTTP 200 and an HTML anti-bot page in
+place of JSON (\cref{sec:dblp-transient-failures}); every search failed,
+yet the probe reported [[ok]] and a pre-flight gate let four review
+sessions run with a dead DBLP.  A probe whose endpoint speaks JSON
+therefore passes [[expect_json=True]], and a 2xx body that does not
+parse is an [[http error]] whose message names the status and the
+content type---[[non-JSON response (HTTP 200, text/html)]]---so
+[[providers check]] exits 1.  Every probe whose search parses JSON does
+so: DBLP, Scopus, Semantic Scholar, OpenAlex (with the preprint servers
+pinned on it), HAL, IEEE and Web of Science.  Any of them can sit behind
+a proxy, gateway or anti-bot layer that answers 200 with a page, and the
+search would then fail on [[response.json()]] while a status-only probe
+said ok.  Only arXiv's probe does not, since its Atom feed is XML.
+The search path uses the same wording ([[non_json_reason]]), so the
+health check and the search record describe one failure the same way.
+
 <<imports>>=
 import dataclasses
 @
@@ -872,11 +902,24 @@ class ProviderHealth:
     message: str = ""
 
 
+def non_json_reason(response) -> str:
+    """Describe a response whose body is not the JSON we asked for."""
+    headers = getattr(response, "headers", None) or {}
+    content_type = headers.get("Content-Type") if hasattr(
+        headers, "get"
+    ) else None
+    detail = f"HTTP {response.status_code}"
+    if isinstance(content_type, str) and content_type:
+        detail += f", {content_type.split(';')[0].strip()}"
+    return f"non-JSON response ({detail})"
+
+
 def classify_check_response(
     response,
     *,
     authenticated: bool,
     key_hint: str = "",
+    expect_json: bool = False,
 ) -> tuple[str, str]:
     """Classify a health-probe HTTP response into a (status, message) pair.
 
@@ -884,7 +927,8 @@ def classify_check_response(
     sent (`authenticated`); `key_hint` names the environment variable to
     check in that case.  Gateway quota rejections (Mashery's
     `X-Mashery-Error-Code`) are decoded first, since they also arrive
-    as 403.
+    as 403.  With `expect_json`, a 2xx body that does not parse as JSON
+    (an anti-bot page, say) is an HTTP error, not ok.
     """
     headers = getattr(response, "headers", None) or {}
     mashery_code = headers.get("X-Mashery-Error-Code", "")
@@ -904,6 +948,11 @@ def classify_check_response(
         )
     if response.status_code == 429:
         return HEALTH_RATE_LIMITED, "HTTP 429 (transient; try again later)"
+    if response.ok and expect_json:
+        try:
+            response.json()
+        except ValueError:
+            return HEALTH_HTTP_ERROR, non_json_reason(response)
     if response.ok:
         return HEALTH_OK, ""
     return HEALTH_HTTP_ERROR, f"HTTP {response.status_code}"
@@ -952,7 +1001,8 @@ Let's verify the cross-provider logic: unconfigured providers are never
 probed, offline mode skips the network entirely, and the classifier maps raw
 responses to the right statuses.  The stale-key case uses the real Semantic
 Scholar provider, since surfacing that exact failure is why this machinery
-exists:
+exists; and every probe that expects JSON, not only DBLP's, must fail on a
+200 that carries a page instead:
 
 <<test functions>>=
 class TestProviderHealth:
@@ -1044,6 +1094,66 @@ class TestProviderHealth:
             health = check_provider(provider)
 
         assert health.status == HEALTH_OK
+
+    def test_dblp_html_200_is_an_error(self):
+        """DBLP's anti-bot page (HTML with HTTP 200) fails the check.
+
+        This is the regression test for the false `ok` that let four
+        review sessions run with a DBLP that answered every search with
+        an HTML challenge page.
+        """
+        provider = DBLPProvider()
+        response = self._response(200)
+        response.headers = {"Content-Type": "text/html; charset=utf-8"}
+        response.json.side_effect = ValueError("Expecting value")
+
+        with patch("requests.get", return_value=response):
+            health = check_provider(provider)
+
+        assert health.status == HEALTH_HTTP_ERROR
+        assert health.message == "non-JSON response (HTTP 200, text/html)"
+
+    @pytest.mark.parametrize("make_provider", [
+        lambda: SemanticScholarProvider(api_key=None),
+        lambda: OpenAlexProvider(),
+        lambda: HALProvider(),
+        lambda: IEEEXploreProvider(api_key="test_key"),
+        lambda: WebOfScienceProvider(
+            starter_api_key=None, expanded_api_key="test_key"
+        ),
+    ], ids=["s2", "openalex", "hal", "ieee", "wos"])
+    def test_json_probes_reject_an_html_200(self, make_provider):
+        """Every JSON probe, not only DBLP's, fails on a page in a 200."""
+        provider = make_provider()
+        response = self._response(200)
+        response.headers = {"Content-Type": "text/html"}
+        response.json.side_effect = ValueError("Expecting value")
+
+        with patch("requests.get", return_value=response):
+            with patch("time.sleep"):
+                status, message = provider.check()
+
+        assert status == HEALTH_HTTP_ERROR
+        assert message == "non-JSON response (HTTP 200, text/html)"
+
+    def test_hal_error_body_still_wins(self):
+        """HAL's 200 with an `error` body keeps its own message."""
+        response = self._response(200)
+        response.headers = {"Content-Type": "application/json"}
+        response.json.return_value = {"error": {"msg": "bad query"}}
+
+        with patch("requests.get", return_value=response):
+            status, message = HALProvider().check()
+
+        assert status == HEALTH_HTTP_ERROR
+        assert message == "query rejected (error body in HTTP 200)"
+
+    def test_non_json_ok_without_expect_json(self):
+        """Only probes that expect JSON hold a 2xx body against it."""
+        response = self._response(200)
+        response.json.side_effect = ValueError("Expecting value")
+        status, _ = classify_check_response(response, authenticated=False)
+        assert status == HEALTH_OK
 
     def test_network_error(self):
         """A connection failure reports a network error, not a crash."""
@@ -1159,6 +1269,26 @@ This design choice ensures:
 To see error messages, ensure logging is configured at WARNING level or above.
 The CLI's [[providers]] command helps diagnose configuration issues like
 missing API keys.
+
+A log line is not a record, though.  The empty list a failed provider
+returns looks exactly like a search that found nothing, and a review
+session used to store it as zero hits.  So, besides logging, a provider
+sets [[last_error]] whenever it returns an empty or truncated list
+because a request failed; [[Search.execute]] stores it on the
+[[SearchResult]], and every view of the hit counts then reads
+\enquote{failed} instead of 0.  The keyed REST providers already know
+when this happens: their [[_search_uncached]] returns a [[cacheable]]
+flag that is false exactly when a rate limit or an HTTP or parse error
+cut the search short (\cref{sec:cache-successful-only}), so the same
+branch that declines to cache the result also records the failure.
+A failed result is therefore never cached, and never mistaken for an
+answer.
+
+<<constants>>=
+SEARCH_CUT_SHORT = (
+    "rate limited or HTTP/parse error; the warnings above say which"
+)
+@
 
 \subsection{Provider implementation}
 
@@ -1356,6 +1486,7 @@ def check(self) -> tuple[str, str]:
         response,
         authenticated=bool(self.api_key),
         key_hint="S2_API_KEY",
+        expect_json=True,
     )
 @
 
@@ -1393,6 +1524,7 @@ def search(
     Automatically fetches multiple pages if the requested limit exceeds
     the API's per-request maximum (100 results per page).
     """
+    self.last_error = None
     cache_key = (query, limit, filters.cache_key() if filters else "")
     if cache_key in self._cache:
         return self._cache[cache_key]
@@ -1400,6 +1532,8 @@ def search(
     papers, cacheable = self._search_uncached(query, limit, filters)
     if cacheable:
         self._cache[cache_key] = papers
+    else:
+        self.last_error = SEARCH_CUT_SHORT
     return papers
 
 def _search_uncached(
@@ -2012,6 +2146,7 @@ class TestSemanticScholarProvider:
         ) as mock_get:
             first = provider.search("test")
             assert first == []
+            assert provider.last_error == SEARCH_CUT_SHORT
 
             later = ratelimit._now() + 2 * ratelimit.DEFAULT_COOLDOWN
             monkeypatch.setattr(ratelimit, "_now", lambda: later)
@@ -2020,6 +2155,7 @@ class TestSemanticScholarProvider:
             assert len(second) == 1
             assert second[0].title == "Recovered Paper"
             assert mock_get.call_count == 2  # not served from cache
+            assert provider.last_error is None
 
     def test_rate_limiting_with_api_key(self):
         """Provider uses faster rate limit when API key is set."""
@@ -2374,6 +2510,7 @@ class OpenAlexProvider:
         Automatically fetches multiple pages if the requested limit exceeds
         the API's per-request maximum (200 results per page).
         """
+        self.last_error = None
         cache_key = (
             self.CACHE_VERSION,
             query,
@@ -2386,9 +2523,12 @@ class OpenAlexProvider:
             papers = self._search_uncached(query, limit, filters)
         except requests.HTTPError as e:
             self._note_http_error(e)
+            status = getattr(e.response, "status_code", None)
+            self.last_error = f"HTTP {status}" if status else str(e)
             return []
         except Exception as e:
             logger.warning("%s: %s", self.name, e)
+            self.last_error = str(e) or type(e).__name__
             return []
         self._cache[cache_key] = papers
         return papers
@@ -2472,7 +2612,7 @@ def _probe(self, params: dict) -> tuple[str, str]:
         )
     self._limiter.record_response(response)
     return classify_check_response(
-        response, authenticated=bool(self.api_key)
+        response, authenticated=bool(self.api_key), expect_json=True
     )
 <<openalex constants>>=
 OPENALEX_API_URL = "https://api.openalex.org/works"
@@ -3365,6 +3505,7 @@ class TestOpenAlexProvider:
         with patch("pyalex.Works") as mock_works:
             mock_works.return_value.search.side_effect = Exception("boom")
             assert provider.search("flaky query") == []
+        assert provider.last_error == "boom"
 
         with patch("pyalex.Works") as mock_works:
             mock_works.return_value.search.return_value.paginate.return_value = [
@@ -3373,6 +3514,7 @@ class TestOpenAlexProvider:
             results = provider.search("flaky query")
             assert len(results) == 1
             assert results[0].title == "Recovered"
+        assert provider.last_error is None
 
     def test_caches_successful_search(self):
         """A successful search is answered from cache on repetition."""
@@ -3579,6 +3721,30 @@ technique the Scopus provider uses for its identifier lists) and by separating
 raises [[_DBLPUnavailable]] and returns an uncached empty list, so a later call
 can retry, whereas a real zero-hit answer is cached normally.
 
+\paragraph{The anti-bot page.}
+The non-JSON body stopped being occasional in September 2026: every
+request got one (\url{https://github.com/dbosk/scholar/issues/94}).
+Probing by hand on 2026-10-11 showed what it is.  [[dblp.org]] and both
+official mirrors, [[dblp.uni-trier.de]] and [[dblp.dagstuhl.de]],
+answer [[/search/publ/api?...&format=json]] with HTTP 200, content type
+[[text/html]], and an Anubis proof-of-work page titled
+\enquote{Making sure you're not a bot!}, which a browser solves in
+JavaScript and an API client cannot.  Neither
+[[Accept: application/json]] nor the descriptive [[User-Agent]] we
+already send changes the answer, and the Dagstuhl mirror began
+answering 429 after a handful of probes.  So there is no header to add
+and no mirror to fall back to, and solving or evading the challenge is
+not something a well-behaved client does.
+
+What remains is to be honest about it.  The search records the failure
+as [[non-JSON response (HTTP 200, text/html)]] in [[last_error]], so
+the session says \enquote{failed} instead of 0
+(\cref{sec:search-result-error} in the core module), and the health
+check holds the probe's body to the same standard (\cref{sec:provider-health}),
+so [[providers check]] fails for DBLP while the page is up.  Should DBLP
+lift the challenge for API clients, or offer a key, both fixes stay
+correct and the provider works again unchanged.
+
 <<dblp provider>>=
 class _DBLPUnavailable(Exception):
     """Raised internally when a DBLP request fails transiently.
@@ -3607,6 +3773,7 @@ class DBLPProvider:
     <<dblp search method>>
     <<dblp sanitize query>>
     <<dblp zero-hit warning>>
+    <<dblp zero-hit retry>>
     <<dblp fetch pages>>
     <<dblp fetch one page>>
     <<dblp check method>>
@@ -3631,7 +3798,9 @@ with what review sessions record as the query provenance.  The cached path
 warns again on purpose: a review pipeline that reruns the same command hits
 the cache and would otherwise never see why a query yields nothing.  The
 transient-failure path does \emph{not} warn---zero results there mean
-\enquote{DBLP was down}, not \enquote{query overconstrained}.
+\enquote{DBLP was down}, not \enquote{query overconstrained}.  It records
+the reason in [[last_error]] instead, so the search record says
+\enquote{failed} rather than 0.
 
 <<dblp search method>>=
 def search(
@@ -3649,6 +3818,8 @@ def search(
     Automatically fetches multiple pages if the requested limit exceeds
     the API's per-request maximum (1000 results per page).
     """
+    self.last_error = None
+    self.last_retries = 0
     sanitized = self._sanitize_query(query)
     cache_key = (query, limit, filters.cache_key() if filters else "")
     if cache_key in self._cache:
@@ -3665,14 +3836,17 @@ def search(
 
     try:
         papers = self._fetch_pages(sanitized, limit, filters)
-    except RateLimited:
+        papers = self._retry_zero_hits(sanitized, limit, filters, papers)
+    except RateLimited as e:
         # A persistent cooldown is active; the limiter already logged it.
+        self.last_error = str(e)
         return []
     except Exception as e:
         # Transient API failure (throttling, malformed body, HTTP error) or
         # an unexpected parsing error: return empty but do NOT cache, so a
         # later call can retry instead of replaying a frozen empty result.
         logger.warning("dblp: %s", e)
+        self.last_error = str(e) or type(e).__name__
         return []
 
     self._warn_if_overconstrained(sanitized, papers)
@@ -3853,14 +4027,15 @@ class TestDBLPQuerySanitization:
                 provider.search(query)
                 provider.search(query)
 
-            assert mock_get.call_count == 1
+            # one request plus the zero-hit retries; the rerun is cached
+            assert mock_get.call_count == 1 + len(DBLP_ZERO_HIT_RETRY_DELAYS)
         warnings = [
             r for r in caplog.records if "implicit AND" in r.message
         ]
         assert len(warnings) == 2
 
     def test_cache_keyed_on_raw_query(self):
-        """Repeating a boolean-laden query makes only one HTTP request."""
+        """Repeating a boolean-laden query is answered from the cache."""
         provider = DBLPProvider()
 
         with patch("requests.get") as mock_get:
@@ -3868,7 +4043,153 @@ class TestDBLPQuerySanitization:
             provider.search("misconceptions AND novice")
             provider.search("misconceptions AND novice")
 
-            assert mock_get.call_count == 1
+            # one request plus the zero-hit retries; the repeat is cached
+            assert mock_get.call_count == 1 + len(DBLP_ZERO_HIT_RETRY_DELAYS)
+@
+
+\subsubsection{Retrying an empty answer}
+\label{sec:dblp-zero-hit-retry}
+
+DBLP has a second way of failing without saying so.  Under a burst of
+queries it sometimes answers with perfectly good JSON that reports zero
+hits, and the same query a little later returns papers
+(\url{https://github.com/dbosk/scholar/issues/82}: in a session of
+about two thousand records, re-runs of queries recorded as empty did
+find papers).  Nothing in the response tells this apart from a genuine
+negative, so we cannot detect it; we can only ask again.
+
+A query of [[DBLP_RETRY_MIN_TERMS]] or more terms that comes back
+empty is therefore repeated, after [[DBLP_ZERO_HIT_RETRY_DELAYS]]
+seconds (2, then 5), until it returns hits or the delays run out.  A
+single term is not repeated: one word that matches no title is the
+ordinary negative, and repeating every typo would double the requests
+for nothing.  The delays grow because throttling is a matter of
+recent request rate, and a backoff gives the rate time to fall; they
+stay short because a genuinely empty multi-term query---common, given
+DBLP's implicit AND---pays them in full.
+
+This is not the auto-relaxing we rejected for overconstrained queries
+(\cref{sec:dblp-sanitize}): the query sent is identical every time, so
+the result stays traceable to the recorded query.  What the record does
+gain is the number of repeats, in [[last_retries]] and from there in the
+search record (\cref{sec:search-result-error} of the core module), so a
+reader can see that the hits---or the zero---came only on a later
+attempt.  An empty answer that survives the retries is recorded and
+cached as zero, a genuine negative as far as we can tell; a retry that
+fails outright (non-JSON, persistent 429) makes the whole search fail,
+since the zero before it is then not trustworthy either.
+
+The waits go through [[ratelimit._sleep]], the seam the test suite
+already disables (\cref{ch:ratelimit}), so tests exercise the retries
+without waiting for them.
+
+<<dblp zero-hit retry>>=
+def _retry_zero_hits(
+    self,
+    sanitized: str,
+    limit: int,
+    filters: SearchFilters | None,
+    papers: list[Paper],
+) -> list[Paper]:
+    """Repeat a multi-term query that returned nothing.
+
+    DBLP's throttling can return zero hits for a query that has some.
+    Counts the repeats in `last_retries`; exceptions propagate, so a
+    failed retry fails the search.
+    """
+    if papers or len(sanitized.split()) < DBLP_RETRY_MIN_TERMS:
+        return papers
+    for delay in DBLP_ZERO_HIT_RETRY_DELAYS:
+        ratelimit._sleep(delay)
+        self.last_retries += 1
+        papers = self._fetch_pages(sanitized, limit, filters)
+        if papers:
+            logger.info(
+                "dblp: retry %d of '%s' returned %d hits after an "
+                "empty answer (throttled)",
+                self.last_retries, sanitized, len(papers),
+            )
+            break
+    return papers
+@
+
+Let's verify the retry from every side: hits on the second attempt are
+kept and counted, a zero that survives all retries is a recorded zero
+(not a failure), the delays are the ones the prose promises, a single
+term is not retried, and a retry that fails fails the search:
+
+<<test functions>>=
+class TestDBLPZeroHitRetry:
+    """Tests for retrying DBLP's empty answers."""
+
+    <<dblp zero-hit retry test methods>>
+<<dblp zero-hit retry test methods>>=
+@staticmethod
+def _page(titles):
+    response = Mock()
+    response.status_code = 200
+    response.raise_for_status = Mock()
+    response.json.return_value = {"result": {"hits": {
+        "@total": str(len(titles)),
+        "hit": [{"info": {"title": t}} for t in titles],
+    }}}
+    return response
+
+def test_hits_on_retry_are_kept(self, monkeypatch, caplog):
+    delays = []
+    monkeypatch.setattr(ratelimit, "_sleep", delays.append)
+    provider = DBLPProvider()
+    with patch("requests.get", side_effect=[
+        self._page([]), self._page(["Found Later"]),
+    ]):
+        with caplog.at_level(logging.INFO, logger="scholar.providers"):
+            papers = provider.search("literate programming")
+    assert [p.title for p in papers] == ["Found Later"]
+    assert provider.last_retries == 1
+    assert provider.last_error is None
+    assert delays == [DBLP_ZERO_HIT_RETRY_DELAYS[0]]
+    assert any("after an empty answer" in r.message for r in caplog.records)
+
+def test_zero_after_retries_is_a_zero(self, monkeypatch):
+    delays = []
+    monkeypatch.setattr(ratelimit, "_sleep", delays.append)
+    provider = DBLPProvider()
+    with patch("requests.get", return_value=self._page([])) as mock_get:
+        assert provider.search("literate programming") == []
+        assert mock_get.call_count == 3
+    assert provider.last_retries == 2
+    assert provider.last_error is None
+    assert delays == [2.0, 5.0]
+
+def test_single_term_not_retried(self):
+    provider = DBLPProvider()
+    with patch("requests.get", return_value=self._page([])) as mock_get:
+        assert provider.search("zyzzyva") == []
+        assert mock_get.call_count == 1
+    assert provider.last_retries == 0
+
+def test_failed_retry_fails_the_search(self):
+    provider = DBLPProvider()
+    page = Mock(status_code=200, headers={"Content-Type": "text/html"})
+    page.raise_for_status = Mock()
+    page.json.side_effect = ValueError("Expecting value")
+    with patch("requests.get", side_effect=[self._page([]), page]):
+        assert provider.search("literate programming") == []
+    assert provider.last_error == "non-JSON response (HTTP 200, text/html)"
+    assert provider.last_retries == 1
+
+def test_retries_reach_the_search_result(self, monkeypatch):
+    from scholar import providers as providers_module
+
+    provider = DBLPProvider()
+    monkeypatch.setattr(providers_module, "PROVIDERS", {"dblp": provider})
+    with patch("requests.get", side_effect=[
+        self._page([]), self._page([]), self._page(["Third Time"]),
+    ]):
+        results = Search("literate programming").execute(providers=["dblp"])
+    assert results[0].retries == 2
+    assert results[0].error is None
+    assert len(results[0].papers) == 1
 @
 
 \subsubsection{Paging through results}
@@ -3971,9 +4292,7 @@ def _fetch_one_page(
         try:
             data = response.json()
         except ValueError as e:
-            raise _DBLPUnavailable(
-                f"non-JSON response (HTTP {response.status_code})"
-            ) from e
+            raise _DBLPUnavailable(non_json_reason(response)) from e
 
         hits = ensure_list(
             safe_get_nested(data, "result", "hits", "hit", default=[])
@@ -4029,7 +4348,9 @@ time.sleep(delay)
 Unlike [[_fetch_one_page]], the probe makes exactly one request with no 429
 retry loop: for a health check, a 429 \emph{is} the answer we want to report,
 not something to wait out.  We keep the descriptive [[User-Agent]] so the
-probe is throttled the same way real searches are.
+probe is throttled the same way real searches are, and we ask the
+classifier to insist on JSON, since a 200 carrying the anti-bot page is
+exactly the failure the probe used to miss.
 
 <<dblp check method>>=
 def check(self) -> tuple[str, str]:
@@ -4040,7 +4361,9 @@ def check(self) -> tuple[str, str]:
         headers={"User-Agent": DBLP_USER_AGENT},
         timeout=30,
     )
-    return classify_check_response(response, authenticated=False)
+    return classify_check_response(
+        response, authenticated=False, expect_json=True
+    )
 @
 
 \subsubsection{Applying filters}
@@ -4116,7 +4439,11 @@ containing:
 \item[url] URL to the DBLP record.
 \end{description}
 
-We convert each hit to our common [[Paper]] type:
+We convert each hit to our common [[Paper]] type.  The venue goes
+through [[normalize_venue]] because DBLP sends some proceedings venues
+as a list (volume title and series); [[Paper]] would join it anyway
+(\cref{sec:paper-venue-invariant}), but saying so here, where the list
+arrives, keeps the conversion honest about what DBLP sends.
 
 <<convert dblp hit>>=
 def _convert_hit(self, hit: dict) -> Paper:
@@ -4149,7 +4476,7 @@ def _convert_hit(self, hit: dict) -> Paper:
         year=year,
         doi=info.get("doi"),
         abstract=None,  # DBLP doesn't provide abstracts
-        venue=info.get("venue"),
+        venue=normalize_venue(info.get("venue")),
         url=info.get("url") or info.get("ee"),
         sources=[self.name],
     )
@@ -4166,6 +4493,9 @@ register_provider(DBLPProvider())
 
 <<dblp imports>>=
 import requests
+
+from scholar import ratelimit
+from scholar.scholar import normalize_venue
 @
 
 <<dblp constants>>=
@@ -4175,6 +4505,8 @@ DBLP_MAX_RETRIES = 3       # extra attempts on HTTP 429 before giving up
 DBLP_RETRY_BACKOFF = 2.0   # base seconds for the exponential 429 back-off
 DBLP_BOOLEAN_TOKENS = frozenset({"AND", "OR", "NOT"})
 DBLP_MANY_TERMS = 4        # warn on zero hits at or above this many terms
+DBLP_RETRY_MIN_TERMS = 2   # repeat empty answers from this many terms up
+DBLP_ZERO_HIT_RETRY_DELAYS = (2.0, 5.0)  # seconds before each repeat
 @
 
 \subsection{Testing DBLP provider}
@@ -4375,11 +4707,30 @@ class TestDBLPProvider:
         ) as mock_get:
             first = provider.search("test")
             assert first == []
+            assert "non-JSON response" in provider.last_error
 
             second = provider.search("test")
             assert len(second) == 1
             assert second[0].title == "Recovered Paper"
             assert mock_get.call_count == 2
+            assert provider.last_error is None
+
+    def test_anti_bot_page_recorded_as_failure(self):
+        """DBLP's HTML challenge page is a recorded failure, not 0 hits."""
+        provider = DBLPProvider()
+
+        page = Mock()
+        page.status_code = 200
+        page.headers = {"Content-Type": "text/html; charset=utf-8"}
+        page.raise_for_status = Mock()
+        page.json.side_effect = ValueError("Expecting value")
+
+        with patch("requests.get", return_value=page):
+            assert provider.search("literate programming") == []
+
+        assert provider.last_error == (
+            "non-JSON response (HTTP 200, text/html)"
+        )
 
     def test_retries_on_rate_limit(self):
         """search() retries after an HTTP 429 before succeeding."""
@@ -4514,6 +4865,31 @@ class TestDBLPProvider:
             # Should stop after first page since total (50) < limit (200)
             assert len(results) == 50
             assert mock_get.call_count == 1
+
+    def test_list_valued_venue_becomes_string(self):
+        """A proceedings venue sent as a list arrives as one string."""
+        provider = DBLPProvider()
+
+        response = Mock()
+        response.status_code = 200
+        response.raise_for_status = Mock()
+        response.json.return_value = {"result": {"hits": {
+            "@total": "1",
+            "hit": [{"info": {
+                "title": "Proceedings Paper",
+                "venue": [
+                    "IIH-MSP",
+                    "Smart Innovation, Systems and Technologies",
+                ],
+            }}],
+        }}}
+
+        with patch("requests.get", return_value=response):
+            papers = provider.search("proceedings")
+
+        assert papers[0].venue == (
+            "IIH-MSP; Smart Innovation, Systems and Technologies"
+        )
 
 
 class TestDBLPIntegration:
@@ -4741,6 +5117,7 @@ def check(self) -> tuple[str, str]:
         response,
         authenticated=True,
         key_hint="WOS_EXPANDED_API_KEY or WOS_STARTER_API_KEY",
+        expect_json=True,
     )
 @
 
@@ -4769,12 +5146,15 @@ def search(
     filters: SearchFilters | None = None,
 ) -> list[Paper]:
     """Search Web of Science for papers matching the query."""
+    self.last_error = None
     cache_key = (query, limit, filters.cache_key() if filters else "")
     if cache_key in self._cache:
         return self._cache[cache_key]
     papers, cacheable = self._search_uncached(query, limit, filters)
     if cacheable:
         self._cache[cache_key] = papers
+    else:
+        self.last_error = SEARCH_CUT_SHORT
     return papers
 
 def _search_uncached(
@@ -6817,12 +7197,15 @@ def search(
     Automatically fetches multiple pages if the requested limit exceeds
     the API's per-request maximum (200 results per page).
     """
+    self.last_error = None
     cache_key = (query, limit, filters.cache_key() if filters else "")
     if cache_key in self._cache:
         return self._cache[cache_key]
     papers, cacheable = self._search_uncached(query, limit, filters)
     if cacheable:
         self._cache[cache_key] = papers
+    else:
+        self.last_error = SEARCH_CUT_SHORT
     return papers
 
 def _search_uncached(
@@ -7022,7 +7405,10 @@ at [[IEEE_API_KEY]].
             timeout=30,
         )
         return classify_check_response(
-            response, authenticated=True, key_hint="IEEE_API_KEY"
+            response,
+            authenticated=True,
+            key_hint="IEEE_API_KEY",
+            expect_json=True,
         )
 @
 
@@ -7756,6 +8142,7 @@ class ArxivProvider:
         Only caches successful results. Failed requests are not cached,
         allowing immediate retry.
         """
+        self.last_error = None
         # Check cache first
         cache_key = (query, limit, filters.cache_key() if filters else "")
         if cache_key in self._cache:
@@ -7911,9 +8298,11 @@ for attempt in range(self.MAX_RETRIES):
     except Exception as e:
         # Non-retryable error
         logger.warning("arxiv: %s", e)
+        self.last_error = str(e) or type(e).__name__
         return []
 
 # All retries exhausted
+self.last_error = f"{last_exception} (after {self.MAX_RETRIES} attempts)"
 return []
 @
 
@@ -8187,6 +8576,7 @@ class TestArxivProvider:
         with patch.object(provider._client, "results", side_effect=Exception("API error")):
             results1 = provider.search("test query")
             assert results1 == []
+            assert provider.last_error == "API error"
 
         # Create mock success result
         mock_result = Mock()
@@ -8204,6 +8594,7 @@ class TestArxivProvider:
             results2 = provider.search("test query")
             assert len(results2) == 1
             assert results2[0].title == "Success Paper"
+            assert provider.last_error is None
 
     def test_handles_missing_fields(self):
         """search() handles results with missing optional fields."""
@@ -8819,19 +9210,22 @@ def search(
     Automatically fetches multiple pages if the requested limit
     exceeds the page size.
     """
+    self.last_error = None
     cache_key = (query, limit, filters.cache_key() if filters else "")
     if cache_key in self._cache:
         return self._cache[cache_key]
 
     try:
         papers = self._fetch_pages(query, limit, filters)
-    except RateLimited:
+    except RateLimited as e:
         # The limiter already logged the reason once; do not cache.
+        self.last_error = str(e)
         return []
     except Exception as e:
         # Rejected query or transient failure: return empty but do NOT
         # cache, so a later (possibly corrected) call gets a fresh answer.
         logger.warning("hal: %s", e)
+        self.last_error = str(e) or type(e).__name__
         return []
 
     self._cache[cache_key] = papers
@@ -9015,7 +9409,10 @@ One row, minimal field list, no retries: for a health probe the first
 answer \emph{is} the diagnosis.
 The probe additionally maps HAL's 200-with-[[error]]-body to an HTTP
 error status---without that, HAL's most characteristic failure mode
-would report as healthy.
+would report as healthy.  A body that is not JSON at all is left to the
+classifier's [[expect_json]], so it is reported in the same words as
+for every other provider, with the content type that tells an HTML
+error page from a truncated answer.
 
 <<hal check method>>=
 def check(self) -> tuple[str, str]:
@@ -9034,8 +9431,10 @@ def check(self) -> tuple[str, str]:
                     "query rejected (error body in HTTP 200)",
                 )
         except ValueError:
-            return HEALTH_HTTP_ERROR, "non-JSON response"
-    return classify_check_response(response, authenticated=False)
+            pass
+    return classify_check_response(
+        response, authenticated=False, expect_json=True
+    )
 @
 
 \subsubsection{Converting HAL documents}
@@ -9489,6 +9888,22 @@ query alone, try again later, and if it lasts, give Elsevier's support
 the request id they ask for.
 
 <<scopus helpers>>=
+def scopus_result_entries(search_results: dict) -> list[dict]:
+    """The paper entries of a Scopus `search-results` object.
+
+    Drops the placeholder Scopus sends for an empty result set
+    (an entry with an `error` field, e.g. "Result set was empty", and
+    `@_fa` "true" or "false").
+    """
+    return [
+        entry
+        for entry in ensure_list(search_results.get("entry", []))
+        if isinstance(entry, dict)
+        and "error" not in entry
+        and entry.get("@_fa") != "false"
+    ]
+
+
 SCOPUS_UNTRANSLATABLE = "Error translating query"
 SCOPUS_SEARCH_REFUSED_HINT = (
     "Scopus answered HTTP 400 'Error translating query'{reqid}. When "
@@ -9676,9 +10091,32 @@ Authentication uses HTTP headers rather than query parameters---the
 carries the optional institutional token.
 
 The pagination loop uses 0-indexed [[start]] and [[count]] parameters.
-Scopus signals empty results by returning an entry with
-[[@_fa]] set to [["false"]] rather than an empty array, so we check
-for this sentinel.
+Scopus does not signal an empty result set with an empty array: it
+returns a single placeholder entry.  We used to recognise it by [[@_fa]]
+set to [["false"]], which is what our test fixture said, but the live
+service sends something else.  A search that matches nothing returned,
+on 2026-10-11,
+
+\begin{verbatim}
+"opensearch:totalResults": "0", ...
+"entry": [{"@_fa": "true", "error": "Result set was empty"}]
+\end{verbatim}
+
+\noindent so the check let the placeholder through and
+[[_convert_entry]] made an empty paper of it.  The search then printed
+\enquote{Results: 1}, and the empty record went into the session, into
+classification and into the exported hit lists, where someone had to
+notice it and delete it by hand
+(\url{https://github.com/dbosk/scholar/issues/106}).
+
+[[scopus_result_entries]] therefore drops any entry that carries an
+[[error]] field---whatever its [[@_fa]] says---as well as the
+[[@_fa = "false"]] form, and the loop stops at once when
+[[opensearch:totalResults]] is present and 0 (a response without it is
+paged by its entries, as before).  Either check alone would catch the
+response above; together they also hold if Elsevier changes one of the
+two.  The empty answer is a genuine zero, not a failure: it is returned
+as [[[]]] with [[last_error]] unset, and cached.
 
 Scopus enforces a request rate (9 per second for the Search API) and
 \emph{weekly} quotas per API key.
@@ -9745,6 +10183,7 @@ class ScopusProvider:
         Fetches multiple pages when the requested limit
         exceeds the per-request maximum of 25 results.
         """
+        self.last_error = None
         standard_key = (
             query,
             limit,
@@ -9773,6 +10212,7 @@ class ScopusProvider:
         a partial or empty result into the cache.
         """
         if not self.api_key:
+            self.last_error = "SCOPUS_API_KEY not set"
             return [], False
 
         logger.debug(
@@ -9804,26 +10244,16 @@ class ScopusProvider:
                 data = response.json()
 
                 results = data.get("search-results", {})
-                entries = results.get("entry", [])
-
-                if not entries or (
-                    len(entries) == 1
-                    and entries[0].get("@_fa") == "false"
-                ):
+                declared = results.get("opensearch:totalResults")
+                total = int(declared or 0)
+                entries = scopus_result_entries(results)
+                if (declared is not None and total == 0) or not entries:
                     break
 
                 all_papers.extend(
-                    self._convert_entry(entry)
-                    for entry in entries
-                    if entry.get("@_fa") != "false"
+                    self._convert_entry(entry) for entry in entries
                 )
                 start += len(entries)
-
-                total = int(
-                    results.get(
-                        "opensearch:totalResults", 0
-                    )
-                )
                 if start >= total:
                     break
 
@@ -9832,13 +10262,17 @@ class ScopusProvider:
                 len(all_papers),
             )
             return all_papers, True
-        except RateLimited:
+        except RateLimited as e:
             # The limiter already logged the reason once
+            self.last_error = str(e)
             return all_papers, False
-        except requests.exceptions.HTTPError:
+        except requests.exceptions.HTTPError as e:
+            status = getattr(e.response, "status_code", None)
+            self.last_error = f"HTTP {status}" if status else str(e)
             return all_papers, False
         except Exception as e:
             logger.warning("scopus: %s", e)
+            self.last_error = str(e) or type(e).__name__
             return all_papers, False
 @
 
@@ -10299,8 +10733,8 @@ fail to parse.
             )
             if response.status_code != 200:
                 return None
-            entries = response.json().get("search-results", {}).get(
-                "entry", []
+            entries = scopus_result_entries(
+                response.json().get("search-results", {})
             )
         except RateLimited:
             return None
@@ -10308,7 +10742,7 @@ fail to parse.
             logger.warning("scopus: DOI lookup failed for %s: %s", doi, e)
             return None
         for entry in entries:
-            if entry.get("@_fa") != "false" and entry.get("dc:title"):
+            if entry.get("dc:title"):
                 return self._convert_entry(entry)
         return None
 @
@@ -10359,6 +10793,8 @@ it used to bypass: its requests are now counted and its quota headers
 recorded like any others.
 [[check_provider]] asks the limiter before it probes, so a refusal here
 is a rare race, but it must surface as a status, not as a traceback.
+Like the DBLP probe, it insists on a JSON body (\cref{sec:provider-health}):
+a gateway or challenge page served with HTTP 200 is not a working search.
 
 <<scopus provider>>=
 
@@ -10380,7 +10816,8 @@ is a rare race, but it must surface as a status, not as a traceback.
                 "institution's network or set SCOPUS_INST_TOKEN"
             )
         status, message = classify_check_response(
-            response, authenticated=True, key_hint="SCOPUS_API_KEY"
+            response, authenticated=True, key_hint="SCOPUS_API_KEY",
+            expect_json=True,
         )
         if status == HEALTH_OK and not message:
             message = (
@@ -10808,6 +11245,63 @@ class TestScopusProvider:
             )
 
         assert papers == []
+
+    def test_live_empty_result_shape_is_zero_papers(self):
+        """The placeholder Scopus really sends is not a paper (#106).
+
+        Live responses mark the placeholder `@_fa: "true"`, which the old
+        check let through as one empty paper ("Results: 1").
+        """
+        provider = ScopusProvider(api_key="test_key", view="standard")
+
+        response = Mock(status_code=200, ok=True, headers={}, text="")
+        response.json.return_value = {"search-results": {
+            "opensearch:totalResults": "0",
+            "opensearch:startIndex": "0",
+            "opensearch:itemsPerPage": "0",
+            "entry": [{"@_fa": "true", "error": "Result set was empty"}],
+        }}
+
+        with patch("requests.get", return_value=response) as mock_get:
+            assert provider.search("zqxjvwk plorbnatz", limit=5) == []
+            assert provider.last_error is None
+            assert provider.search("zqxjvwk plorbnatz", limit=5) == []
+            assert mock_get.call_count == 1  # a genuine zero is cached
+
+    def test_zero_total_stops_before_converting(self):
+        """totalResults 0 means no papers, whatever the entries say."""
+        assert scopus_result_entries({"entry": [
+            {"@_fa": "true", "error": "Result set was empty"},
+        ]}) == []
+        assert scopus_result_entries({}) == []
+        provider = ScopusProvider(api_key="test_key", view="standard")
+        response = Mock(status_code=200, ok=True, headers={}, text="")
+        response.json.return_value = {"search-results": {
+            "opensearch:totalResults": "0",
+            "entry": [{"@_fa": "true", "dc:title": ""}],
+        }}
+        with patch("requests.get", return_value=response):
+            assert provider.search("q", limit=5) == []
+
+    def test_server_error_recorded_and_not_cached(self):
+        """An HTTP 500 is a recorded failure, and the next call asks again."""
+        provider = ScopusProvider(api_key="test_key", view="standard")
+
+        failed = Mock(status_code=500, ok=False, headers={}, text="oops")
+        failed.raise_for_status.side_effect = requests.HTTPError(
+            response=failed
+        )
+        answered = Mock(status_code=200, ok=True, headers={}, text="")
+        answered.json.return_value = {"search-results": {
+            "opensearch:totalResults": "1",
+            "entry": [{"dc:title": "T", "dc:creator": "Fares E."}],
+        }}
+
+        with patch("requests.get", side_effect=[failed, answered]):
+            assert provider.search("q", limit=5) == []
+            assert provider.last_error == "HTTP 500"
+            assert len(provider.search("q", limit=5)) == 1
+            assert provider.last_error is None
 @
 
 <<test functions>>=
