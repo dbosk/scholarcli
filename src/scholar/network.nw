@@ -1,0 +1,733 @@
+\chapter{Network route and identity}
+\label{ch:network}
+
+Every request scholar makes leaves the machine by some route and under
+some name.
+Both used to be accidental.
+The route was whatever [[requests]] made of the environment: it honours
+[[HTTPS_PROXY]], so a user who needed a campus address---for a
+subscription that a publisher grants by IP, or for the Scopus view that
+Elsevier serves only to the subscribing network (\cref{sec:scopus-view})
+---could route scholar through an SSH tunnel by exporting that variable.
+But nothing documented it, nothing reported whether it had taken effect,
+and a typo in the variable name fell back to the direct route without a
+word.
+The name was [[python-requests/2.x]], the library's default, except
+where a provider had added its own; and publishers turn that name away.
+Through a working campus tunnel, Springer refused [[python-requests]]
+while serving the same PDF to [[curl]].
+
+This chapter makes both settings explicit, in one module that every
+outgoing request consults:
+\begin{description}
+\item[The route] A proxy given by the global [[--proxy URL]] option or the
+  [[SCHOLAR_PROXY]] variable, applied to every request; when neither is
+  set, [[requests]]' own handling of [[HTTP(S)_PROXY]] applies as before.
+  [[scholar providers check]] states the route, and can ask a third party
+  for the exit address.
+\item[The identity] A User-Agent that names scholar, its version and
+  its home page: [[scholar/1.27 (+https://github.com/dbosk/scholar)]].
+  [[SCHOLAR_USER_AGENT]] overrides it.
+\end{description}
+
+What the identity is \emph{not} is a disguise.
+A browser-like User-Agent would not even help: in the same experiment,
+Springer answered a browser string with a \enquote{Client Challenge}
+page, and the large publishers (Elsevier, Wiley, Taylor~\&~Francis,
+ACM, \dots) put every script behind Cloudflare or a login page whatever
+it calls itself.
+Those checks are the publisher saying no.
+Scholar treats them as a stopping point---the PDF is not available to
+this client---and does not try to get around them, neither here nor in
+the PDF module (\cref{pdf-module}).
+An honest name is what lets the services that do welcome tools
+(OpenAlex's and Crossref's polite pools, the small publishers and
+repositories) tell scholar apart from abuse.
+
+
+\section{Design overview}
+
+The module has three parts:
+\begin{description}
+\item[Settings] [[proxy_url()]] and [[user_agent()]] answer \enquote{which
+  route?} and \enquote{which name?} from the CLI option and the
+  environment, at the moment of each request.
+  Reading late matters: the providers register themselves, and create
+  their sessions, when [[scholar.providers]] is imported---long before
+  the CLI has parsed [[--proxy]].
+\item[Application] Three ways for the settings to reach a request:
+  [[get()]] for the one-off [[requests.get]] calls most providers make,
+  [[ScholarSession]] (via [[new_session()]]) for code that keeps a
+  session, and [[configure_pyalex()]] plus a session handed to the
+  [[arxiv]] client for the two libraries that make requests for us.
+\item[Reporting] [[describe_route()]] and [[exit_ip()]] for
+  [[scholar providers check]].
+\end{description}
+
+[[get()]] is a thin wrapper that still calls [[requests.get]].
+That keeps every existing test that patches [[requests.get]] working
+unchanged, and it means a provider's request code changes by one name.
+
+<<[[network.py]]>>=
+"""
+Network route and identity for every outgoing scholar request.
+
+The route is a proxy from `--proxy` or `SCHOLAR_PROXY` (otherwise
+requests' own `HTTP(S)_PROXY` handling); the identity is a User-Agent
+naming scholar, overridable by `SCHOLAR_USER_AGENT`.  Use `get()` for
+single requests and `new_session()` for sessions; `configure_pyalex()`
+hands the settings to pyalex.
+"""
+
+<<imports>>
+<<constants>>
+<<proxy settings>>
+<<user agent>>
+<<applying the settings>>
+<<library configuration>>
+<<route reporting>>
+@
+
+
+\section{Testing}
+
+Tests appear after the code they verify.
+The autouse [[isolate_cache]] fixture (\cref{sec:test-configuration})
+unsets [[SCHOLAR_PROXY]], [[SCHOLAR_USER_AGENT]] and the standard proxy
+variables, so every test starts from the direct route and the default
+name; a test that needs a setting sets it.
+The CLI option lives in module state, which the fixture below clears.
+
+<<test [[network.py]]>>=
+"""Tests for the network module."""
+from unittest.mock import Mock, patch
+
+import pytest
+import requests
+
+import scholar.network as network
+from scholar.network import *
+
+
+@pytest.fixture(autouse=True)
+def no_cli_proxy(monkeypatch):
+    """Start every test without a `--proxy` option."""
+    monkeypatch.setattr(network, "_cli_proxy", None)
+
+
+<<test functions>>
+@
+
+
+\section{The route}
+
+\subsection{Where the proxy comes from}
+
+The CLI option wins over the variable, as options do: [[--proxy]] is the
+more specific, more deliberate setting.
+The option is stored by [[set_proxy]], which the CLI's global callback
+calls on every invocation (with [[None]] when the option is absent), so
+the module state never outlives the command that set it.
+Each answer records its source, because the route report names it: a
+user who exported [[SCHOLAR_PROXY]] last week and forgot should be told
+where the proxy came from.
+
+<<proxy settings>>=
+_cli_proxy: str | None = None
+
+
+def set_proxy(url: str | None) -> None:
+    """Set (or clear, with `None`) the proxy given by `--proxy`.
+
+    Raises `ProxyConfigError` if the URL is unusable.
+    """
+    global _cli_proxy
+    if url is not None:
+        validate_proxy(url)
+    _cli_proxy = url
+
+
+def configured_proxy() -> tuple[str, str] | None:
+    """Return scholar's own proxy setting as `(url, source)`, or `None`.
+
+    The `--proxy` option wins over `SCHOLAR_PROXY`; requests' standard
+    variables are not consulted here.
+    """
+    if _cli_proxy:
+        return _cli_proxy, "--proxy"
+    value = os.environ.get(PROXY_VAR, "").strip()
+    if value:
+        return value, PROXY_VAR
+    return None
+
+
+def proxy_url() -> str | None:
+    """Return the proxy URL scholar applies to its requests, or `None`."""
+    configured = configured_proxy()
+    return configured[0] if configured else None
+<<constants>>=
+PROXY_VAR = "SCHOLAR_PROXY"
+@
+
+\subsection{Validating a proxy URL}
+
+A proxy URL that cannot work should fail the command, not each request.
+Requests fail silently in scholar---every provider turns an error into
+an empty result---so a malformed proxy would look exactly like
+\enquote{no papers found}, the very silence this chapter set out to end.
+We therefore check the URL up front, and the CLI turns a
+[[ProxyConfigError]] into a usage error before any provider runs.
+
+Three things can be wrong.
+The scheme must be one [[requests]] can speak: [[http]] or [[https]]
+for an HTTP proxy, [[socks4]], [[socks4a]], [[socks5]] or [[socks5h]] for
+SOCKS.
+The URL must name a host.
+And a SOCKS proxy needs the PySocks package, which [[requests]] imports
+only when the first request goes out---so without this check, the
+missing package would surface as one swallowed error per provider.
+
+The difference between [[socks5h]] and [[socks5]] is where host names
+are resolved.
+With [[socks5h]] the proxy resolves them, so the DNS lookup happens on
+the far side of the tunnel---which is what a campus tunnel needs, both
+for privacy and because some institutional host names resolve only
+inside the network.
+With [[socks5]] the local machine resolves them and sends the proxy an
+address.
+We accept both, since both are legitimate, but recommend [[socks5h]] in
+the documentation.
+
+<<proxy settings>>=
+class ProxyConfigError(ValueError):
+    """A configured proxy URL cannot be used."""
+
+
+def validate_proxy(url: str) -> str:
+    """Return `url` if it is a usable proxy URL; raise otherwise.
+
+    Raises `ProxyConfigError` for an unknown scheme, a missing host, or a
+    SOCKS proxy without the PySocks package installed.
+    """
+    parts = urlsplit(url)
+    scheme = parts.scheme.lower()
+    if scheme not in PROXY_SCHEMES:
+        raise ProxyConfigError(
+            f"unsupported proxy scheme in {redact_proxy(url)!r}; use one of "
+            + ", ".join(f"{s}://" for s in PROXY_SCHEMES)
+        )
+    if not parts.hostname:
+        raise ProxyConfigError(f"no host in proxy URL {redact_proxy(url)!r}")
+    if scheme.startswith("socks") and not socks_supported():
+        raise ProxyConfigError(
+            f"{scheme}:// proxies need the PySocks package: "
+            "pip install PySocks (with pipx: pipx inject scholarcli PySocks)"
+        )
+    return url
+
+
+def socks_supported() -> bool:
+    """Whether PySocks, which requests needs for SOCKS, is installed."""
+    return importlib.util.find_spec("socks") is not None
+<<constants>>=
+PROXY_SCHEMES = ("http", "https", "socks4", "socks4a", "socks5", "socks5h")
+@
+
+A proxy URL may carry credentials ([[socks5h://user:secret@host:1080]]).
+Everything we print---the route report, error messages---goes through
+[[redact_proxy]], which keeps the scheme, host and port and drops the
+rest.
+
+<<proxy settings>>=
+def redact_proxy(url: str) -> str:
+    """Return `url` without credentials: `scheme://host:port`."""
+    parts = urlsplit(url)
+    host = parts.hostname or ""
+    if ":" in host:
+        host = f"[{host}]"
+    try:
+        port = parts.port
+    except ValueError:
+        port = None
+    netloc = f"{host}:{port}" if port else host
+    return urlunsplit((parts.scheme, netloc, "", "", ""))
+@
+
+Let's verify the precedence, the validation and the redaction.
+
+<<test functions>>=
+class TestProxySettings:
+    """Where the proxy comes from, and which URLs are usable."""
+
+    def test_direct_by_default(self):
+        assert proxy_url() is None
+        assert configured_proxy() is None
+
+    def test_variable_is_used(self, monkeypatch):
+        monkeypatch.setenv("SCHOLAR_PROXY", "http://proxy:3128")
+        assert configured_proxy() == ("http://proxy:3128", "SCHOLAR_PROXY")
+
+    def test_option_wins_over_variable(self, monkeypatch):
+        monkeypatch.setenv("SCHOLAR_PROXY", "http://proxy:3128")
+        set_proxy("http://other:8080")
+        assert configured_proxy() == ("http://other:8080", "--proxy")
+        set_proxy(None)
+        assert proxy_url() == "http://proxy:3128"
+
+    def test_rejects_unknown_scheme(self):
+        with pytest.raises(ProxyConfigError, match="scheme"):
+            validate_proxy("ftp://proxy:21")
+
+    def test_rejects_missing_host(self):
+        with pytest.raises(ProxyConfigError, match="host"):
+            validate_proxy("socks5h://:1080")
+
+    def test_socks_needs_pysocks(self, monkeypatch):
+        monkeypatch.setattr(network, "socks_supported", lambda: False)
+        with pytest.raises(ProxyConfigError, match="PySocks"):
+            validate_proxy("socks5h://127.0.0.1:1081")
+
+    def test_socks_accepted_with_pysocks(self, monkeypatch):
+        monkeypatch.setattr(network, "socks_supported", lambda: True)
+        url = "socks5h://127.0.0.1:1081"
+        assert validate_proxy(url) == url
+
+    def test_redaction_drops_credentials(self):
+        assert (
+            redact_proxy("socks5h://me:secret@127.0.0.1:1081")
+            == "socks5h://127.0.0.1:1081"
+        )
+        assert "secret" not in redact_proxy("http://me:secret@proxy")
+@
+
+
+\section{The identity}
+
+The default User-Agent names the tool, its version and where to read
+about it.
+It deliberately carries no contact address, although the polite-pool
+convention suggests one.
+The User-Agent goes with \emph{every} request, so an address in it
+would reach every host scholar contacts, a publisher's server during a
+PDF download included, and the services that want an address already
+get [[SCHOLAR_EMAIL]] through their own channel: OpenAlex and Crossref
+as the [[mailto]] parameter of their polite pools, Unpaywall as its
+mandatory [[email]] parameter (\cref{sec:contact-email}).
+Keeping the address out of the User-Agent therefore costs those
+services nothing and tells everyone else nothing.
+A user who does want it everywhere can set [[SCHOLAR_USER_AGENT]].
+
+The version comes from the installed distribution's metadata (the
+package is published as [[scholarcli]]); a source tree that was never
+installed reports [[unknown]] rather than failing.
+
+<<user agent>>=
+def scholar_version() -> str:
+    """Return the installed scholar version, or `"unknown"`."""
+    try:
+        return importlib.metadata.version(DISTRIBUTION_NAME)
+    except importlib.metadata.PackageNotFoundError:
+        return "unknown"
+
+
+def default_user_agent() -> str:
+    """Return scholar's own User-Agent: name, version and home page."""
+    return f"scholar/{scholar_version()} (+{PROJECT_URL})"
+
+
+def user_agent() -> str:
+    """Return the User-Agent for scholar's requests.
+
+    `SCHOLAR_USER_AGENT` overrides the default.
+    """
+    return os.environ.get(USER_AGENT_VAR, "").strip() or default_user_agent()
+<<constants>>=
+USER_AGENT_VAR = "SCHOLAR_USER_AGENT"
+DISTRIBUTION_NAME = "scholarcli"
+PROJECT_URL = "https://github.com/dbosk/scholar"
+@
+
+<<test functions>>=
+class TestUserAgent:
+    """The name scholar's requests go out under."""
+
+    def test_default_names_scholar_and_project(self):
+        agent = user_agent()
+        assert agent.startswith("scholar/")
+        assert "+https://github.com/dbosk/scholar" in agent
+        assert "python-requests" not in agent
+        assert "mailto" not in agent
+
+    def test_contact_address_is_never_included(self, monkeypatch):
+        monkeypatch.setenv("SCHOLAR_EMAIL", "me@example.org")
+        assert "me@example.org" not in user_agent()
+
+    def test_override(self, monkeypatch):
+        monkeypatch.setenv("SCHOLAR_USER_AGENT", "my-review-bot/1.0")
+        assert user_agent() == "my-review-bot/1.0"
+@
+
+
+\section{Applying the settings}
+
+\subsection{Per-request options}
+
+[[request_options]] is the one place the two settings meet a request.
+It adds the User-Agent unless the caller set one---DBLP and arXiv
+identify themselves on their own terms, and a caller that names itself
+deliberately should be believed---and it adds the proxy as the
+request's own [[proxies]] argument.
+
+The per-request argument is not a matter of style.
+[[requests]] lets the environment's proxy variables \emph{override} a
+session's [[proxies]] attribute (the environment is merged into the
+request before the session's defaults), so a session configured with
+[[--proxy]] would quietly obey a stale [[HTTPS_PROXY]] instead.
+Only a proxy passed with the request itself beats the environment.
+When scholar has no proxy of its own we pass none, and the environment
+applies exactly as it did before this module existed.
+
+<<applying the settings>>=
+def request_options(options: dict) -> dict:
+    """Return request keyword arguments with scholar's identity and route.
+
+    Adds the User-Agent unless `options` already sets one, and the
+    configured proxy (if any) unless `options` already gives `proxies`.
+    """
+    options = dict(options)
+    headers = dict(options.get("headers") or {})
+    if not any(name.lower() == "user-agent" for name in headers):
+        headers["User-Agent"] = user_agent()
+    options["headers"] = headers
+    proxy = proxy_url()
+    if proxy and "proxies" not in options:
+        options["proxies"] = {"http": proxy, "https": proxy}
+    return options
+@
+
+\subsection{One-off requests}
+
+<<applying the settings>>=
+def get(url: str, **kwargs) -> requests.Response:
+    """`requests.get` with scholar's User-Agent and proxy applied."""
+    return requests.get(url, **request_options(kwargs))
+@
+
+\subsection{Sessions}
+
+A session subclass applies the same options to every request it sends,
+whichever method sends it.
+Overriding [[request]] rather than [[get]] catches them all, since every
+verb method of [[requests.Session]] delegates to it.
+[[new_session]] adds the retry policy the callers mount today, for both
+schemes, so moving a client onto it changes nothing else about how it
+retries.
+
+<<applying the settings>>=
+class ScholarSession(requests.Session):
+    """A `requests.Session` that applies scholar's identity and route."""
+
+    def request(self, method, url, *args, **kwargs):
+        return super().request(method, url, *args, **request_options(kwargs))
+
+
+def new_session(retry: Retry | None = None) -> ScholarSession:
+    """Return a `ScholarSession`, mounting `retry` for HTTP and HTTPS."""
+    session = ScholarSession()
+    if retry is not None:
+        adapter = HTTPAdapter(max_retries=retry)
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+    return session
+@
+
+Let's verify that both paths carry the settings, that a caller's own
+User-Agent survives, and---the property the per-request argument exists
+for---that scholar's proxy beats a proxy in the environment.
+The session test stops at [[send]], after [[requests]] has merged the
+environment in, so it sees exactly what would go on the wire.
+
+<<test functions>>=
+class TestApplyingSettings:
+    """Requests carry the identity and route."""
+
+    def test_get_adds_user_agent_and_no_proxy_by_default(self):
+        with patch("requests.get") as get_:
+            network.get("https://example.org", params={"q": 1})
+        kwargs = get_.call_args.kwargs
+        assert kwargs["headers"]["User-Agent"] == user_agent()
+        assert kwargs["params"] == {"q": 1}
+        assert "proxies" not in kwargs
+
+    def test_get_routes_through_the_proxy(self, monkeypatch):
+        monkeypatch.setenv("SCHOLAR_PROXY", "http://proxy:3128")
+        with patch("requests.get") as get_:
+            network.get("https://example.org")
+        assert get_.call_args.kwargs["proxies"] == {
+            "http": "http://proxy:3128", "https": "http://proxy:3128",
+        }
+
+    def test_callers_user_agent_is_kept(self):
+        options = request_options({"headers": {"user-agent": "arxiv.py"}})
+        assert options["headers"] == {"user-agent": "arxiv.py"}
+
+    def test_session_proxy_beats_the_environment(self, monkeypatch):
+        monkeypatch.setenv("HTTPS_PROXY", "http://stale:9999")
+        monkeypatch.setenv("SCHOLAR_PROXY", "http://proxy:3128")
+        with patch.object(requests.Session, "send") as send:
+            new_session().get("https://example.org")
+        prepared = send.call_args.args[0]
+        assert prepared.headers["User-Agent"] == user_agent()
+        assert send.call_args.kwargs["proxies"]["https"] == (
+            "http://proxy:3128"
+        )
+
+    def test_environment_proxy_applies_without_our_own(self, monkeypatch):
+        monkeypatch.setenv("HTTPS_PROXY", "http://corporate:8080")
+        with patch.object(requests.Session, "send") as send:
+            new_session().get("https://example.org")
+        assert send.call_args.kwargs["proxies"]["https"] == (
+            "http://corporate:8080"
+        )
+
+    def test_new_session_mounts_the_retry_policy(self):
+        retry = Retry(total=3)
+        session = new_session(retry)
+        adapter = session.get_adapter("https://example.org")
+        assert adapter.max_retries.total == 3
+@
+
+
+\section{Libraries that make their own requests}
+
+Two providers talk to their APIs through client libraries, and each
+needs the settings handed over in its own way.
+
+The [[arxiv]] client keeps one [[requests.Session]] in its [[_session]]
+attribute, so the arXiv provider simply gives it a [[ScholarSession]]
+(\cref{sec:arxiv}).
+The client sends its own User-Agent ([[arxiv.py/...]]) with each
+request, which [[request_options]] respects; that name is honest and
+identifies the library, and the route is what matters there.
+
+[[pyalex]] is less accommodating.
+It takes the User-Agent from its configuration, which we set, but it
+creates a fresh session for every query through a module-level factory,
+[[pyalex.api._get_requests_session]], and offers no proxy setting.
+We wrap that factory: the wrapper lets [[pyalex]] build its session
+(with its own retry policy), then moves the mounted adapters onto a
+[[ScholarSession]].
+The factory is private to [[pyalex]], so a release may rename it.
+In that case the wrapper cannot be installed and OpenAlex would go
+direct while everything else used the proxy; that is worth a warning,
+and the warning is given only when a proxy is actually configured,
+because without one nothing is lost.
+The wrapper is installed once; [[OpenAlexProvider]] calls
+[[configure_pyalex]] whenever it is constructed, which also refreshes the
+User-Agent.
+[[pyalex]] is imported inside the function, so that the modules needing
+only [[get]] or [[new_session]] (Crossref, Unpaywall, the PDF module)
+do not load it.
+
+<<library configuration>>=
+def configure_pyalex() -> None:
+    """Hand scholar's identity and route to pyalex."""
+    import pyalex
+    import pyalex.api
+
+    pyalex.config.user_agent = user_agent()
+    factory = getattr(pyalex.api, "_get_requests_session", None)
+    if factory is None:
+        if proxy_url():
+            logger.warning(
+                "pyalex has no session factory to wrap; OpenAlex requests "
+                "will not use the configured proxy"
+            )
+        return
+    if getattr(factory, "_scholar_wrapped", False):
+        return
+
+    def scholar_session():
+        session = new_session()
+        for prefix, adapter in factory().adapters.items():
+            session.mount(prefix, adapter)
+        return session
+
+    scholar_session._scholar_wrapped = True
+    pyalex.api._get_requests_session = scholar_session
+@
+
+<<test functions>>=
+def test_pyalex_sessions_carry_the_settings():
+    """pyalex builds ScholarSessions with its own retry policy."""
+    import pyalex
+    import pyalex.api
+
+    configure_pyalex()
+    configure_pyalex()  # idempotent
+    session = pyalex.api._get_requests_session()
+    assert isinstance(session, ScholarSession)
+    assert session.get_adapter("https://api.openalex.org").max_retries
+    assert pyalex.config.user_agent == user_agent()
+@
+
+
+\section{Where the settings are applied}
+
+The functions above only help where they are used.
+Every client in scholar now goes through them: the providers' one-off
+requests and health probes call [[get]]; Semantic Scholar, Crossref,
+Unpaywall and the arXiv client keep [[ScholarSession]]s; OpenAlex and
+its source-pinned siblings go through [[pyalex]], configured above; the
+PDF module's resolvers and downloads call [[get]] (\cref{pdf-module}).
+The one exception is DBLP, whose request loop is being rewritten
+separately; until it moves over, DBLP keeps its own User-Agent and
+follows only the environment's proxy variables.
+The tests below pin the wiring down, so that a client that slips back
+to a bare [[requests.Session]] or [[requests.get]] is noticed.
+
+<<test functions>>=
+def test_clients_keep_scholar_sessions():
+    """Session-keeping clients hold ScholarSessions."""
+    from scholar import crossref, unpaywall
+    from scholar.providers import get_provider
+
+    assert isinstance(get_provider("s2")._session, ScholarSession)
+    assert isinstance(get_provider("arxiv")._client._session, ScholarSession)
+    assert isinstance(crossref._client._session, ScholarSession)
+    assert isinstance(unpaywall._client._session, ScholarSession)
+
+
+def test_provider_requests_carry_identity_and_route(monkeypatch):
+    """A provider's one-off request goes out under scholar's settings."""
+    from scholar.providers import get_provider
+
+    monkeypatch.setenv("SCHOLAR_PROXY", "http://proxy:3128")
+    failed = Mock(ok=False, status_code=500, headers={})
+    with patch("requests.get", return_value=failed) as get_:
+        get_provider("hal").check()
+    kwargs = get_.call_args.kwargs
+    assert kwargs["headers"]["User-Agent"] == user_agent()
+    assert kwargs["proxies"]["https"] == "http://proxy:3128"
+@
+
+
+\section{Reporting the route}
+
+[[scholar providers check]] states the route once, above its table.
+Three answers are possible: scholar's own proxy (with its source),
+a proxy [[requests]] will take from the environment, or none.
+The second case is reported too, because it is the old implicit route,
+and it is exactly where a forgotten variable---or a misspelt one, which
+yields \enquote{direct}---shows up.
+For the environment we ask [[requests]] itself, for the same probe URL a
+provider would use, so [[NO_PROXY]] and the precedence among the
+variables are applied by the code that will apply them to the requests.
+A SOCKS proxy from the environment is not validated at start-up (it is
+not ours), so the report says when PySocks is missing, since every
+request would then fail.
+
+<<route reporting>>=
+def describe_route(url: str = ROUTE_PROBE_URL) -> str:
+    """Describe how a request to `url` leaves this machine.
+
+    Returns `"direct"` or `"proxy <scheme://host:port> (<source>)"`, with
+    credentials removed.
+    """
+    configured = configured_proxy()
+    if configured:
+        proxy, source = configured
+    else:
+        environment = requests.utils.get_environ_proxies(url)
+        proxy = requests.utils.select_proxy(url, environment)
+        source = "environment"
+    if not proxy:
+        return "direct"
+    description = f"proxy {redact_proxy(proxy)} ({source})"
+    if proxy.lower().startswith("socks") and not socks_supported():
+        description += " -- PySocks missing, SOCKS requests will fail"
+    return description
+<<constants>>=
+ROUTE_PROBE_URL = "https://api.openalex.org"
+@
+
+The exit address answers the question the route cannot: did the tunnel
+actually land on the campus network?
+Finding it means asking a third party, which learns our address and
+that we use scholar, so it happens only on request
+([[providers check --show-ip]]), never by default.
+The service is [[api.ipify.org]], which answers a plain GET with the
+address as text.
+
+<<route reporting>>=
+def exit_ip() -> str:
+    """Return this machine's public address as seen through the route.
+
+    Contacts a third-party service; raises `requests.RequestException`
+    on failure.
+    """
+    response = get(EXIT_IP_URL, timeout=EXIT_IP_TIMEOUT)
+    response.raise_for_status()
+    return response.text.strip()
+<<constants>>=
+EXIT_IP_URL = "https://api.ipify.org"
+EXIT_IP_TIMEOUT = 10
+@
+
+<<test functions>>=
+class TestRouteReporting:
+    """The route report and the exit-address lookup."""
+
+    def test_direct(self):
+        assert describe_route() == "direct"
+
+    def test_own_proxy_with_source_and_no_credentials(self, monkeypatch):
+        monkeypatch.setenv("SCHOLAR_PROXY", "http://me:pw@proxy:3128")
+        assert describe_route() == (
+            "proxy http://proxy:3128 (SCHOLAR_PROXY)"
+        )
+
+    def test_environment_proxy(self, monkeypatch):
+        monkeypatch.setenv("HTTPS_PROXY", "http://corporate:8080")
+        assert describe_route() == (
+            "proxy http://corporate:8080 (environment)"
+        )
+
+    def test_no_proxy_is_respected(self, monkeypatch):
+        monkeypatch.setenv("HTTPS_PROXY", "http://corporate:8080")
+        monkeypatch.setenv("NO_PROXY", "api.openalex.org")
+        assert describe_route() == "direct"
+
+    def test_missing_pysocks_is_reported(self, monkeypatch):
+        monkeypatch.setenv("ALL_PROXY", "socks5h://127.0.0.1:1081")
+        monkeypatch.setattr(network, "socks_supported", lambda: False)
+        assert "PySocks missing" in describe_route()
+
+    def test_exit_ip_goes_through_the_route(self, monkeypatch):
+        monkeypatch.setenv("SCHOLAR_PROXY", "http://proxy:3128")
+        response = Mock(text="130.237.0.1\n")
+        with patch("requests.get", return_value=response) as get_:
+            assert exit_ip() == "130.237.0.1"
+        assert get_.call_args.args[0] == EXIT_IP_URL
+        assert get_.call_args.kwargs["proxies"]["https"] == (
+            "http://proxy:3128"
+        )
+@
+
+
+\section{Dependencies}
+
+<<imports>>=
+import importlib.metadata
+import importlib.util
+import logging
+import os
+from urllib.parse import urlsplit, urlunsplit
+
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+
+logger = logging.getLogger(__name__)
+@
