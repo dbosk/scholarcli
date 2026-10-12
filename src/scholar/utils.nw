@@ -800,3 +800,452 @@ class TestContactEmail:
         monkeypatch.setenv("OPENALEX_EMAIL", "   ")
         assert contact_email("OPENALEX_EMAIL") == "generic@example.org"
 @
+
+
+\section{Writing files atomically}
+\label{sec:atomic-write}
+
+Scholar's most valuable files are its review sessions: a session is the
+audit record of a literature review, and its decisions often took hours of
+human and model work.  Writing such a file with a plain [[open(path, "w")]]
+truncates it first and fills it afterwards, so a crash, a full disk or a
+killed process in between leaves a half-written file, which the next
+command cannot read
+(\url{https://github.com/dbosk/scholar/issues/107}).  The same holds for
+exports that consist of several files (\cref{sec:sessions-export-atomic}):
+a failure half-way used to leave a new [[.csv]] next to a stale
+[[.tex]] (\url{https://github.com/dbosk/scholar/issues/83}).
+
+The standard remedy is to write the new content to a temporary file
+\emph{in the same directory} and then rename it over the target with
+[[os.replace]].  The rename is atomic on POSIX and Windows as long as both
+names are on the same file system, which is why the temporary file must sit
+next to the target rather than in [[/tmp]]: a reader sees either the old
+file or the new one, never a mixture.  Before renaming we [[fsync]] the
+temporary file, since otherwise a power loss could make the rename durable
+before the data it points to; afterwards we [[fsync]] the directory (where
+the platform allows it) so the rename itself survives.
+
+\subsection{One file, with an optional backup}
+
+[[atomic_write_text]] writes one file this way.  With [[backup=True]] it
+first copies the current file to [[<name>.bak]], keeping exactly one
+generation.  The copy is itself written to a temporary name and renamed
+into place, so the [[.bak]] is always a complete earlier version, and the
+target never disappears in between (moving the old file away and then
+moving the new one in would leave a moment with no file at all, which a
+concurrent reader would take for a missing session).  The new file takes
+over the permissions of the one it replaces; a first write gets the
+permissions an ordinary [[open]] would have given it, since [[mkstemp]]
+always creates its files private to the user.
+
+<<utils functions>>=
+import shutil
+import tempfile
+from contextlib import contextmanager
+from pathlib import Path
+from collections.abc import Iterator
+
+BACKUP_SUFFIX = ".bak"
+
+
+def backup_path(path: str | os.PathLike) -> Path:
+    """Return where `atomic_write_text(path, ..., backup=True)` keeps
+    the previous version: `path` with `.bak` appended."""
+    path = Path(path)
+    return path.with_name(path.name + BACKUP_SUFFIX)
+
+
+def atomic_write_text(
+    path: str | os.PathLike,
+    text: str,
+    *,
+    encoding: str = "utf-8",
+    backup: bool = False,
+) -> Path | None:
+    """Replace `path` with `text` so readers never see a partial file.
+
+    The text goes to a temporary file in the same directory, which is
+    flushed to disk and renamed over `path`. With `backup`, the current
+    file (if any) is first copied to `path` + `.bak`. Returns the backup
+    path when a backup was made, otherwise `None`. On error the target
+    is left as it was and the temporary file is removed.
+    """
+    path = Path(path)
+    tmp = _write_temp_beside(path, text.encode(encoding))
+    try:
+        bak = _keep_backup(path) if backup else None
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    _fsync_directory(path.parent)
+    return bak
+@
+
+The helpers below do the low-level work.  The temporary names start with a
+dot and the target's name, so a leftover from a killed process is both
+hidden and recognisable.
+
+<<utils functions>>=
+def _write_temp_beside(path: Path, data: bytes) -> Path:
+    """Write `data` to a new temporary file next to `path`, synced."""
+    fd, name = tempfile.mkstemp(
+        dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
+    )
+    tmp = Path(name)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        _copy_permissions(path, tmp)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    return tmp
+
+
+def _copy_permissions(target: Path, tmp: Path) -> None:
+    """Give `tmp` the mode of `target`, or the umask default if new."""
+    if target.exists():
+        shutil.copymode(target, tmp)
+    else:
+        umask = os.umask(0)
+        os.umask(umask)
+        os.chmod(tmp, 0o666 & ~umask)
+
+
+def _keep_backup(path: Path) -> Path | None:
+    """Copy `path` to its `.bak` atomically; `None` if there is no file."""
+    if not path.exists():
+        return None
+    bak = backup_path(path)
+    tmp = _write_temp_beside(bak, path.read_bytes())
+    try:
+        os.replace(tmp, bak)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    return bak
+
+
+def _fsync_directory(directory: Path) -> None:
+    """Make a rename in `directory` durable, where the OS supports it."""
+    try:
+        fd = os.open(directory, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+@
+
+Let's verify the contract: the content arrives, the backup holds the
+previous version and only one generation of it, the permissions of an
+existing file survive, and a failed write leaves the target untouched with
+no temporary file behind.
+
+<<test functions>>=
+class TestAtomicWriteText:
+    """Tests for atomic_write_text."""
+
+    @pytest.fixture
+    def out_dir(self, tmp_path):
+        """A directory of its own (conftest puts data dirs in tmp_path)."""
+        out = tmp_path / "out"
+        out.mkdir()
+        return out
+
+    def test_writes_new_file_without_backup(self, out_dir):
+        target = out_dir / "s.json"
+        assert atomic_write_text(target, "one", backup=True) is None
+        assert target.read_text() == "one"
+        assert not backup_path(target).exists()
+
+    def test_backup_keeps_one_previous_generation(self, out_dir):
+        target = out_dir / "s.json"
+        atomic_write_text(target, "one")
+        bak = atomic_write_text(target, "two", backup=True)
+        assert bak == out_dir / "s.json.bak"
+        assert bak.read_text() == "one"
+        atomic_write_text(target, "three", backup=True)
+        assert target.read_text() == "three"
+        assert bak.read_text() == "two"
+
+    def test_keeps_permissions_of_replaced_file(self, out_dir):
+        target = out_dir / "s.json"
+        target.write_text("old")
+        target.chmod(0o640)
+        atomic_write_text(target, "new")
+        assert target.stat().st_mode & 0o777 == 0o640
+
+    def test_failed_write_leaves_target_untouched(
+        self, out_dir, monkeypatch
+    ):
+        import scholar.utils as utils
+
+        target = out_dir / "s.json"
+        target.write_text("old")
+
+        def broken_replace(src, dst):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(utils.os, "replace", broken_replace)
+        with pytest.raises(OSError):
+            atomic_write_text(target, "new")
+        assert target.read_text() == "old"
+        assert [p.name for p in out_dir.iterdir()] == ["s.json"]
+@
+
+\subsection{Several files, all or nothing}
+
+An export that writes a [[.csv]], a [[.tex]] and a [[.bib]] must not leave
+some of them new and some old.  Renaming several files can never be one
+atomic step, but we can make the dangerous part, producing the
+content (where bugs and bad data strike), happen before anything
+is touched.  [[staged_outputs]] hands the caller an empty staging directory
+inside the target directory.  The caller's generators write their files
+there under their final names.  Only when the block finishes without an
+exception are the files synced and renamed into the target directory, one
+[[os.replace]] each.  If the block raises, the staging directory and
+everything in it is removed and the target directory is exactly as before.
+
+The staging directory sits inside the target directory for the same reason
+the temporary file does: the renames stay on one file system.  Generators
+that derive sibling names from their output path (the \LaTeX{} report
+writes [[<stem>.bib]] next to [[<stem>.tex]]) keep working unchanged, and
+any reference one file makes to another uses the bare file name, which is
+the same in both places.
+
+<<utils functions>>=
+@contextmanager
+def staged_outputs(directory: str | os.PathLike) -> Iterator[Path]:
+    """Stage files and move them into `directory` only if all succeed.
+
+    Yields a fresh staging directory inside `directory`. Write every
+    output there under its final file name. When the block completes,
+    each staged file is synced and renamed into `directory`; when it
+    raises, the staged files are discarded and `directory` is untouched.
+    """
+    directory = Path(directory)
+    staging = Path(
+        tempfile.mkdtemp(dir=directory, prefix=".scholar-staging-")
+    )
+    try:
+        yield staging
+        staged = sorted(p for p in staging.iterdir() if p.is_file())
+        for path in staged:
+            with open(path, "rb") as f:
+                os.fsync(f.fileno())
+        for path in staged:
+            os.replace(path, directory / path.name)
+        _fsync_directory(directory)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+@
+
+We check both outcomes: on success the files land under their own names and
+replace older ones; on failure the older files stay and no staging
+directory is left behind.
+
+<<test functions>>=
+class TestStagedOutputs:
+    """Tests for staged_outputs."""
+
+    @pytest.fixture
+    def out_dir(self, tmp_path):
+        """A directory of its own (conftest puts data dirs in tmp_path)."""
+        out = tmp_path / "out"
+        out.mkdir()
+        return out
+
+    def test_moves_all_files_on_success(self, out_dir):
+        (out_dir / "r.csv").write_text("old csv")
+        with staged_outputs(out_dir) as staging:
+            (staging / "r.csv").write_text("new csv")
+            (staging / "r.tex").write_text("new tex")
+        assert (out_dir / "r.csv").read_text() == "new csv"
+        assert (out_dir / "r.tex").read_text() == "new tex"
+        assert sorted(p.name for p in out_dir.iterdir()) == [
+            "r.csv", "r.tex",
+        ]
+
+    def test_failure_leaves_existing_files_untouched(self, out_dir):
+        (out_dir / "r.csv").write_text("old csv")
+        (out_dir / "r.tex").write_text("old tex")
+        with pytest.raises(RuntimeError):
+            with staged_outputs(out_dir) as staging:
+                (staging / "r.csv").write_text("new csv")
+                raise RuntimeError("latex step failed")
+        assert (out_dir / "r.csv").read_text() == "old csv"
+        assert (out_dir / "r.tex").read_text() == "old tex"
+        assert sorted(p.name for p in out_dir.iterdir()) == [
+            "r.csv", "r.tex",
+        ]
+@
+
+\subsection{One writer at a time: [[file_lock]]}
+\label{sec:file-lock}
+
+An atomic write protects the file from a crash, not from another
+process.  Saving a session or a note is a read--modify--write: re-read
+the file, merge or change it, write it back.  If two processes do that
+at once, the interleaving \emph{B reads, A replaces, B replaces} throws
+away A's change, merge or no merge, because B merged against a file
+that A replaced a moment later.  The window is short (it is a re-read
+and a serialisation, not the hours between loading a session and saving
+it, which the merge on save handles,
+\cref{sec:session-integrity}), but it is real when several agents run
+[[scholar sessions decide]] on one session in parallel.
+
+[[file_lock]] closes it: a writer holds an exclusive lock on the file
+from its re-read to its replace, so the second writer re-reads only
+after the first has written.  Three properties of the design matter.
+\begin{description}
+\item[The lock is on a separate file] [[.<name>.lock]] next to the
+  target.  Locking the target itself would protect nothing, because
+  [[os.replace]] puts a new file under the name and the next writer
+  locks that one.  The leading dot hides it, like the temporary files
+  above, and keeps it out of every [[*.json]] listing.
+\item[The operating system releases it] The
+  \href{https://py-filelock.readthedocs.io/}{[[filelock]]} package
+  locks with [[flock]] on POSIX and [[LockFileEx]] on Windows, so a
+  process that dies holding the lock frees it at once.  A lock file
+  created with [[O_EXCL]] would instead outlive a crash and need
+  stale-lock detection.  Where neither works, [[filelock]] falls back to
+  such a file itself.  None of this coordinates two machines sharing a
+  network or synchronised directory; there, the merge stays the only
+  protection.
+\item[It never blocks for long] Writers hold it for milliseconds, so
+  waiting [[LOCK_TIMEOUT]] seconds without getting it means a holder is
+  stuck (a process suspended with Ctrl-Z in mid-save, say).  Hanging
+  would then turn a stuck process into two, so we log a warning and go
+  ahead without the lock, which is what every save did before.  A
+  directory where no lock file can be created (a read-only data
+  directory) is no reason to fail either: the write that follows will
+  report the real problem.
+\end{description}
+One process can take the same lock again while it holds it (a note
+save inside a migration, say), and threads of one process exclude each
+other as processes do (the TUI migrates notes in a background thread).
+[[FileLock]] is reentrant per thread when every caller uses the
+\emph{same} object, so the locks are kept in a dictionary by path; two
+objects for one file would each count only their own holder and
+deadlock against each other.
+
+<<utils functions>>=
+import logging
+import threading
+
+from filelock import FileLock, Timeout
+
+LOCK_TIMEOUT = 10  # seconds; holders keep the lock for milliseconds
+
+_FILE_LOCKS: dict[Path, FileLock] = {}
+_FILE_LOCKS_GUARD = threading.Lock()
+
+
+def lock_path(path: str | os.PathLike) -> Path:
+    """Return the lock file `file_lock(path)` uses: `.<name>.lock`."""
+    path = Path(path)
+    return path.with_name(f".{path.name}.lock")
+
+
+@contextmanager
+def file_lock(
+    path: str | os.PathLike, timeout: float | None = None
+) -> Iterator[bool]:
+    """Hold an exclusive lock on `path` for one read-modify-write.
+
+    Yields True while the lock is held, or False if it could not be
+    taken within `timeout` seconds (default `LOCK_TIMEOUT`) or the lock
+    file cannot be created; the body then runs unlocked.
+    """
+    if timeout is None:
+        timeout = LOCK_TIMEOUT
+    target = lock_path(path).absolute()
+    with _FILE_LOCKS_GUARD:
+        lock = _FILE_LOCKS.setdefault(target, FileLock(target))
+    try:
+        lock.acquire(timeout=timeout)
+    except Timeout:
+        logging.getLogger(__name__).warning(
+            "%s is still locked after %g s; writing without the lock",
+            path, timeout,
+        )
+        yield False
+        return
+    except OSError as error:
+        logging.getLogger(__name__).debug(
+            "Cannot lock %s (%s); writing without the lock", path, error
+        )
+        yield False
+        return
+    try:
+        yield True
+    finally:
+        lock.release()
+@
+
+The tests use a second thread as the second writer.  It must wait while
+the first holds the lock and get it once the first lets go; the holder
+itself may lock again; and a holder that never lets go costs the waiter
+only the timeout and a warning.
+
+<<test functions>>=
+class TestFileLock:
+    """file_lock serialises read-modify-writes of one file."""
+
+    def test_a_second_writer_waits(self, tmp_path):
+        import threading
+
+        target = tmp_path / "s.json"
+        events = []
+
+        def second():
+            with file_lock(target):
+                events.append("second")
+
+        with file_lock(target) as locked:
+            assert locked
+            thread = threading.Thread(target=second)
+            thread.start()
+            thread.join(0.3)
+            events.append("first")
+        thread.join(5)
+        assert events == ["first", "second"]
+
+    def test_reentrant_and_hidden(self, tmp_path):
+        target = tmp_path / "s.json"
+        with file_lock(target) as outer:
+            with file_lock(target) as inner:
+                assert outer and inner
+        assert lock_path(target).name == ".s.json.lock"
+        assert not list(tmp_path.glob("*.json"))
+
+    def test_gives_up_with_a_warning(self, tmp_path, caplog):
+        import threading
+
+        target = tmp_path / "s.json"
+        holding, release = threading.Event(), threading.Event()
+
+        def holder():
+            with file_lock(target):
+                holding.set()
+                release.wait(5)
+
+        thread = threading.Thread(target=holder)
+        thread.start()
+        holding.wait(5)
+        try:
+            with file_lock(target, timeout=0.1) as locked:
+                assert not locked
+        finally:
+            release.set()
+            thread.join(5)
+        assert "writing without the lock" in caplog.text
+@

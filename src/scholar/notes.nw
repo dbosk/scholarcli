@@ -108,15 +108,19 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+import functools
 import hashlib
 import json
 import os
+import tempfile
 
 from cachetools import TTLCache, cached
 import click
 import platformdirs
 
-from scholar.utils import legacy_hash_paper_id
+from scholar.utils import (
+    atomic_write_text, file_lock, legacy_hash_paper_id,
+)
 @
 
 \subsection{Timestamp Representation}
@@ -597,13 +601,51 @@ def invalidate_notes_cache() -> None:
 def _get_cached_notes() -> dict[str, PaperNote]:
     """Load notes with short-lived cache for bulk operations."""
     return _load_all_notes()
+@
+
+\paragraph{Never treat a broken file as an empty one.}
+Every change to a note is a read--modify--write of the whole file.  The
+loader used to return an empty dictionary when the file existed but
+could not be parsed, so the next [[save_note]] wrote a file holding only
+the new note, and every other note was gone
+(\url{https://github.com/dbosk/scholar/issues/114}).  The writers made it
+worse by swallowing [[OSError]], so a failed write looked like a
+successful one.  This is the same failure class as the session file
+(\cref{sec:session-integrity}), and it gets the same remedies:
+\begin{description}
+\item[Unreadable is an error] A file that exists but cannot be read or
+  parsed raises [[NotesFileError]], which names the file.  Missing is
+  still empty: that is simply a user without notes yet.  Reading and
+  writing commands alike stop, which is the point: nothing may be
+  written over a file we could not read.  The CLI turns the error into
+  one line (\cref{sec:cli-main}).
+\item[Writes are atomic, with a backup] [[atomic_write_text]]
+  (\cref{sec:atomic-write}) replaces the file in one rename and keeps
+  the previous version as [[.bak]], so a crash mid-write cannot leave a
+  truncated file in the first place.
+\item[Write errors are reported] A failed write raises
+  [[NotesFileError]] too, instead of pretending to have saved.
+\end{description}
+The per-query decision files (\cref{sec:notes-search-decisions}) are
+handled the same way.
+
+<<paper notes functions>>=
+class NotesFileError(Exception):
+    """A notes or search-decisions file cannot be read or written."""
+
+    def __init__(self, path: Path, cause: Exception, action: str = "read"):
+        self.path = path
+        self.cause = cause
+        self.unsaved_note: Path | None = None
+        super().__init__(f"Cannot {action} notes file {path}: {cause}")
 
 
 def _load_all_notes() -> dict[str, PaperNote]:
     """
     Load all paper notes from disk.
 
-    Returns empty dict if file doesn't exist or is corrupted.
+    Returns an empty dict if the file does not exist. Raises
+    `NotesFileError` if it exists but cannot be read or parsed.
     Note: For bulk operations, prefer _get_cached_notes() to avoid
     repeated disk reads.
     """
@@ -617,24 +659,140 @@ def _load_all_notes() -> dict[str, PaperNote]:
             pid: PaperNote.from_dict(note_data)
             for pid, note_data in data.items()
         }
-    except (json.JSONDecodeError, OSError, KeyError):
-        return {}
+    except (json.JSONDecodeError, OSError, KeyError, ValueError,
+            TypeError, AttributeError) as error:
+        raise NotesFileError(notes_file, error) from error
 
 
 def _save_all_notes(notes: dict[str, PaperNote]) -> None:
     """
-    Save all paper notes to disk.
+    Save all paper notes to disk atomically, keeping a `.bak`.
+
+    Raises `NotesFileError` if the file cannot be written.
     """
     invalidate_notes_cache()  # Clear cache since notes are changing
     notes_file = get_data_dir() / NOTES_FILE
     data = {pid: note.to_dict() for pid, note in notes.items()}
     try:
-        with open(notes_file, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-    except OSError:
-        pass  # Silently fail if we can't write
+        atomic_write_text(
+            notes_file,
+            json.dumps(data, indent=2, ensure_ascii=False),
+            backup=True,
+        )
+    except OSError as error:
+        raise NotesFileError(notes_file, error, "write") from error
+@
+
+The regression test corrupts the notes file and then tries to add a note:
+the attempt must fail with the file named, and the file must be exactly
+as it was.  A write that fails must say so.
+
+<<test functions>>=
+class TestNotesFileIntegrity:
+    """A broken notes file is never read as empty or overwritten."""
+
+    def test_corrupt_notes_file_is_not_overwritten(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        invalidate_notes_cache()
+        paper = Paper(title="T", authors=["A"], doi="10.1/wp1-notes")
+        save_note(paper, "First note.")
+        notes_file = get_data_dir() / NOTES_FILE
+        truncated = notes_file.read_text()[:20]
+        notes_file.write_text(truncated)
+        invalidate_notes_cache()
+
+        other = Paper(title="U", authors=["B"], doi="10.1/wp1-notes-2")
+        with pytest.raises(NotesFileError, match="paper_notes.json"):
+            save_note(other, "Second note.")
+        assert notes_file.read_text() == truncated
+
+    def test_saves_keep_a_backup(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        invalidate_notes_cache()
+        paper = Paper(title="T", authors=["A"], doi="10.1/wp1-notes")
+        save_note(paper, "First note.")
+        save_note(paper, "Second note.")
+        backup = get_data_dir() / (NOTES_FILE + ".bak")
+        assert "First note." in backup.read_text()
+
+    def test_write_error_is_reported(self, tmp_path, monkeypatch):
+        import scholar.notes as notes
+
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        invalidate_notes_cache()
+
+        def failing_write(*args, **kwargs):
+            raise OSError("No space left on device")
+
+        monkeypatch.setattr(notes, "atomic_write_text", failing_write)
+        paper = Paper(title="T", authors=["A"], doi="10.1/wp1-notes")
+        with pytest.raises(NotesFileError, match="Cannot write"):
+            save_note(paper, "Lost?")
+@
+
+\paragraph{One writer at a time.}
+Atomic writes keep the file whole, but two processes changing notes at
+once can still lose one change: both read the file, each adds its note,
+and the second replace drops the first one's note.  Unlike a session,
+the notes file is not merged on save, so the window is the whole
+read--modify--write.  Every function that rewrites the file therefore
+runs under [[file_lock]] on it (\cref{sec:file-lock}): the second
+process reads only after the first has written.  The decorator below
+applies it, to [[get_note]] too, which rewrites the file when it moves a
+note to a paper's new DOI id.  The lock is reentrant, so a locked
+function may call another.
+
+<<paper notes functions>>=
+def _holding_notes_lock(function):
+    """Run `function` while holding the notes file's lock."""
+    @functools.wraps(function)
+    def locked(*args, **kwargs):
+        with file_lock(get_data_dir() / NOTES_FILE):
+            return function(*args, **kwargs)
+    return locked
+@
+
+The test makes the first writer slow: its read of the file starts a
+second writer in a thread and gives it time to finish.  Without the
+lock the second note is written in between and then lost; with it, the
+second writer waits and both notes are kept.
+
+<<test functions>>=
+def test_concurrent_note_saves_keep_both(tmp_path, monkeypatch):
+    import threading
+    import scholar.notes as notes
+
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+    invalidate_notes_cache()
+    first = Paper(title="T", authors=["A"], doi="10.1/lock-1")
+    second = Paper(title="U", authors=["B"], doi="10.1/lock-2")
+    load = notes._load_all_notes
+    threads = []
+
+    def slow_load():
+        loaded = load()
+        if not threads:
+            threads.append(threading.Thread(
+                target=save_note, args=(second, "Second.")
+            ))
+            threads[0].start()
+            threads[0].join(0.5)
+        return loaded
+
+    monkeypatch.setattr(notes, "_load_all_notes", slow_load)
+    save_note(first, "First.")
+    threads[0].join(5)
+    invalidate_notes_cache()
+    assert get_note(first).note == "First."
+    assert get_note(second).note == "Second."
+@
+
+<<paper notes functions>>=
 
 
+@_holding_notes_lock
 def get_note(paper: Any) -> PaperNote | None:
     """
     Get the note for a paper, if one exists.
@@ -679,6 +837,7 @@ def get_note(paper: Any) -> PaperNote | None:
     return None
 
 
+@_holding_notes_lock
 def save_note(paper: Any, note_text: str) -> PaperNote:
     """
     Save or update a note for a paper.
@@ -728,6 +887,7 @@ def save_note(paper: Any, note_text: str) -> PaperNote:
     return notes[paper_id]
 
 
+@_holding_notes_lock
 def delete_note(paper: Any) -> bool:
     """
     Delete the note for a paper.
@@ -1163,9 +1323,17 @@ class TestNotesCache:
 
 
 \section{Search Decisions Functions}
+\label{sec:notes-search-decisions}
 
 Search decisions are stored per-query, allowing us to restore the previous
 review state when repeating a search. Each query gets its own JSON file.
+Like the notes file, a decision file that exists but cannot be parsed
+raises [[NotesFileError]] rather than reading as \enquote{no previous
+decisions}, which would let the next save replace it; and it is written
+atomically with a [[.bak]].  Reading one file is a function of its own,
+[[read_search_decisions_file]], because [[migrate_paper_id]]
+(\cref{sec:notes-migrate-paper-id}) reads every file in the directory
+and must judge them by the same rule.
 
 This store predates the review session files of [[review.py]], which now
 hold the record of every review.
@@ -1185,19 +1353,32 @@ def load_search_decisions(query: str) -> SearchDecisions | None:
     
     Returns:
         SearchDecisions if found, None otherwise.
+
+    Raises:
+        NotesFileError: The file exists but cannot be read or parsed.
     """
     query_hash = get_query_hash(query)
     decisions_file = get_decisions_dir() / f"{query_hash}.json"
-    
+
     if not decisions_file.exists():
         return None
-    
+    return read_search_decisions_file(decisions_file)
+
+
+def read_search_decisions_file(decisions_file: Path) -> SearchDecisions:
+    """
+    Read one search-decisions file.
+
+    Raises:
+        NotesFileError: The file cannot be read or parsed.
+    """
     try:
         with open(decisions_file, "r", encoding="utf-8") as f:
             data = json.load(f)
         return SearchDecisions.from_dict(data)
-    except (json.JSONDecodeError, OSError, KeyError):
-        return None
+    except (json.JSONDecodeError, OSError, KeyError, ValueError,
+            TypeError, AttributeError) as error:
+        raise NotesFileError(decisions_file, error) from error
 
 
 def save_search_decisions(
@@ -1222,15 +1403,15 @@ def save_search_decisions(
     
     decisions_file = get_decisions_dir() / f"{query_hash}.json"
     try:
-        with open(decisions_file, "w", encoding="utf-8") as f:
-            json.dump(
-                search_decisions.to_dict(),
-                f,
-                indent=2,
-                ensure_ascii=False,
-            )
-    except OSError:
-        pass  # Silently fail
+        atomic_write_text(
+            decisions_file,
+            json.dumps(
+                search_decisions.to_dict(), indent=2, ensure_ascii=False
+            ),
+            backup=True,
+        )
+    except OSError as error:
+        raise NotesFileError(decisions_file, error, "write") from error
 
 
 def get_previous_decision(query: str, paper: Any) -> ReviewDecisionRecord | None:
@@ -1296,7 +1477,24 @@ def clear_all_decisions() -> int:
     return count
 @
 
+A corrupt decision file is an error, not an absent one, and stays as it
+was:
+
+<<test functions>>=
+def test_corrupt_decision_file_is_an_error(tmp_path, monkeypatch):
+    """load_search_decisions refuses a broken file instead of ignoring it."""
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+    record = ReviewDecisionRecord(status="kept", title="T")
+    save_search_decisions("wp1 query", {"doi:10.1/wp1": record})
+    path = get_decisions_dir() / f"{get_query_hash('wp1 query')}.json"
+    path.write_text("{")
+    with pytest.raises(NotesFileError, match=path.name):
+        load_search_decisions("wp1 query")
+    assert path.read_text() == "{"
+@
+
 \subsection{Migrating a paper's identity}
+\label{sec:notes-migrate-paper-id}
 
 The legacy-hash migrations above handle one identity change---a paper
 gaining a DOI---lazily, at lookup time, because the old id is always
@@ -1316,18 +1514,49 @@ simplicity wins over indexing.  In both stores an existing record
 under the new id is left alone---the new identity's own data is
 fresher than what we would migrate onto it.
 
+\paragraph{An unreadable store is reported, not raised.}
+Elsewhere an unreadable notes or decision file raises
+[[NotesFileError]] (\cref{sec:notes-search-decisions}), and here it
+used to be skipped without a word, so the migration left the paper's
+records under its old id and nobody learnt of it
+(\url{https://github.com/dbosk/scholar/issues/121}).  Raising here too
+would be consistent, but it would cost the callers more than it saves.
+The loaders raise because their callers go on to write the file they
+read, and that write would destroy what could not be parsed.
+[[migrate_paper_id]] writes only the files it could read, so skipping a
+broken one leaves it byte-identical, which is all the
+\enquote{never overwrite} rule asks for.  Its callers, on the other
+hand, have done expensive work by the time they call it:
+[[scholar enrich]] calls it after the whole enrichment run and before
+saving the session, [[create_review_session]] in the middle of
+appending a search, the TUI in an enrichment thread.  An exception
+would discard the run or the append to protect an index entry in a file
+that nothing can read anyway.  So each unreadable file, the notes file
+included, gets a WARNING that names it and both ids, which is what the
+user needs to re-key the record by hand once the file is repaired, and
+the migration carries on with the other files.  Write errors still
+raise: they mean the data directory cannot be written at all, and the
+caller's own save is about to fail the same way.
+
 <<search decisions functions>>=
+@_holding_notes_lock
 def migrate_paper_id(old_id: str, new_id: str) -> None:
     """Move any note and search decisions from `old_id` to `new_id`.
 
     Used when an entry's identity changes, e.g. when enrichment
     replaces a published paper with its preprint version. Records
     already present under `new_id` are kept and the old ones dropped.
+    A notes or decisions file that cannot be read is left untouched
+    and named in a warning; a failed write raises `NotesFileError`.
     """
     if old_id == new_id:
         return
 
-    notes = _load_all_notes()
+    try:
+        notes = _load_all_notes()
+    except NotesFileError as error:
+        _warn_not_migrated(error, old_id, new_id)
+        notes = {}
     if old_id in notes:
         note = notes.pop(old_id)
         if new_id not in notes:
@@ -1336,10 +1565,9 @@ def migrate_paper_id(old_id: str, new_id: str) -> None:
 
     for decision_file in get_decisions_dir().glob("*.json"):
         try:
-            with open(decision_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            search_decisions = SearchDecisions.from_dict(data)
-        except (json.JSONDecodeError, OSError, KeyError):
+            search_decisions = read_search_decisions_file(decision_file)
+        except NotesFileError as error:
+            _warn_not_migrated(error, old_id, new_id)
             continue
         if old_id not in search_decisions.decisions:
             continue
@@ -1349,6 +1577,18 @@ def migrate_paper_id(old_id: str, new_id: str) -> None:
         save_search_decisions(
             search_decisions.query, search_decisions.decisions
         )
+
+
+def _warn_not_migrated(error: NotesFileError, old_id: str,
+                       new_id: str) -> None:
+    logger.warning(
+        "%s; records of %s in it were not moved to %s",
+        error, old_id, new_id,
+    )
+<<notes imports>>=
+import logging
+<<notes constants>>=
+logger = logging.getLogger(__name__)
 @
 
 Let's verify both stores migrate and that existing records under the
@@ -1414,6 +1654,46 @@ class TestMigratePaperId:
     def test_same_id_is_a_no_op(self, tmp_path, monkeypatch):
         monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
         migrate_paper_id("doi:10.1/x", "doi:10.1/x")
+@
+
+An unreadable file is named in a warning and left as it was, and the
+readable files are migrated all the same.  That holds for a decision
+file and for the notes file:
+
+<<test functions>>=
+class TestMigratePaperIdUnreadableStores:
+    """migrate_paper_id reports unreadable files and carries on."""
+
+    @staticmethod
+    def readable_decision(monkeypatch, tmp_path):
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        invalidate_notes_cache()
+        record = ReviewDecisionRecord(status="kept", title="A")
+        save_search_decisions("readable", {"doi:10.1/old": record})
+
+    def test_unreadable_decision_file(self, tmp_path, monkeypatch, caplog):
+        self.readable_decision(monkeypatch, tmp_path)
+        broken = get_decisions_dir() / "broken.json"
+        broken.write_text("{")
+        with caplog.at_level("WARNING", logger="scholar.notes"):
+            migrate_paper_id("doi:10.1/old", "doi:10.1/new")
+        assert broken.read_text() == "{"
+        assert "broken.json" in caplog.text
+        assert "doi:10.1/old" in caplog.text
+        assert "doi:10.1/new" in caplog.text
+        moved = load_search_decisions("readable").decisions
+        assert list(moved) == ["doi:10.1/new"]
+
+    def test_unreadable_notes_file(self, tmp_path, monkeypatch, caplog):
+        self.readable_decision(monkeypatch, tmp_path)
+        notes_file = get_data_dir() / NOTES_FILE
+        notes_file.write_text("{")
+        with caplog.at_level("WARNING", logger="scholar.notes"):
+            migrate_paper_id("doi:10.1/old", "doi:10.1/new")
+        assert notes_file.read_text() == "{"
+        assert NOTES_FILE in caplog.text
+        moved = load_search_decisions("readable").decisions
+        assert list(moved) == ["doi:10.1/new"]
 @
 
 \subsection{Testing search decisions}
@@ -1701,8 +1981,118 @@ def edit_note_in_editor(paper: Any) -> str | None:
             delete_note(paper)
         return None
     
-    save_note(paper, result)
+    try:
+        save_note(paper, result)
+    except NotesFileError as error:
+        error.unsaved_note = keep_unsaved_note(paper, result)
+        raise
     return result
+@
+
+\paragraph{A failed save must not lose what was typed.}
+By the time [[save_note]] runs, the text exists only in [[result]]:
+[[click.edit]] has already deleted its temporary file.  When the save
+raises [[NotesFileError]] (a full disk, a read-only data directory),
+the caller reports the error, but the minutes of reading notes behind
+it would be gone
+(\url{https://github.com/dbosk/scholar/issues/126}).  So
+[[keep_unsaved_note]] writes the text to a file of its own and records
+the path on the error as [[unsaved_note]], which the TUI names in its
+message (\cref{sec:tui-unreadable-notes}).
+
+The data directory comes first, since that is where the user's notes
+live and it survives a reboot.  But the failed save may be exactly
+because that directory cannot be written, so the system's temporary
+directory is the fallback.  [[get_data_dir]] creates its directory and
+can fail too, which is why it is called inside the [[try]].  Each file gets a fresh name from
+[[tempfile.mkstemp]]: two failed saves must not overwrite each other,
+and a paper id ([[doi:10.1/x]]) is no safe file name.  The header names
+the paper, in the same [[#]] lines the editor shows, so pasting the
+file back into the editor drops them.  If neither directory can be
+written, there is nothing left to try; the path stays [[None]] and the
+original error is reported alone.
+
+<<editor integration>>=
+UNSAVED_NOTE_PREFIX = "unsaved-note-"
+
+
+def keep_unsaved_note(paper: Any, text: str) -> Path | None:
+    """Write a note that could not be saved to a file of its own.
+
+    Tries the data directory, then the system's temporary directory.
+    Returns the file's path, or None if neither can be written.
+    """
+    content = (
+        f"# Unsaved note for: {paper.title}\n"
+        f"# Paper id: {get_paper_id(paper)}\n\n"
+        f"{text}\n"
+    )
+    for find_directory in (get_data_dir, tempfile.gettempdir):
+        try:
+            fd, name = tempfile.mkstemp(
+                prefix=UNSAVED_NOTE_PREFIX, suffix=".md",
+                dir=find_directory(),
+            )
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(content)
+            return Path(name)
+        except OSError:
+            continue
+    return None
+@
+
+The test lets the editor return a note and makes every write of the
+notes file fail.  The text must then be in the file the error names,
+first in the data directory and, when that cannot be written either, in
+the temporary directory.  A data directory below a regular file is one
+that nothing can create, the lock included.
+
+<<test functions>>=
+class TestUnsavedNote:
+    """A note whose save fails is kept in a file of its own (#126)."""
+
+    @pytest.fixture
+    def failing_save(self, tmp_path, monkeypatch):
+        import scholar.notes as notes
+
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path / "data"))
+        invalidate_notes_cache()
+
+        def failing_write(*args, **kwargs):
+            raise OSError("No space left on device")
+
+        monkeypatch.setattr(notes, "atomic_write_text", failing_write)
+        monkeypatch.setattr(
+            notes.click, "edit", lambda *args, **kwargs: "Hours of reading."
+        )
+        return Paper(title="T", authors=["A"], doi="10.1/unsaved")
+
+    def test_kept_in_the_data_dir(self, failing_save):
+        with pytest.raises(NotesFileError) as caught:
+            edit_note_in_editor(failing_save)
+        kept = caught.value.unsaved_note
+        assert kept.parent == get_data_dir()
+        assert "Hours of reading." in kept.read_text()
+        assert "doi:10.1/unsaved" in kept.read_text()
+
+    def test_falls_back_to_the_temp_dir(
+        self, failing_save, tmp_path, monkeypatch
+    ):
+        import scholar.notes as notes
+
+        temp = tmp_path / "temp"
+        temp.mkdir()
+        blocker = tmp_path / "a-file"
+        blocker.write_text("")
+        monkeypatch.setattr(
+            notes, "get_data_dir", lambda: blocker / "data"
+        )
+        monkeypatch.setattr(notes.tempfile, "gettempdir", lambda: str(temp))
+        with pytest.raises(NotesFileError) as caught:
+            edit_note_in_editor(failing_save)
+        kept = caught.value.unsaved_note
+        assert kept.parent == temp
+        assert "Hours of reading." in kept.read_text()
 @
 
 
@@ -1733,14 +2123,33 @@ precedence. This prevents accidentally overwriting recent changes with
 an older export. The import fills in gaps---papers that don't have notes
 locally will get the imported notes.
 
+\subsection{Writing the export atomically}
+
+An export is usually written over the previous export of the same name,
+and that previous export is the user's backup.  Writing it with a plain
+[[open(path, "w")]] truncated the backup before the new content was in
+place, so a full disk or a killed process left neither version
+(\url{https://github.com/dbosk/scholar/issues/121}).  The export
+therefore goes through [[atomic_write_text]] (\cref{sec:atomic-write})
+like every other file Scholar writes: the old export stays complete until
+the new one replaces it in one rename.  We do not ask for a [[.bak]]:
+the path is the user's own choice, and a second file appearing next to it
+would be a surprise; keeping generations of a backup is the user's
+business.  A write error propagates as [[OSError]], and the [[notes
+export]] command reports it in one line
+(\cref{ch:notes-cli}).
+
 <<paper notes functions>>=
 def export_notes(output_path: Path) -> int:
     """
     Export all notes to a JSON file.
-    
+
+    The file is replaced atomically: if writing fails, an earlier file
+    at `output_path` is left as it was and `OSError` is raised.
+
     Args:
         output_path: Path to write the export file.
-    
+
     Returns:
         Number of notes exported.
     """
@@ -1750,13 +2159,13 @@ def export_notes(output_path: Path) -> int:
         "exported_at": datetime.now().isoformat(),
         "notes": {pid: note.to_dict() for pid, note in notes.items()},
     }
-    
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-    
+    atomic_write_text(
+        output_path, json.dumps(data, indent=2, ensure_ascii=False)
+    )
     return len(notes)
 
 
+@_holding_notes_lock
 def import_notes(input_path: Path, merge: bool = True) -> int:
     """
     Import notes from a JSON file.
@@ -1817,6 +2226,25 @@ class TestExportImport:
             data = json.load(f)
         assert "notes" in data
         assert len(data["notes"]) == 1
+
+    def test_failed_export_keeps_the_previous_one(
+        self, tmp_path, monkeypatch
+    ):
+        """A failed export leaves the earlier export intact."""
+        import scholar.notes as notes
+
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        save_note(Paper(title="T", authors=["A"], doi="10.1/t"), "Kept.")
+        export_path = tmp_path / "export.json"
+        export_path.write_text("previous export")
+
+        def failing_write(*args, **kwargs):
+            raise OSError("No space left on device")
+
+        monkeypatch.setattr(notes, "atomic_write_text", failing_write)
+        with pytest.raises(OSError, match="No space"):
+            export_notes(export_path)
+        assert export_path.read_text() == "previous export"
 
     def test_import_notes_merge(self, tmp_path, monkeypatch):
         """Import with merge preserves existing notes."""

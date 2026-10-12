@@ -2,6 +2,7 @@ TESTS+=		test_scholar.py
 TESTS+=		test_providers.py
 TESTS+=		test_cache.py
 TESTS+=		test_ratelimit.py
+TESTS+=		test_network.py
 TESTS+=		test_crossref.py
 TESTS+=		test_unpaywall.py
 TESTS+=		test_preprint.py
@@ -31,6 +32,9 @@ test_cache.py: ../src/scholar/cache.nw
 
 test_ratelimit.py: ../src/scholar/ratelimit.nw
 	notangle -R"test [[ratelimit.py]]" $< | cpif $@
+
+test_network.py: ../src/scholar/network.nw
+	notangle -R"test [[network.py]]" $< | cpif $@
 
 test_crossref.py: ../src/scholar/crossref.nw
 	notangle -R"test [[crossref.py]]" $< | cpif $@
