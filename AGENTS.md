@@ -44,9 +44,20 @@ Providers self-register via `register_provider()` at module load time.
 - `affiliations`: institution names (Scopus COMPLETE view, OpenAlex). Merges
   like `authors` (kept, else filled), **not** unioned like `keywords`: two
   providers' lists are two spellings of one fact. Names only, no countries.
+- `venue` is always `str | None`: `__post_init__` joins a list/tuple
+  (DBLP proceedings) with `"; "` via `normalize_venue`, which also
+  repairs sessions stored with a list on load. Consumers need no guard.
 
 **SearchResult** (`scholar.py:42-67`):
-- `query`, `provider`, `timestamp`, `papers`, `filters`
+- `query`, `provider`, `timestamp`, `papers`, `filters`, `limit`
+- `error` (`None` = provider answered; else the reason it failed) and
+  `retries` (repeats before the answer was accepted). `merge` prefixes
+  each error with its provider and sums retries. Never show a failed
+  result as 0: format counts with `hits_label(hits, error, retries)`
+  ("12", "failed (reason)", "25, incomplete (reason)").
+- Session `SearchRecord`s store the same outcome (`hits`, `error`,
+  `retries`; old records load as `hits=None`). A failed re-run of the
+  same (query, provider) does not overwrite an earlier answered record.
 
 ### Search Flow
 
@@ -98,7 +109,19 @@ per-server. TechRxiv is a known gap: no API and not in OpenAlex.
 
 ### Error Handling
 
-All providers silently return empty `list[Paper]` on errors. No exceptions propagate to CLI.
+All providers still return an empty (or truncated) `list[Paper]` on errors,
+and no exceptions propagate to the CLI — but a failure is no longer
+silent. A provider resets `last_error = None` first thing in `search()`
+(before the cache lookup) and sets it to a short reason on every failure
+path, which is also every path that declines to cache; a retrying
+provider sets `last_retries`. `Search.execute` (and `rq`) read them via
+`provider_outcome()` (Mock-safe) onto `SearchResult.error`/`retries`, and
+the search output (`# Results: failed (...)` in CSV, the table, JSON),
+`sessions show` ("Queries by provider:") and the report's provider table
+show "failed". The keyed REST providers (S2/WoS/IEEE) set the generic
+`SEARCH_CUT_SHORT` in the `cacheable=False` branch; DBLP, Scopus,
+OpenAlex (+ source-pinned), HAL and arXiv set specific reasons. A new
+provider should do the same.
 
 ### Provider Health Checks
 
@@ -109,6 +132,14 @@ configured`. Exit code is 1 iff a *configured* provider fails — usable as a
 pre-flight gate before a big search. `--offline` skips the network probes.
 Implemented as `check_provider()`/`classify_check_response()` plus a
 per-provider optional `check()` method in `providers.py`.
+`classify_check_response(..., expect_json=True)` turns a 2xx body that is
+not JSON into `http error` "non-JSON response (HTTP 200, text/html)"
+(`non_json_reason()`); every JSON probe uses it (DBLP, Scopus, S2,
+OpenAlex and its preprint servers, HAL, IEEE, WoS), only arXiv's
+Atom probe does not. Since Sep 2026
+dblp.org and both mirrors (uni-trier, dagstuhl) serve an Anubis anti-bot
+HTML page with HTTP 200 to API clients; no header or mirror helps (#94),
+so `providers check` fails for dblp and DBLP searches record `failed`.
 
 ### DBLP Query Sanitization
 
@@ -116,7 +147,20 @@ DBLP has no boolean syntax (space = implicit AND; uppercase `AND`/`OR`/`NOT`
 become literal search terms). `DBLPProvider` strips operators, parentheses,
 and quotes before sending (warning shows the sent query) and warns when a
 query of ≥4 terms yields zero hits. Queries are never auto-relaxed — results
-stay traceable to the recorded query.
+stay traceable to the recorded query. Because DBLP throttling can answer
+with a valid zero, a query of ≥2 terms that returns nothing is repeated
+(identical query) after 2 s and 5 s (`DBLP_ZERO_HIT_RETRY_DELAYS`, via
+the `ratelimit._sleep` test seam); hits on a retry are logged at INFO,
+the count goes to `last_retries` → `SearchResult.retries`, and a zero
+that survives is recorded (and cached) as 0, not as failed (#82).
+
+### Scopus Empty Results
+
+A Scopus search with no hits returns one placeholder entry,
+`{"@_fa": "true", "error": "Result set was empty"}` with
+`opensearch:totalResults` "0" (live shape). `scopus_result_entries()`
+drops it (any entry with `error`, or `@_fa` "false"), so it is never
+converted into an empty paper (#106).
 
 ### Scopus Views
 
@@ -400,7 +444,12 @@ report body builders (`build_review_provenance_latex`,
   `off-topic-false-hit` (4), pending (5), other (6). The caption never
   names the session (it is a `%` comment in the fragment) and ends with
   a full-name-first "Databases:" sentence built from the providers
-  present. `--bearing-only` lists only orders 0-2 and states the other
+  the session searched (search records that answered at least once,
+  zero hits included, plus the rows; rows only for old sessions); one
+  whose `SearchRecord`s carry errors is marked
+  "failed for k of n queries" / "incomplete for k of n queries"
+  (localised), and one that failed every query outright is not
+  named. `--bearing-only` lists only orders 0-2 and states the other
   counts in the caption. `all` stays csv + latex.
 - The TUI's `prompt_for_report` keeps the standalone default.
 

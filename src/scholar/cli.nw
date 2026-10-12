@@ -949,6 +949,62 @@ class TestSearchSessionPersist:
         assert path.read_text() == '{"query": "q", "decisions": ['
 @
 
+The point of the failure marker (\cref{sec:search-result-error}) is the
+whole path from a provider that did not answer to the views a reviewer
+reads.  So we follow it end to end: a provider reporting a failure
+yields [[failed]] in the CSV count line, in the session record, and
+under \enquote{Queries by provider:} in [[sessions show]]---never a 0:
+
+<<test functions>>=
+class TestSearchFailureRecorded:
+    """A provider failure reads as failed, not as zero hits."""
+
+    def _failing_provider(self, monkeypatch):
+        from scholar import providers
+
+        mock_provider = Mock()
+        mock_provider.name = "mock"
+        mock_provider.MAX_LIMIT = None
+        mock_provider.search.return_value = []
+        mock_provider.last_error = "non-JSON response (HTTP 200, text/html)"
+        mock_provider.last_retries = 0
+        monkeypatch.setattr(
+            providers, "PROVIDERS", {"mock": mock_provider}
+        )
+
+    def test_csv_count_says_failed(self, monkeypatch):
+        self._failing_provider(monkeypatch)
+        result = runner.invoke(app, ["search", "q", "-f", "csv"])
+        assert result.exit_code == 0
+        assert (
+            "# Results: failed (non-JSON response (HTTP 200, text/html))"
+            in result.stdout
+        )
+
+    def test_json_carries_error(self, monkeypatch):
+        import json as _json
+
+        self._failing_provider(monkeypatch)
+        result = runner.invoke(app, ["search", "q", "-f", "json"])
+        data = _json.loads(result.stdout)
+        assert data[0]["error"].startswith("non-JSON response")
+        assert data[0]["retries"] == 0
+
+    def test_session_records_and_shows_failure(self, tmp_path, monkeypatch):
+        from scholar.review import load_session
+
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        self._failing_provider(monkeypatch)
+        runner.invoke(app, ["search", "q", "-n", "dead", "-f", "json"])
+
+        record = load_session("dead").search_records[0]
+        assert record.error.startswith("non-JSON response")
+        assert record.hits == 0
+
+        shown = runner.invoke(app, ["sessions", "show", "dead"])
+        assert "failed (non-JSON response" in shown.stdout
+@
+
 \subsection{Testing the search command}
 
 We verify that the search command executes properly and handles command-line
@@ -1172,14 +1228,17 @@ if enrich and merged_results:
                 progress_callback=update_progress,
                 preprint_search=preprint_search,
             )
-            merged_results[i] = SearchResult(
-                query=result.query,
-                provider=result.provider,
-                timestamp=result.timestamp,
-                papers=enriched,
-                filters=result.filters,
-                limit=result.limit,
-            )
+            merged_results[i] = dataclasses.replace(result, papers=enriched)
+@
+
+Enrichment changes the papers and nothing else, so the result is copied
+with [[dataclasses.replace]] rather than rebuilt field by field: a
+rebuilt result silently dropped every field added later---which is how a
+failed provider's [[error]] would have vanished from [[search --enrich
+-n]] sessions.
+
+<<cli imports>>=
+import dataclasses
 @
 
 
@@ -1320,7 +1379,7 @@ from scholar.providers import (
     get_provider,
     expand_provider_names,
 )
-from scholar.scholar import SearchResult
+from scholar.scholar import SearchResult, provider_outcome
 from scholar.review import create_review_session, save_session
 from scholar.llm_review import (
     classify_papers_with_llm,
@@ -1397,6 +1456,7 @@ for pname in provider_names:
 
     q = provider_queries.get(pname, rq_text)
     papers = p.search(q, limit=effective_limit, filters=filters)
+    error, retries = provider_outcome(p)
     results.append(
         SearchResult(
             query=q,
@@ -1405,6 +1465,8 @@ for pname in provider_names:
             papers=papers,
             filters=filters.as_dict() if filters else None,
             limit=effective_limit,
+            error=error,
+            retries=retries,
         )
     )
 
@@ -4786,7 +4848,24 @@ We print [[Paper.id]] rather than the bare DOI: it is exactly the string
 The three decision groups print the same line, so one helper builds it;
 only the tags differ, and a pending paper simply has none.
 
+Each line under \enquote{Queries by provider:} also says what the search
+returned, as recorded in the session (\cref{sec:search-result-error}):
+the hit count, or a highlighted \enquote{failed} with the reason.  This
+listing is where someone auditing a review reads the query--provider
+grid, so it is where a dead provider has to stand out.  Records from
+before outcomes were stored show nothing, since nothing is known.
+
 <<sessions command>>=
+def _record_outcome_markup(record) -> str:
+    """Rich markup for a search record's outcome, or "" if unknown."""
+    label = hits_label(record.hits, record.error, record.retries)
+    if not label:
+        return ""
+    if record.error:
+        return f" [yellow]— {escape(label)}[/yellow]"
+    return f"[dim] — hits: {escape(label)}[/dim]"
+
+
 def session_paper_line(decision) -> str:
     """Return the Rich markup `sessions show` prints for one paper.
 
@@ -4849,6 +4928,9 @@ def sessions_show(
                     "provider": r.provider,
                     "filters": r.filters,
                     "limit": r.limit,
+                    "hits": r.hits,
+                    "error": r.error,
+                    "retries": r.retries,
                 }
                 for r in session.search_records
             ],
@@ -4888,6 +4970,7 @@ def sessions_show(
                     con.print(
                         f"[dim]  {record.provider}: "
                         f"{escape(record.query + suffix)}[/dim]"
+                        + _record_outcome_markup(record)
                     )
             else:
                 # Fallback: show providers with session query
@@ -7632,7 +7715,14 @@ def display_results(results: list, output_format: str = "table") -> None:
 \subsection{Table formatter}
 
 The table formatter uses Rich to create visually appealing output.
-We show the query and provider as context, then list papers with key metadata:
+We show the query and provider as context, then list papers with key metadata.
+Below an empty table it used to say \enquote{No results found.} whatever
+the reason; a provider that failed (\cref{sec:search-result-error}) now
+gets its own line with the reason, worded by [[hits_label]] as in every
+other view, and so does one that answered only in part.
+
+<<cli imports>>=
+from scholar.scholar import hits_label
 
 <<formatter classes>>=
 class TableFormatter:
@@ -7671,7 +7761,12 @@ class TableFormatter:
 
             self.console.print(table)
 
-            if not result.papers:
+            if result.error:
+                label = hits_label(len(result.papers), result.error)
+                self.console.print(
+                    f"[yellow]Results: {escape(label)}[/yellow]"
+                )
+            elif not result.papers:
                 self.console.print("[dim]No results found.[/dim]")
 @
 
@@ -7713,7 +7808,13 @@ Let's verify the table formatter produces correct output:
 
 For scripting and shell pipelines, we provide a tab-separated CSV format.
 This is especially useful when output is piped to other commands.
-We include metadata as a comment header so consumers know the search context:
+We include metadata as a comment header so consumers know the search context.
+The [[# Results:]] line is the count a script records per query and
+provider, so it is where a failure must show: it reads
+[[failed (reason)]] instead of 0 (or [[N, incomplete (reason)]]),
+deliberately not a number, so a script that parses it stops instead of
+recording a zero.  Retries get a line of their own, which keeps the
+count of an answered search a plain number:
 
 <<formatter classes>>=
 class CSVFormatter:
@@ -7726,7 +7827,9 @@ class CSVFormatter:
             print(f"# Query: {result.query}")
             print(f"# Provider: {result.provider}")
             print(f"# Timestamp: {result.timestamp}")
-            print(f"# Results: {len(result.papers)}")
+            print(f"# Results: {hits_label(len(result.papers), result.error)}")
+            if result.retries:
+                print(f"# Retries: {result.retries}")
             print()
 
             # Header row
@@ -7770,7 +7873,9 @@ We also surface the [[filters]] and [[limit]] that were applied, so a consumer
 reading the JSON has the same provenance the [[bibtex+prov]] export
 reconstructs --- the search is fully described by its query, providers,
 filters, and limit, and JSON is the natural place to expose all four to a
-machine reader.
+machine reader.  The [[error]] and [[retries]] of the result go along
+for the same reason: a consumer counting papers must be able to tell a
+failed provider from an empty answer.
 
 <<formatter classes>>=
 class JSONFormatter:
@@ -7786,6 +7891,8 @@ class JSONFormatter:
                 "timestamp": result.timestamp,
                 "filters": result.filters,
                 "limit": result.limit,
+                "error": result.error,
+                "retries": result.retries,
                 "papers": [
                     {
                         "title": p.title,
