@@ -117,7 +117,7 @@ from scholar.notes import (
 
 from scholar.utils import (
     clean_metadata_text, clean_paper_text, derive_arxiv_doi,
-    given_name_first, legacy_hash_paper_id,
+    given_name_first, legacy_hash_paper_id, strip_dblp_homonym_number,
     atomic_write_text, backup_path, file_lock,
 )
 
@@ -1501,15 +1501,56 @@ def given_name_first_id(paper: Paper) -> str | None:
     return legacy_hash_paper_id(paper.title, [reordered])
 @
 
+\label{sec:review-renamed-authors}
+DBLP gave the same trouble the other way round.  Its author names
+carried a homonym number, \enquote{Wei Wang 0001}, until the provider
+learnt to drop it (\cref{sec:utils-dblp-homonyms}), so a DBLP paper
+without a DOI was stored hashed on [[0001]] and now arrives under
+another id.  The cure is the same: [[homonym_free_id]] computes the id a
+stored entry gets once the number is gone, and both kinds of alias go
+into one lookup of \emph{renamed} entries, handled alike below.
+
+The number can also arrive.  DBLP's search cache never expires
+(\cref{sec:dblp-transient-failures}), so a rerun may be served the
+numbered names recorded before the fix, and they would re-enter a
+session that already holds the plain names as a second, pending entry.
+We therefore drop the number from every incoming paper as well, before
+its id is taken; whichever side still has it, the two then meet under
+the plain name.  Doing so for every provider costs nothing, since only
+DBLP writes names that end in a separate four-digit word.
+
+<<review session functions>>=
+def homonym_free_id(paper: Paper) -> str | None:
+    """Return the id `paper` gets once DBLP's homonym number is dropped.
+
+    None when nothing would change: the paper has a DOI (the hash is
+    not its id), no authors, or a first author without the number.
+    """
+    if paper.doi or not paper.authors:
+        return None
+    stripped = strip_dblp_homonym_number(paper.authors[0])
+    if stripped == paper.authors[0]:
+        return None
+    return legacy_hash_paper_id(paper.title, [stripped])
+
+
+def without_homonym_numbers(paper: Paper) -> Paper:
+    """Return `paper` with DBLP's homonym numbers dropped from its authors."""
+    authors = [strip_dblp_homonym_number(a) for a in paper.authors or []]
+    if authors == (paper.authors or []):
+        return paper
+    return replace(paper, authors=authors)
+@
+
 <<convert search results to decisions>>=
 decision_lookup: dict[str, ReviewDecision] = {
     get_paper_id(d.paper): d for d in session.decisions
 }
-surname_first_lookup: dict[str, ReviewDecision] = {}
+renamed_lookup: dict[str, ReviewDecision] = {}
 for d in session.decisions:
-    reordered_id = given_name_first_id(d.paper)
-    if reordered_id and reordered_id not in decision_lookup:
-        surname_first_lookup[reordered_id] = d
+    for new_id in (given_name_first_id(d.paper), homonym_free_id(d.paper)):
+        if new_id and new_id not in decision_lookup:
+            renamed_lookup[new_id] = d
 provenance_lookup: dict[str, ReviewDecision] = {}
 for d in session.decisions:
     for entry in d.paper.published_versions or []:
@@ -1520,7 +1561,9 @@ for d in session.decisions:
 
 for result in results:
     for paper in result.papers:
-        paper = _normalize_paper_identifiers(paper)
+        paper = without_homonym_numbers(
+            _normalize_paper_identifiers(paper)
+        )
         paper_id = get_paper_id(paper)
 
         existing = decision_lookup.get(paper_id)
@@ -1531,15 +1574,15 @@ for result in results:
                 pass
             continue
 
-        surname_first = surname_first_lookup.pop(paper_id, None)
-        if surname_first is not None:
-            old_id = get_paper_id(surname_first.paper)
+        renamed = renamed_lookup.pop(paper_id, None)
+        if renamed is not None:
+            old_id = get_paper_id(renamed.paper)
             migrate_paper_id(old_id, paper_id)
-            surname_first.paper = replace(
-                surname_first.paper, authors=paper.authors
+            renamed.paper = replace(
+                renamed.paper, authors=paper.authors
             ).merge_with(paper)
             decision_lookup.pop(old_id, None)
-            decision_lookup[paper_id] = surname_first
+            decision_lookup[paper_id] = renamed
             continue
 
         adopted = provenance_lookup.get(paper_id)
@@ -3033,6 +3076,106 @@ class TestSessionFunctions:
             assert decision.paper.authors == ["Elie Fares", "Mamoun Filali"]
             assert decision.paper.abstract == "Now with an abstract."
             assert get_paper_id(decision.paper) != get_paper_id(stored)
+
+    def test_homonym_numbered_entry_keeps_its_decision(
+        self, tmp_path, monkeypatch
+    ):
+        """A paper stored as `Wei Wang 0001` is recognised as `Wei Wang`.
+
+        Its decision and its note follow it to the new id.
+        """
+        from scholar import isolated_registry
+        from scholar.notes import get_note, save_note
+
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+
+        with isolated_registry():
+            stored = Paper(
+                title="A Work", authors=["Wei Wang 0001", "Alice Smith"],
+                sources=["dblp"],
+            )
+            session = ReviewSession(
+                query="test query",
+                providers=["dblp"],
+                timestamp=datetime.now(),
+                name="test query",
+            )
+            session.decisions.append(
+                ReviewDecision(
+                    paper=stored,
+                    provider="dblp",
+                    status=DecisionStatus.KEPT,
+                    tags=["background"],
+                )
+            )
+            save_session(session)
+            save_note(stored, "read it")
+
+            result = Mock()
+            result.provider = "dblp"
+            result.query = "test query"
+            result.papers = [Paper(
+                title="A Work", authors=["Wei Wang", "Alice Smith"],
+                sources=["dblp"],
+            )]
+
+            merged = create_review_session([result], "test query")
+
+            assert len(merged.decisions) == 1
+            decision = merged.decisions[0]
+            assert decision.status == DecisionStatus.KEPT
+            assert decision.tags == ["background"]
+            assert decision.paper.authors == ["Wei Wang", "Alice Smith"]
+            assert get_paper_id(decision.paper) != get_paper_id(stored)
+            note = get_note(decision.paper)
+            assert note is not None and "read it" in note.note
+
+    def test_numbered_names_from_the_cache_meet_the_plain_entry(
+        self, tmp_path, monkeypatch
+    ):
+        """A cached DBLP result with the number joins the plain entry."""
+        from scholar import isolated_registry
+
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+
+        with isolated_registry():
+            session = ReviewSession(
+                query="test query",
+                providers=["dblp"],
+                timestamp=datetime.now(),
+                name="test query",
+            )
+            session.decisions.append(ReviewDecision(
+                paper=Paper(title="A Work", authors=["Wei Wang"],
+                            sources=["dblp"]),
+                provider="dblp",
+                status=DecisionStatus.KEPT,
+            ))
+            save_session(session)
+
+            result = Mock()
+            result.provider = "dblp"
+            result.query = "test query"
+            result.papers = [Paper(
+                title="A Work", authors=["Wei Wang 0001"],
+                sources=["dblp"],
+            )]
+
+            merged = create_review_session([result], "test query")
+
+            assert len(merged.decisions) == 1
+            assert merged.decisions[0].status == DecisionStatus.KEPT
+            assert merged.decisions[0].paper.authors == ["Wei Wang"]
+
+    def test_homonym_free_id_only_for_numbered_papers(self):
+        """DOIs, empty author lists and plain names yield no alias."""
+        assert homonym_free_id(Paper(title="T", authors=["Wei Wang 0001"]))
+        for paper in (
+            Paper(title="T", authors=["Wei Wang 0001"], doi="10.1/x"),
+            Paper(title="T", authors=[]),
+            Paper(title="T", authors=["Wei Wang"]),
+        ):
+            assert homonym_free_id(paper) is None
 
     def test_given_name_first_id_only_for_reorderable_papers(self):
         """DOIs, empty author lists and ordered names yield no alias."""

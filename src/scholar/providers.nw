@@ -4035,6 +4035,28 @@ so [[providers check]] fails for DBLP while the page is up.  Should DBLP
 lift the challenge for API clients, or offer a key, both fixes stay
 correct and the provider works again unchanged.
 
+\paragraph{Pacing.}
+DBLP publishes no request quota, only advice.  Its FAQ entry
+\enquote{Am I allowed to crawl the dblp website?} (as archived on
+2025-01-16) asks scripts to keep to \enquote{a reasonable number of
+requests per minute} and says they \enquote{should always be fine when
+waiting for at least one or two second between two consecutive
+requests}; beyond that, DBLP answers 429 with a [[Retry-After]] header.
+We take the cautious end of that advice, two seconds between requests,
+because DBLP's throttling does not always answer 429: under a burst it
+can also answer with an empty result set
+(\cref{sec:dblp-zero-hit-retry}), which no status code reveals.
+
+The pacing is declared, like every other provider's, as [[LIMITS]] for
+the shared limiter (\cref{ch:ratelimit}), so it holds across
+consecutive [[scholar]] invocations too, and
+[[scholar providers limits]] shows it (as [[0.5/s]]).  [[Limits.per_second]] is a rate, so the two-second
+gap is [[per_second=0.5]], its reciprocal.  DBLP never paced itself
+before; its only waits were the back-off of its 429 loop and the
+zero-hit retries, which keep their own delays (below).  Those delays are
+at least two seconds each, so after either of them the limiter has
+nothing left to add.
+
 <<dblp provider>>=
 class _DBLPUnavailable(Exception):
     """Raised internally when a DBLP request fails transiently.
@@ -4049,6 +4071,7 @@ class DBLPProvider:
 
     name = "dblp"
     MAX_LIMIT = 1000  # DBLP API caps at 1000 results per request
+    LIMITS = Limits(per_second=0.5)  # FAQ: wait 1-2 s between requests
 
     def __init__(self):
         """Initialize the DBLP provider."""
@@ -4068,6 +4091,59 @@ class DBLPProvider:
     <<dblp fetch one page>>
     <<dblp check method>>
     <<convert dblp hit>>
+@
+
+To test the pacing we need time under control.  The [[dblp_clock]]
+fixture gives the tests a fresh [[dblp]] limiter (the shared one may
+remember a request from an earlier test) on a fake clock that sleeping
+advances, and returns the list of sleeps.  Advancing the clock matters:
+with a sleep that only records, a retry delay would leave the clock
+where it was, and the limiter would add a pacing sleep that never
+happens in real use.
+
+<<test functions>>=
+@pytest.fixture
+def dblp_clock(monkeypatch):
+    """Run DBLP on a fresh limiter and a fake clock; return the sleeps."""
+    clock = {"now": 1_700_000_000.0, "sleeps": []}
+
+    def sleep(seconds):
+        clock["sleeps"].append(seconds)
+        clock["now"] += seconds
+
+    monkeypatch.setattr(ratelimit, "_now", lambda: clock["now"])
+    monkeypatch.setattr(ratelimit, "_sleep", sleep)
+    monkeypatch.delitem(ratelimit._LIMITERS, "dblp", raising=False)
+    return clock["sleeps"]
+@
+
+Let's verify that the limiter, not the provider, spaces DBLP's requests
+two seconds apart, and that the declared value is the rate, not the gap:
+
+<<test functions>>=
+class TestDBLPPacing:
+    """DBLP's requests are paced by the shared limiter."""
+
+    @staticmethod
+    def _page(title):
+        response = Mock(status_code=200, headers={})
+        response.json.return_value = {"result": {"hits": {
+            "@total": "1", "hit": [{"info": {"title": title}}],
+        }}}
+        return response
+
+    def test_declares_a_two_second_gap(self):
+        assert DBLPProvider.LIMITS.per_second == pytest.approx(0.5)
+
+    def test_requests_are_paced_by_the_limiter(self, dblp_clock):
+        provider = DBLPProvider()
+        with patch("requests.get", side_effect=[
+            self._page("First"), self._page("Second"),
+        ]):
+            provider.search("first")
+            provider.search("second")
+        assert dblp_clock == [pytest.approx(2.0)]
+        assert provider._limiter.status().day_count == 2
 @
 
 \subsubsection{Search entry point}
@@ -4371,7 +4447,10 @@ since the zero before it is then not trustworthy either.
 
 The waits go through [[ratelimit._sleep]], the seam the test suite
 already disables (\cref{ch:ratelimit}), so tests exercise the retries
-without waiting for them.
+without waiting for them.  Being at least two seconds each, they also
+satisfy the limiter's pacing, which therefore adds no wait of its own
+before a retry; the tests below run on the [[dblp_clock]] and would see
+such a wait among the delays.
 
 <<dblp zero-hit retry>>=
 def _retry_zero_hits(
@@ -4425,9 +4504,8 @@ def _page(titles):
     }}}
     return response
 
-def test_hits_on_retry_are_kept(self, monkeypatch, caplog):
-    delays = []
-    monkeypatch.setattr(ratelimit, "_sleep", delays.append)
+def test_hits_on_retry_are_kept(self, dblp_clock, caplog):
+    delays = dblp_clock
     provider = DBLPProvider()
     with patch("requests.get", side_effect=[
         self._page([]), self._page(["Found Later"]),
@@ -4440,9 +4518,8 @@ def test_hits_on_retry_are_kept(self, monkeypatch, caplog):
     assert delays == [DBLP_ZERO_HIT_RETRY_DELAYS[0]]
     assert any("after an empty answer" in r.message for r in caplog.records)
 
-def test_zero_after_retries_is_a_zero(self, monkeypatch):
-    delays = []
-    monkeypatch.setattr(ratelimit, "_sleep", delays.append)
+def test_zero_after_retries_is_a_zero(self, dblp_clock):
+    delays = dblp_clock
     provider = DBLPProvider()
     with patch("requests.get", return_value=self._page([])) as mock_get:
         assert provider.search("literate programming") == []
@@ -4533,13 +4610,30 @@ def _fetch_pages(
 
 \subsubsection{Fetching and normalising a single page}
 
-This is where the two robustness fixes live.  We send a descriptive
-[[User-Agent]]---DBLP throttles anonymous default-agent traffic more
-readily---and we treat HTTP 429 as recoverable: we honour a [[Retry-After]]
-header when present, otherwise back off exponentially, and give up only after
-[[DBLP_MAX_RETRIES]] attempts.  A body that will not parse as JSON, or a
-429 we never escape, is reported as [[_DBLPUnavailable]] so the result is not
-cached.
+This is where the two robustness fixes live.  We treat HTTP 429 as
+recoverable: we honour a [[Retry-After]] header when present, otherwise back
+off exponentially, and give up only after [[DBLP_MAX_RETRIES]] attempts.  A
+body that will not parse as JSON, or a 429 we never escape, is reported as
+[[_DBLPUnavailable]] so the result is not cached.
+
+Every attempt is a request like any other provider's: it passes the
+limiter's [[acquire()]] first, which paces it (see above), counts it and
+refuses while a remembered cooldown is active, and it goes out through
+[[network.get]] (\cref{ch:network}), so [[--proxy]] and
+[[SCHOLAR_PROXY]] apply to DBLP as they do elsewhere.  That also gives
+DBLP scholar's own User-Agent.  DBLP used to send a name of its own,
+[[scholarcli (https://github.com/dbosk/scholar)]], on the grounds that
+DBLP throttles default-agent traffic more readily.  That default was
+[[requests]]' own [[python-requests/...]], which scholar's agent is
+not; DBLP documents no requirement on the agent; and the probing of
+the anti-bot page above found that the agent changes nothing.  One
+descriptive name for all of scholar's traffic is simpler and lets
+[[SCHOLAR_USER_AGENT]] reach DBLP too.
+
+A response other than 429 is handed to [[record_response()]], which
+syncs any [[X-RateLimit-*]] headers; a 429 is not, because the loop
+handles it (below), and recording it would start a persistent cooldown
+that makes the very next [[acquire()]] refuse the retry.
 
 The returned [[hits]] is always a list: [[safe_get_nested]] tolerates missing
 intermediate keys, and [[ensure_list]] wraps DBLP's single-result bare object
@@ -4561,7 +4655,7 @@ def _fetch_one_page(
     """
     for attempt in range(DBLP_MAX_RETRIES + 1):
         self._limiter.acquire()
-        response = requests.get(
+        response = network.get(
             DBLP_API_URL,
             params={
                 "q": effective_query,
@@ -4569,7 +4663,6 @@ def _fetch_one_page(
                 "h": page_size,
                 "f": offset,
             },
-            headers={"User-Agent": DBLP_USER_AGENT},
             timeout=30,
         )
 
@@ -4577,6 +4670,7 @@ def _fetch_one_page(
             <<dblp wait out throttling or give up>>
             continue
 
+        self._limiter.record_response(response)
         response.raise_for_status()
 
         try:
@@ -4591,7 +4685,10 @@ def _fetch_one_page(
         return hits, total
 
     self._limiter.record_limit_hit(
-        reason="rate limited (HTTP 429) after retries"
+        retry_after=ratelimit.parse_retry_after(
+            response.headers.get("Retry-After")
+        ),
+        reason="rate limited (HTTP 429) after retries",
     )
     raise _DBLPUnavailable("rate limited (HTTP 429) after retries")
 
@@ -4615,9 +4712,17 @@ the loop itself absorbs, and persisting a cooldown for it would abort
 the very retries that usually succeed.
 Exhausted retries, by contrast, mean DBLP is saturated---remembering
 that across invocations spares the next run the same futile minute.
+The cooldown lasts as long as the last 429's [[Retry-After]] says, since
+DBLP's FAQ documents that header as the time until its block is lifted;
+without one, the limiter's default applies.
 [[acquire()]] at the top of each attempt enforces such a remembered
-cooldown (and counts the request); no request rate is declared, so the
-loop's own pacing stays as it is.
+cooldown.
+
+The back-off waits go through [[ratelimit._sleep]], like the zero-hit
+retries' waits (\cref{sec:dblp-zero-hit-retry}): it is the seam the
+test suite disables, so tests exercise the 429 loop without sleeping
+through it.  The back-off starts at two seconds, so the limiter's pacing
+adds nothing to the retry that follows.
 
 <<dblp wait out throttling or give up>>=
 if attempt >= DBLP_MAX_RETRIES:
@@ -4630,30 +4735,67 @@ if retry_after:
     except ValueError:
         pass
 logger.warning("dblp: rate limited (429), retrying in %.1fs", delay)
-time.sleep(delay)
+ratelimit._sleep(delay)
 @
 
 \subsubsection{Health check}
 
 Unlike [[_fetch_one_page]], the probe makes exactly one request with no 429
 retry loop: for a health check, a 429 \emph{is} the answer we want to report,
-not something to wait out.  We keep the descriptive [[User-Agent]] so the
-probe is throttled the same way real searches are, and we ask the
-classifier to insist on JSON, since a 200 carrying the anti-bot page is
-exactly the failure the probe used to miss.
+not something to wait out.  It goes out the way searches do, through
+[[network.get]] with scholar's User-Agent and route, so it is throttled
+and routed the same way real searches are, and we ask the classifier to
+insist on JSON, since a 200 carrying the anti-bot page is exactly the
+failure the probe used to miss.
+
+The probe passes the limiter like every other provider's probe: it is
+paced and counted, and its response is recorded, so a probed 429 starts
+a cooldown that the next search respects.  [[check_provider]] consults
+the limiter before probing, so a refusal here is a rare race; it is
+reported as the status it is rather than raised.
 
 <<dblp check method>>=
 def check(self) -> tuple[str, str]:
     """Probe the publication search endpoint with a one-result query."""
-    response = requests.get(
+    try:
+        self._limiter.acquire()
+    except RateLimited as e:
+        return HEALTH_RATE_LIMITED, str(e)
+    response = network.get(
         DBLP_API_URL,
         params={"q": "test", "format": "json", "h": 1},
-        headers={"User-Agent": DBLP_USER_AGENT},
         timeout=30,
     )
+    self._limiter.record_response(response)
     return classify_check_response(
         response, authenticated=False, expect_json=True
     )
+@
+
+Let's verify both sides: a probe that DBLP throttles leaves a cooldown
+behind, and a probe made during a cooldown is refused without a request.
+
+<<test functions>>=
+class TestDBLPCheckThroughLimiter:
+    """DBLP's health probe is paced, counted and recorded."""
+
+    def test_probed_429_starts_a_cooldown(self, dblp_clock):
+        provider = DBLPProvider()
+        throttled = Mock(status_code=429, headers={"Retry-After": "30"})
+        with patch("requests.get", return_value=throttled):
+            status, _ = provider.check()
+        assert status == HEALTH_RATE_LIMITED
+        assert provider._limiter.status().day_count == 1
+        assert not provider._limiter.check_available().ok
+
+    def test_probe_refused_during_cooldown(self, dblp_clock):
+        provider = DBLPProvider()
+        provider._limiter.record_limit_hit(retry_after=60, reason="test")
+        with patch("requests.get") as mock_get:
+            status, message = provider.check()
+            mock_get.assert_not_called()
+        assert status == HEALTH_RATE_LIMITED
+        assert "test" in message
 @
 
 \subsubsection{Applying filters}
@@ -4758,7 +4900,7 @@ def _convert_hit(self, hit: dict) -> Paper:
     for author in authors_data:
         name = author.get("text") if isinstance(author, dict) else author
         if name:
-            authors.append(name)
+            authors.append(strip_dblp_homonym_number(name))
 
     return Paper(
         title=info.get("title", "") or "",
@@ -4772,6 +4914,47 @@ def _convert_hit(self, hit: dict) -> Paper:
     )
 @
 
+\paragraph{Homonym numbers.}
+DBLP tells apart people who share a name by numbering them: the
+author pages and the API's [[text]] field say \enquote{Wei Wang 0001},
+\enquote{Wei Wang 0002}, and so on, a space and four digits after the
+name.  The number identifies a DBLP person record; it is not part of
+anyone's name, and no other provider sends it.  Passed through, it did
+real damage downstream.  Everything that takes the last word of a
+name for the surname took [[0001]]: citation keys came out as
+[[00012024]], and the audit table's work key ([[audit_work_key]],
+first-author surname plus title) could not merge DBLP's copy of a paper
+with the other providers' copies.
+
+We therefore drop it where the name arrives, with
+[[strip_dblp_homonym_number]] (\cref{sec:utils-dblp-homonyms}), which
+removes exactly DBLP's pattern.  The helper lives with the other name
+utilities because the review module needs it too: a paper without a
+DOI is identified by a hash of its title and first author's last word,
+so stripping the number changes the id of papers that sessions stored
+before this fix, and the review module reconciles those
+(\cref{sec:review-renamed-authors}).
+
+Let's verify that a converted hit carries the plain names:
+
+<<test functions>>=
+class TestDBLPHomonymNumbers:
+    """DBLP's homonym numbers are not part of author names."""
+
+    def test_converted_hit_has_plain_names(self):
+        provider = DBLPProvider()
+        paper = provider._convert_hit({"info": {
+            "title": "A Paper",
+            "year": "2024",
+            "authors": {"author": [
+                {"@pid": "w/WeiWang1", "text": "Wei Wang 0001"},
+                {"text": "Alice Smith"},
+            ]},
+        }})
+        assert paper.authors == ["Wei Wang", "Alice Smith"]
+        assert paper.authors[0].split()[-1] == "Wang"
+@
+
 \subsection{Auto-registration}
 
 <<dblp provider>>=
@@ -4782,15 +4965,13 @@ register_provider(DBLPProvider())
 \subsection{Dependencies}
 
 <<dblp imports>>=
-import requests
-
 from scholar import ratelimit
 from scholar.scholar import normalize_venue
+from scholar.utils import strip_dblp_homonym_number
 @
 
 <<dblp constants>>=
 DBLP_API_URL = "https://dblp.org/search/publ/api"
-DBLP_USER_AGENT = "scholarcli (https://github.com/dbosk/scholar)"
 DBLP_MAX_RETRIES = 3       # extra attempts on HTTP 429 before giving up
 DBLP_RETRY_BACKOFF = 2.0   # base seconds for the exponential 429 back-off
 DBLP_BOOLEAN_TOKENS = frozenset({"AND", "OR", "NOT"})
@@ -4944,12 +5125,13 @@ class TestDBLPProvider:
             results = provider.search("test")
             assert results == []
 
-    def test_search_sends_user_agent(self):
-        """search() identifies itself with a descriptive User-Agent.
+    def test_search_carries_identity_and_route(self, monkeypatch):
+        """search() goes out under scholar's User-Agent and proxy.
 
-        DBLP throttles anonymous default-agent traffic more readily, so we
-        always send our own User-Agent header.
+        DBLP used to call `requests.get` itself, with a User-Agent of its
+        own and no way to follow `--proxy`.
         """
+        monkeypatch.setenv("SCHOLAR_PROXY", "http://proxy:3128")
         provider = DBLPProvider()
 
         mock_response = Mock()
@@ -4963,8 +5145,9 @@ class TestDBLPProvider:
 
             provider.search("test")
 
-            headers = mock_get.call_args[1]["headers"]
-            assert headers["User-Agent"] == DBLP_USER_AGENT
+            kwargs = mock_get.call_args.kwargs
+            assert kwargs["headers"]["User-Agent"] == network.user_agent()
+            assert kwargs["proxies"]["https"] == "http://proxy:3128"
 
     def test_transient_failure_is_not_cached(self):
         """A non-JSON (throttled) body returns empty without caching it.
@@ -5022,8 +5205,11 @@ class TestDBLPProvider:
             "non-JSON response (HTTP 200, text/html)"
         )
 
-    def test_retries_on_rate_limit(self):
-        """search() retries after an HTTP 429 before succeeding."""
+    def test_retries_on_rate_limit(self, dblp_clock):
+        """search() retries after an HTTP 429 before succeeding.
+
+        The back-off is the only wait: it already exceeds the pacing gap.
+        """
         provider = DBLPProvider()
 
         throttled = Mock()
@@ -5043,13 +5229,32 @@ class TestDBLPProvider:
         }
 
         with patch("requests.get", side_effect=[throttled, ok]) as mock_get:
-            with patch("time.sleep") as mock_sleep:
-                results = provider.search("test")
+            results = provider.search("test")
 
             assert len(results) == 1
             assert results[0].title == "After Backoff"
             assert mock_get.call_count == 2
-            mock_sleep.assert_called_once()
+        assert dblp_clock == [DBLP_RETRY_BACKOFF]
+        assert provider._limiter.check_available().ok
+
+    def test_exhausted_retries_honour_retry_after(self, dblp_clock):
+        """Only the final 429 is remembered, for as long as DBLP asks.
+
+        Recording the first 429 would make the limiter refuse the
+        retries; the give-up's cooldown follows `Retry-After`.
+        """
+        provider = DBLPProvider()
+        throttled = Mock(status_code=429, headers={"Retry-After": "120"})
+
+        with patch("requests.get", return_value=throttled) as mock_get:
+            assert provider.search("test") == []
+            assert mock_get.call_count == DBLP_MAX_RETRIES + 1
+
+        assert provider.last_error == "rate limited (HTTP 429) after retries"
+        assert dblp_clock == [120.0] * DBLP_MAX_RETRIES
+        availability = provider._limiter.check_available()
+        assert not availability.ok
+        assert availability.retry_at - ratelimit._now() == 120
 
     def test_handles_missing_fields(self):
         """search() handles publications with missing optional fields."""
