@@ -306,6 +306,61 @@ set when the status changed, mirroring the TUI.
 Together these let scripted/agent-driven systematic reviews produce the same
 session record and `sessions export` audit trail as TUI reviews.
 
+### Session Integrity
+
+Commands that load a session and save it much later (`scholar enrich`,
+`verify`, the TUI) used to overwrite whatever was saved in between. That
+is how two classified sessions lost every decision and their research
+context (#107). `review.save_session` now:
+
+- **merges**: it re-reads the file and does a three-way merge against
+  `session._baseline` (`SessionBaseline`, recorded by `read_session_file`
+  and after each save). Decision fields and `research_context` this
+  process did not change take the on-disk value. Papers, search records
+  and snowball rounds that only the file has are added. Paper metadata is
+  not merged (ours wins).
+- **guards**: `warn_if_decisions_dropped` logs a WARNING (session,
+  before/after decided counts, `.bak` path) when the save still leaves
+  fewer decided papers than the file has, beyond this process's own
+  resets to pending. It never refuses the save.
+- **locks**: the re-read, merge and replace run under
+  `utils.file_lock` (`filelock`: `flock` on POSIX, `LockFileEx` on
+  Windows) on a hidden sidecar `.<name>.json.lock`, so two processes
+  saving at once take turns. Held for milliseconds only, never from
+  load to save; after `LOCK_TIMEOUT` (10 s) it warns and writes
+  unlocked. Notes writers (`save_note`, `delete_note`, `get_note`,
+  `import_notes`, `migrate_paper_id`) take the notes file's lock via
+  `_holding_notes_lock`. Same machine only: no help across
+  machines on a shared directory.
+- **writes atomically**: `utils.atomic_write_text` (temp file in the
+  same directory, fsync, `os.replace`), keeping the previous file as
+  `<name>.json.bak` (one generation).
+
+`load_session(..., strict=True)` raises `SessionFileError` for a file
+that exists but does not parse. `create_review_session` uses it, so
+`search -n`/`--review`/`rq` stop with one line instead of rebuilding over
+the file. Read-only callers still get `None` plus a warning.
+Notes (`paper_notes.json`) and per-query decision files follow the same
+rules (#114). A file that exists but does not parse raises
+`notes.NotesFileError` instead of reading as empty, which used to make
+the next save erase every other note. Writes are atomic with a `.bak`,
+and write errors raise instead of being swallowed. `cli.main()` turns
+the error into one line and exit 1. Two deliberate exceptions (#121):
+the TUI catches it, shows it as a notification (and in red on the
+detail screen), hides note markers and refuses note editing, but keeps
+reviewing (a note whose save fails after editing is kept in
+`unsaved-note-*.md`, data dir else temp dir, and the message names
+it, #126); and `migrate_paper_id` logs a WARNING naming each unreadable
+store file and both ids and skips it (raising would discard the
+caller's enrichment run or search append), raising only on write
+errors. `notes export` also writes atomically (no `.bak`).
+`sessions export` stages all its files with `utils.staged_outputs` and
+moves them into place only if every format succeeded (#83).
+`sessions list` warns on stderr about sessions with records but no
+decisions and no context (`needs_check` in the JSON). The paper registry
+is process-global, so tests that load sessions should use unique DOIs or
+`isolated_registry()`.
+
 ### Provenance Round-Trip
 
 The `bibtex+prov` export format wraps each entry in a provenance comment
@@ -566,6 +621,7 @@ requests/day and each `scholar` run is a fresh process.
 - `pytorial` - Interactive tutorial runner behind `scholar tutorial`
 - `llm` and its plugins (`llm-openai-plugin`, `llm-anthropic`, `llm-gemini`, `llm-mistral`, `llm-azure`, `llm-github-copilot`, `llm-gpt4all`, `llm-openai-via-codex`) - model access for `scholar rq` and `scholar llm`
 - `platformdirs` - Platform-appropriate cache directory
+- `filelock` - Cross-platform file lock around session/notes saves
 
 
 ## grepai - Semantic Code Search
