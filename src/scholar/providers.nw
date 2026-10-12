@@ -272,6 +272,34 @@ class SearchProvider(Protocol):
         ...
 @
 
+\subsection{API keys: argument first, then the environment}
+\label{sec:provider-api-keys}
+
+The keyed providers---Semantic Scholar, OpenAlex, IEEE Xplore and
+Scopus---take their key as an optional constructor argument and fall back
+to their environment variable when the argument is [[None]] or empty.
+[[ScopusProvider(api_key=None)]] therefore has a key whenever
+[[SCOPUS_API_KEY]] is set: [[None]] means \enquote{not given here}, not
+\enquote{no key}.
+The fallback is what makes the environment the normal source of keys:
+the registry creates every provider without arguments at import time
+(\cref{sec:provider-registry}), so a key reaches it only through the
+environment, and the argument is an override for scripts and tests that
+hold a key of their own.
+An empty string falls through as well, since an empty variable or argument
+is never a usable key.
+
+A test that needs a provider without a key must therefore remove the
+variable ([[monkeypatch.delenv]]) or clear [[api_key]] after construction;
+passing [[None]] alone would let a developer's key through and turn a unit
+test into a live request.
+Web of Science is the one exception.
+It has two API tiers, and its tests must switch one tier off while the
+other tier's variable may be set, so its constructor uses a sentinel for
+\enquote{not given} and treats an explicit [[None]] as \enquote{disabled}
+(\cref{sec:wos-init})---although the legacy [[WOS_API_KEY]] still fills a
+tier disabled that way.
+
 
 \section{Provider Registry}
 \label{sec:provider-registry}
@@ -869,9 +897,14 @@ sessions run with a dead DBLP.  A probe whose endpoint speaks JSON
 therefore passes [[expect_json=True]], and a 2xx body that does not
 parse is an [[http error]] whose message names the status and the
 content type---[[non-JSON response (HTTP 200, text/html)]]---so
-[[providers check]] exits 1.  The search path uses the same wording
-([[non_json_reason]]), so the health check and the search record
-describe one failure the same way.
+[[providers check]] exits 1.  Every probe whose search parses JSON does
+so: DBLP, Scopus, Semantic Scholar, OpenAlex (with the preprint servers
+pinned on it), HAL, IEEE and Web of Science.  Any of them can sit behind
+a proxy, gateway or anti-bot layer that answers 200 with a page, and the
+search would then fail on [[response.json()]] while a status-only probe
+said ok.  Only arXiv's probe does not, since its Atom feed is XML.
+The search path uses the same wording ([[non_json_reason]]), so the
+health check and the search record describe one failure the same way.
 
 <<imports>>=
 import dataclasses
@@ -997,7 +1030,8 @@ Let's verify the cross-provider logic: unconfigured providers are never
 probed, offline mode skips the network entirely, and the classifier maps raw
 responses to the right statuses.  The stale-key case uses the real Semantic
 Scholar provider, since surfacing that exact failure is why this machinery
-exists:
+exists; and every probe that expects JSON, not only DBLP's, must fail on a
+200 that carries a page instead:
 
 <<test functions>>=
 class TestProviderHealth:
@@ -1108,6 +1142,41 @@ class TestProviderHealth:
         assert health.status == HEALTH_HTTP_ERROR
         assert health.message == "non-JSON response (HTTP 200, text/html)"
 
+    @pytest.mark.parametrize("make_provider", [
+        lambda: SemanticScholarProvider(api_key=None),
+        lambda: OpenAlexProvider(),
+        lambda: HALProvider(),
+        lambda: IEEEXploreProvider(api_key="test_key"),
+        lambda: WebOfScienceProvider(
+            starter_api_key=None, expanded_api_key="test_key"
+        ),
+    ], ids=["s2", "openalex", "hal", "ieee", "wos"])
+    def test_json_probes_reject_an_html_200(self, make_provider):
+        """Every JSON probe, not only DBLP's, fails on a page in a 200."""
+        provider = make_provider()
+        response = self._response(200)
+        response.headers = {"Content-Type": "text/html"}
+        response.json.side_effect = ValueError("Expecting value")
+
+        with patch("requests.get", return_value=response):
+            with patch("time.sleep"):
+                status, message = provider.check()
+
+        assert status == HEALTH_HTTP_ERROR
+        assert message == "non-JSON response (HTTP 200, text/html)"
+
+    def test_hal_error_body_still_wins(self):
+        """HAL's 200 with an `error` body keeps its own message."""
+        response = self._response(200)
+        response.headers = {"Content-Type": "application/json"}
+        response.json.return_value = {"error": {"msg": "bad query"}}
+
+        with patch("requests.get", return_value=response):
+            status, message = HALProvider().check()
+
+        assert status == HEALTH_HTTP_ERROR
+        assert message == "query rejected (error body in HTTP 200)"
+
     def test_non_json_ok_without_expect_json(self):
         """Only probes that expect JSON hold a 2xx body against it."""
         response = self._response(200)
@@ -1155,7 +1224,6 @@ class TestProviderHealth:
 
     def test_spent_quota_skips_probe(self):
         """A known-spent quota is reported without burning a probe."""
-        ratelimit._LIMITERS.pop("ieee", None)
         provider = IEEEXploreProvider(api_key="test_key")
         provider._limiter.record_limit_hit(
             reason="daily quota exhausted (IEEE)", exhausted_daily=True
@@ -1165,7 +1233,6 @@ class TestProviderHealth:
             mock_get.assert_not_called()
         assert health.status == HEALTH_QUOTA_EXHAUSTED
         assert "daily quota exhausted" in health.message
-        ratelimit._LIMITERS.pop("ieee", None)
 
 
 class TestProviderHealthIntegration:
@@ -1398,8 +1465,10 @@ paces and counts each request and refuses while a persistent cooldown
 is active, and [[record_response()]] turns a 429 that survived the
 session's own retries into such a cooldown---so the \emph{next}
 [[scholar]] invocation waits it out instead of rediscovering it.
-The [[RateLimited]] this can raise is contained by the same broad
-exception handling every caller already has for network failures.
+The [[RateLimited]] this can raise is contained where every caller
+already contains network failures; the search catches it ahead of its
+catch-all, though, since [[acquire]] has logged the refusal already
+(\cref{sec:openalex-refusal}).
 
 <<semantic scholar request helper>>=
 def _build_headers(self) -> dict:
@@ -1483,6 +1552,7 @@ def check(self) -> tuple[str, str]:
         response,
         authenticated=bool(self.api_key),
         key_hint="S2_API_KEY",
+        expect_json=True,
     )
 @
 
@@ -1498,6 +1568,7 @@ results they want, and the provider handles the underlying paging.
 The loop terminates when we have fetched enough results, when the API returns
 no more data, or when we reach the total number of available results.
 
+\label{sec:s2-search-cacheable}
 As with DBLP, [[search]] caches only \emph{trustworthy} results.  A rate
 limit, a rejected key, or an HTTP/parse error can cut a search short, and the
 persistent pickle cache would otherwise freeze that partial or empty result for
@@ -1611,6 +1682,9 @@ def _search_uncached(
         self._limiter.record_limit_hit(
             reason="rate limited (HTTP 429) after retries"
         )
+        return all_papers, False
+    except RateLimited:
+        # The limiter already logged the reason once
         return all_papers, False
     except requests.exceptions.HTTPError as e:
         logger.warning("s2: HTTP error: %s", e)
@@ -1748,6 +1822,9 @@ def get_paper_by_doi(self, doi: str | None) -> Paper | None:
         self._cache[cache_key] = paper
         return paper
 
+    except RateLimited:
+        # The limiter already logged the reason once
+        return None
     except requests.exceptions.HTTPError as e:
         logger.warning("s2: DOI lookup error: %s", e)
         return None
@@ -1772,6 +1849,20 @@ The API endpoints are:
 Both endpoints return a list of objects with a [[citingPaper]] or
 [[citedPaper]] field containing the paper data.
 We request the same fields as the search API for consistency.
+
+The cache follows the search's rule (\cref{sec:s2-search-cacheable}):
+only a complete answer is stored.
+The fetch used to cache whatever it held when the loop ended, so a 429,
+a rejected key, an HTTP error or a malformed body froze an empty or
+truncated list into the never-expiring cache, and every later snowball
+from that paper found no citations without asking again.
+[[_fetch_related_pages]] therefore reports a [[cacheable]] flag beside
+its papers, and [[_get_related_papers]] stores the result only when the
+flag is true.
+A 404 counts as complete: the paper is unknown to Semantic Scholar,
+which is a definite answer, like a search with zero hits.
+The partial list is still returned, as the search returns its partial
+results.
 
 <<semantic scholar get citations and references>>=
 def get_paper_citations(
@@ -1840,6 +1931,24 @@ def _get_related_papers(
 
     logger.info(f"s2: Cache miss for {relation} of {paper_id}, fetching from API")
 
+    papers, cacheable = self._fetch_related_pages(paper_id, relation, limit)
+    logger.info("s2: Found %d %s for %s", len(papers), relation, paper_id)
+    if cacheable:
+        self._cache[cache_key] = papers
+    return papers
+
+def _fetch_related_pages(
+    self,
+    paper_id: str,
+    relation: str,
+    limit: int,
+) -> tuple[list[Paper], bool]:
+    """Page through citations or references, returning
+    ``(papers, cacheable)``.
+
+    ``cacheable`` is False when a rate limit, a rejected key, or an HTTP
+    or parse error cut the fetch short.
+    """
     all_papers: list[Paper] = []
     offset = 0
     page_size = min(limit, 100)
@@ -1864,12 +1973,12 @@ def _get_related_papers(
                 logger.warning(
                     "s2: Rate limited (429) during %s fetch", relation
                 )
-                break
+                return all_papers, False
 
             if response.status_code == 403:
                 # Key rejected and anonymous access also forbidden (logged
                 # by the helper). Stop with what we have.
-                break
+                return all_papers, False
 
             response.raise_for_status()
             data = response.json()
@@ -1897,16 +2006,59 @@ def _get_related_papers(
 
             offset += page_size
 
+    except RateLimited:
+        # The limiter already logged the reason once
+        return all_papers, False
     except requests.exceptions.HTTPError as e:
         logger.warning("s2: %s fetch error: %s", relation, e)
+        return all_papers, False
     except Exception as e:
         logger.warning("s2: %s fetch failed: %s", relation, e)
+        return all_papers, False
 
-    logger.info("s2: Found %d %s for %s", len(all_papers), relation, paper_id)
-    
-    # Cache the result
-    self._cache[cache_key] = all_papers
-    return all_papers
+    return all_papers, True
+@
+
+Let's verify that a failed fetch leaves nothing in the cache, so the next
+call asks again, while a complete answer and a 404 are cached.
+Each case makes two calls with the same arguments and counts the
+requests that reach the session.
+A 429 also puts Semantic Scholar on cooldown, which would keep the
+second call from asking for a reason of its own; the test lifts the
+cooldown between the calls, so that only the cache decides.
+
+<<test functions>>=
+def related_response(status_code, payload=None):
+    """A mocked Semantic Scholar response for the related-papers fetch."""
+    response = Mock(status_code=status_code, headers={})
+    response.json.return_value = payload or {}
+    if status_code >= 400:
+        response.raise_for_status.side_effect = requests.HTTPError(
+            f"{status_code} error", response=response
+        )
+    return response
+
+
+RELATED_PAGE = {"data": [{"citingPaper": {"title": "Citing paper"}}]}
+
+
+@pytest.mark.parametrize("first, cached", [
+    (related_response(429), False),
+    (related_response(500), False),
+    (related_response(200, {"data": "not a list"}), False),
+    (related_response(404), True),
+    (related_response(200, RELATED_PAGE), True),
+], ids=["429", "http-error", "malformed", "not-found", "complete"])
+def test_s2_related_papers_cache_only_complete_answers(first, cached):
+    """A fetch cut short is not cached; the next call asks again."""
+    provider = SemanticScholarProvider(api_key=None)
+    with patch.object(provider._session, "get",
+                      return_value=first) as get:
+        provider.get_paper_citations("10.1/related", limit=5)
+        ratelimit.reset_state(provider._limiter.name)
+        provider.get_paper_citations("10.1/related", limit=5)
+    assert get.call_count == (1 if cached else 2)
+    assert (("citations", "DOI:10.1/related", 5) in provider._cache) == cached
 @
 
 \subsubsection{Converting paper format}
@@ -2171,7 +2323,6 @@ class TestSemanticScholarProvider:
         sleeps = []
         monkeypatch.setattr(ratelimit, "_sleep", sleeps.append)
         monkeypatch.setattr(ratelimit, "_now", lambda: 1_700_000_000.0)
-        ratelimit._LIMITERS.pop("s2", None)
         provider = SemanticScholarProvider(api_key=None)
         ok = Mock(status_code=200)
         ok.json.return_value = {"total": 0, "data": []}
@@ -2535,6 +2686,9 @@ class OpenAlexProvider:
             return self._cache[cache_key]
         try:
             papers = self._search_uncached(query, limit, filters)
+        except RateLimited:
+            # The limiter already logged the reason once; do not cache.
+            return []
         except requests.HTTPError as e:
             self._note_http_error(e)
             status = getattr(e.response, "status_code", None)
@@ -2629,6 +2783,68 @@ def test_openalex_pages_pass_the_limiter_first():
     assert seen == [1, 2]
 @
 
+\label{sec:openalex-refusal}
+When the limiter refuses, [[acquire()]] has already said so: it logs
+one warning per process, naming the provider, and then raises
+[[RateLimited]].
+[[search()]] therefore catches that exception on its own, before the
+catch-all, and returns an uncached empty list without a word.
+The catch-all would have logged the exception a second time, and since
+the exception's message starts with the provider name too, the line read
+\enquote{openalex: openalex: \dots}.
+The source-pinned providers inherit [[search()]], and Semantic Scholar
+and arXiv, which pass the same limiter, catch it the same way.
+So does every other method of these three that passes the limiter and
+has a catch-all: the DOI lookups, Semantic Scholar's citation and
+reference fetch, and the two preprint lookups
+(\cref{sec:preprint-lookups}).
+Each returns its empty answer---[[None]] or an empty list---and caches
+nothing, because a refusal says nothing about the paper.
+Web of Science's DOI lookup needs no handler of its own: it goes through
+the search helpers, which already absorb the refusal.
+
+Let's verify that a refused request leaves exactly one warning and no
+cache entry, for the searches and for each lookup.
+A cooldown recorded beforehand makes the first [[acquire()]] refuse, so
+no request is attempted and no mock is needed.
+
+<<test functions>>=
+ARXIV_TEST_DOI = "10.48550/arXiv.2101.00001"
+
+
+@pytest.mark.parametrize("provider_class, request_once", [
+    (OpenAlexProvider, lambda p: p.search("refused", limit=5)),
+    (SemanticScholarProvider, lambda p: p.search("refused", limit=5)),
+    (ArxivProvider, lambda p: p.search("refused", limit=5)),
+    (OpenAlexProvider, lambda p: p.get_paper_by_doi("10.1/refused")),
+    (OpenAlexProvider, lambda p: p.get_preprint_locations("10.1/refused")),
+    (OpenAlexProvider, lambda p: p.search_preprints_by_title("Refused")),
+    (SemanticScholarProvider, lambda p: p.get_paper_by_doi("10.1/refused")),
+    (SemanticScholarProvider,
+     lambda p: p.get_paper_citations("10.1/refused")),
+    (ArxivProvider, lambda p: p.get_paper_by_doi(ARXIV_TEST_DOI)),
+], ids=[
+    "openalex-search", "s2-search", "arxiv-search",
+    "openalex-doi", "openalex-preprint-locations",
+    "openalex-preprint-title", "s2-doi", "s2-citations", "arxiv-doi",
+])
+def test_refused_request_is_logged_once(provider_class, request_once,
+                                        caplog):
+    """A limiter refusal is reported by the limiter alone, never cached."""
+    provider = provider_class()
+    provider._limiter.record_limit_hit(retry_after=3600, reason="cooldown")
+    cached_before = dict(provider._cache)
+    with caplog.at_level(logging.WARNING):
+        assert not request_once(provider)
+    warnings = [
+        r.getMessage() for r in caplog.records
+        if r.levelno >= logging.WARNING
+    ]
+    assert len(warnings) == 1, warnings
+    assert warnings[0].startswith(f"{provider.name}: cooldown")
+    assert dict(provider._cache) == cached_before
+@
+
 \subsubsection{Health check}
 
 [[pyalex]] hides HTTP status codes behind its own exceptions, so the probe
@@ -2675,7 +2891,7 @@ def _probe(self, params: dict) -> tuple[str, str]:
         )
     self._limiter.record_response(response)
     return classify_check_response(
-        response, authenticated=bool(self.api_key)
+        response, authenticated=bool(self.api_key), expect_json=True
     )
 <<openalex constants>>=
 OPENALEX_API_URL = "https://api.openalex.org/works"
@@ -3167,6 +3383,9 @@ def get_paper_by_doi(self, doi: str | None) -> Paper | None:
         self._cache[cache_key] = paper
         return paper
 
+    except RateLimited:
+        # The limiter already logged the reason once
+        return None
     except requests.exceptions.HTTPError as e:
         if getattr(e.response, "status_code", None) == 404:
             # DOI unknown to OpenAlex: cache the definite miss.
@@ -3181,6 +3400,7 @@ def get_paper_by_doi(self, doi: str | None) -> Paper | None:
 @
 
 \subsubsection{Preprint locations of a work}
+\label{sec:preprint-lookups}
 
 An OpenAlex work carries a [[locations]] array listing \emph{every}
 host of the work---publisher, aggregators, and repository deposits.
@@ -3224,6 +3444,9 @@ def get_preprint_locations(self, doi: str | None) -> list[dict]:
         self._limiter.acquire()
         doi_url = f"https://doi.org/{doi}"
         work = pyalex.Works()[doi_url]
+    except RateLimited:
+        # The limiter already logged the reason once
+        return []
     except requests.exceptions.HTTPError as e:
         if getattr(e.response, "status_code", None) == 404:
             # DOI unknown to OpenAlex: cache the definite miss.
@@ -3338,6 +3561,9 @@ def search_preprints_by_title(
             .filter(title={"search": normalized}, type="preprint")
             .get(per_page=limit)
         )
+    except RateLimited:
+        # The limiter already logged the reason once
+        return []
     except Exception as e:
         logger.warning(
             "openalex: preprint title search failed: %s", e
@@ -5267,6 +5493,7 @@ class WebOfScienceProvider:
 @
 
 \subsubsection{Initialization}
+\label{sec:wos-init}
 
 During initialization, we check for API keys in the following order:
 \begin{enumerate}
@@ -5449,6 +5676,7 @@ def check(self) -> tuple[str, str]:
         response,
         authenticated=True,
         key_hint="WOS_EXPANDED_API_KEY or WOS_STARTER_API_KEY",
+        expect_json=True,
     )
 @
 
@@ -7732,7 +7960,10 @@ does not overstate what is left.
         )
         self._limiter.record_response(response)
         return classify_check_response(
-            response, authenticated=True, key_hint="IEEE_API_KEY"
+            response,
+            authenticated=True,
+            key_hint="IEEE_API_KEY",
+            expect_json=True,
         )
 @
 
@@ -8221,20 +8452,14 @@ before any HTTP request, every request made counts against the budget,
 the two Mashery rejection codes update the persistent state differently,
 and---the cache-poisoning regression---a blocked or rate-limited search
 is never frozen into the cache.
-Each test evicts the shared [[ieee]] limiter so no warning-flag or
-pacing state leaks between tests (the state \emph{files} are already
-isolated by [[isolate_cache]], \cref{sec:cache-testing}).
+The [[fresh_rate_limiters]] fixture resets the shared [[ieee]] limiter
+after each test, so no warning-flag or pacing state leaks between tests,
+and [[isolate_cache]] gives each test its own state \emph{files}
+(\cref{sec:test-configuration}).
 
 <<test functions>>=
 class TestIEEERateLimits:
     """Tests for IEEE quota tracking and blocked-search caching."""
-
-    @pytest.fixture(autouse=True)
-    def fresh_limiter(self):
-        """Evict the shared ieee limiter around each test."""
-        ratelimit._LIMITERS.pop("ieee", None)
-        yield
-        ratelimit._LIMITERS.pop("ieee", None)
 
     @staticmethod
     def _page():
@@ -8470,7 +8695,6 @@ class TestPacedArxivClient:
         sleeps = []
         monkeypatch.setattr(ratelimit, "_sleep", sleeps.append)
         monkeypatch.setattr(ratelimit, "_now", lambda: 1_700_000_000.0)
-        ratelimit._LIMITERS.pop("arxiv", None)
         provider = ArxivProvider()
         monkeypatch.setattr(
             arxiv.Client, "_Client__try_parse_feed",
@@ -8483,7 +8707,6 @@ class TestPacedArxivClient:
         assert provider._limiter.status().day_count == 2
 
     def test_final_429_starts_a_cooldown(self, monkeypatch):
-        ratelimit._LIMITERS.pop("arxiv", None)
         provider = ArxivProvider()
 
         def throttled(self, url, first_page, try_index):
@@ -8664,6 +8887,9 @@ def get_paper_by_doi(self, doi: str | None) -> Paper | None:
 
         self._cache[cache_key] = None
         return None
+    except RateLimited:
+        # The limiter already logged the reason once
+        return None
     except Exception as e:
         logger.warning("arxiv: DOI lookup failed: %s", e)
         return None
@@ -8678,6 +8904,9 @@ The backoff starts at 3 seconds and doubles with each attempt.
 Importantly, we only cache successful results.
 If a request fails after all retries, we return an empty list without caching,
 allowing the user to retry immediately.
+A refusal by the rate limiter is not retried at all: a cooldown outlasts
+any backoff, and the limiter has already logged it, so the search returns
+quietly (\cref{sec:openalex-refusal}).
 
 <<arxiv search with retry>>=
 last_exception: Exception | None = None
@@ -8712,6 +8941,10 @@ for attempt in range(self.MAX_RETRIES):
                 "arxiv: %s (attempt %d/%d, giving up)",
                 e, attempt + 1, self.MAX_RETRIES
             )
+
+    except RateLimited:
+        # The limiter already logged the reason once
+        return []
 
     except Exception as e:
         # Non-retryable error
@@ -9834,7 +10067,10 @@ One row, minimal field list, no retries: for a health probe the first
 answer \emph{is} the diagnosis.
 The probe additionally maps HAL's 200-with-[[error]]-body to an HTTP
 error status---without that, HAL's most characteristic failure mode
-would report as healthy.
+would report as healthy.  A body that is not JSON at all is left to the
+classifier's [[expect_json]], so it is reported in the same words as
+for every other provider, with the content type that tells an HTML
+error page from a truncated answer.
 Like the searches, the probe passes the rate limiter and is counted.
 
 <<hal check method>>=
@@ -9858,8 +10094,10 @@ def check(self) -> tuple[str, str]:
                     "query rejected (error body in HTTP 200)",
                 )
         except ValueError:
-            return HEALTH_HTTP_ERROR, "non-JSON response"
-    return classify_check_response(response, authenticated=False)
+            pass
+    return classify_check_response(
+        response, authenticated=False, expect_json=True
+    )
 @
 
 \subsubsection{Converting HAL documents}
@@ -11188,14 +11426,17 @@ def test_doi_lookup_only_where_complete_is_served(self):
         assert provider.get_paper_by_doi("10.1/y") is None
     assert len(calls) == 1
 
-def test_doi_lookup_without_a_match(self):
+def test_doi_lookup_without_a_match(self, monkeypatch):
     """Scopus's empty-result sentinel is not a paper."""
     response = Mock(status_code=200, ok=True, headers={}, text="")
     response.json.return_value = {"search-results": {
         "entry": [{"@_fa": "false", "error": "Result set was empty"}]}}
     with patch("requests.get", return_value=response):
         assert ScopusProvider(api_key="k").get_paper_by_doi("10.1/x") is None
-    assert ScopusProvider(api_key=None).get_paper_by_doi("10.1/x") is None
+    monkeypatch.delenv("SCOPUS_API_KEY", raising=False)
+    with patch("requests.get") as keyless_get:
+        assert ScopusProvider(api_key=None).get_paper_by_doi("10.1/x") is None
+    keyless_get.assert_not_called()
 @
 
 \subsection{Health check}

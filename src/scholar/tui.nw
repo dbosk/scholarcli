@@ -33,7 +33,7 @@ The interface provides:
 The TUI supports two operational modes:
 \begin{description}
 \item[Review mode] Used when reviewing search results, with keep/discard 
-  functionality enabled and decisions saved per-query.
+  functionality enabled and decisions saved to the review session.
 \item[Notes mode] Used when browsing papers with notes, with keep/discard 
   disabled but note editing still available.
 \end{description}
@@ -101,6 +101,7 @@ from simple widgets to complex screens, culminating in the main application:
 <<tui pdf cache>>
 <<tui paper list widget>>
 <<tui abstract helpers>>
+<<tui notes helpers>>
 <<tui abstract screen>>
 <<tui discard modal>>
 <<tui sort modal>>
@@ -136,7 +137,10 @@ from scholar.tui import *
 
 TUI tests require a running Textual application, which makes them more
 integration-like than unit tests. The TUI module is primarily tested
-through manual interaction and the existing review module tests.
+through manual interaction and the existing review module tests.  Where
+a behaviour only shows in the running application, a test drives it
+headless with Textual's [[run_test]]
+(\cref{sec:tui-unreadable-notes}).
 
 <<test functions>>=
 # TUI tests are primarily integration tests that require
@@ -174,11 +178,12 @@ from rich.markup import escape
 from scholar.scholar import Paper, SearchResult, SearchFilters
 from scholar.notes import (
     get_note, has_note, edit_note_in_editor,
-    _get_cached_notes, get_paper_id,
+    _get_cached_notes, get_paper_id, NotesFileError, PaperNote,
 )
+from scholar.utils import backup_path
 from scholar.review import (
     DecisionStatus, ReviewDecision, ReviewSession, ReviewSource,
-    create_review_session, save_search_decisions, save_session,
+    create_review_session, save_session,
     escape_latex, filter_decisions,
     generate_csv_report, generate_latex_report,
 )
@@ -525,14 +530,22 @@ class AbstractScreen(Screen[None]):
                     yield Static("[dim]No abstract available and no PDF link found.[/dim]")
             
             # Show notes section if paper has notes
-            note = get_note(paper)
-            if note:
+            try:
+                note = get_note(paper)
+            except NotesFileError as error:
                 yield Static("")
-                yield Static("[bold cyan]─── Notes ───[/bold cyan]")
-                yield Markdown(note.note, id="notes-content")
+                yield Static(
+                    Text(notes_unavailable_message(error), style="red"),
+                    id="notes-error",
+                )
             else:
-                yield Static("")
-                yield Static("[dim]No notes. Press [bold yellow]n[/bold yellow] to add notes.[/dim]")
+                if note:
+                    yield Static("")
+                    yield Static("[bold cyan]─── Notes ───[/bold cyan]")
+                    yield Markdown(note.note, id="notes-content")
+                else:
+                    yield Static("")
+                    yield Static("[dim]No notes. Press [bold yellow]n[/bold yellow] to add notes.[/dim]")
             
             # Show tags (themes for kept, motivations for discarded)
             if self.decision.tags:
@@ -565,9 +578,7 @@ class AbstractScreen(Screen[None]):
     
     def action_edit_notes(self) -> None:
         """Open editor to edit notes for this paper."""
-        paper = self.decision.paper
-        with self.app.suspend():
-            edit_note_in_editor(paper)
+        edit_note_reporting_errors(self.app, self.decision.paper)
         # Refresh the screen to show updated notes
         self.refresh(recompose=True)
     
@@ -621,9 +632,16 @@ class AbstractScreen(Screen[None]):
             # notes/decisions to the new id and tell the user.
             if enriched.id != paper.id:
                 from scholar.notes import get_paper_id, migrate_paper_id
-                migrate_paper_id(
-                    get_paper_id(paper), get_paper_id(enriched)
-                )
+                try:
+                    migrate_paper_id(
+                        get_paper_id(paper), get_paper_id(enriched)
+                    )
+                except NotesFileError as error:
+                    app.call_from_thread(
+                        app.notify, notes_unavailable_message(error),
+                        severity="error", markup=False,
+                        timeout=NOTES_ERROR_TIMEOUT,
+                    )
                 enriched_fields.append(
                     f"adopted preprint {enriched.doi}"
                 )
@@ -1980,14 +1998,16 @@ class PaperReviewApp(App):
 
         return filter_decisions(decisions, self.search_filters)
     
+    <<app methods for unreadable notes>>
+
     def _refresh_list(self) -> None:
         """Refresh the paper list display."""
         list_view = self.query_one("#paper-list", ListView)
         list_view.clear()
 
         # Pre-compute note indicators (one cache lookup instead of N)
-        notes = _get_cached_notes()
-        papers_with_notes = set(notes.keys())
+        notes = self.read_notes_for_display()
+        papers_with_notes = set(notes or ())
 
         filtered = self.get_filtered_decisions()
         for i, decision in enumerate(filtered):
@@ -2095,8 +2115,7 @@ class PaperReviewApp(App):
         """Open editor to edit notes for current paper."""
         decision = self.get_current_decision()
         if decision:
-            with self.suspend():
-                edit_note_in_editor(decision.paper)
+            edit_note_reporting_errors(self, decision.paper)
             self._refresh_list()
     
     def action_keep(self) -> None:
@@ -2417,6 +2436,227 @@ class PaperReviewApp(App):
     <<search filters action>>
 @
 
+\subsection{A notes file that cannot be read}
+\label{sec:tui-unreadable-notes}
+
+The TUI reads the notes file while it draws: the paper list marks the
+papers that have a note, and the detail screen shows the note itself.
+Since an unreadable [[paper_notes.json]] raises [[NotesFileError]]
+instead of reading as empty (\cref{notes-module}), a broken file made
+the TUI crash with a traceback as it started
+(\url{https://github.com/dbosk/scholar/issues/121}).  The CLI turns the
+error into one line and stops (\cref{sec:cli-main}), but stopping is
+the wrong answer for the TUI: the review decisions do not depend on the
+notes, and a reviewer half-way through a session should be able to go
+on.  So the TUI catches the error where it reads notes and goes on
+without them:
+\begin{description}
+\item[The paper list] shows no note markers and reports the error as
+  an error notification.  The list is redrawn after every decision, so
+  [[read_notes_for_display]] remembers the message it last showed and
+  stays quiet until the error changes or the file reads again; the
+  notification itself stays longer than the default so that a message
+  shown once at start-up is not missed.
+\item[The detail screen] shows the message in red where the note would
+  be, so it is in view whenever a note is.
+\item[Editing a note] ([[n]], on either screen) is refused with the
+  same message before the terminal is handed to the editor, so the user
+  never types a note that could not be saved.  This is what keeps the
+  notes read-only, and it costs one read of the file per key press.
+  A write that fails after the edit is reported the same way, and
+  the message names the file where [[keep_unsaved_note]] kept the text
+  just typed (\cref{notes-module}), since the editor's own copy is
+  gone by then.
+\item[Migrating notes on enrichment] runs in a background thread
+  (\cref{sec:abstract-screen}).  [[migrate_paper_id]] reports an
+  unreadable file itself and only raises when a write fails; the thread
+  turns that into the same notification instead of dying with a
+  traceback over the screen.
+\end{description}
+The message names the file and its [[.bak]], like the CLI's.  The TUI
+cannot meet the session file's [[SessionFileError]] this way: it never
+reads the session file while it runs, only the caller saves it after
+the TUI has closed, and [[save_session]] treats an unreadable file on
+disk as nothing to merge (\cref{sec:session-integrity}).
+
+<<tui notes helpers>>=
+NOTES_ERROR_TIMEOUT = 30  # seconds; the default of 5 is easy to miss
+
+
+def notes_unavailable_message(error: NotesFileError) -> str:
+    """Return how the TUI reports a notes file it cannot read or write."""
+    kept = (
+        f"Your note was not saved; its text is in {error.unsaved_note}.\n"
+        if error.unsaved_note is not None else ""
+    )
+    return (
+        f"{error}\n{kept}"
+        "Notes are unavailable until the file is repaired or its previous "
+        f"version is restored from {backup_path(error.path)}."
+    )
+
+
+def edit_note_reporting_errors(app: App, paper: Paper) -> None:
+    """Edit `paper`'s note in the external editor.
+
+    A notes file that cannot be read is reported as an error
+    notification before the editor opens; a failed save is reported
+    the same way. Neither raises.
+    """
+    try:
+        get_note(paper)
+        with app.suspend():
+            edit_note_in_editor(paper)
+    except NotesFileError as error:
+        app.notify(
+            notes_unavailable_message(error),
+            severity="error", markup=False, timeout=NOTES_ERROR_TIMEOUT,
+        )
+<<app methods for unreadable notes>>=
+notes_error: str | None = None
+
+def read_notes_for_display(self) -> dict[str, PaperNote] | None:
+    """Return all notes, or None if the notes file cannot be read.
+
+    The error is shown as a notification the first time it occurs;
+    later calls stay quiet until it changes or the file reads again.
+    """
+    try:
+        notes = _get_cached_notes()
+    except NotesFileError as error:
+        message = notes_unavailable_message(error)
+        if message != self.notes_error:
+            self.notes_error = message
+            self.notify(
+                message,
+                severity="error", markup=False, timeout=NOTES_ERROR_TIMEOUT,
+            )
+        return None
+    self.notes_error = None
+    return notes
+@
+
+The tests drive the real application headless with Textual's
+[[run_test]], from ordinary synchronous tests through [[asyncio.run]]
+because the suite has no asynchronous test plugin.  A corrupt notes file
+must leave the TUI running and usable: one notification at start, none
+for the redraw after a decision, the decision recorded, the message on
+the detail screen, editing refused without opening the editor, and the
+file exactly as it was.
+
+<<test functions>>=
+class TestUnreadableNotesFile:
+    """A broken notes file is reported in the TUI, never raised."""
+
+    @pytest.fixture
+    def notes_file(self, tmp_path, monkeypatch):
+        from scholar.notes import (
+            NOTES_FILE, get_data_dir, invalidate_notes_cache,
+        )
+
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        notes_file = get_data_dir() / NOTES_FILE
+        notes_file.parent.mkdir(parents=True, exist_ok=True)
+        notes_file.write_text("{")
+        invalidate_notes_cache()
+        yield notes_file
+        invalidate_notes_cache()
+
+    @staticmethod
+    def run(keys, inspect=None):
+        """Run the app on a one-paper session, press `keys`, and return
+        the app and the (message, severity) notifications it showed."""
+        import asyncio
+
+        paper = Paper(title="T", authors=["A B"], doi="10.1/tui")
+        session = ReviewSession(
+            query="q", providers=["openalex"], timestamp=datetime.now(),
+            decisions=[ReviewDecision(paper=paper, provider="openalex")],
+        )
+        app = PaperReviewApp(session)
+        notices = []
+        show = app.notify
+
+        def record(message, **kwargs):
+            notices.append((message, kwargs.get("severity")))
+            show(message, **kwargs)
+
+        app.notify = record
+
+        async def drive():
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                await pilot.press(*keys)
+                await pilot.pause()
+                if inspect is not None:
+                    inspect(app)
+
+        asyncio.run(drive())
+        return app, notices
+
+    def test_the_list_reports_once_and_stays_usable(self, notes_file):
+        app, notices = self.run(["K"])
+        assert len(notices) == 1
+        message, severity = notices[0]
+        assert severity == "error"
+        assert "paper_notes.json" in message
+        assert "paper_notes.json.bak" in message
+        assert app.session.decisions[0].status == DecisionStatus.KEPT
+        assert notes_file.read_text() == "{"
+
+    def test_the_detail_screen_shows_the_error(self, notes_file):
+        shown = []
+
+        def inspect(app):
+            shown.extend(app.screen.query("#notes-error"))
+
+        self.run(["enter"], inspect)
+        assert len(shown) == 1
+
+    def test_editing_is_refused(self, notes_file, monkeypatch):
+        from contextlib import nullcontext
+        from unittest.mock import MagicMock
+
+        editor = MagicMock()
+        monkeypatch.setattr("scholar.tui.edit_note_in_editor", editor)
+        # A headless app cannot suspend; let it, so that only the
+        # refusal can keep the editor closed.
+        monkeypatch.setattr(
+            PaperReviewApp, "suspend", lambda self: nullcontext()
+        )
+        app, notices = self.run(["n"])
+        assert not editor.called
+        assert len(notices) == 2
+        assert "paper_notes.json" in notices[1][0]
+        assert notes_file.read_text() == "{"
+
+    def test_a_failed_save_names_the_kept_text(
+        self, notes_file, monkeypatch
+    ):
+        from contextlib import nullcontext
+        import scholar.notes as notes
+
+        notes_file.write_text("{}")
+        notes.invalidate_notes_cache()
+
+        def failing_write(*args, **kwargs):
+            raise OSError("No space left on device")
+
+        monkeypatch.setattr(notes, "atomic_write_text", failing_write)
+        monkeypatch.setattr(
+            notes.click, "edit", lambda *args, **kwargs: "Hours of reading."
+        )
+        monkeypatch.setattr(
+            PaperReviewApp, "suspend", lambda self: nullcontext()
+        )
+        app, notices = self.run(["n"])
+        assert len(notices) == 1
+        message, severity = notices[0]
+        assert severity == "error"
+        kept = Path(message.split("its text is in ")[1].split(".md")[0] + ".md")
+        assert kept.read_text().endswith("Hours of reading.\n")
+@
+
 \subsection{Search Filters Action}
 \label{sec:search-filters-action}
 
@@ -2631,7 +2871,9 @@ the TUI application.
 A key feature is the ability to resume interrupted review sessions. When a user
 runs the same query again (or uses a named session), we:
 \begin{enumerate}
-\item Load previously saved decisions from [[notes.py]] storage
+\item Load previously saved decisions from the session file (or, for
+  sessions older than session files, from the per-query decisions of
+  [[notes.py]])
 \item Match papers by ID (DOI or title hash) to restore their status
 \item Merge any new papers from the current search with existing decisions
 \item Preserve papers from previous sessions even if not in current results
@@ -2650,6 +2892,19 @@ The entry point supports two distinct modes:
 \item[Notes mode] ([[run_notes_browser]]) For browsing papers that have notes
   attached, without keep/discard. Useful for revisiting annotated papers.
 \end{description}
+
+\subsection{Where a review is saved}
+
+A review is saved once, as the session file of [[save_session]], which
+[[scholar sessions]] reads and which holds every field of every decision.
+Before session files existed, the TUI stored decisions per query through
+[[notes.py]], and it kept writing that copy on every save after the session
+file took over.
+That copy only duplicated the session (2.8\,MB in one user's store), and
+nothing reads it except [[create_review_session]], as a fallback for a
+session that has no session file.
+A session saved here always has one, so the TUI no longer writes the
+per-query copy; the fallback still reads old data.
 
 <<tui entry point>>=
 def run_review(results: list[SearchResult], query: str, 
@@ -2673,9 +2928,6 @@ def run_review(results: list[SearchResult], query: str,
                        session. If False (the default), no prompt is shown.
         search_filters: Initial search filters for local filtering within TUI
     """
-    # Use session_name for persistence, fall back to query
-    persistence_key = session_name if session_name else query
-    
     # Create review session using the review module
     session = create_review_session(results, query, session_name)
     
@@ -2687,10 +2939,7 @@ def run_review(results: list[SearchResult], query: str,
     )
     app.run()
     
-    # Save decisions for this session (legacy per-query storage)
-    save_search_decisions(persistence_key, session.decisions)
-    
-    # Save the complete session for `scholar sessions` commands
+    # The session file is the one record of the review's decisions
     save_session(session)
     
     # Prompt for report only if requested
@@ -2720,4 +2969,33 @@ def run_notes_browser() -> None:
     # Run the TUI in notes-only mode (no keep/discard)
     app = PaperReviewApp(session, review_mode=False)
     app.run()
+@
+
+Let's verify that a review is saved as a session and nowhere else.
+We replace the Textual application by a stand-in whose [[run]] returns at
+once, since the save path is what we test, not the interface.
+
+<<test functions>>=
+def test_run_review_saves_session_only(monkeypatch):
+    """run_review writes the session file, not legacy per-query decisions."""
+    from scholar.notes import get_decisions_dir
+    from scholar.review import load_session
+
+    class FakeApp:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def run(self):
+            pass
+
+    monkeypatch.setattr("scholar.tui.PaperReviewApp", FakeApp)
+    result = SearchResult(
+        query="q",
+        provider="openalex",
+        timestamp=datetime.now(),
+        papers=[Paper(title="A paper", authors=["A. Author"], year=2024)],
+    )
+    run_review([result], "q", session_name="legacy-test")
+    assert load_session("legacy-test") is not None
+    assert list(get_decisions_dir().glob("*.json")) == []
 @

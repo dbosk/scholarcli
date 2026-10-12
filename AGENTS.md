@@ -90,6 +90,17 @@ Providers self-register via `register_provider()` at module load time.
 | Preprints.org | `preprintsorg` | OpenAlex (`pyalex`), source-pinned | `SCHOLAR_EMAIL` (optional) |
 | IACR ePrint | `iacr` | OpenAlex (`pyalex`), source-pinned | `SCHOLAR_EMAIL` (optional) |
 
+**Key arguments.** The keyed constructors (`SemanticScholarProvider`,
+`OpenAlexProvider`, `IEEEXploreProvider`, `ScopusProvider`) treat
+`api_key=None` (or `""`) as "not given" and fall back to the environment
+variable: `ScopusProvider(api_key=None)` has a key when `SCOPUS_API_KEY`
+is set. The registry builds providers without arguments, so the
+environment is the normal key source. Tests wanting no key must
+`monkeypatch.delenv` the variable (or clear `provider.api_key` after
+construction). Exception: `WebOfScienceProvider` uses a sentinel, so an
+explicit `None` disables that tier (the legacy `WOS_API_KEY` still
+fills it).
+
 ### Preprint-Server Providers and Groups
 
 The seven source-pinned providers exist because their servers have no
@@ -136,7 +147,9 @@ Implemented as `check_provider()`/`classify_check_response()` plus a
 per-provider optional `check()` method in `providers.py`.
 `classify_check_response(..., expect_json=True)` turns a 2xx body that is
 not JSON into `http error` "non-JSON response (HTTP 200, text/html)"
-(`non_json_reason()`); the DBLP and Scopus probes use it. Since Sep 2026
+(`non_json_reason()`); every JSON probe uses it (DBLP, Scopus, S2,
+OpenAlex and its preprint servers, HAL, IEEE, WoS), only arXiv's
+Atom probe does not. Since Sep 2026
 dblp.org and both mirrors (uni-trier, dagstuhl) serve an Anubis anti-bot
 HTML page with HTTP 200 to API clients; no header or mirror helps (#94),
 so `providers check` fails for dblp and DBLP searches record `failed`.
@@ -347,11 +360,68 @@ confirmation goes to stderr so `-f json`/`-f bibtex` stdout stays pure.
 `--paper-id` takes) under its title, and `show -f json` carries `doi` and
 `paper_id`, so a decision never needs a CSV detour.
 `--source llm` stores the decision as an unreviewed LLM decision
-(agent-driven screening that the TUI still queues for confirmation); a
+(agent-driven screening that the TUI still queues for confirmation),
+with `--confidence/-c 0..1` in `llm_confidence` like `llm classify`
+(validated; ignored with a note for human decisions); a
 human `decide` on such a row marks it `llm_reviewed`, with `is_example`
 set when the status changed, mirroring the TUI.
 Together these let scripted/agent-driven systematic reviews produce the same
 session record and `sessions export` audit trail as TUI reviews.
+
+### Session Integrity
+
+Commands that load a session and save it much later (`scholar enrich`,
+`verify`, the TUI) used to overwrite whatever was saved in between. That
+is how two classified sessions lost every decision and their research
+context (#107). `review.save_session` now:
+
+- **merges**: it re-reads the file and does a three-way merge against
+  `session._baseline` (`SessionBaseline`, recorded by `read_session_file`
+  and after each save). Decision fields and `research_context` this
+  process did not change take the on-disk value. Papers, search records
+  and snowball rounds that only the file has are added. Paper metadata is
+  not merged (ours wins).
+- **guards**: `warn_if_decisions_dropped` logs a WARNING (session,
+  before/after decided counts, `.bak` path) when the save still leaves
+  fewer decided papers than the file has, beyond this process's own
+  resets to pending. It never refuses the save.
+- **locks**: the re-read, merge and replace run under
+  `utils.file_lock` (`filelock`: `flock` on POSIX, `LockFileEx` on
+  Windows) on a hidden sidecar `.<name>.json.lock`, so two processes
+  saving at once take turns. Held for milliseconds only, never from
+  load to save; after `LOCK_TIMEOUT` (10 s) it warns and writes
+  unlocked. Notes writers (`save_note`, `delete_note`, `get_note`,
+  `import_notes`, `migrate_paper_id`) take the notes file's lock via
+  `_holding_notes_lock`. Same machine only: no help across
+  machines on a shared directory.
+- **writes atomically**: `utils.atomic_write_text` (temp file in the
+  same directory, fsync, `os.replace`), keeping the previous file as
+  `<name>.json.bak` (one generation).
+
+`load_session(..., strict=True)` raises `SessionFileError` for a file
+that exists but does not parse. `create_review_session` uses it, so
+`search -n`/`--review`/`rq` stop with one line instead of rebuilding over
+the file. Read-only callers still get `None` plus a warning.
+Notes (`paper_notes.json`) and per-query decision files follow the same
+rules (#114). A file that exists but does not parse raises
+`notes.NotesFileError` instead of reading as empty, which used to make
+the next save erase every other note. Writes are atomic with a `.bak`,
+and write errors raise instead of being swallowed. `cli.main()` turns
+the error into one line and exit 1. Two deliberate exceptions (#121):
+the TUI catches it, shows it as a notification (and in red on the
+detail screen), hides note markers and refuses note editing, but keeps
+reviewing (a note whose save fails after editing is kept in
+`unsaved-note-*.md`, data dir else temp dir, and the message names
+it, #126); and `migrate_paper_id` logs a WARNING naming each unreadable
+store file and both ids and skips it (raising would discard the
+caller's enrichment run or search append), raising only on write
+errors. `notes export` also writes atomically (no `.bak`).
+`sessions export` stages all its files with `utils.staged_outputs` and
+moves them into place only if every format succeeded (#83).
+`sessions list` warns on stderr about sessions with records but no
+decisions and no context (`needs_check` in the JSON). The paper registry
+is process-global, so tests that load sessions should use unique DOIs or
+`isolated_registry()`.
 
 ### Provenance Round-Trip
 
@@ -404,21 +474,36 @@ report body builders (`build_review_provenance_latex`,
   literal `\textcite{key}`s, so `_synthesis_key_space` orders the key
   space as included kept papers (original order), then remaining kept,
   then discarded, deduplicated by paper id; suffixes are assigned in
-  iteration order, so kept keys never change. The report keeps its own
-  `surname{year}_{index}` scheme keyed by `id(decision)` (a loaded
-  session can hold one paper twice); builders take a `cite_key`
-  resolver so the two schemes never have to agree. Synthesis keys strip
-  only the characters biber rejects (apostrophes, quotes, braces,
-  delimiters), so `O'Brien` yields `obrien2024` while all other keys are
-  unchanged.
+  iteration order, so kept keys never change.
+- **One key scheme** (#85, `review.py`): `cite_key_base` = surname
+  (`author_surname`: before the comma in `Smith, John`, else the last
+  word) lower-cased and reduced to letters/digits (biber-safe; `O'Brien`
+  → `obrien`, `Smith-Jones` → `smithjones`, `Müller` kept) + year or
+  `nd`; `unknown` without author. `assign_cite_keys` suffixes clashes in
+  list order from `a` (`smith2024`, `smith2024a`, …, `z`, `aa`), so a
+  key depends only on the papers before it. Both `report_cite_keys`
+  (keyed by `id(decision)`: a loaded session can hold one paper twice,
+  and the report lists both) and the synthesis's
+  `_generate_all_citation_keys` (keyed by paper id after
+  `_unique_by_paper_id`) use it; the builders keep the `cite_key`
+  resolver because the two look keys up by different identities.
+  Changing the scheme requires a `SYNTHESIS_CACHE_VERSION` bump (now
+  `v5`: cached prose cites keys literally). `search -f bibtex` and
+  `bibtex+prov` use it too (#122, `cli._keyed_papers`: keys assigned
+  once over all results in output order); this changed their keys
+  for comma-form names, apostrophes and clashes. `prov import/export`
+  match entries by `Paper.id`, never by key, so old `.bib` files still
+  round-trip.
 - `scholar sessions export -f table --lang en|sv --label L --track T
   --theme TAG=NAME -o base` writes `base.tex`, always a fragment: one
   row per *work* (`audit_work_key`: title and first-author surname
-  reduced to case-folded letters and digits, year ignored; joined
+  (`author_surname`; a blank author gives an empty surname) reduced to case-folded letters and digits, year ignored; joined
   provider strings like `openalex; dblp` are split, mapped to codes and
   deduplicated; the best-placed decision wins). The *last* category tag
   is the decision (`decide -t` appends); confidence is shown for
-  unreviewed and human-confirmed LLM rows, not for changed ones. The
+  unreviewed and human-confirmed LLM rows, not for changed ones, and
+  such a row without one shows `AUDIT_STRINGS[lang]["no_confidence"]`
+  (`n/a`, `saknas`) because the caption promises a confidence. The
   escapers decode HTML entities, strip inline markup, repair
   cp1252/Latin-1 mojibake and turn `"` into `\textquotedbl{}` (babel
   shorthand). Titles are printed whole unless `--truncate-titles`
@@ -428,15 +513,25 @@ report body builders (`build_review_provenance_latex`,
   `duplicate-record-of-cited-source`, `extended-tech-report`, …) and
   theme tags (the rest; with `--theme` given, only the listed tags).
   *Cited* = kept by a human decision (source `human` or `llm_reviewed`)
-  with a theme tag or no tags; otherwise the first category tag, with
-  the confidence for unreviewed LLM rows; notes are appended in
-  parentheses, note-only rows are "other". An LLM keep is a candidate,
-  not a citation. Order: cited (0), `supports-claim` (1),
+  with a theme tag or no tags; otherwise the last category tag
+  (`audit_category`), with the confidence for unreviewed LLM rows; notes
+  are appended in parentheses, note-only rows are "other". An LLM keep
+  is a candidate, not a citation. Order: cited (0), `supports-claim` (1),
   `qualifies-claim` (2), `adjacent-subtopic` (3),
-  `off-topic-false-hit` (4), pending (5), other (6). The caption never
+  `off-topic-false-hit` (4), pending (5), other (6). The status wins
+  over the category (#89): a *discarded* row whose category is
+  `supports-claim`/`qualifies-claim` (`audit_excluded`) is never in
+  orders 0-2; it sorts as other (6) with reason "<category>, excluded"
+  and the caption counts it apart (`extra_excluded`), so
+  `--bearing-only` never lists a rejected hit. The caption never
   names the session (it is a `%` comment in the fragment) and ends with
   a full-name-first "Databases:" sentence built from the providers
-  present. `--bearing-only` lists only orders 0-2 and states the other
+  the session searched (search records that answered at least once,
+  zero hits included, plus the rows; rows only for old sessions); one
+  whose `SearchRecord`s carry errors is marked
+  "failed for k of n queries" / "incomplete for k of n queries"
+  (localised), and one that failed every query outright is not
+  named. `--bearing-only` lists only orders 0-2 and states the other
   counts in the caption. `all` stays csv + latex.
 - The TUI's `prompt_for_report` keeps the standalone default.
 
@@ -461,8 +556,21 @@ batch once with the vocabulary spelled out when a paper would be left
 without tags. A session without tags imposes nothing unless
 `llm classify --tag` (the `vocabulary=` argument) seeds it; with
 `--allow-new-tags` (`allow_new_tags=`) the prompt asks the model to
-prefer the vocabulary but nothing is dropped or retried. The `llm`
+prefer the vocabulary and new tags are not dropped. The `llm`
 module is looked up via `globals()` so tests can substitute a fake model.
+
+Tag kinds: note tags (`NOTE_TAGS`, the union of every language's
+`AUDIT_STRINGS[lang]["notes"]`) are human-only, never offered (not even
+on examples' tag lines) and dropped if returned (`excluded_tags=`, also
+under `--allow-new-tags`). When the vocabulary holds any of
+`AUDIT_CATEGORIES`, the prompt lists them in a separate "Category
+(exactly one per paper)" section and the theme lists become optional
+extras; `parse_llm_response(category_tags=…)` sets
+`LLMDecision.category_problem` unless exactly one category remains
+after mapping, that triggers the same single retry, and a paper still
+invalid afterwards gets no decision (stays pending) and is listed in
+`LLMBatchResult.withheld`, which `llm classify` prints at the end.
+Sessions without category tags are classified as before.
 
 ### Interactive Tutorials (`scholar tutorial`)
 
@@ -522,7 +630,15 @@ refuses DNS and connections to anything but loopback and **fails the
 test** naming the hosts (providers swallow errors, so a refusal alone
 would go unnoticed). Both exempt `@pytest.mark.integration` tests, which
 run only with `--run-live` and keep the developer's keys. No `env -u`
-prefix is needed to run the suite safely.
+prefix is needed to run the suite safely. The autouse
+`fresh_paper_registry` fixture gives every test an empty `PaperRegistry`
+(`Paper.from_dict` returns the registered object for a known id, so a
+shared registry let one test's titles leak into the next), and
+`fresh_rate_limiters` returns the limiter registry to its import-time
+state after every test (test-created limiters dropped, the others'
+limits, last request and warning flag reset). It restores rather than
+empties: `providers limits` lists Crossref/Unpaywall only because their
+import registered limiters. No test needs to pop `ratelimit._LIMITERS`.
 
 ## Adding Features
 
@@ -554,9 +670,17 @@ Search results are cached to avoid redundant API calls:
 CLI commands:
 ```bash
 scholar cache info   # Show cache statistics
-scholar cache clear  # Delete all cached results
+scholar cache clear  # Delete cached results (keeps LLM caches)
+scholar cache clear --include-llm  # ... and the LLM synthesis caches
 scholar cache path   # Print cache directory
 ```
+
+`cache clear` keeps the `llm_*.pkl` caches (`cache.is_llm_cache`: the
+synthesis prose of `scholar llm synthesize`, paid model output that
+never goes stale) and says how many it kept; `cache info` lists them on
+their own line. `clear_cache()` also empties the in-memory copy of each
+deleted cache in `CACHE_REGISTRY`, else the exit hook would write it
+back (the CLI loads `crossref.pkl` at import).
 
 Environment variable: `SCHOLAR_CACHE_DIR` to override cache location.
 
@@ -595,7 +719,8 @@ requests/day and each `scholar` run is a fresh process.
 - CLI: `scholar providers limits` shows usage/remaining/reset per
   quota group; `--reset <name|all>` clears state (use after a key
   rotation or when the real quota is known to have rolled over).
-- Tests: `tests/conftest.py` isolates `SCHOLAR_DATA_DIR` per test and
+- Tests: `tests/conftest.py` isolates `SCHOLAR_DATA_DIR` per test,
+  resets the in-memory limiters (`fresh_rate_limiters`) and
   no-ops the pacing sleep; `test_ratelimit.py` controls time via the
   module's `_now`/`_sleep` seams.
 - OpenAlex meters requests in credits (a search is 10 credits, $0.001;
@@ -645,6 +770,7 @@ requests/day and each `scholar` run is a fresh process.
 - `pytorial` - Interactive tutorial runner behind `scholar tutorial`
 - `llm` and its plugins (`llm-openai-plugin`, `llm-anthropic`, `llm-gemini`, `llm-mistral`, `llm-azure`, `llm-github-copilot`, `llm-gpt4all`, `llm-openai-via-codex`) - model access for `scholar rq` and `scholar llm`
 - `platformdirs` - Platform-appropriate cache directory
+- `filelock` - Cross-platform file lock around session/notes saves
 
 
 ## grepai - Semantic Code Search
