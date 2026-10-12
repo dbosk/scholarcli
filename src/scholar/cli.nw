@@ -5391,7 +5391,7 @@ class TestSessionsExport:
             review.ReviewDecision(
                 paper=Paper(title="Supports", authors=["B"], year=2023,
                             doi="10/b"),
-                provider="dblp", status=review.DecisionStatus.DISCARDED,
+                provider="dblp", status=review.DecisionStatus.KEPT,
                 tags=["supports-claim"], source=llm, llm_confidence=0.93,
             ),
             review.ReviewDecision(
@@ -5621,6 +5621,14 @@ def sessions_decide(
             autocompletion=complete_decision_source,
         ),
     ] = "human",
+    confidence: Annotated[
+        Optional[float],
+        typer.Option(
+            "--confidence", "-c",
+            help="The model's confidence (0-1) for an LLM decision "
+                 "(--source llm); ignored for human decisions.",
+        ),
+    ] = None,
 ) -> None:
     """
     Record keep/discard decisions in a saved session, without the TUI.
@@ -5630,14 +5638,15 @@ def sessions_decide(
     nothing, no changes are saved and the exit code is nonzero.
 
     --source llm records an unreviewed LLM decision (an agent deciding on
-    the LLM's behalf). A human decision on such a paper marks it
-    reviewed, and changed if the status differs.
+    the LLM's behalf), with the model's --confidence if given. A human
+    decision on such a paper marks it reviewed, and changed if the
+    status differs.
 
     Examples:
         scholar sessions decide my-review --keep --doi 10.1145/3568813 \\
             --tag misconceptions
         scholar sessions decide my-review --source llm --discard \\
-            --doi 10.1145/3568813 --tag off-topic-false-hit
+            --doi 10.1145/3568813 --tag off-topic-false-hit -c 0.9
     """
     from scholar.review import (
         DecisionStatus, ReviewSource, load_session, save_session,
@@ -5688,6 +5697,7 @@ if discard and not tag:
         "[red]--discard requires at least one --tag (motivation).[/red]"
     )
     raise typer.Exit(1)
+<<validate the decide confidence>>
 @
 
 Recording one decision has three cases. An LLM decision is stored as
@@ -5702,6 +5712,8 @@ if source == "llm":
     decision.status = status
     decision.source = ReviewSource.LLM_UNREVIEWED
     decision.is_example = False
+    if confidence is not None:
+        decision.llm_confidence = confidence
 elif decision.source == ReviewSource.LLM_UNREVIEWED:
     mark_as_reviewed(
         decision,
@@ -5713,6 +5725,34 @@ else:
     decision.source = ReviewSource.HUMAN
 for t in tag or []:
     decision.add_tag(t)
+@
+
+An agent that records a classifier's verdicts through [[decide]] also
+has the classifier's confidence, and the audit table promises one for
+every machine-classified row (issue~\#90). [[--confidence]] stores it
+where [[scholar llm classify]] does, in [[llm_confidence]], so the two
+paths produce the same row. It belongs to the model, so it is stored
+only with [[--source llm]]: a human decision on an LLM row is a review,
+and overwriting the model's number with the reviewer's would make the
+table misreport what the model said, while a plain human decision has
+no machine label to qualify. Given with a human source the option is
+therefore accepted but ignored, with a note, rather than refused, so a
+script that always passes it keeps working. Without the option an LLM
+decision keeps whatever confidence it had (none for a fresh row, which
+the table then marks as missing). Like the other checks, the range is
+validated before the session is loaded.
+
+<<validate the decide confidence>>=
+if confidence is not None and not 0.0 <= confidence <= 1.0:
+    console.print(
+        f"[red]--confidence must be between 0 and 1, got {confidence}.[/red]"
+    )
+    raise typer.Exit(1)
+if confidence is not None and source != "llm":
+    console.print(
+        "[yellow]--confidence is the model's; ignored for a human "
+        "decision.[/yellow]"
+    )
 @
 
 Selection collects matches into a dict keyed by paper id, which both
@@ -5816,6 +5856,44 @@ class TestSessionsDecideCommand:
         decision = load_session("headless").discarded_papers()[0]
         assert decision.source == ReviewSource.LLM_UNREVIEWED
         assert decision.is_example is False
+
+    def test_llm_decision_records_confidence(self, tmp_path, monkeypatch):
+        """--confidence is stored with an LLM decision, like classify's."""
+        from scholar.review import load_session
+
+        self._make_session(tmp_path, monkeypatch)
+        result = runner.invoke(app, [
+            "sessions", "decide", "headless", "--source", "llm",
+            "--keep", "--doi", "10.1/withdoi", "--tag", "supports-claim",
+            "--confidence", "0.75",
+        ])
+        assert result.exit_code == 0, result.output
+        assert load_session("headless").kept_papers()[0].llm_confidence \
+            == 0.75
+
+    def test_confidence_validated_and_ignored_for_humans(
+        self, tmp_path, monkeypatch
+    ):
+        """Out-of-range confidence is refused; a human's is not stored."""
+        from scholar.review import load_session
+
+        self._make_session(tmp_path, monkeypatch)
+        result = runner.invoke(app, [
+            "sessions", "decide", "headless", "--source", "llm",
+            "--keep", "--doi", "10.1/withdoi", "--confidence", "1.5",
+        ])
+        assert result.exit_code == 1
+        assert "between 0 and 1" in result.output
+        assert load_session("headless").kept_papers() == []
+
+        result = runner.invoke(app, [
+            "sessions", "decide", "headless",
+            "--keep", "--doi", "10.1/withdoi", "-c", "0.5",
+        ])
+        assert result.exit_code == 0
+        assert "ignored" in result.output
+        assert load_session("headless").kept_papers()[0].llm_confidence \
+            is None
 
     def test_human_decision_reviews_llm_decision(self, tmp_path, monkeypatch):
         """A human decision on an LLM row marks it reviewed and changed."""
@@ -6809,6 +6887,12 @@ def llm_classify(
     can be constrained from the first batch; --allow-new-tags asks the model
     to prefer the vocabulary but lets it add tags when none fits.
 
+    When the vocabulary holds audit categories (supports-claim,
+    qualifies-claim, adjacent-subtopic, off-topic-false-hit), every paper
+    must get exactly one of them; a paper that does not, even after the
+    retry, is left pending and listed at the end. Note tags such as
+    duplicate-record-of-cited-source are for humans and never assigned.
+
     Example:
         scholar llm classify "my review" --count 20
         scholar llm classify "my review" --no-examples
@@ -6868,6 +6952,7 @@ def llm_classify(
         console.print(f"  Model: {result.model_id}")
         console.print(f"  LLM unreviewed: {stats['llm_unreviewed']}")
         console.print(f"  Pending: {stats['pending']}")
+        <<report papers left pending by the category rule>>
 
     except ValueError as e:
         console.print(f"[red]Error: {escape(str(e))}[/red]")
@@ -7501,6 +7586,78 @@ def llm_synthesize(
 @
 
 
+\subsection{Papers left pending by the category rule}
+
+When the session's vocabulary holds audit categories, the classifier
+withholds the decision of a paper whose answer still lacks exactly one
+category after its retry (\cref{sec:classifier-categories} in the LLM
+review module). The paper silently staying pending would look like a
+paper the batch never reached, so the run ends with a warning that
+names each one and says what was wrong; the reviewer can then decide
+it with [[sessions decide]] or leave it for the next batch.
+
+<<report papers left pending by the category rule>>=
+if result.withheld:
+    from scholar.notes import get_paper_id
+
+    titles = {get_paper_id(d.paper): d.paper.title for d in session.decisions}
+    console.print(
+        f"[yellow]Left pending, not exactly one category tag "
+        f"({len(result.withheld)}):[/yellow]"
+    )
+    for withheld in result.withheld:
+        title = titles.get(withheld.paper_id, withheld.paper_id)
+        console.print(
+            f"  {escape(title)} [dim]({escape(withheld.paper_id)}: "
+            f"{escape(withheld.category_problem)})[/dim]"
+        )
+@
+
+The summary reaches the user even though the other decisions of the
+batch were applied and saved:
+
+<<test functions>>=
+class TestLLMClassifyWithheld:
+    def test_withheld_papers_are_listed(self, monkeypatch):
+        from datetime import datetime
+        from scholar import llm_review, review
+        from scholar.llm_review import LLMBatchResult, LLMDecision
+        from scholar.notes import get_paper_id
+
+        session = review.ReviewSession(
+            query="t", providers=["p"], timestamp=datetime.now(),
+            research_context="ctx", name="s",
+        )
+        paper = Paper(title="Two Categories", authors=["A"], doi="10.1/x")
+        session.decisions.append(
+            review.ReviewDecision(paper=paper, provider="p")
+        )
+        monkeypatch.setattr(review, "load_session", lambda x: session)
+        monkeypatch.setattr(review, "save_session", lambda s: None)
+        withheld = LLMDecision(
+            paper_id=get_paper_id(paper), status="kept",
+            tags=["supports-claim", "qualifies-claim"], confidence=0.9,
+            reasoning="r",
+            category_problem="several category tags: supports-claim, "
+                             "qualifies-claim",
+        )
+        monkeypatch.setattr(
+            llm_review, "classify_papers_with_llm",
+            lambda **kwargs: LLMBatchResult(
+                decisions=[], model_id="fake", timestamp="t",
+                withheld=[withheld],
+            ),
+        )
+        result = runner.invoke(app, ["llm", "classify", "s"])
+        assert result.exit_code == 0, result.output
+        assert "Left pending, not exactly one category tag (1)" \
+            in result.output
+        assert "Two Categories" in result.output
+        assert "several category tags" in result.output
+        assert session.decisions[0].status == review.DecisionStatus.PENDING
+@
+
+
 \subsection{Testing LLM Commands}
 
 <<test functions>>=
@@ -7965,22 +8122,45 @@ structure, including the search metadata:
 For \LaTeX{} users, we generate BibTeX entries that can be added to a
 [[.bib]] file.
 
-The citation key is the first author's surname glued to the year.  We compute
-it in a free function rather than inside the entry builder because the
-provenance-stub formatter below needs the same key for its comment header
-\emph{before} the entry itself is rendered --- sharing one function guarantees
-the header and the entry never disagree.  A missing \emph{or blank} author
-list falls back to [[unknown]] and a missing year to [[nd]], so a key always
-exists: we take the surname from the split parts only when there is a part to
-take, since a blank author string splits to nothing.
+The citation keys follow the scheme the review report and the \LaTeX{}
+synthesis use (\cref{sec:cite-keys} in the review module): the first
+author's surname reduced to letters and digits, then the year or [[nd]], and a
+letter suffix [[a]], [[b]], \dots{} for a second paper with the same key.
+This formatter used to build keys its own way, from the last word of the first
+author's name with nothing removed, and that went wrong in three ways
+(issue~\#122).  \enquote{Smith, John} gave [[john2024]], because the last word
+of a surname-first name is the given name.  \enquote{O'Brien} gave
+[[o'brien2024]], and biber rejects an apostrophe in a key, which aborts the
+whole bibliography.  And two Smiths from 2024 both got [[smith2024]], so the
+second entry's key was a duplicate that biber also rejects.  Using the shared
+scheme fixes all three and gives a reader one rule for every [[.bib]] Scholar
+writes.
+
+The price is that a key in a newly written [[.bib]] can differ from the key
+an earlier version of Scholar wrote for the same paper (only for papers that
+hit one of the three cases above), so a document citing the old key must be
+updated.  The provenance round-trip below is not affected: it matches an entry
+to its note by [[Paper.id]], computed from the entry's fields, never by the
+key.
+
+A key depends on the papers before it in the output, because only the first
+paper with a base key keeps it plain.  The keys are therefore assigned once,
+over every paper of every result in output order, by one generator that both
+formatters iterate.  The provenance-stub formatter below needs the key for its
+comment header \emph{before} the entry itself is rendered, so the generator
+hands out each key together with its paper and the entry builder takes the key
+as an argument: the header and the entry cannot disagree.  We import the
+scheme lazily, as the other commands do with the review module.
 
 <<formatter classes>>=
-def _bibtex_key(paper) -> str:
-    """Return the citation key for a paper (first surname plus year)."""
-    parts = paper.authors[0].split() if paper.authors else []
-    first_author = parts[-1] if parts else "unknown"
-    year = paper.year or "nd"
-    return f"{first_author.lower()}{year}"
+def _keyed_papers(results: list):
+    """Yield `(result, paper, key)` for every paper, keys unique overall."""
+    from scholar.review import assign_cite_keys
+
+    pairs = [(result, paper) for result in results for paper in result.papers]
+    keys = assign_cite_keys([paper for _, paper in pairs])
+    for (result, paper), key in zip(pairs, keys):
+        yield result, paper, key
 @
 
 The entry builder returns the [[@article]] block as a string instead of
@@ -7994,15 +8174,14 @@ class BibTeXFormatter:
 
     def format(self, results: list) -> None:
         """Output results as BibTeX."""
-        for result in results:
-            for paper in result.papers:
-                print(self._format_paper(paper))
-                print()
+        for _, paper, key in _keyed_papers(results):
+            print(self._format_paper(paper, key))
+            print()
 
-    def _format_paper(self, paper) -> str:
-        """Return a single paper rendered as a BibTeX entry string."""
+    def _format_paper(self, paper, key: str) -> str:
+        """Return `paper` rendered as a BibTeX entry with citation `key`."""
         lines = [
-            f"@article{{{_bibtex_key(paper)},",
+            f"@article{{{key},",
             f"  title = {{{paper.title}}},",
             f"  author = {{{' and '.join(paper.authors)}}},",
         ]
@@ -8027,6 +8206,35 @@ structure:
         captured = capsys.readouterr()
         assert "@article{" in captured.out
         assert "title = {Test Paper}" in captured.out
+@
+
+The three failures of the old key scheme each get a case: a surname-first
+name, an apostrophe, and two Smiths from 2024 in \emph{different} results,
+which must still be told apart because the keys are assigned over the whole
+output:
+
+<<test functions>>=
+    def test_bibtex_formatter_uses_shared_key_scheme(self, capsys):
+        """Keys are surname-based, biber-safe and unique over the output."""
+        def result(*papers):
+            return SearchResult(
+                query="q", provider="dblp",
+                timestamp="2024-01-01T00:00:00", papers=list(papers),
+            )
+
+        BibTeXFormatter().format([
+            result(
+                Paper(title="A", authors=["Smith, John"], year=2024),
+                Paper(title="B", authors=["Ann O'Brien"], year=2024),
+            ),
+            result(Paper(title="C", authors=["Jane Smith"], year=2024)),
+        ])
+        out = capsys.readouterr().out
+        heads = [l for l in out.splitlines() if l.startswith("@article{")]
+        assert heads == [
+            "@article{smith2024,", "@article{obrien2024,",
+            "@article{smith2024a,",
+        ]
 @
 
 
@@ -8128,19 +8336,17 @@ class BibTeXProvFormatter(BibTeXFormatter):
 
     def format(self, results: list) -> None:
         """Output results as provenance-stub BibTeX."""
-        for result in results:
-            found_via = _found_via(result)
+        for result, paper, key in _keyed_papers(results):
             date = result.timestamp.split("T")[0] if result.timestamp else ""
-            for paper in result.papers:
-                print(f"% === provenance: {_bibtex_key(paper)} ===")
-                print("% CLAIM: TODO")
-                print(f"% FOUND-VIA: {found_via}")
-                print("% PICKED: TODO")
-                print("% QUOTE (<loc>): TODO")
-                print("% VERIFIED: TODO")
-                print(f"% DATE: {date}")
-                print(self._format_paper(paper))
-                print()
+            print(f"% === provenance: {key} ===")
+            print("% CLAIM: TODO")
+            print(f"% FOUND-VIA: {_found_via(result)}")
+            print("% PICKED: TODO")
+            print("% QUOTE (<loc>): TODO")
+            print("% VERIFIED: TODO")
+            print(f"% DATE: {date}")
+            print(self._format_paper(paper, key))
+            print()
 @
 
 Let's verify the stub carries the pre-filled command, the placeholder fields,
@@ -8221,6 +8427,30 @@ crashing on an empty surname:
         out = capsys.readouterr().out
         assert "% === provenance: unknown2024 ===" in out
         assert "@article{unknown2024," in out
+@
+
+A suffixed key must reach the comment header too, or the block would name a
+different entry than the one below it:
+
+<<test functions>>=
+    def test_bibtex_prov_formatter_header_matches_suffixed_key(self, capsys):
+        """Each block's header carries its entry's (suffixed) key."""
+        results = [
+            SearchResult(
+                query="test",
+                provider="dblp",
+                timestamp="2024-01-01T00:00:00",
+                papers=[
+                    Paper(title="P", authors=["Ann Smith"], year=2024),
+                    Paper(title="Q", authors=["Bo Smith"], year=2024),
+                ],
+            )
+        ]
+        BibTeXProvFormatter().format(results)
+        lines = capsys.readouterr().out.splitlines()
+        header = lines.index("% === provenance: smith2024a ===")
+        assert lines.index("@article{smith2024,") < header \
+            < lines.index("@article{smith2024a,")
 @
 
 The filters and limit carried on the result must reappear as flags, in a
@@ -9062,6 +9292,53 @@ class TestProvExportCommand:
         assert "% === provenance: alice2024 ===" in result.output
         assert "% CLAIM: privacy matters" in result.output
         assert "private thoughts" not in result.output
+@
+
+The key change of \cref{ch:output-formatting} must not strand provenance
+recorded under an old key.  A [[.bib]] written by an earlier version keys a
+surname-first author by the given name ([[john2024]]); its block is imported,
+and exported into a [[.bib]] the current formatter writes for the same paper
+([[smith2024]]).  The paper has no DOI, so the two entries meet only through
+the title-and-author hash of [[Paper.id]], the harder of the two matches.  The
+block arrives, headed by the new key:
+
+<<test functions>>=
+    def test_old_scheme_key_round_trips_to_new_key(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """Blocks are matched by paper id, so a key change loses nothing."""
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        old_bib = tmp_path / "old.bib"
+        old_bib.write_text(
+            "% === provenance: john2024 ===\n"
+            "% CLAIM: keys may change\n"
+            "@article{john2024,\n"
+            "  title = {A Paper},\n"
+            "  author = {Smith, John},\n"
+            "  year = {2024},\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        runner = CliRunner()
+        assert runner.invoke(
+            app, ["prov", "import", str(old_bib)]
+        ).exit_code == 0
+
+        from scholar import Paper
+        BibTeXFormatter().format([SearchResult(
+            query="q", provider="dblp", timestamp="2024-01-01T00:00:00",
+            papers=[Paper(title="A Paper", authors=["Smith, John"],
+                          year=2024)],
+        )])
+        new_bib = tmp_path / "new.bib"
+        new_bib.write_text(capsys.readouterr().out, encoding="utf-8")
+        assert "@article{smith2024," in new_bib.read_text(encoding="utf-8")
+
+        result = runner.invoke(app, ["prov", "export", str(new_bib)])
+        assert result.exit_code == 0
+        assert "% === provenance: smith2024 ===" in result.output
+        assert "% CLAIM: keys may change" in result.output
+        assert "john2024" not in result.output
 @
 
 

@@ -300,7 +300,9 @@ confirmation goes to stderr so `-f json`/`-f bibtex` stdout stays pure.
 `--paper-id` takes) under its title, and `show -f json` carries `doi` and
 `paper_id`, so a decision never needs a CSV detour.
 `--source llm` stores the decision as an unreviewed LLM decision
-(agent-driven screening that the TUI still queues for confirmation); a
+(agent-driven screening that the TUI still queues for confirmation),
+with `--confidence/-c 0..1` in `llm_confidence` like `llm classify`
+(validated; ignored with a note for human decisions); a
 human `decide` on such a row marks it `llm_reviewed`, with `is_example`
 set when the status changed, mirroring the TUI.
 Together these let scripted/agent-driven systematic reviews produce the same
@@ -412,21 +414,36 @@ report body builders (`build_review_provenance_latex`,
   literal `\textcite{key}`s, so `_synthesis_key_space` orders the key
   space as included kept papers (original order), then remaining kept,
   then discarded, deduplicated by paper id; suffixes are assigned in
-  iteration order, so kept keys never change. The report keeps its own
-  `surname{year}_{index}` scheme keyed by `id(decision)` (a loaded
-  session can hold one paper twice); builders take a `cite_key`
-  resolver so the two schemes never have to agree. Synthesis keys strip
-  only the characters biber rejects (apostrophes, quotes, braces,
-  delimiters), so `O'Brien` yields `obrien2024` while all other keys are
-  unchanged.
+  iteration order, so kept keys never change.
+- **One key scheme** (#85, `review.py`): `cite_key_base` = surname
+  (`author_surname`: before the comma in `Smith, John`, else the last
+  word) lower-cased and reduced to letters/digits (biber-safe; `O'Brien`
+  → `obrien`, `Smith-Jones` → `smithjones`, `Müller` kept) + year or
+  `nd`; `unknown` without author. `assign_cite_keys` suffixes clashes in
+  list order from `a` (`smith2024`, `smith2024a`, …, `z`, `aa`), so a
+  key depends only on the papers before it. Both `report_cite_keys`
+  (keyed by `id(decision)`: a loaded session can hold one paper twice,
+  and the report lists both) and the synthesis's
+  `_generate_all_citation_keys` (keyed by paper id after
+  `_unique_by_paper_id`) use it; the builders keep the `cite_key`
+  resolver because the two look keys up by different identities.
+  Changing the scheme requires a `SYNTHESIS_CACHE_VERSION` bump (now
+  `v5`: cached prose cites keys literally). `search -f bibtex` and
+  `bibtex+prov` use it too (#122, `cli._keyed_papers`: keys assigned
+  once over all results in output order); this changed their keys
+  for comma-form names, apostrophes and clashes. `prov import/export`
+  match entries by `Paper.id`, never by key, so old `.bib` files still
+  round-trip.
 - `scholar sessions export -f table --lang en|sv --label L --track T
   --theme TAG=NAME -o base` writes `base.tex`, always a fragment: one
   row per *work* (`audit_work_key`: title and first-author surname
-  reduced to case-folded letters and digits, year ignored; joined
+  (`author_surname`; a blank author gives an empty surname) reduced to case-folded letters and digits, year ignored; joined
   provider strings like `openalex; dblp` are split, mapped to codes and
   deduplicated; the best-placed decision wins). The *last* category tag
   is the decision (`decide -t` appends); confidence is shown for
-  unreviewed and human-confirmed LLM rows, not for changed ones. The
+  unreviewed and human-confirmed LLM rows, not for changed ones, and
+  such a row without one shows `AUDIT_STRINGS[lang]["no_confidence"]`
+  (`n/a`, `saknas`) because the caption promises a confidence. The
   escapers decode HTML entities, strip inline markup, repair
   cp1252/Latin-1 mojibake and turn `"` into `\textquotedbl{}` (babel
   shorthand). Titles are printed whole unless `--truncate-titles`
@@ -436,12 +453,17 @@ report body builders (`build_review_provenance_latex`,
   `duplicate-record-of-cited-source`, `extended-tech-report`, …) and
   theme tags (the rest; with `--theme` given, only the listed tags).
   *Cited* = kept by a human decision (source `human` or `llm_reviewed`)
-  with a theme tag or no tags; otherwise the first category tag, with
-  the confidence for unreviewed LLM rows; notes are appended in
-  parentheses, note-only rows are "other". An LLM keep is a candidate,
-  not a citation. Order: cited (0), `supports-claim` (1),
+  with a theme tag or no tags; otherwise the last category tag
+  (`audit_category`), with the confidence for unreviewed LLM rows; notes
+  are appended in parentheses, note-only rows are "other". An LLM keep
+  is a candidate, not a citation. Order: cited (0), `supports-claim` (1),
   `qualifies-claim` (2), `adjacent-subtopic` (3),
-  `off-topic-false-hit` (4), pending (5), other (6). The caption never
+  `off-topic-false-hit` (4), pending (5), other (6). The status wins
+  over the category (#89): a *discarded* row whose category is
+  `supports-claim`/`qualifies-claim` (`audit_excluded`) is never in
+  orders 0-2; it sorts as other (6) with reason "<category>, excluded"
+  and the caption counts it apart (`extra_excluded`), so
+  `--bearing-only` never lists a rejected hit. The caption never
   names the session (it is a `%` comment in the fragment) and ends with
   a full-name-first "Databases:" sentence built from the providers
   the session searched (search records that answered at least once,
@@ -474,8 +496,21 @@ batch once with the vocabulary spelled out when a paper would be left
 without tags. A session without tags imposes nothing unless
 `llm classify --tag` (the `vocabulary=` argument) seeds it; with
 `--allow-new-tags` (`allow_new_tags=`) the prompt asks the model to
-prefer the vocabulary but nothing is dropped or retried. The `llm`
+prefer the vocabulary and new tags are not dropped. The `llm`
 module is looked up via `globals()` so tests can substitute a fake model.
+
+Tag kinds: note tags (`NOTE_TAGS`, the union of every language's
+`AUDIT_STRINGS[lang]["notes"]`) are human-only, never offered (not even
+on examples' tag lines) and dropped if returned (`excluded_tags=`, also
+under `--allow-new-tags`). When the vocabulary holds any of
+`AUDIT_CATEGORIES`, the prompt lists them in a separate "Category
+(exactly one per paper)" section and the theme lists become optional
+extras; `parse_llm_response(category_tags=…)` sets
+`LLMDecision.category_problem` unless exactly one category remains
+after mapping, that triggers the same single retry, and a paper still
+invalid afterwards gets no decision (stays pending) and is listed in
+`LLMBatchResult.withheld`, which `llm classify` prints at the end.
+Sessions without category tags are classified as before.
 
 ### Interactive Tutorials (`scholar tutorial`)
 
