@@ -117,7 +117,7 @@ from scholar.notes import (
 from scholar.utils import (
     clean_metadata_text, clean_paper_text, derive_arxiv_doi,
     given_name_first, legacy_hash_paper_id,
-    atomic_write_text, backup_path,
+    atomic_write_text, backup_path, file_lock,
 )
 
 logger = logging.getLogger(__name__)
@@ -1640,54 +1640,9 @@ def save_session(session: ReviewSession) -> Path:
     session_path = _get_sessions_dir() / filename
     logger.info("Saving session to %s", session_path)
 
-    <<merge changes other processes saved>>
-
-    # Convert to serializable format
-    data = {
-        "query": session.query,
-        "name": session.name,
-        "providers": session.providers,
-        "timestamp": session.timestamp.isoformat(),
-        "research_context": session.research_context,
-        "search_records": [
-            {
-                "query": r.query,
-                "provider": r.provider,
-                "filters": r.filters,
-                "limit": r.limit,
-            }
-            for r in session.search_records
-        ],
-        "snowball_rounds": [
-            {
-                "timestamp": r.timestamp.isoformat(),
-                "source_papers": r.source_papers,
-                "direction": r.direction,
-                "papers_added": r.papers_added,
-            }
-            for r in session.snowball_rounds
-        ],
-        "decisions": [
-            {
-                "paper_id": get_paper_id(d.paper),
-                "provider": d.provider,
-                "status": d.status.value,
-                "tags": d.tags,
-                "source": d.source.value,
-                "is_example": d.is_example,
-                "llm_confidence": d.llm_confidence,
-                "paper": d.paper.to_dict(include_refs_cites=True),
-            }
-            for d in session.decisions
-        ],
-    }
-
-    <<warn if the save drops decisions>>
-    atomic_write_text(
-        session_path,
-        json.dumps(data, indent=2, ensure_ascii=False),
-        backup=True,
-    )
+    with file_lock(session_path):
+        <<merge changes other processes saved>>
+        <<write the session file>>
     session._baseline = SessionBaseline.of(session)
 
     logger.debug("Saved %d decisions (%d kept, %d discarded, %d pending)",
@@ -1825,6 +1780,102 @@ def read_session_file(session_path: Path) -> ReviewSession:
         raise SessionFileError(session_path, e) from e
     session._baseline = SessionBaseline.of(session)
     return session
+@
+
+The file is re-read, merged and replaced under [[file_lock]]
+(\cref{sec:file-lock}), so that two processes saving one session at
+the same moment take turns: the second re-reads only after the first
+has written, and merges against what the first wrote.  The lock covers
+only those milliseconds, never the time between loading a session and
+saving it, which may be hours of enrichment or a whole TUI session; the
+merge is what reconciles that.  The write itself serialises the merged
+session:
+
+<<write the session file>>=
+# Convert to serializable format
+data = {
+    "query": session.query,
+    "name": session.name,
+    "providers": session.providers,
+    "timestamp": session.timestamp.isoformat(),
+    "research_context": session.research_context,
+    "search_records": [
+        {
+            "query": r.query,
+            "provider": r.provider,
+            "filters": r.filters,
+            "limit": r.limit,
+        }
+        for r in session.search_records
+    ],
+    "snowball_rounds": [
+        {
+            "timestamp": r.timestamp.isoformat(),
+            "source_papers": r.source_papers,
+            "direction": r.direction,
+            "papers_added": r.papers_added,
+        }
+        for r in session.snowball_rounds
+    ],
+    "decisions": [
+        {
+            "paper_id": get_paper_id(d.paper),
+            "provider": d.provider,
+            "status": d.status.value,
+            "tags": d.tags,
+            "source": d.source.value,
+            "is_example": d.is_example,
+            "llm_confidence": d.llm_confidence,
+            "paper": d.paper.to_dict(include_refs_cites=True),
+        }
+        for d in session.decisions
+    ],
+}
+
+<<warn if the save drops decisions>>
+atomic_write_text(
+    session_path,
+    json.dumps(data, indent=2, ensure_ascii=False),
+    backup=True,
+)
+@
+
+The test makes the race happen on purpose.  Process~A's merge starts
+process~B's save in a thread and gives it half a second.  Without the
+lock, B writes its decision in that half second and A then replaces the
+file with a merge of what it read before, so B's decision is gone.
+With the lock, B waits, re-reads A's file and merges, and both
+decisions survive.
+
+<<test functions>>=
+def test_simultaneous_saves_keep_both(tmp_path, monkeypatch):
+    import threading
+    import scholar.review as review
+
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+    TestConcurrentSaves()._create()
+    first = load_session("race")
+    second = load_session("race")
+    first.decisions[0].status = DecisionStatus.KEPT
+    second.decisions[1].status = DecisionStatus.KEPT
+    merge = review.merge_concurrent_changes
+    threads = []
+
+    def slow_merge(session, on_disk):
+        if not threads:
+            threads.append(threading.Thread(
+                target=save_session, args=(second,)
+            ))
+            threads[0].start()
+            threads[0].join(0.5)
+        merge(session, on_disk)
+
+    monkeypatch.setattr(review, "merge_concurrent_changes", slow_merge)
+    save_session(first)
+    threads[0].join(5)
+    final = {d.paper.title: d.status for d in load_session("race").decisions}
+    assert final["Paper 0"] == DecisionStatus.KEPT
+    assert final["Paper 1"] == DecisionStatus.KEPT
 @
 
 \subsubsection{Session integrity}
@@ -2033,9 +2084,8 @@ if on_disk is not None:
 @
 
 The window that remains, between reading the file and replacing it, is
-milliseconds instead of hours.  Closing it too would need a file lock,
-which the session directory has never had and which we leave out until a
-real collision shows it is needed.
+milliseconds instead of hours, and [[save_session]] closes it by holding
+[[file_lock]] across both.
 
 Now the regression test for the incident.  Process~A (the enrichment)
 loads the session; process~B sets the research context and classifies,

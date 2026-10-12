@@ -108,6 +108,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+import functools
 import hashlib
 import json
 import os
@@ -117,7 +118,9 @@ from cachetools import TTLCache, cached
 import click
 import platformdirs
 
-from scholar.utils import atomic_write_text, legacy_hash_paper_id
+from scholar.utils import (
+    atomic_write_text, file_lock, legacy_hash_paper_id,
+)
 @
 
 \subsection{Timestamp Representation}
@@ -729,9 +732,67 @@ class TestNotesFileIntegrity:
             save_note(paper, "Lost?")
 @
 
+\paragraph{One writer at a time.}
+Atomic writes keep the file whole, but two processes changing notes at
+once can still lose one change: both read the file, each adds its note,
+and the second replace drops the first one's note.  Unlike a session,
+the notes file is not merged on save, so the window is the whole
+read--modify--write.  Every function that rewrites the file therefore
+runs under [[file_lock]] on it (\cref{sec:file-lock}): the second
+process reads only after the first has written.  The decorator below
+applies it, to [[get_note]] too, which rewrites the file when it moves a
+note to a paper's new DOI id.  The lock is reentrant, so a locked
+function may call another.
+
+<<paper notes functions>>=
+def _holding_notes_lock(function):
+    """Run `function` while holding the notes file's lock."""
+    @functools.wraps(function)
+    def locked(*args, **kwargs):
+        with file_lock(get_data_dir() / NOTES_FILE):
+            return function(*args, **kwargs)
+    return locked
+@
+
+The test makes the first writer slow: its read of the file starts a
+second writer in a thread and gives it time to finish.  Without the
+lock the second note is written in between and then lost; with it, the
+second writer waits and both notes are kept.
+
+<<test functions>>=
+def test_concurrent_note_saves_keep_both(tmp_path, monkeypatch):
+    import threading
+    import scholar.notes as notes
+
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+    invalidate_notes_cache()
+    first = Paper(title="T", authors=["A"], doi="10.1/lock-1")
+    second = Paper(title="U", authors=["B"], doi="10.1/lock-2")
+    load = notes._load_all_notes
+    threads = []
+
+    def slow_load():
+        loaded = load()
+        if not threads:
+            threads.append(threading.Thread(
+                target=save_note, args=(second, "Second.")
+            ))
+            threads[0].start()
+            threads[0].join(0.5)
+        return loaded
+
+    monkeypatch.setattr(notes, "_load_all_notes", slow_load)
+    save_note(first, "First.")
+    threads[0].join(5)
+    invalidate_notes_cache()
+    assert get_note(first).note == "First."
+    assert get_note(second).note == "Second."
+@
+
 <<paper notes functions>>=
 
 
+@_holding_notes_lock
 def get_note(paper: Any) -> PaperNote | None:
     """
     Get the note for a paper, if one exists.
@@ -776,6 +837,7 @@ def get_note(paper: Any) -> PaperNote | None:
     return None
 
 
+@_holding_notes_lock
 def save_note(paper: Any, note_text: str) -> PaperNote:
     """
     Save or update a note for a paper.
@@ -825,6 +887,7 @@ def save_note(paper: Any, note_text: str) -> PaperNote:
     return notes[paper_id]
 
 
+@_holding_notes_lock
 def delete_note(paper: Any) -> bool:
     """
     Delete the note for a paper.
@@ -1468,6 +1531,7 @@ raise: they mean the data directory cannot be written at all, and the
 caller's own save is about to fail the same way.
 
 <<search decisions functions>>=
+@_holding_notes_lock
 def migrate_paper_id(old_id: str, new_id: str) -> None:
     """Move any note and search decisions from `old_id` to `new_id`.
 
@@ -1972,7 +2036,8 @@ def keep_unsaved_note(paper: Any, text: str) -> Path | None:
 The test lets the editor return a note and makes every write of the
 notes file fail.  The text must then be in the file the error names,
 first in the data directory and, when that cannot be written either, in
-the temporary directory.
+the temporary directory.  A data directory below a regular file is one
+that nothing can create, the lock included.
 
 <<test functions>>=
 class TestUnsavedNote:
@@ -2009,8 +2074,10 @@ class TestUnsavedNote:
 
         temp = tmp_path / "temp"
         temp.mkdir()
+        blocker = tmp_path / "a-file"
+        blocker.write_text("")
         monkeypatch.setattr(
-            notes, "get_data_dir", lambda: tmp_path / "missing"
+            notes, "get_data_dir", lambda: blocker / "data"
         )
         monkeypatch.setattr(notes.tempfile, "gettempdir", lambda: str(temp))
         with pytest.raises(NotesFileError) as caught:
@@ -2090,6 +2157,7 @@ def export_notes(output_path: Path) -> int:
     return len(notes)
 
 
+@_holding_notes_lock
 def import_notes(input_path: Path, merge: bool = True) -> int:
     """
     Import notes from a JSON file.

@@ -1087,3 +1087,165 @@ class TestStagedOutputs:
             "r.csv", "r.tex",
         ]
 @
+
+\subsection{One writer at a time: [[file_lock]]}
+\label{sec:file-lock}
+
+An atomic write protects the file from a crash, not from another
+process.  Saving a session or a note is a read--modify--write: re-read
+the file, merge or change it, write it back.  If two processes do that
+at once, the interleaving \emph{B reads, A replaces, B replaces} throws
+away A's change, merge or no merge, because B merged against a file
+that A replaced a moment later.  The window is short (it is a re-read
+and a serialisation, not the hours between loading a session and saving
+it, which the merge on save handles,
+\cref{sec:session-integrity}), but it is real when several agents run
+[[scholar sessions decide]] on one session in parallel.
+
+[[file_lock]] closes it: a writer holds an exclusive lock on the file
+from its re-read to its replace, so the second writer re-reads only
+after the first has written.  Three properties of the design matter.
+\begin{description}
+\item[The lock is on a separate file] [[.<name>.lock]] next to the
+  target.  Locking the target itself would protect nothing, because
+  [[os.replace]] puts a new file under the name and the next writer
+  locks that one.  The leading dot hides it, like the temporary files
+  above, and keeps it out of every [[*.json]] listing.
+\item[The operating system releases it] The
+  \href{https://py-filelock.readthedocs.io/}{[[filelock]]} package
+  locks with [[flock]] on POSIX and [[LockFileEx]] on Windows, so a
+  process that dies holding the lock frees it at once.  A lock file
+  created with [[O_EXCL]] would instead outlive a crash and need
+  stale-lock detection.  Where neither works, [[filelock]] falls back to
+  such a file itself.  None of this coordinates two machines sharing a
+  network or synchronised directory; there, the merge stays the only
+  protection.
+\item[It never blocks for long] Writers hold it for milliseconds, so
+  waiting [[LOCK_TIMEOUT]] seconds without getting it means a holder is
+  stuck (a process suspended with Ctrl-Z in mid-save, say).  Hanging
+  would then turn a stuck process into two, so we log a warning and go
+  ahead without the lock, which is what every save did before.  A
+  directory where no lock file can be created (a read-only data
+  directory) is no reason to fail either: the write that follows will
+  report the real problem.
+\end{description}
+One process can take the same lock again while it holds it (a note
+save inside a migration, say), and threads of one process exclude each
+other as processes do (the TUI migrates notes in a background thread).
+[[FileLock]] is reentrant per thread when every caller uses the
+\emph{same} object, so the locks are kept in a dictionary by path; two
+objects for one file would each count only their own holder and
+deadlock against each other.
+
+<<utils functions>>=
+import logging
+import threading
+
+from filelock import FileLock, Timeout
+
+LOCK_TIMEOUT = 10  # seconds; holders keep the lock for milliseconds
+
+_FILE_LOCKS: dict[Path, FileLock] = {}
+_FILE_LOCKS_GUARD = threading.Lock()
+
+
+def lock_path(path: str | os.PathLike) -> Path:
+    """Return the lock file `file_lock(path)` uses: `.<name>.lock`."""
+    path = Path(path)
+    return path.with_name(f".{path.name}.lock")
+
+
+@contextmanager
+def file_lock(
+    path: str | os.PathLike, timeout: float | None = None
+) -> Iterator[bool]:
+    """Hold an exclusive lock on `path` for one read-modify-write.
+
+    Yields True while the lock is held, or False if it could not be
+    taken within `timeout` seconds (default `LOCK_TIMEOUT`) or the lock
+    file cannot be created; the body then runs unlocked.
+    """
+    if timeout is None:
+        timeout = LOCK_TIMEOUT
+    target = lock_path(path).absolute()
+    with _FILE_LOCKS_GUARD:
+        lock = _FILE_LOCKS.setdefault(target, FileLock(target))
+    try:
+        lock.acquire(timeout=timeout)
+    except Timeout:
+        logging.getLogger(__name__).warning(
+            "%s is still locked after %g s; writing without the lock",
+            path, timeout,
+        )
+        yield False
+        return
+    except OSError as error:
+        logging.getLogger(__name__).debug(
+            "Cannot lock %s (%s); writing without the lock", path, error
+        )
+        yield False
+        return
+    try:
+        yield True
+    finally:
+        lock.release()
+@
+
+The tests use a second thread as the second writer.  It must wait while
+the first holds the lock and get it once the first lets go; the holder
+itself may lock again; and a holder that never lets go costs the waiter
+only the timeout and a warning.
+
+<<test functions>>=
+class TestFileLock:
+    """file_lock serialises read-modify-writes of one file."""
+
+    def test_a_second_writer_waits(self, tmp_path):
+        import threading
+
+        target = tmp_path / "s.json"
+        events = []
+
+        def second():
+            with file_lock(target):
+                events.append("second")
+
+        with file_lock(target) as locked:
+            assert locked
+            thread = threading.Thread(target=second)
+            thread.start()
+            thread.join(0.3)
+            events.append("first")
+        thread.join(5)
+        assert events == ["first", "second"]
+
+    def test_reentrant_and_hidden(self, tmp_path):
+        target = tmp_path / "s.json"
+        with file_lock(target) as outer:
+            with file_lock(target) as inner:
+                assert outer and inner
+        assert lock_path(target).name == ".s.json.lock"
+        assert not list(tmp_path.glob("*.json"))
+
+    def test_gives_up_with_a_warning(self, tmp_path, caplog):
+        import threading
+
+        target = tmp_path / "s.json"
+        holding, release = threading.Event(), threading.Event()
+
+        def holder():
+            with file_lock(target):
+                holding.set()
+                release.wait(5)
+
+        thread = threading.Thread(target=holder)
+        thread.start()
+        holding.wait(5)
+        try:
+            with file_lock(target, timeout=0.1) as locked:
+                assert not locked
+        finally:
+            release.set()
+            thread.join(5)
+        assert "writing without the lock" in caplog.text
+@

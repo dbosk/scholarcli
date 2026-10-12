@@ -279,6 +279,15 @@ context (#107). `review.save_session` now:
   before/after decided counts, `.bak` path) when the save still leaves
   fewer decided papers than the file has, beyond this process's own
   resets to pending. It never refuses the save.
+- **locks**: the re-read, merge and replace run under
+  `utils.file_lock` (`filelock`: `flock` on POSIX, `LockFileEx` on
+  Windows) on a hidden sidecar `.<name>.json.lock`, so two processes
+  saving at once take turns. Held for milliseconds only, never from
+  load to save; after `LOCK_TIMEOUT` (10 s) it warns and writes
+  unlocked. Notes writers (`save_note`, `delete_note`, `get_note`,
+  `import_notes`, `migrate_paper_id`) take the notes file's lock via
+  `_holding_notes_lock`. Same machine only: no help across
+  machines on a shared directory.
 - **writes atomically**: `utils.atomic_write_text` (temp file in the
   same directory, fsync, `os.replace`), keeping the previous file as
   `<name>.json.bak` (one generation).
@@ -295,7 +304,9 @@ and write errors raise instead of being swallowed. `cli.main()` turns
 the error into one line and exit 1. Two deliberate exceptions (#121):
 the TUI catches it, shows it as a notification (and in red on the
 detail screen), hides note markers and refuses note editing, but keeps
-reviewing; and `migrate_paper_id` logs a WARNING naming each unreadable
+reviewing (a note whose save fails after editing is kept in
+`unsaved-note-*.md`, data dir else temp dir, and the message names
+it, #126); and `migrate_paper_id` logs a WARNING naming each unreadable
 store file and both ids and skips it (raising would discard the
 caller's enrichment run or search append), raising only on write
 errors. `notes export` also writes atomically (no `.bak`).
@@ -561,6 +572,7 @@ requests/day and each `scholar` run is a fresh process.
 - `pytorial` - Interactive tutorial runner behind `scholar tutorial`
 - `llm` and its plugins (`llm-openai-plugin`, `llm-anthropic`, `llm-gemini`, `llm-mistral`, `llm-azure`, `llm-github-copilot`, `llm-gpt4all`, `llm-openai-via-codex`) - model access for `scholar rq` and `scholar llm`
 - `platformdirs` - Platform-appropriate cache directory
+- `filelock` - Cross-platform file lock around session/notes saves
 
 
 ## grepai - Semantic Code Search
