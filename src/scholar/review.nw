@@ -169,6 +169,20 @@ class ReviewSource(Enum):
 A [[ReviewDecision]] captures the review state of a single paper, including
 its status and associated tags.
 
+It also remembers which searches returned the paper ([[found_by]]).
+A session accumulates many searches, often several on one provider, and
+the [[provider]] field alone cannot tell them apart.  [[prov found-via]]
+used to fill that gap by picking one search for the provider, and so
+named a query that had never returned the paper
+(\url{https://github.com/dbosk/scholar/issues/128}).  Only the moment a
+result is turned into decisions knows which search a paper came from,
+so that is where the link is recorded (\cref{sec:review-found-by}).  A
+link is the [[(query, provider)]] key of the search's [[SearchRecord]],
+the key that identifies a record in the session, so it always resolves
+to the stored query, filters and limit.  The list stays empty when
+nothing was recorded: decisions saved before the link existed, and
+papers added by snowballing, which no search returned.
+
 <<review data structures>>=
 @dataclass
 class ReviewDecision:
@@ -186,6 +200,9 @@ class ReviewDecision:
         source: Where the decision came from (human or LLM).
         is_example: True if this paper is a training example for LLM.
         llm_confidence: Confidence score from LLM (0.0-1.0), if applicable.
+        found_by: The `(query, provider)` keys of the search records whose
+            results contained the paper, oldest first; empty when not
+            recorded (sessions saved before the link existed, snowballing).
     """
     paper: Paper
     provider: str
@@ -194,11 +211,19 @@ class ReviewDecision:
     source: ReviewSource = ReviewSource.HUMAN
     is_example: bool = False
     llm_confidence: float | None = None
+    found_by: list[tuple[str, str]] = field(default_factory=list)
 
     def __post_init__(self):
         """Coerce None list fields to empty lists."""
         if self.tags is None:
             self.tags = []
+        if self.found_by is None:
+            self.found_by = []
+
+    def record_search(self, query: str, provider: str) -> None:
+        """Note that the search `(query, provider)` returned this paper."""
+        if (query, provider) not in self.found_by:
+            self.found_by.append((query, provider))
 
     @property
     def is_decided(self) -> bool:
@@ -640,8 +665,13 @@ provider keep working. The [[query_provider_pairs]] property derives the
 [[(query, provider)]] pairs from the records, so every reader written against
 the old field is unaffected. The [[queries_for_provider]] method retrieves all
 queries used with a specific provider, and [[search_record_for]] retrieves the
-first whole record for a provider---query, filters, and limit---which is what
-[[found-via]] needs to rebuild the search.
+first whole record for a provider---query, filters, and limit.
+[[search_record]] looks a record up by its full key, which is what a
+paper's [[found_by]] link holds and what [[found-via]] needs to rebuild the
+search.  [[search_record_for]] cannot serve that purpose: a session with
+several queries on one provider has several records for it, and the first
+is merely the most recent search
+(\url{https://github.com/dbosk/scholar/issues/128}).
 
 <<query-provider pair methods>>=
 def add_query_provider_pair(
@@ -694,6 +724,13 @@ def search_record_for(self, provider: str) -> SearchRecord | None:
     """
     for record in self.search_records:
         if record.provider == provider:
+            return record
+    return None
+
+def search_record(self, query: str, provider: str) -> SearchRecord | None:
+    """Get the record of the search `(query, provider)`, or `None`."""
+    for record in self.search_records:
+        if (record.query, record.provider) == (query, provider):
             return record
     return None
 @
@@ -1542,6 +1579,19 @@ def without_homonym_numbers(paper: Paper) -> Paper:
     return replace(paper, authors=authors)
 @
 
+\label{sec:review-found-by}
+Whichever way an incoming paper finds its decision (an entry already in
+this run, a renamed or adopted entry, a previous decision, or a new one),
+the decision records the search that returned it ([[record_search]]).  The
+link has to be made here: this loop is the only place that still knows
+which [[SearchResult]], and so which search record, a paper came from.
+The result's [[(query, provider)]] is exactly the key
+[[add_query_provider_pair]] recorded above, merged results included
+([[q | q]], [[openalex, dblp]]), so the link always names a stored record.
+A decision rebuilt from the previous session copies that session's links,
+and the new one is added to them: a paper returned by three queries keeps
+all three.
+
 <<convert search results to decisions>>=
 decision_lookup: dict[str, ReviewDecision] = {
     get_paper_id(d.paper): d for d in session.decisions
@@ -1572,6 +1622,7 @@ for result in results:
                 existing.paper = existing.paper.merge_with(paper)
             except ValueError:
                 pass
+            existing.record_search(result.query, result.provider)
             continue
 
         renamed = renamed_lookup.pop(paper_id, None)
@@ -1583,11 +1634,13 @@ for result in results:
             ).merge_with(paper)
             decision_lookup.pop(old_id, None)
             decision_lookup[paper_id] = renamed
+            renamed.record_search(result.query, result.provider)
             continue
 
         adopted = provenance_lookup.get(paper_id)
         if adopted is not None:
             adopted.paper = merge_version_of(adopted.paper, paper)
+            adopted.record_search(result.query, result.provider)
             continue
 
         replaced = None
@@ -1604,6 +1657,7 @@ for result in results:
             replaced.paper = merge_version_of(paper, replaced.paper)
             decision_lookup[paper_id] = replaced
             provenance_lookup[old_id] = replaced
+            replaced.record_search(result.query, result.provider)
             continue
 
         # Check for previous decision (prefer session data over notes)
@@ -1631,6 +1685,7 @@ for result in results:
                 source=prev_dec.source,
                 is_example=prev_dec.is_example,
                 llm_confidence=prev_dec.llm_confidence,
+                found_by=list(prev_dec.found_by),
             )
         elif prev_record:
             # Fallback to notes module format
@@ -1666,8 +1721,86 @@ for result in results:
                 status=DecisionStatus.PENDING,
             )
 
+        decision.record_search(result.query, result.provider)
         session.decisions.append(decision)
         decision_lookup[paper_id] = decision
+@
+
+Let's verify the links against the situation of
+\url{https://github.com/dbosk/scholar/issues/128}: two queries on one
+provider, appended to one session, with a paper that only the first
+returned.  The second search returns another paper twice, once from each
+of two providers, so the in-run duplicate branch is exercised too.  Every
+step goes through the real [[create_review_session]] and a save and load,
+because the links must survive exactly that.
+
+<<test functions>>=
+class TestFoundByLinks:
+    """Decisions record the searches that returned their paper."""
+
+    @staticmethod
+    def _result(query, provider, papers):
+        from scholar.scholar import SearchResult
+        return SearchResult(
+            query=query, provider=provider, timestamp="t", papers=papers,
+        )
+
+    @staticmethod
+    def _links(session):
+        return {d.paper.doi: d.found_by for d in session.decisions}
+
+    def _two_searches(self):
+        first = Paper(title="First", authors=["A"], doi="10.1/fb-first")
+        both = Paper(title="Both", authors=["B"], doi="10.1/fb-both")
+        save_session(create_review_session(
+            [self._result("q1", "openalex", [first, both])],
+            "q1", session_name="links",
+        ))
+        save_session(create_review_session(
+            [
+                self._result("q2", "openalex", [both]),
+                self._result("q2", "arxiv", [both]),
+            ],
+            "q2", session_name="links",
+        ))
+        return load_session("links")
+
+    def test_each_paper_names_the_searches_that_returned_it(self):
+        links = self._links(self._two_searches())
+        assert links["10.1/fb-first"] == [("q1", "openalex")]
+        assert links["10.1/fb-both"] == [
+            ("q1", "openalex"), ("q2", "openalex"), ("q2", "arxiv"),
+        ]
+
+    def test_old_files_load_without_links(self):
+        import json
+        from scholar.review import _get_sessions_dir
+        self._two_searches()
+        path = _get_sessions_dir() / "links.json"
+        data = json.loads(path.read_text())
+        for decision in data["decisions"]:
+            del decision["found_by"]
+        path.write_text(json.dumps(data))
+        session = load_session("links")
+        assert all(d.found_by == [] for d in session.decisions)
+
+    def test_concurrent_save_keeps_links_from_disk(self):
+        first = Paper(title="First", authors=["A"], doi="10.1/fb-first")
+        save_session(create_review_session(
+            [self._result("q1", "openalex", [first])],
+            "q1", session_name="links",
+        ))
+        stale = load_session("links")
+        save_session(create_review_session(
+            [self._result("q2", "openalex", [first])],
+            "q2", session_name="links",
+        ))
+        stale.decisions[0].status = DecisionStatus.KEPT
+        save_session(stale)
+        links = self._links(load_session("links"))
+        assert set(links["10.1/fb-first"]) == {
+            ("q1", "openalex"), ("q2", "openalex"),
+        }
 @
 
 Extracting tags from a [[ReviewDecisionRecord]] is useful for backward compatibility
@@ -1742,6 +1875,9 @@ carry [[search_records]]; files from before filters were persisted carry only a
 [[query_provider_pairs]] list, which we load with empty filters; and the oldest
 files carry neither, so we reconstruct one record per provider by pairing the
 single [[query]] with each provider in [[providers]].
+Each decision carries its [[found_by]] links as a list of
+[[{"query", "provider"}]] objects; files from before the links existed
+have none, and their decisions load with an empty list.
 
 Saving is where a session can lose its decisions, so [[save_session]] does
 more than serialise: it merges what other processes saved since this one
@@ -1916,6 +2052,10 @@ def read_session_file(session_path: Path) -> ReviewSession:
                 source = ReviewSource.HUMAN
             is_example = dec_data.get("is_example", False) or False
             llm_confidence = dec_data.get("llm_confidence")
+            found_by = [
+                (link["query"], link["provider"])
+                for link in dec_data.get("found_by") or []
+            ]
 
             session.decisions.append(
                 ReviewDecision(
@@ -1926,6 +2066,7 @@ def read_session_file(session_path: Path) -> ReviewSession:
                     source=source,
                     is_example=is_example,
                     llm_confidence=llm_confidence,
+                    found_by=found_by,
                 )
             )
         
@@ -1984,6 +2125,10 @@ data = {
             "source": d.source.value,
             "is_example": d.is_example,
             "llm_confidence": d.llm_confidence,
+            "found_by": [
+                {"query": query, "provider": provider}
+                for query, provider in d.found_by
+            ],
             "paper": d.paper.to_dict(include_refs_cites=True),
         }
         for d in session.decisions
@@ -2107,7 +2252,11 @@ later save, but never a decision.  (Reading the file could not even show
 us the other process's metadata: the paper registry hands
 [[Paper.from_dict]] the [[Paper]] objects this process already holds for
 the same ids.)  Search records and snowball rounds only
-ever accumulate, so we add any that only the file has.
+ever accumulate, so we add any that only the file has.  So do a paper's
+links to the searches that returned it ([[found_by]],
+\cref{sec:review-found-by}): each is a fact about a search that ran, not
+a judgement, so the links the file holds for a paper are added to this
+process's whatever the decision rules say.
 
 The baseline keeps one comparable state per paper id.  We compare the
 whole decision state rather than the status alone, because a change of
@@ -2176,6 +2325,9 @@ def merge_concurrent_changes(
         paper_id = get_paper_id(decision.paper)
         own_ids.add(paper_id)
         theirs = disk_decisions.get(paper_id)
+        if theirs is not None:
+            for query, provider in theirs.found_by:
+                decision.record_search(query, provider)
         if theirs is None or paper_id not in base_states:
             continue
         mine, base_state = decision_state(decision), base_states[paper_id]
@@ -2906,6 +3058,133 @@ def test_list_sessions_flags_records_without_decisions(tmp_path, monkeypatch):
         "reset": True, "decided": False, "context": False,
         "unsearched": False,
     }
+@
+
+\subsubsection{Finding the sessions that hold a paper}
+\label{sec:review-sessions-mentioning}
+
+[[prov found-via]] needs every session that holds one paper.  Loading all
+sessions to look took over a minute on a data directory of 117 sessions
+(300\,MB): [[list_sessions]] decodes every file for its counts, loading
+decodes it again, and loading also builds a [[Paper]] for every decision.
+JSON decoding and building the papers are the cost, reading the bytes is
+not, so [[sessions_mentioning]] reads each file as text and decodes only
+the files in which the paper's id occurs.
+
+That shortcut is sound because of what the file holds.  Every decision
+stores its [[paper_id]] (and every session format has), so a file that
+holds the paper contains its id as text.  Three details keep the test
+from missing a file.  It ignores case, since stored DOIs and the id a user
+types may differ in case.  It drops a [[doi:]] prefix, so the paper's own
+[[doi]] field matches too.  And for an arXiv DOI it also looks for the bare
+arXiv id: loading derives that DOI for papers stored without one
+([[_normalize_paper_identifiers]]), and saving does not write it back, so
+the file may hold only the arXiv URL.  A fragment with a quote, a backslash or a non-ASCII character
+could be escaped in the JSON text, so then we skip the shortcut and decode
+every file: slower, never wrong.  Because the needles are ASCII, the test
+can run on the file's bytes: [[bytes.lower]] folds only ASCII letters,
+which are the only ones a needle has, and it skips the decoding and the
+Unicode case mapping that made a [[str]] version take four of its six
+seconds.
+
+The caller still matches each loaded decision against the id; the text
+test only decides which files are worth decoding.  Files that cannot be
+read or parsed are reported with a warning, as [[list_sessions]] does, but
+only when they mention the paper, since only then could they hide its
+provenance.
+
+<<review session functions>>=
+def sessions_mentioning(fragment: str) -> list[ReviewSession]:
+    """Load the saved sessions whose file mentions `fragment`, newest first.
+
+    `fragment` is a paper id or a part of one (a bare DOI, say). Only
+    files whose text contains it are parsed, which makes the lookup cheap
+    on a large data directory. The caller still has to match the loaded
+    decisions against `fragment`.
+    """
+    needles = _mention_needles(fragment)
+    sessions = []
+    for session_file in _get_sessions_dir().glob("*.json"):
+        if needles is not None:
+            try:
+                text = session_file.read_bytes().lower()
+            except OSError as error:
+                logger.warning(
+                    "Cannot read session file %s: %s", session_file, error
+                )
+                continue
+            if not any(needle in text for needle in needles):
+                continue
+        try:
+            sessions.append(read_session_file(session_file))
+        except SessionFileError as error:
+            logger.warning("%s", error)
+    return sorted(sessions, key=lambda s: s.timestamp, reverse=True)
+
+
+def _mention_needles(fragment: str) -> set[bytes] | None:
+    """The lower-case texts a session file holding `fragment` contains.
+
+    None when `fragment` could be escaped in JSON text, so that every
+    file must be parsed.
+    """
+    text = fragment.lower().removeprefix("doi:")
+    if not text.isascii() or '"' in text or "\\" in text:
+        return None
+    needles = {text}
+    if "arxiv." in text:
+        needles.add(text.split("arxiv.", 1)[1])
+    return {needle.encode("ascii") for needle in needles}
+@
+
+We check the three claims the shortcut rests on.  A broken file that does
+not mention the paper is never decoded, so it raises no warning, while one
+that does is still reported.  And an arXiv paper saved without a DOI,
+which gets one only when loaded, is found by that DOI.
+
+<<test functions>>=
+class TestSessionsMentioning:
+    """sessions_mentioning decodes only the files that hold the id."""
+
+    @staticmethod
+    def _save(name, paper):
+        session = ReviewSession(
+            query=name, providers=["arxiv"], timestamp=datetime.now(),
+            name=name,
+        )
+        session.decisions.append(ReviewDecision(paper=paper, provider="arxiv"))
+        save_session(session)
+
+    def test_finds_only_sessions_holding_the_paper(self):
+        self._save("holds", Paper(title="T", authors=["A"], doi="10.1/Men"))
+        self._save("other", Paper(title="U", authors=["B"], doi="10.1/oth"))
+        found = sessions_mentioning("doi:10.1/men")
+        assert [s.name for s in found] == ["holds"]
+
+    def test_broken_files_warn_only_when_they_mention_the_paper(
+        self, caplog
+    ):
+        from scholar.review import _get_sessions_dir
+        self._save("holds", Paper(title="T", authors=["A"], doi="10.1/men"))
+        sessions_dir = _get_sessions_dir()
+        (sessions_dir / "unrelated.json").write_text('{"decisions": [')
+        (sessions_dir / "related.json").write_text('{"x": "10.1/men", ')
+        with caplog.at_level("WARNING"):
+            found = sessions_mentioning("doi:10.1/men")
+        assert [s.name for s in found] == ["holds"]
+        assert "related.json" in caplog.text
+        assert "unrelated.json" not in caplog.text
+
+    def test_finds_arxiv_paper_stored_without_its_doi(self):
+        from scholar.review import _get_sessions_dir
+        paper = Paper(
+            title="T", authors=["A"],
+            url="https://arxiv.org/abs/2101.00001v2",
+        )
+        self._save("old", paper)
+        assert "10.48550" not in (_get_sessions_dir() / "old.json").read_text()
+        found = sessions_mentioning("doi:10.48550/arxiv.2101.00001")
+        assert [s.name for s in found] == ["old"]
 @
 
 \subsection{Testing Session Functions}
