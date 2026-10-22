@@ -640,6 +640,16 @@ limits, last request and warning flag reset). It restores rather than
 empties: `providers limits` lists Crossref/Unpaywall only because their
 import registered limiters. No test needs to pop `ratelimit._LIMITERS`.
 
+Per-test fixtures cannot protect state touched at import or at exit:
+provider caches load when their module is imported (during collection)
+and the `atexit` hook saves them after monkeypatch has restored the
+environment, which used to overwrite the real `~/.cache/scholar`
+(search and LLM caches) on every run (#132). `conftest.py` therefore
+sets `SCHOLAR_CACHE_DIR`/`SCHOLAR_DATA_DIR` to a per-process temp dir
+at import time; keep it free of module-level `scholar` imports.
+`test_a_test_run_leaves_the_real_directories_alone` checks this in a
+subprocess with a fake `XDG_CACHE_HOME`.
+
 ## Adding Features
 
 ### New Provider
