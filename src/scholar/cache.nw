@@ -73,6 +73,9 @@ The test file collects all distributed test chunks:
 <<test [[cache.py]]>>=
 """Tests for the cache module."""
 import os
+import pickle
+import subprocess
+import sys
 import pytest
 from pathlib import Path
 from unittest.mock import patch
@@ -266,6 +269,7 @@ Users need ways to inspect and clear the cache.
 We provide functions to get statistics and clear cached data.
 
 \subsection{Keeping paid model output}
+\label{sec:cache-keep-llm}
 
 Not every file in the cache directory is a search result.
 The literature synthesis of [[scholar llm synthesize]] caches the
@@ -590,6 +594,7 @@ own [[scholar]] runs skip that provider for the rest of the day.
 
 <<[[conftest.py]]>>=
 """Pytest configuration and fixtures for Scholar tests."""
+<<give the test process its own cache and data directories>>
 import ipaddress
 import socket
 
@@ -645,6 +650,135 @@ def isolate_cache(tmp_path, monkeypatch, request):
     if not is_live_test(request):
         for var in PROVIDER_CREDENTIAL_VARS:
             monkeypatch.delenv(var, raising=False)
+@
+
+\subsection{Isolating import time and exit time}
+
+A fixture only covers the time while a test runs, and the caches are
+also read before the first test and written after the last one.
+Each provider module loads its cache when it is imported
+([[load_cache]], \cref{sec:cache-autosave}), and pytest imports the test
+modules, and with them every provider, while collecting, before any
+fixture has set [[SCHOLAR_CACHE_DIR]].
+The tests then fill and empty those in-memory caches, and the exit hook
+writes every registered cache to [[get_cache_dir()]] once the
+interpreter exits.
+By then monkeypatch has restored the environment, so before this was
+fixed every test run replaced the developer's real cache with whatever
+the tests had left in memory: the cached search results, which make
+re-running a session's searches free, and the language-model output that
+[[cache clear]] deliberately keeps (\cref{sec:cache-keep-llm}) were
+lost, and test entries such as [[10.1234/test]] took their place
+(\url{https://github.com/dbosk/scholar/issues/132}).
+
+The fix gives the whole test process directories of its own before
+anything can read the real ones.
+The conftest is imported before any test module, so setting the
+variables there, first thing, is early enough for the import-time loads.
+That holds only while nothing in the conftest imports [[scholar]] at
+module level, which is why the chunk opens the file and checks that
+[[scholar.cache]] is not loaded yet, instead of trusting a convention.
+When the exit hook runs, monkeypatch has restored [[SCHOLAR_CACHE_DIR]]
+to the process directory rather than unsetting it.
+The data directory gets the same treatment, since nothing guarantees
+that every module reads it only inside a test.
+The per-test directories of [[isolate_cache]] stay: they keep the tests
+from seeing each other's files.
+Python runs exit handlers in reverse order of registration, and the
+conftest registers its clean-up before [[scholar.cache]] registers the
+save, so the caches are written into the process directory first and
+then removed together with it.
+
+<<give the test process its own cache and data directories>>=
+import atexit
+import os
+import shutil
+import sys
+import tempfile
+
+assert "scholar.cache" not in sys.modules, (
+    "scholar was imported before conftest.py could redirect its cache "
+    "and data directories; the test run would use the developer's own"
+)
+TEST_PROCESS_DIR = tempfile.mkdtemp(prefix="scholar-tests-")
+os.environ["SCHOLAR_CACHE_DIR"] = os.path.join(TEST_PROCESS_DIR, "cache")
+os.environ["SCHOLAR_DATA_DIR"] = os.path.join(TEST_PROCESS_DIR, "data")
+atexit.register(shutil.rmtree, TEST_PROCESS_DIR, ignore_errors=True)
+@
+
+The regression test runs a test in a separate pytest process whose
+home directories ([[XDG_CACHE_HOME]], [[XDG_DATA_HOME]]) point into
+[[tmp_path]] and already hold a cache, and checks that the run neither
+changed nor added a file there.
+A separate process is needed because the leak happens at import and at
+exit, which a test inside the current process can observe neither of.
+The inner test is one of the CLI's cache tests, but any test that
+imports the CLI would do: the import loads the Crossref cache, and
+before the fix the exit hook wrote it back to the fake home.
+It wrote the same bytes it had read, so the comparison includes
+modification times, and the test first dates the files back to 2001:
+then a rewrite shows even on a file system with coarse timestamps.
+The inner run also gets a temporary directory of its own, where pytest
+keeps its [[tmp_path]] directories too, and no process directory may be
+left there afterwards, so a run that fails to clean up fails the test.
+[[platformdirs]] follows the XDG variables only on Linux, so elsewhere
+the test is skipped.
+
+<<test functions>>=
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="platformdirs reads XDG_CACHE_HOME only on Linux",
+)
+def test_a_test_run_leaves_the_real_directories_alone(tmp_path):
+    """Running tests never writes to the developer's cache or data dir."""
+    cache_home = tmp_path / "cache-home"
+    data_home = tmp_path / "data-home"
+    (cache_home / "scholar").mkdir(parents=True)
+    (data_home / "scholar").mkdir(parents=True)
+    for name in ("crossref", "openalex", "llm_synthesis_theme"):
+        cache_file = cache_home / "scholar" / f"{name}.pkl"
+        with open(cache_file, "wb") as f:
+            pickle.dump({("developer's", name): "kept"}, f)
+        os.utime(cache_file, ns=(10**18, 10**18))
+    inner_tmp = tmp_path / "tmp"
+    inner_tmp.mkdir()
+
+    def snapshot():
+        return {
+            path.relative_to(tmp_path): (
+                path.read_bytes(),
+                path.stat().st_mtime_ns,
+            )
+            for path in tmp_path.rglob("*")
+            if path.is_file()
+        }
+
+    before = snapshot()
+    env = {
+        var: value
+        for var, value in os.environ.items()
+        if var not in ("SCHOLAR_CACHE_DIR", "SCHOLAR_DATA_DIR")
+    }
+    env["XDG_CACHE_HOME"] = str(cache_home)
+    env["XDG_DATA_HOME"] = str(data_home)
+    env["TMPDIR"] = str(inner_tmp)
+    project = Path(__file__).resolve().parent.parent
+    inner_test = (
+        "tests/test_cli.py::TestCacheCommand"
+        "::test_cache_clear_keeps_llm_caches"
+    )
+    run = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
+         inner_test],
+        cwd=project,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    assert run.returncode == 0, run.stdout[-2000:]
+    assert snapshot() == before
+    assert list(inner_tmp.glob("scholar-tests-*")) == []
 @
 
 Unsetting variables removes the known ways a test reaches the network,
