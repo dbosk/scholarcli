@@ -6417,16 +6417,29 @@ app.add_typer(prov_app, name="prov")
 
 \subsection{Reconstructing a reproducible search}
 
-The record for one paper in one session pins the command to the single provider
-that actually returned the paper ([[decision.provider]]): re-running every
-provider's query would reproduce the whole session, not the one result we are
-citing.  We look that provider's whole search up via [[search_record_for]],
-which gives back the query along with the filters and limit that were applied;
-those become the same flags the [[bibtex+prov]] formatter emits, via the shared
-[[_search_flags]] helper, so the command reproduces the \emph{exact} search and
-not a broader one.  Sessions saved before per-provider records existed have
-none, so we fall back to the session's overall [[query]] with no filters, which
-is the best the older format can offer.
+The record for one paper in one session pins the command to the search that
+actually returned the paper: re-running every query would reproduce the
+whole session, not the one result we are citing.  Each decision keeps the
+[[(query, provider)]] keys of the searches that returned its paper
+([[found_by]], \cref{sec:review-found-by}), and [[search_record]] turns a
+key back into the stored search with its filters and limit.  Those become
+the same flags the [[bibtex+prov]] formatter emits, through the shared
+[[_search_command]], so the command reproduces the \emph{exact} search and
+not a broader one.  A paper that several searches returned gets a record
+for each.
+
+Sessions saved before the links existed have none, and then we must not
+guess.  The provider alone used to stand in for the link, and picking that
+provider's search named a query that had never returned the paper
+(\url{https://github.com/dbosk/scholar/issues/128}): a FOUND-VIA line
+looks verified, so a wrong one is worse than none.  There is one case the
+provider settles: if the session ran a single search on it, that search
+returned the paper, since [[decision.provider]] is the provider of a
+search that did.  We report that as an [[inferred]] link, with the same
+command.  Otherwise the link is [[missing]]: no command, and the
+provider's searches listed as candidates, as queries and as commands, so
+the author can see what to re-run.  Snowballed papers are always missing,
+since no search returned them.
 
 The research question travels along as [[research_context]] for the human
 reader, but it never shapes the command.  We deliberately do \emph{not} key the
@@ -6435,32 +6448,81 @@ session to drive automated classification, so it is not a marker of how the
 session was built.
 
 <<prov command>>=
-def _found_via_record(session, decision) -> dict:
-    """Build the reproducible provenance record for one paper.
+def _found_via_records(session, decision) -> list[dict]:
+    """Build the provenance records of one paper in one session.
 
-    The command re-sends the exact provider query, filters, and limit stored
-    for the paper's provider, reproducing the search without re-invoking the
-    language model that ``scholar rq`` used to generate that query.
+    One record per search that returned the paper, each with the
+    `scholar search` command that reproduces it. Without recorded links,
+    a provider searched only once is still certain (`link` "inferred");
+    otherwise one record with no command (`link` "missing").
     """
-    provider = decision.provider
-    record = session.search_record_for(provider)
-    provider_query = record.query if record else session.query
-    filters = record.filters if record else None
-    limit = record.limit if record else None
-    parts = [f"scholar search {_quote_arg(provider_query)} -p {provider}"]
-    parts += _search_flags(filters, limit)
-    return {
+    base = {
         "paper_id": decision.paper.id,
         "title": decision.paper.title,
         "session": session.name or session.query,
-        "command": " ".join(parts),
-        "provider": provider,
-        "provider_query": provider_query,
-        "filters": filters,
-        "limit": limit,
         "research_context": session.research_context,
         "timestamp": session.timestamp.isoformat(),
     }
+    <<find the searches that returned the paper>>
+    records = []
+    for record in searches:
+        records.append({
+            **base,
+            "command": _search_command(
+                record.query, record.provider, record.filters, record.limit
+            ),
+            "provider": record.provider,
+            "provider_query": record.query,
+            "filters": record.filters,
+            "limit": record.limit,
+            "link": link,
+        })
+    if not records:
+        candidates = [
+            record for record in session.search_records
+            if record.provider == decision.provider
+        ]
+        records.append({
+            **base,
+            "command": None,
+            "provider": decision.provider,
+            "provider_query": None,
+            "filters": None,
+            "limit": None,
+            "link": "missing",
+            "candidate_queries": [r.query for r in candidates],
+            "candidate_commands": [
+                _search_command(r.query, r.provider, r.filters, r.limit)
+                for r in candidates
+            ],
+        })
+    return records
+@
+
+A recorded link whose search record is gone cannot be turned into a
+command; that does not happen (records are never removed), and we skip such
+a link rather than fail.  The inference compares the provider string
+exactly, so a merged provider such as [[openalex, dblp]] infers only its
+own merged record.
+
+<<find the searches that returned the paper>>=
+if decision.found_by:
+    link = "recorded"
+    searches = [
+        record for record in (
+            session.search_record(query, provider)
+            for query, provider in decision.found_by
+        )
+        if record is not None
+    ]
+else:
+    link = "inferred"
+    searches = [
+        record for record in session.search_records
+        if record.provider == decision.provider
+    ]
+    if len(searches) != 1:
+        searches = []
 @
 
 \subsection{The found-via command}
@@ -6510,12 +6572,12 @@ def prov_found_via(
     returned it, prints the 'scholar search' command that reproduces the
     search which surfaced it. Use '-f json' for machine-readable output.
     """
-    from scholar.review import list_sessions, load_session
+    from scholar.review import sessions_mentioning
 
     console = Console()
     <<collect matching decisions for the paper>>
     <<resolve the matches to a single paper>>
-    records = [_found_via_record(s, d) for s, d in matches]
+    records = [r for s, d in matches for r in _found_via_records(s, d)]
 
     if not records:
         if output_format == "json":
@@ -6533,18 +6595,19 @@ def prov_found_via(
         <<print FOUND-VIA blocks>>
 @
 
-The scan loads each session by name and matches every decision's paper,
-remembering the distinct IDs hit so we can detect ambiguity afterwards.  A
-session that fails to load is skipped rather than fatal, so one corrupt file
-does not hide the provenance held in the others.
+The scan matches every decision's paper in every session that mentions the
+ID, remembering the distinct IDs hit so we can detect ambiguity afterwards.
+[[sessions_mentioning]] decodes only the session files whose text contains
+the ID (\cref{sec:review-sessions-mentioning} explains why that misses
+none); decoding them all made one lookup take over a minute on a large data
+directory.  A
+session that fails to load is skipped with a warning rather than fatal, so
+one corrupt file does not hide the provenance held in the others.
 
 <<collect matching decisions for the paper>>=
 matches = []  # (session, decision) pairs, newest session first
 matched_ids = set()
-for meta in reversed(list_sessions()):
-    session = load_session(meta["name"])
-    if session is None:
-        continue
+for session in sessions_mentioning(paper_id):
     for decision in session.decisions:
         pid = decision.paper.id
         if pid == paper_id or paper_id in pid:
@@ -6591,13 +6654,48 @@ for record in records:
         question = " ".join(research.split()).replace('"', '\\"')
         context += f'; research question: "{question}"'
     context += ")"
+    if record["command"] is not None:
+        prefix, lines = FOUND_VIA_PREFIX, [record["command"]]
+    else:
+        prefix, lines = NO_FOUND_VIA_PREFIX, _missing_link_lines(record)
+    indent = " " * len(prefix)
     blocks.append(
-        f"{FOUND_VIA_PREFIX}{record['command']}\n"
-        f"{' ' * len(FOUND_VIA_PREFIX)}{context}"
+        prefix + f"\n{indent}".join(lines + [context])
     )
 print("\n\n".join(blocks))
 <<constants>>=
 FOUND_VIA_PREFIX = "FOUND-VIA: "
+NO_FOUND_VIA_PREFIX = "Not reproducible: "
+@
+
+A missing link is printed without the [[FOUND-VIA:]] token, under
+[[Not reproducible:]], so that nothing in the output can be pasted or
+grepped into a provenance block as if it were a verified search.  The
+message says why there is no command and, when there are candidate
+searches, how to get one: running a search again with [[-n]] records the
+link (\cref{sec:review-found-by}).  So we print each candidate as the
+exact command to run, with its stored filters and limit and the [[-n]]
+of the session.  Exactness matters twice: the search cache is keyed by
+query, limit and filters, so only the exact search is answered without a
+request to the provider; and a re-run's search record replaces the stored
+one, so a different limit would change what later FOUND-VIA lines print.
+
+<<prov command>>=
+def _missing_link_lines(record: dict) -> list[str]:
+    """Explain why a provenance record has no command."""
+    provider = record["provider"]
+    candidates = record.get("candidate_commands") or []
+    if provider == "snowball":
+        return ["added by snowballing, not returned by a search."]
+    if len(candidates) < 2:
+        return ["the session did not record which search returned it."]
+    session_flag = f"-n {_quote_arg(record['session'])}"
+    return [
+        f"the session did not record which of its {len(candidates)} "
+        f"{provider} searches returned it.",
+        "Re-run them exactly as below to record it "
+        "(a cached search sends no request):",
+    ] + [f"  {command} {session_flag}" for command in candidates]
 @
 
 Let's verify the heart of the command: that the [[FOUND-VIA]] line carries the
@@ -6978,6 +7076,167 @@ def test_found_via_includes_filter_flags(self, tmp_path, monkeypatch):
     assert record["filters"]["venue"] == "NeurIPS"
     assert record["limit"] == 50
     assert "--venue NeurIPS" in record["command"]
+@
+
+The case of \url{https://github.com/dbosk/scholar/issues/128}: two queries
+on one provider, run one after the other into one session, and a paper
+that only the first returned.  The session is built the way [[search -n]]
+builds it, through [[create_review_session]], so the test checks the link
+where it is made as well as where it is read.  Before the links existed
+the command named the second query, the session's latest search on the
+provider.
+
+<<prov test methods>>=
+@staticmethod
+def _search_into(session_name, query, provider, papers, limit=None):
+    """Append one search to ``session_name`` as ``search -n`` does."""
+    from scholar.review import create_review_session, save_session
+    from scholar.scholar import SearchResult
+    result = SearchResult(
+        query=query, provider=provider, timestamp="t", papers=papers,
+        limit=limit,
+    )
+    save_session(
+        create_review_session([result], query, session_name=session_name)
+    )
+
+def test_found_via_names_the_search_that_returned_the_paper(
+    self, tmp_path, monkeypatch
+):
+    """Not the provider's latest search in the session (#128)."""
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+    paper = Paper(title="P", authors=["Alice"], year=2024, doi="10.1/s2")
+    other = Paper(title="O", authors=["Bob"], year=2024, doi="10.1/m4")
+    self._search_into("w45", "round-trip query", "openalex", [paper], 40)
+    self._search_into("w45", "differential query", "openalex", [other], 40)
+
+    result = runner.invoke(app, ["prov", "found-via", paper.id])
+
+    assert result.exit_code == 0
+    assert (
+        "FOUND-VIA: scholar search 'round-trip query' -p openalex "
+        "--limit 40"
+    ) in result.output
+    assert "differential" not in result.output
+@
+
+A paper that several searches returned gets a line for each, since any
+of them reproduces the find:
+
+<<prov test methods>>=
+def test_found_via_lists_every_search_that_returned_the_paper(
+    self, tmp_path, monkeypatch
+):
+    """One FOUND-VIA line per linked search, oldest first."""
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+    paper = Paper(title="P", authors=["Alice"], year=2024, doi="10.1/two")
+    self._search_into("s", "first query", "openalex", [paper])
+    self._search_into("s", "second query", "openalex", [paper])
+    self._search_into("s", "third query", "openalex", [])
+
+    result = runner.invoke(
+        app, ["prov", "found-via", paper.id, "-f", "json"]
+    )
+
+    records = json.loads(result.output)
+    assert [r["provider_query"] for r in records] == [
+        "first query", "second query",
+    ]
+    assert {r["link"] for r in records} == {"recorded"}
+@
+
+A search over several providers is stored merged, with the query and
+provider joins of [[SearchResult.merge]].  The command undoes them as the
+[[bibtex+prov]] formatter does (\cref{sec:prov-bibtex}), instead of
+printing [[-p openalex, dblp]], which no shell would run as intended:
+
+<<prov test methods>>=
+def test_found_via_splits_a_merged_search(self, tmp_path, monkeypatch):
+    """A merged record becomes one -p flag per provider."""
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+    paper = Paper(title="P", authors=["Alice"], year=2024, doi="10.1/mrg")
+    self._search_into("s", "q | q", "openalex, dblp", [paper])
+
+    result = runner.invoke(app, ["prov", "found-via", paper.id])
+
+    assert "FOUND-VIA: scholar search q -p openalex -p dblp" in result.output
+@
+
+A session saved before the links existed has none.  When its provider ran
+only one query, that query returned the paper and the command is printed
+as before (the tests above that build sessions by hand rely on this).
+When it ran several, the session cannot tell which, and [[found-via]]
+says so instead of printing a command:
+
+<<prov test methods>>=
+def test_found_via_reports_a_missing_link(self, tmp_path, monkeypatch):
+    """Several candidate searches and no link: no FOUND-VIA line."""
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+    paper = Paper(title="P", authors=["Alice"], year=2024, doi="10.1/old")
+    self._make_session(
+        name="w45", providers=["openalex"],
+        pairs=[("query a", "openalex"), ("query b", "openalex")],
+        paper=paper, provider="openalex", limit=40,
+    )
+
+    result = runner.invoke(app, ["prov", "found-via", paper.id])
+    assert result.exit_code == 0
+    assert "FOUND-VIA:" not in result.output
+    assert "did not record" in result.output
+    assert "2 openalex searches" in result.output
+    for query in ("query a", "query b"):
+        assert (
+            f"scholar search '{query}' -p openalex --limit 40 -n w45"
+        ) in result.output
+
+    as_json = runner.invoke(
+        app, ["prov", "found-via", paper.id, "-f", "json"]
+    )
+    record = json.loads(as_json.output)[0]
+    assert record["link"] == "missing"
+    assert record["command"] is None
+    assert record["candidate_queries"] == ["query a", "query b"]
+    assert record["candidate_commands"] == [
+        "scholar search 'query a' -p openalex --limit 40",
+        "scholar search 'query b' -p openalex --limit 40",
+    ]
+
+def test_found_via_infers_the_only_search(self, tmp_path, monkeypatch):
+    """No link, but one search on the provider: that one."""
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+    paper = Paper(title="P", authors=["Alice"], year=2024, doi="10.1/one")
+    self._make_session(
+        name="s", providers=["openalex", "dblp"],
+        pairs=[("query a", "openalex"), ("query b", "dblp")],
+        paper=paper, provider="openalex",
+    )
+
+    result = runner.invoke(
+        app, ["prov", "found-via", paper.id, "-f", "json"]
+    )
+
+    record = json.loads(result.output)[0]
+    assert record["link"] == "inferred"
+    assert record["command"] == "scholar search 'query a' -p openalex"
+@
+
+A snowballed paper was not returned by any search, so it has no
+command to give either:
+
+<<prov test methods>>=
+def test_found_via_reports_snowballed_paper(self, tmp_path, monkeypatch):
+    """A snowballed paper names no search."""
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+    paper = Paper(title="P", authors=["Alice"], year=2024, doi="10.1/snow")
+    self._make_session(
+        name="s", providers=["openalex"], pairs=[("q", "openalex")],
+        paper=paper, provider="snowball",
+    )
+
+    result = runner.invoke(app, ["prov", "found-via", paper.id])
+
+    assert "FOUND-VIA:" not in result.output
+    assert "snowballing" in result.output
 @
 
 
@@ -8470,6 +8729,7 @@ output:
 
 
 \subsection{Provenance-stub BibTeX formatter}
+\label{sec:prov-bibtex}
 
 When a written claim is backed by a reference, the citation should travel with
 a record of \emph{how it was found}, \emph{why it was picked}, and the
@@ -8536,24 +8796,37 @@ def _search_flags(filters: dict | None, limit: int | None) -> list[str]:
     return flags
 @
 
-With the helpers in place, [[_found_via]] is just the query, the [[-p]] flags,
-and the reconstructed filter flags joined into one command:
+With the helpers in place, the command is just the query, the [[-p]] flags,
+and the reconstructed filter flags joined into one line.  The merged joins
+reach [[prov found-via]] too, since a session stores the merged result of a
+multi-provider [[search -n]] as one search record, so [[_search_command]]
+takes the four parts rather than a result and serves both callers;
+[[_found_via]] applies it to a live result.
 
 <<formatter classes>>=
-def _found_via(result) -> str:
-    """Reconstruct the ``scholar search`` command behind a result.
+def _search_command(
+    query: str, provider: str, filters: dict | None, limit: int | None
+) -> str:
+    """Reconstruct the `scholar search` command of one search.
 
-    Undoes the ``" | "`` query join and ``", "`` provider join introduced
-    by ``SearchResult.merge``, then re-emits the filter and limit flags, so
+    Undoes the `" | "` query join and `", "` provider join introduced by
+    `SearchResult.merge`, then re-emits the filter and limit flags, so
     the command reproduces the original search.
     """
-    queries = list(dict.fromkeys(result.query.split(" | ")))
+    queries = list(dict.fromkeys(query.split(" | ")))
     query = " | ".join(queries)
-    providers = [p.strip() for p in result.provider.split(",") if p.strip()]
+    providers = [p.strip() for p in provider.split(",") if p.strip()]
     parts = [f"scholar search {_quote_arg(query)}"]
     parts += [f"-p {p}" for p in providers]
-    parts += _search_flags(result.filters, result.limit)
+    parts += _search_flags(filters, limit)
     return " ".join(parts)
+
+
+def _found_via(result) -> str:
+    """Reconstruct the `scholar search` command behind a result."""
+    return _search_command(
+        result.query, result.provider, result.filters, result.limit
+    )
 @
 
 Each paper is preceded by the comment block and then the reused entry.  The

@@ -443,6 +443,28 @@ reconstructing a `Paper` from the `.bib` fields and reusing `Paper.id`
 (DOI, else title+author hash). All round-trip code lives in `cli.nw`'s
 `<<formatter classes>>` and `<<prov command>>` chunks.
 
+### Search Provenance (`prov found-via`)
+
+Each `ReviewDecision` records the searches that returned its paper in
+`found_by`: `(query, provider)` keys of the session's `SearchRecord`s
+(merged `q | q` / `openalex, dblp` keys included), set in
+`create_review_session` on every branch that resolves a result to a
+decision, persisted as `found_by` in the session JSON, and unioned from
+disk by `merge_concurrent_changes` (#128). `prov found-via` prints one
+command per link via `ReviewSession.search_record(query, provider)` and
+`cli._search_command` (shared with `bibtex+prov`'s `_found_via`; undoes
+the merge joins). JSON `link` is `recorded`, `inferred` (no links, but
+the provider ran exactly one search in the session) or `missing` (no
+command; printed under `Not reproducible:` with `candidate_queries`,
+never with the `FOUND-VIA:` token). Old sessions get links when their
+searches are re-run with `-n` (cache hits cost nothing). Never fall back
+to `search_record_for(provider)`: with several queries on a provider it
+returns the latest search, which is how #128 named wrong queries.
+`review.sessions_mentioning(fragment)` finds the sessions by a
+case-insensitive byte search for the id in each file (every decision
+stores `paper_id`; an arXiv DOI also matches its bare arXiv id) and
+decodes only those; non-ASCII/`"`/`\` fragments decode every file.
+
 ### LaTeX Output: Standalone, Fragment, Audit Table
 
 `review.py` owns the shared LaTeX pieces: the escapers (`escape_latex`,
