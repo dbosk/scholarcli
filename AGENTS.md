@@ -295,8 +295,8 @@ lookups (`get_paper_by_doi`, `get_preprint_locations`,
 `_note_http_error(e, during=...)`, so a 429 there starts a cooldown.
 
 Keys in messages (#159): `network.redact_secrets(text)` hides the
-values of `api_key`/`apikey`/`api-key`/`key` URL parameters (any
-case). `check_provider` applies it to every health message; the
+values of `api_key`/`apikey`/`api-key`/`key` URL parameters and
+`mailto` (personal data, #160), in any case. `check_provider` applies it to every health message; the
 OpenAlex and IEEE (`apikey` in the URL) error logs use it. The OpenAlex
 `/works` probe sends the key as `Authorization: Bearer` (documented,
 as pyalex does); `/rate-limit` keeps the `api_key` parameter (the only
@@ -891,7 +891,12 @@ Unit tests are offline by construction (`tests/conftest.py`, tangled from
 key/option variable (`S2_API_KEY`, `OPENALEX_API_KEY`, `IEEE_API_KEY`,
 `WOS_*API_KEY`, `SCOPUS_API_KEY`, `SCOPUS_INST_TOKEN`, `SCOPUS_VIEW`),
 the contact emails and the proxy/User-Agent variables, so a test that
-needs a key sets it explicitly; the autouse `block_network` fixture
+needs a key sets it explicitly. It also resets `pyalex.config.email`
+and (except for live tests) `pyalex.config.api_key`, which the OpenAlex
+providers built at import (during collection) had set from the
+developer's environment (#160; pyalex is imported inside the fixture).
+Registered providers still keep their own `api_key` attributes from
+import time. The autouse `block_network` fixture
 refuses DNS and connections to anything but loopback and **fails the
 test** naming the hosts (providers swallow errors, so a refusal alone
 would go unnoticed). Both exempt `@pytest.mark.integration` tests, which
