@@ -74,6 +74,7 @@ learning from human-tagged examples in a round-based workflow.
 <<llm review llm interaction>>
 <<llm review decision application>>
 <<llm review statistics>>
+<<llm review sampling>>
 <<llm review synthesis>>
 @
 
@@ -113,7 +114,7 @@ the user wants to use OpenAI, Anthropic, local models, or other providers.
 
 <<llm review imports>>=
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 from collections.abc import Callable
 import hashlib
@@ -162,20 +163,33 @@ class LLMDecision:
         paper_id: Identifier of the classified paper
         status: Classification result ("kept" or "discarded")
         tags: Themes (kept) or motivations (discarded) assigned
-        confidence: LLM's confidence in the decision (0.0-1.0)
+        confidence: LLM's confidence in the decision (0.0-1.0), or
+            `None` when the answer gave none that is usable
         reasoning: Brief explanation of the classification
         dropped_tags: Tags the model proposed outside the vocabulary
         category_problem: Why the tags break the one-category rule
             (empty when they do not, or when the session has no
             category tags)
+        answer_problem: Why the answer cannot be used as a decision
+            (no answer, an invalid decision or confidence); empty when
+            it can
+        abstract_truncated: Whether the prompt showed only the start of
+            the paper's abstract
     """
     paper_id: str
     status: str  # "kept" or "discarded"
     tags: list[str]
-    confidence: float
+    confidence: float | None
     reasoning: str
     dropped_tags: list[str] = field(default_factory=list)
     category_problem: str = ""
+    answer_problem: str = ""
+    abstract_truncated: bool = False
+
+    @property
+    def problem(self) -> str:
+        """Why the decision is withheld; empty when it is not."""
+        return self.answer_problem or self.category_problem
 @
 
 
@@ -196,9 +210,11 @@ class LLMBatchResult:
         timestamp: When the classification was performed
         prompt_tokens: Optional token count for the prompt
         completion_tokens: Optional token count for the response
-        withheld: Decisions not applied because they broke the
-            one-category rule even after the retry; their papers stay
-            pending
+        withheld: Decisions not applied because the answer was
+            unusable or broke the one-category rule even after the
+            retry; their papers stay pending
+        prompt_version: Hash of the prompt template and run options
+            (see `classification_prompt_version`)
     """
     decisions: list[LLMDecision]
     model_id: str
@@ -206,6 +222,7 @@ class LLMBatchResult:
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
     withheld: list[LLMDecision] = field(default_factory=list)
+    prompt_version: str | None = None
 @
 
 
@@ -262,26 +279,70 @@ For a paper to serve as an example:
 \begin{enumerate}
 \item It must be classified (kept or discarded), not pending
 \item It must have at least one tag (theme or motivation)
+\item A human must have made or confirmed the decision
 \item Papers where the user corrected an LLM decision are prioritized
   (they represent edge cases the LLM got wrong)
 \end{enumerate}
+
+The third rule is the one that keeps the classifier from teaching
+itself.  Examples used to be drawn from every decided paper, and sorted
+lowest confidence first among the uncorrected ones, so after the first
+round the prompt was mostly the model's own least certain unreviewed
+guesses, shown to it as the reviewer's judgement.  An error then
+propagates: a paper the model wrongly discarded becomes the example of
+a discard.  So by default only decisions a human made or confirmed are
+examples: source [[human]] or [[llm_reviewed]], and [[agent_reviewed]],
+the confirmed form of a decision an AI agent recorded, once that source
+exists (issue~\#162).  Unreviewed decisions ([[llm]], and [[agent]])
+are left out, and so is any source value this module does not know,
+because an unknown source cannot be assumed to be a human's.  The
+sources are compared by their stored values rather than by enum
+members, so this module keeps working whichever members the review
+module defines.  [[include_unreviewed]] (the
+[[--include-llm-examples]] option) restores the old behaviour for a
+user who wants it; the unreviewed examples then come after the
+confirmed ones.
+
+<<llm review constants>>=
+CONFIRMED_SOURCES = frozenset({"human", "llm_reviewed", "agent_reviewed"})
+UNREVIEWED_MACHINE_SOURCES = frozenset({"llm", "agent"})
+<<llm review example gathering>>=
+def source_value(decision: ReviewDecision) -> str:
+    """Return the stored value of the decision's source (e.g. `"llm"`)."""
+    return getattr(decision.source, "value", str(decision.source))
+
+
+def is_confirmed(decision: ReviewDecision) -> bool:
+    """Tell whether a human made or confirmed the decision."""
+    return source_value(decision) in CONFIRMED_SOURCES
+
+
+def is_unreviewed_machine(decision: ReviewDecision) -> bool:
+    """Tell whether an LLM or agent decided and no human has reviewed it."""
+    return source_value(decision) in UNREVIEWED_MACHINE_SOURCES
+@
 
 <<llm review example gathering>>=
 def get_example_decisions(
     session: ReviewSession,
     max_kept: int = MAX_KEPT_EXAMPLES,
     max_discarded: int = MAX_DISCARDED_EXAMPLES,
+    include_unreviewed: bool = False,
 ) -> tuple[list[ReviewDecision], list[ReviewDecision]]:
     """
     Gather tagged examples from a review session.
 
-    Prioritizes user-corrected LLM decisions (is_example=True) as these
-    represent cases where the LLM's initial classification was wrong.
+    Only decisions a human made or confirmed are examples, unless
+    `include_unreviewed` is set; then unreviewed machine decisions follow
+    the confirmed ones. Prioritizes user-corrected LLM decisions
+    (is_example=True) as these represent cases where the LLM's initial
+    classification was wrong.
 
     Args:
         session: The review session to gather examples from
         max_kept: Maximum number of kept examples to include
         max_discarded: Maximum number of discarded examples to include
+        include_unreviewed: Also use unreviewed LLM (and agent) decisions
 
     Returns:
         Tuple of (kept_examples, discarded_examples)
@@ -293,20 +354,24 @@ def get_example_decisions(
         # Only include papers with tags (our example requirement)
         if not decision.tags:
             continue
+        if not is_confirmed(decision) and not (
+            include_unreviewed and is_unreviewed_machine(decision)
+        ):
+            continue
 
         if decision.status == DecisionStatus.KEPT:
             kept_examples.append(decision)
         elif decision.status == DecisionStatus.DISCARDED:
             discarded_examples.append(decision)
 
-    # Sort to prioritize corrected examples (is_example=True first)
-    # Then by confidence (lower first, as these are harder cases)
-    def sort_key(d: ReviewDecision) -> tuple[int, float]:
-        # is_example=True should come first (0), then False (1)
+    # Sort to prioritize corrected examples (is_example=True first),
+    # then confirmed before unreviewed, then by confidence (lower first,
+    # as these are harder cases)
+    def sort_key(d: ReviewDecision) -> tuple[int, int, float]:
         example_priority = 0 if d.is_example else 1
-        # Lower confidence first (more informative examples)
+        unreviewed = 0 if is_confirmed(d) else 1
         confidence = d.llm_confidence if d.llm_confidence is not None else 1.0
-        return (example_priority, confidence)
+        return (example_priority, unreviewed, confidence)
 
     kept_examples.sort(key=sort_key)
     discarded_examples.sort(key=sort_key)
@@ -547,6 +612,52 @@ class TestExampleGathering:
 
 @
 
+Unreviewed machine decisions are no examples unless asked for, and then
+they come after the confirmed ones; a source value this module does not
+know is never one:
+
+<<test functions>>=
+class TestExamplesAreConfirmed:
+    <<confirmed example test methods>>
+
+<<confirmed example test methods>>=
+def _session(self):
+    session = ReviewSession(
+        query="q", providers=["p"], timestamp=datetime(2026, 11, 18),
+    )
+    rows = [
+        ("Human", ReviewSource.HUMAN, None),
+        ("Confirmed", ReviewSource.LLM_REVIEWED, 0.9),
+        ("Guess", ReviewSource.LLM_UNREVIEWED, 0.1),
+    ]
+    for title, source, confidence in rows:
+        session.decisions.append(ReviewDecision(
+            paper=Paper(title=title, authors=["A"],
+                        doi=f"10.5555/example-{title}"),
+            provider="p", status=DecisionStatus.DISCARDED, tags=["off"],
+            source=source, llm_confidence=confidence,
+        ))
+    return session
+
+def test_unreviewed_decisions_are_left_out(self):
+    _, discarded = get_example_decisions(self._session())
+    assert [d.paper.title for d in discarded] == ["Confirmed", "Human"]
+
+def test_opt_in_puts_them_last(self):
+    _, discarded = get_example_decisions(
+        self._session(), include_unreviewed=True
+    )
+    assert [d.paper.title for d in discarded] == [
+        "Confirmed", "Human", "Guess"
+    ]
+
+def test_unknown_source_is_not_confirmed(self):
+    decision = self._session().decisions[0]
+    decision.source = Mock(value="robot")
+    assert not is_confirmed(decision)
+    assert not is_unreviewed_machine(decision)
+@
+
 
 \section{Prompt Construction}
 \label{sec:prompt-construction}
@@ -570,7 +681,38 @@ sentence from the methodology or results can.
 When the caller supplies quotes (see \cref{sec:fulltext-classification}), the
 classifier therefore assigns labels on evidence the abstract never carried.
 
+Abstracts are cut to bound the prompt, and where they are cut decides
+what the model can see.  The limit used to be 1000 characters for every
+paper, examples and papers to classify alike.  Measured over the about
+114\,000 distinct papers with an abstract in the author's own review
+sessions (November 2026; the median abstract is about 1300 characters),
+that cut 74\,\% of the abstracts, and three quarters of those by more
+than a fifth.  A decision made on part of an abstract is not the
+decision the report says was made.  The papers to classify therefore
+get [[MAX_ABSTRACT_CHARS]] = 4000 characters, which in the same
+sessions shows 96\,\% of the abstracts whole.  Some limit is still
+needed, because the longest stored \enquote{abstract} there runs to
+about 95\,000 characters, and ten such records would fill a prompt on
+their own.  When an
+abstract is cut, the prompt says so, and the decision records it
+([[llm_abstract_truncated]], \cref{sec:llm-audit-fields} in the review
+module).  The examples keep the old 1000 characters
+([[EXAMPLE_ABSTRACT_CHARS]]): up to twenty of them go into every
+prompt, they only illustrate the criteria, and no decision is taken
+about them, so raising their limit would let the examples' abstracts
+grow to four times their length in every prompt without changing what
+any decision rests on.
+
+<<llm review constants>>=
+MAX_ABSTRACT_CHARS = 4000
+EXAMPLE_ABSTRACT_CHARS = 1000
+TRUNCATION_MARK = " [abstract truncated]"
 <<llm review prompt construction>>=
+def abstract_is_truncated(paper: Paper) -> bool:
+    """Tell whether the prompt shows only the start of the abstract."""
+    return bool(paper.abstract) and len(paper.abstract) > MAX_ABSTRACT_CHARS
+
+
 def _format_paper_for_prompt(
     decision: ReviewDecision,
     include_abstract: bool = True,
@@ -599,10 +741,9 @@ def _format_paper_for_prompt(
         lines.append(f"Venue: {paper.venue}")
 
     if include_abstract and paper.abstract:
-        # Truncate very long abstracts
         abstract = paper.abstract
-        if len(abstract) > 1000:
-            abstract = abstract[:1000] + "..."
+        if len(abstract) > EXAMPLE_ABSTRACT_CHARS:
+            abstract = abstract[:EXAMPLE_ABSTRACT_CHARS] + "..."
         lines.append(f"Abstract: {abstract}")
 
     tags = [t for t in decision.tags if t.casefold() not in NOTE_TAGS]
@@ -645,8 +786,8 @@ def _format_paper_to_classify(
 
     if paper.abstract:
         abstract = paper.abstract
-        if len(abstract) > 1000:
-            abstract = abstract[:1000] + "..."
+        if abstract_is_truncated(paper):
+            abstract = abstract[:MAX_ABSTRACT_CHARS] + TRUNCATION_MARK
         lines.append(f"Abstract: {abstract}")
     else:
         lines.append("Abstract: [Not available]")
@@ -892,6 +1033,24 @@ class TestPromptConstruction:
         assert len(result) < 2000
         assert "..." in result
 
+    def test_paper_to_classify_shows_more_and_says_when_cut(self):
+        """The classified paper's abstract is cut later, and visibly."""
+        from scholar.llm_review import _format_paper_to_classify
+
+        def shown(length):
+            paper = Paper(title="T", authors=["A"], abstract="x" * length)
+            text = _format_paper_to_classify(
+                ReviewDecision(paper=paper, provider="test"), 0
+            )
+            return text, abstract_is_truncated(paper)
+
+        text, cut = shown(MAX_ABSTRACT_CHARS)
+        assert "x" * MAX_ABSTRACT_CHARS in text and not cut
+        assert TRUNCATION_MARK not in text
+        text, cut = shown(MAX_ABSTRACT_CHARS + 1)
+        assert cut and text.endswith(TRUNCATION_MARK)
+        assert "x" * (MAX_ABSTRACT_CHARS + 1) not in text
+
     def test_build_classification_prompt_includes_context(self):
         """Prompt includes research context when provided."""
         paper = Paper(title="Test", authors=["A"], year=2024)
@@ -952,6 +1111,121 @@ class TestPromptConstruction:
 @
 
 
+\subsection{Versioning the prompt}
+\label{sec:prompt-version}
+
+A decision is only as reproducible as the instructions it was made
+under, and those change: this chapter has changed the prompt several
+times (the vocabulary rule, the category section, the abstract limit).
+Storing the full prompt with every decision would be exact but huge,
+and most of it is the batch's own papers.  What a reader needs is
+narrower: were two decisions made under the same procedure?  So every
+decision of a batch records [[llm_prompt_version]], a hash of the
+procedure, and the procedure is the part of the prompt that does not
+depend on which papers happen to be in the batch.
+
+The template is captured by building the prompt, and the retry
+reminder, for a fixed probe: a placeholder paper with a supporting
+passage, one placeholder example of each kind and one placeholder tag
+in every list.  Any change to the wording, the section headings or the
+way a paper is shown changes the probe's prompt and so the hash,
+without anyone having to remember to bump a version number.  The
+options are the ones that change what the model is told or shown: the
+research context, which the prompt carries verbatim; the tags seeded
+with [[--tag]]; whether new tags are allowed; which examples are used;
+the full-text passages; the batch size; and the abstract and example
+limits.  Left out on purpose are the session's own tags and examples,
+which grow every round by design: with them in the hash, every batch
+would get a version of its own and the version could no longer group
+decisions made the same way.  The model is recorded separately
+([[llm_model]]).  Sixteen hexadecimal digits are plenty to tell a
+handful of procedures apart and short enough to read in a table.
+
+<<llm review constants>>=
+PROMPT_VERSION_DIGITS = 16
+<<llm review prompt construction>>=
+def classification_prompt_version(
+    *,
+    research_context: str | None,
+    vocabulary: set[str] | None,
+    allow_new_tags: bool,
+    examples: str,
+    use_fulltext: bool,
+    max_quotes: int,
+    count: int,
+) -> str:
+    """Return a short hash of the classification procedure.
+
+    `examples` names which examples the prompt uses: `"none"`,
+    `"confirmed"` or `"including-unreviewed"`.
+    """
+    from types import SimpleNamespace
+
+    def probe(title, status=DecisionStatus.PENDING, tags=()):
+        return ReviewDecision(
+            paper=Paper(title=title, authors=["AUTHOR"], year=2000,
+                        venue="VENUE", abstract="ABSTRACT"),
+            provider="probe", status=status, tags=list(tags),
+        )
+
+    template = build_classification_prompt(
+        papers_to_classify=[probe("PAPER")],
+        kept_examples=[probe("KEPT", DecisionStatus.KEPT, ["THEME"])],
+        discarded_examples=[
+            probe("DISCARDED", DecisionStatus.DISCARDED, ["MOTIVATION"])
+        ],
+        research_context="CONTEXT",
+        available_themes={"THEME"},
+        available_motivations={"MOTIVATION"},
+        paper_quotes=[[SimpleNamespace(page=1, text="PASSAGE")]],
+        extra_tags={"TAG"},
+        allow_new_tags=allow_new_tags,
+        category_tags={"CATEGORY"},
+    )
+    procedure = {
+        "template": template,
+        "retry": _retry_reminder({"TAG"}, {"CATEGORY"}),
+        "research_context": research_context or "",
+        "vocabulary": sorted(vocabulary or ()),
+        "allow_new_tags": allow_new_tags,
+        "examples": examples,
+        "max_examples": [MAX_KEPT_EXAMPLES, MAX_DISCARDED_EXAMPLES],
+        "use_fulltext": use_fulltext,
+        "max_quotes": max_quotes if use_fulltext else None,
+        "count": count,
+        "abstract_chars": [MAX_ABSTRACT_CHARS, EXAMPLE_ABSTRACT_CHARS],
+    }
+    digest = hashlib.sha256(
+        json.dumps(procedure, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    return digest[:PROMPT_VERSION_DIGITS]
+@
+
+The version is stable for an unchanged procedure, and each of the
+options moves it:
+
+<<test functions>>=
+class TestPromptVersion:
+    def test_same_procedure_same_version_each_option_changes_it(self):
+        base = dict(
+            research_context="Why?", vocabulary={"a"}, allow_new_tags=False,
+            examples="confirmed", use_fulltext=False, max_quotes=3,
+            count=10,
+        )
+        version = classification_prompt_version(**base)
+        assert version == classification_prompt_version(**base)
+        assert len(version) == PROMPT_VERSION_DIGITS
+        changes = [
+            {"research_context": "Why not?"}, {"vocabulary": {"b"}},
+            {"allow_new_tags": True}, {"examples": "including-unreviewed"},
+            {"use_fulltext": True}, {"count": 20},
+        ]
+        for change in changes:
+            assert classification_prompt_version(**{**base, **change}) \
+                != version, change
+@
+
+
 \section{LLM Interaction}
 \label{sec:llm-interaction}
 
@@ -959,9 +1233,14 @@ This section handles the actual interaction with the LLM. We use the [[llm]]
 package which provides a unified interface to various language models.
 
 \subsection{Parsing LLM Response}
+\label{sec:llm-parse}
 
-The LLM returns JSON which we parse into [[LLMDecision]] objects. We need
-to handle potential parsing errors gracefully.
+The LLM returns JSON which we parse into [[LLMDecision]] objects, one
+per paper of the batch.  A response with no JSON at all raises an
+error, since no paper can be decided from it.  Within a readable
+response, each paper's answer is checked on its own, and a defective
+one is recorded as such rather than repaired, as the rest of this
+subsection explains.
 
 <<llm review llm interaction>>=
 def _restrict_tags(
@@ -1045,20 +1324,14 @@ def parse_llm_response(
         raise ValueError("Response missing 'classifications' key")
 
     decisions = []
+    answered: set[int] = set()
     for item in data["classifications"]:
-        paper_index = item.get("paper_index", 0)
-        if paper_index < 0 or paper_index >= len(papers):
-            logger.warning(f"Invalid paper_index {paper_index}, skipping")
-            continue
-
+        <<find the paper an answer is for>>
         paper_decision = papers[paper_index]
         paper_id = get_paper_id(paper_decision.paper)
+        problems: list[str] = []
 
-        # Validate status
-        status = item.get("decision", "").lower()
-        if status not in ("kept", "discarded"):
-            logger.warning(f"Invalid decision '{status}', defaulting to kept")
-            status = "kept"
+        <<check the decision of an answer>>
 
         # Ensure tags are present, and inside the vocabulary if given
         tags = item.get("tags", [])
@@ -1073,15 +1346,16 @@ def parse_llm_response(
         tags, problem = _check_one_category(tags, category_tags)
         if problem:
             logger.warning("Paper %d: %s", paper_index, problem)
+        if status == "discarded" and not tags:
+            problems.append("discarded without a tag")
 
-        # Validate confidence
-        confidence = item.get("confidence", 0.5)
-        try:
-            confidence = float(confidence)
-            confidence = max(0.0, min(1.0, confidence))
-        except (TypeError, ValueError):
-            confidence = 0.5
+        <<check the confidence of an answer>>
 
+        if problems:
+            logger.warning(
+                "Paper %d left pending: %s", paper_index, "; ".join(problems)
+            )
+        reasoning = item.get("reasoning")
         decisions.append(
             LLMDecision(
                 paper_id=paper_id,
@@ -1090,11 +1364,165 @@ def parse_llm_response(
                 confidence=confidence,
                 dropped_tags=dropped,
                 category_problem=problem,
-                reasoning=item.get("reasoning", ""),
+                answer_problem="; ".join(problems),
+                abstract_truncated=abstract_is_truncated(paper_decision.paper),
+                reasoning=reasoning if isinstance(reasoning, str) else "",
             )
         )
 
+    <<add a pending entry for each paper without an answer>>
     return decisions
+@
+
+An answer is attributed to a paper only by its [[paper_index]], so an
+answer without a usable index is skipped: guessing paper~0, as the
+parser used to, files one paper's verdict under another.  The index
+must be an integer (a model may write it as the string
+\enquote{3}, which is unambiguous) within the batch; a boolean is
+rejected although Python counts it as an integer.  A second answer for
+the same paper is skipped too, so the first one stands, as it did when
+both were applied and the second found the paper already decided.
+
+<<find the paper an answer is for>>=
+paper_index = _answer_index(
+    item.get("paper_index") if isinstance(item, dict) else None,
+    len(papers),
+)
+if paper_index is None:
+    logger.warning("Answer without a valid paper_index skipped: %r", item)
+    continue
+if paper_index in answered:
+    logger.warning("Second answer for paper %d skipped", paper_index)
+    continue
+answered.add(paper_index)
+<<llm review llm interaction>>=
+def _answer_index(value, count: int) -> int | None:
+    """Return `value` as a paper index below `count`, or `None`."""
+    if isinstance(value, str) and value.strip().isdigit():
+        value = int(value)
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if 0 <= value < count else None
+@
+
+The parser used to repair every other defect with a default: a
+decision it could not read became \enquote{kept} and a missing
+confidence became 0.5.  Those values then looked exactly like the
+model's own, in the session and in every report built from it, so a
+report could state that the model kept a paper it had said nothing
+sensible about.  Now a defect is recorded instead, in
+[[answer_problem]], and the answer is withheld like one that breaks the
+category rule (\cref{sec:classifier-categories}): the paper stays
+pending, and [[scholar llm classify]] lists it at the end.  The
+defects are a decision that is neither \enquote{kept} nor
+\enquote{discarded}, a discard without any tag (which the review
+module would hold invalid), and a confidence that is missing, not a
+number, or outside $[0, 1]$.  An out-of-range confidence used to be
+clamped, but a model that writes 85 probably means 85\,\%, and
+clamping it to 1.0 would invent a certainty; we do not guess which
+scale it used.
+
+<<check the decision of an answer>>=
+raw_status = item.get("decision")
+status = raw_status.strip().lower() if isinstance(raw_status, str) else ""
+if status not in ("kept", "discarded"):
+    problems.append(f"invalid decision {raw_status!r}")
+    status = ""
+<<check the confidence of an answer>>=
+confidence = _answer_confidence(item.get("confidence"))
+if confidence is None:
+    problems.append(f"invalid confidence {item.get('confidence')!r}")
+<<llm review llm interaction>>=
+def _answer_confidence(value) -> float | None:
+    """Return `value` as a confidence in [0, 1], or `None` if it is not one."""
+    if isinstance(value, bool):
+        return None
+    try:
+        confidence = float(value)
+    except (TypeError, ValueError):
+        return None
+    return confidence if 0.0 <= confidence <= 1.0 else None
+@
+
+A paper the model did not answer at all is the plainest defect of
+the three: the batch was sent, and nothing came back for it.  It gets
+an entry with no decision, so that it is listed with the others instead
+of looking like a paper the batch never reached.
+
+<<add a pending entry for each paper without an answer>>=
+for index, paper_decision in enumerate(papers):
+    if index not in answered:
+        logger.warning("Paper %d left pending: no answer", index)
+        decisions.append(LLMDecision(
+            paper_id=get_paper_id(paper_decision.paper),
+            status="",
+            tags=[],
+            confidence=None,
+            reasoning="",
+            answer_problem="no answer for this paper",
+            abstract_truncated=abstract_is_truncated(paper_decision.paper),
+        ))
+@
+
+Let's check each defect on its own, and that a sound answer beside them
+is still used:
+
+<<test functions>>=
+class TestMalformedAnswers:
+    """A defective answer leaves its paper pending, with the reason."""
+
+    <<malformed answer test methods>>
+
+<<malformed answer test methods>>=
+def _papers(self, count):
+    return [
+        ReviewDecision(
+            paper=Paper(title=f"P{i}", authors=["A"],
+                        doi=f"10.5555/malformed-{i}"),
+            provider="p",
+        )
+        for i in range(count)
+    ]
+
+def _parse(self, answers, count):
+    return parse_llm_response(
+        json.dumps({"classifications": answers}), self._papers(count)
+    )
+
+def test_each_defect_is_recorded_not_repaired(self):
+    good = {"decision": "kept", "tags": ["t"], "confidence": 0.8,
+            "reasoning": "fits"}
+    parsed = self._parse([
+        {**good, "paper_index": 0},
+        {**good, "paper_index": 1, "decision": "maybe"},
+        {**good, "paper_index": 2, "confidence": None},
+        {**good, "paper_index": 3, "confidence": 85},
+        {**good, "paper_index": "4", "decision": "discarded", "tags": []},
+    ], 6)
+    problems = [d.answer_problem for d in parsed]
+    assert problems == [
+        "",
+        "invalid decision 'maybe'",
+        "invalid confidence None",
+        "invalid confidence 85",
+        "discarded without a tag",
+        "no answer for this paper",
+    ]
+    assert parsed[0].confidence == 0.8 and parsed[0].problem == ""
+    assert parsed[1].status == "" and parsed[2].confidence is None
+    assert all(d.problem for d in parsed[1:])
+
+def test_answers_without_a_usable_index_are_skipped(self):
+    good = {"decision": "kept", "tags": ["t"], "confidence": 0.8}
+    parsed = self._parse([
+        good,
+        {**good, "paper_index": True},
+        {**good, "paper_index": 7},
+        {**good, "paper_index": 0, "confidence": 0.9},
+        {**good, "paper_index": 0, "confidence": 0.1},
+    ], 1)
+    assert len(parsed) == 1
+    assert parsed[0].confidence == 0.9
 @
 
 
@@ -1163,6 +1591,7 @@ def classify_papers_with_llm(
     max_quotes: int = 3,
     vocabulary: set[str] | None = None,
     allow_new_tags: bool = False,
+    include_llm_examples: bool = False,
 ) -> LLMBatchResult | str:
     """
     Classify pending papers using LLM.
@@ -1185,6 +1614,8 @@ def classify_papers_with_llm(
             themes and motivations (seeds a fresh session's vocabulary)
         allow_new_tags: Let the model propose tags outside the vocabulary
             instead of dropping them and retrying
+        include_llm_examples: Also use unreviewed LLM (and agent)
+            decisions as examples, after the confirmed ones
         enrich_missing: Whether to auto-enrich papers without abstracts
         dry_run: If True, return the prompt without calling LLM
         require_examples: If True (default), gather tagged example papers
@@ -1207,7 +1638,9 @@ def classify_papers_with_llm(
     """
     # Gather examples (optional)
     if require_examples:
-        kept_examples, discarded_examples = get_example_decisions(session)
+        kept_examples, discarded_examples = get_example_decisions(
+            session, include_unreviewed=include_llm_examples
+        )
 
         # Below-threshold examples are a quality concern, not a hard stop:
         # warn and continue with whatever was gathered (possibly none) so
@@ -1346,17 +1779,36 @@ def classify_papers_with_llm(
         response_text = response.text()
         decisions = parse(response_text)
 
-    <<withhold decisions that still break the category rule>>
+    <<withhold the decisions that cannot be applied>>
 
     return LLMBatchResult(
         decisions=decisions,
         model_id=model.model_id,
-        timestamp=datetime.now().isoformat(),
+        timestamp=datetime.now(timezone.utc).isoformat(timespec="seconds"),
         prompt_tokens=getattr(response, "prompt_tokens", None),
         completion_tokens=getattr(response, "completion_tokens", None),
         withheld=withheld,
+        prompt_version=classification_prompt_version(
+            research_context=session.research_context,
+            vocabulary=vocabulary,
+            allow_new_tags=allow_new_tags,
+            examples=(
+                "none" if not require_examples
+                else "including-unreviewed" if include_llm_examples
+                else "confirmed"
+            ),
+            use_fulltext=bool(use_fulltext and session.research_context),
+            max_quotes=max_quotes,
+            count=count,
+        ),
     )
 @
+
+The batch's time is taken in UTC when the answer is in, because it is
+the time stored with every decision of the batch
+([[llm_decided_at]]); the local time it used to be, without a zone,
+would have been ambiguous as soon as a session was classified on two
+machines.
 
 \subsection{Keeping the classifier inside the vocabulary}
 
@@ -1658,9 +2110,9 @@ batch, as it always has.
 def _needs_retry(
     decisions: list[LLMDecision], allowed: set[str] | None
 ) -> bool:
-    """Tell whether a paper lost all its tags or broke the category rule."""
+    """Tell whether a paper lost all its tags or has no usable decision."""
     return any(
-        (allowed and d.dropped_tags and not d.tags) or d.category_problem
+        (allowed and d.dropped_tags and not d.tags) or d.problem
         for d in decisions
     )
 
@@ -1690,16 +2142,21 @@ decision at all. Recording it anyway would put a row into the audit
 table under the wrong heading, or hide it from [[--bearing-only]],
 which is the failure we set out to remove; left pending, it is counted
 as unclassified in the caption and comes up again in the next batch or
-for a human. The withheld decisions travel in the batch result so that
-[[scholar llm classify]] can name them at the end of the run.
+for a human. The same holds for a paper whose answer is unusable
+(\cref{sec:llm-parse}): it triggers the same single retry, for the
+same reason as a paper left without tags (a second attempt costs less
+than a paper a human has to classify), and if the retry does not mend
+it the paper stays pending. The withheld decisions travel in the
+batch result so that [[scholar llm classify]] can name them at the end
+of the run.
 
-<<withhold decisions that still break the category rule>>=
-withheld = [d for d in decisions if d.category_problem]
-decisions = [d for d in decisions if not d.category_problem]
+<<withhold the decisions that cannot be applied>>=
+withheld = [d for d in decisions if d.problem]
+decisions = [d for d in decisions if not d.problem]
 if withheld:
     logger.warning(
-        "%d paper(s) left pending: still not exactly one category tag "
-        "after the retry",
+        "%d paper(s) left pending: no usable answer, or not exactly one "
+        "category tag, after the retry",
         len(withheld),
     )
 @
@@ -2196,7 +2653,29 @@ session and provide functions for users to review and correct them.
 
 \subsection{Applying LLM Decisions}
 
+Applying a decision writes the classifier's record of it onto the
+paper (\cref{sec:llm-audit-fields} in the review module): the batch's
+model, time and prompt version, whether the abstract was cut, and the
+model's reason.  The reason is cut to [[MAX_REASON_CHARS]] characters.
+The prompt asks for one or two sentences, which fit with room to
+spare; the limit is there for the model that ignores the request, whose
+essay would otherwise be copied into the session file once per paper.
+An empty reason is stored as [[None]], unknown, rather than as an
+empty string that would read as \enquote{no reason given}.
+
+<<llm review constants>>=
+MAX_REASON_CHARS = 500
 <<llm review decision application>>=
+def truncate_reason(reasoning: str) -> str | None:
+    """Return the model's reason cut to `MAX_REASON_CHARS`, or `None`."""
+    reasoning = (reasoning or "").strip()
+    if not reasoning:
+        return None
+    if len(reasoning) <= MAX_REASON_CHARS:
+        return reasoning
+    return reasoning[: MAX_REASON_CHARS - 1].rstrip() + "\u2026"
+
+
 def _build_paper_id_lookup(
     session: ReviewSession,
 ) -> dict[str, ReviewDecision]:
@@ -2251,6 +2730,11 @@ def apply_llm_decisions(
         decision.source = ReviewSource.LLM_UNREVIEWED
         decision.llm_confidence = llm_decision.confidence
         decision.is_example = False  # Not an example until user reviews
+        decision.llm_model = batch_result.model_id
+        decision.llm_decided_at = batch_result.timestamp
+        decision.llm_prompt_version = batch_result.prompt_version
+        decision.llm_reason = truncate_reason(llm_decision.reasoning)
+        decision.llm_abstract_truncated = llm_decision.abstract_truncated
 
         # Log info about each paper's review outcome
         status_str = "KEPT" if llm_decision.status == "kept" else "DISCARDED"
@@ -2272,6 +2756,84 @@ def apply_llm_decisions(
     return updated
 @
 
+
+Let's run the whole path once with a fake model, through the
+[[globals()]] seam the other classifier tests use: a batch of three
+where the model answers the first paper soundly (with a long abstract
+and a long reason), gives the second an unreadable decision on both
+attempts, and forgets the third.  The first is applied with the whole
+record; the other two are withheld and stay pending, after one retry.
+
+<<test functions>>=
+class TestClassificationIsRecorded:
+    def test_record_and_withheld_answers(self, monkeypatch):
+        import scholar.llm_review as llm_review
+        from scholar.notes import get_paper_id
+
+        session = ReviewSession(
+            query="q", providers=["p"], timestamp=datetime(2026, 11, 18),
+            research_context="Does it hold?",
+        )
+        session.decisions = [
+            ReviewDecision(
+                paper=Paper(title=f"New {i}", authors=["A"],
+                            doi=f"10.5555/recorded-{i}",
+                            abstract="y" * (MAX_ABSTRACT_CHARS + 10 * i)),
+                provider="p",
+            )
+            for i in range(3)
+        ]
+        answer = json.dumps({"classifications": [
+            {"paper_index": 0, "decision": "discarded", "tags": ["off"],
+             "confidence": 0.75, "reasoning": "r" * 900},
+            {"paper_index": 1, "decision": "unsure", "tags": ["off"],
+             "confidence": 0.5, "reasoning": "?"},
+        ]})
+
+        class FakeResponse:
+            def text(self):
+                return answer
+
+        class FakeModel:
+            model_id = "fake-model"
+            prompts = []
+
+            def prompt(self, prompt):
+                self.prompts.append(prompt)
+                return FakeResponse()
+
+        model = FakeModel()
+
+        class FakeLLMModule:
+            def get_model(self, _model_id=None):
+                return model
+
+        monkeypatch.setattr(llm_review, "llm", FakeLLMModule(), raising=False)
+        result = classify_papers_with_llm(
+            session, model_id="fake-model", enrich_missing=False,
+            require_examples=False,
+        )
+        assert len(model.prompts) == 2
+        assert [d.problem for d in result.withheld] == [
+            "invalid decision 'unsure'", "no answer for this paper"
+        ]
+        assert datetime.fromisoformat(result.timestamp).utcoffset() \
+            .total_seconds() == 0
+
+        apply_llm_decisions(session, result)
+        first, second, third = session.decisions
+        assert first.status == DecisionStatus.DISCARDED
+        assert first.llm_model == "fake-model"
+        assert first.llm_decided_at == result.timestamp
+        assert first.llm_prompt_version == result.prompt_version
+        assert first.llm_prompt_version is not None
+        assert len(first.llm_reason) == MAX_REASON_CHARS
+        assert first.llm_abstract_truncated is False
+        for pending in (second, third):
+            assert pending.status == DecisionStatus.PENDING
+            assert pending.llm_model is None
+        assert [d.abstract_truncated for d in result.withheld] == [True, True]
+@
 
 \subsection{Marking Decisions as Reviewed}
 
@@ -2399,6 +2961,17 @@ class TestDecisionApplication:
         assert updated[0].status == DecisionStatus.KEPT
         assert updated[0].source == ReviewSource.LLM_UNREVIEWED
         assert updated[0].llm_confidence == 0.85
+        assert updated[0].llm_model == "test"
+        assert updated[0].llm_decided_at == "2024-01-01"
+        assert updated[0].llm_reason == "Good paper."
+        assert updated[0].llm_abstract_truncated is False
+
+    def test_reason_is_cut_and_empty_reason_is_unknown(self):
+        long = "word " * 200
+        cut = truncate_reason(long)
+        assert len(cut) == MAX_REASON_CHARS and cut.endswith("\u2026")
+        assert truncate_reason("  ") is None
+        assert truncate_reason("Short.") == "Short."
 
     def test_mark_as_reviewed_agrees(self):
         """Marking as reviewed when user agrees."""
@@ -2582,6 +3155,978 @@ class TestStatistics:
         assert stats["pending"] == 1
         assert stats["examples"] == 1
         assert stats["total"] == 7
+@
+
+
+\section{Sampling machine decisions for review}
+\label{sec:llm-sample}
+
+A confidence score is the model's own report of its certainty, and a
+review that leaves most LLM decisions unreviewed has, so far, no
+measure of how often those decisions are wrong.  In the author's
+sessions about 85\,000 LLM discards were unreviewed in November 2026
+(78\,000 distinct papers); reviewing
+them all would defeat the purpose of the classifier, but reviewing a
+\emph{random sample} of them gives an estimate, with an interval, of
+the rate at which a human would overturn them.  With it, the report
+can say about the automated screening step not only that it ran, but
+how well it agreed with a human on a sample the human did not choose.
+
+This section has three parts.  [[draw_llm_sample]] draws a reproducible
+sample and records it in the sessions; [[sample_reports]] counts, once
+the sample has been reviewed, how many decisions the reviewer changed
+and puts a Wilson score interval around the rate; and
+[[build_llm_screening_latex]] turns both, and the classifier's record
+of its decisions, into the paragraphs of the review report.  The
+command [[scholar llm sample]] in the CLI drives the first two; the TUI
+queues the sample for review (filter [[s]]); and [[sessions decide]]
+reviews a sampled paper like any other.
+
+\subsection{The population and the draw}
+
+The population is every \emph{unreviewed machine decision} of the
+pooled sessions that matches the criteria: its source is [[llm]] (or
+[[agent]], the unreviewed decision of an AI agent, once the review
+module has that source), its status is one of the requested ones
+(discarded, kept or both), and, with [[min_confidence]], its confidence
+is at least that.  A decision without a confidence is left out when a
+minimum is asked for, since it cannot be shown to meet it.  Each
+decision appears once, keyed by its session's name and its paper id.
+
+The draw has to be reproducible from what is stored: given the seed
+and the population, anyone must get the same papers.  Python's
+[[random.sample]] is not enough for that, because the documentation of
+the [[random]] module promises only that [[random()]] keeps producing
+the same sequence for a given seed across Python versions, and says
+that most of the module's other algorithms may change (\enquote{Notes
+on Reproducibility},
+\url{https://docs.python.org/3/library/random.html}, read 2026-11-18).
+So the population is sorted by session name and paper id, each member
+gets the next value of [[random()]] as its key, in that order, and the
+sample is the [[size]] members with the smallest keys.  Every member
+gets an independent uniform key, so every ordering of the keys is
+equally likely, and so is every set of [[size]] members: it is a simple
+random sample without replacement.  Ties, which [[random()]] makes
+practically impossible, fall back on the sorted order.
+
+The sample is recorded in every pooled session (\cref{sec:llm-sample-record}
+in the review module) with the criteria, the population's size and a
+digest of its sorted keys, so that a reader can check later that the
+population a re-draw starts from is the one the sample was drawn from.
+The criteria also list which machine sources the population held, so
+that the report can say \enquote{LLM decisions} when no agent decision
+was among them.
+
+<<llm review sampling>>=
+@dataclass
+class SampleDraw:
+    """The outcome of `draw_llm_sample`: the id and the drawn decisions."""
+    sample_id: str
+    population: int
+    drawn: list[tuple[str, ReviewDecision]]
+
+
+def session_label(session: ReviewSession) -> str:
+    """Return the name a session is known by in a sample."""
+    return session.name or session.query
+
+
+def sample_population(
+    sessions: list[ReviewSession],
+    *,
+    statuses: set[str],
+    min_confidence: float | None = None,
+) -> list[tuple[str, str, ReviewDecision]]:
+    """Return the eligible decisions as sorted `(session, paper id, decision)`.
+
+    Eligible are unreviewed LLM or agent decisions whose status value is in
+    `statuses` and, if `min_confidence` is given, whose confidence is at
+    least that.
+    """
+    from scholar.notes import get_paper_id
+
+    pool: dict[tuple[str, str], ReviewDecision] = {}
+    for session in sessions:
+        name = session_label(session)
+        for decision in session.decisions:
+            if not is_unreviewed_machine(decision):
+                continue
+            if decision.status.value not in statuses:
+                continue
+            if min_confidence is not None and (
+                decision.llm_confidence is None
+                or decision.llm_confidence < min_confidence
+            ):
+                continue
+            pool.setdefault((name, get_paper_id(decision.paper)), decision)
+    return [(name, pid, d) for (name, pid), d in sorted(pool.items())]
+
+
+def draw_llm_sample(
+    sessions: list[ReviewSession],
+    *,
+    statuses: set[str],
+    size: int,
+    seed: int,
+    min_confidence: float | None = None,
+    now: datetime | None = None,
+) -> SampleDraw:
+    """Draw a seeded random sample of unreviewed machine decisions.
+
+    Records the sample in every session of `sessions` (as an `LLMSample`
+    in `session.llm_samples`); the caller saves them.
+
+    Raises:
+        ValueError: `size` is not positive, or no decision is eligible.
+    """
+    from scholar.review import LLMSample
+
+    if size < 1:
+        raise ValueError("The sample size must be at least 1")
+    pool = sample_population(
+        sessions, statuses=statuses, min_confidence=min_confidence
+    )
+    if not pool:
+        raise ValueError("No unreviewed LLM decisions match the criteria")
+    <<draw the members with the smallest keys>>
+    <<record the sample in each session>>
+    return SampleDraw(
+        sample_id=sample_id,
+        population=len(pool),
+        drawn=[(name, decision) for name, _, decision in drawn],
+    )
+@
+
+<<draw the members with the smallest keys>>=
+rng = random.Random(seed)
+keys = [rng.random() for _ in pool]
+order = sorted(range(len(pool)), key=lambda i: (keys[i], i))
+drawn = [pool[i] for i in order[:size]]
+<<record the sample in each session>>=
+drawn_at = (now or datetime.now(timezone.utc)).isoformat(timespec="seconds")
+sample_id = f"{drawn_at}/seed={seed}/{uuid.uuid4().hex[:SAMPLE_ID_DIGITS]}"
+digest = hashlib.sha256(
+    "\n".join(f"{name}\t{pid}" for name, pid, _ in pool).encode("utf-8")
+).hexdigest()[:PROMPT_VERSION_DIGITS]
+criteria = {
+    "statuses": sorted(statuses),
+    "min_confidence": min_confidence,
+    "population_sources": sorted({source_value(d) for _, _, d in pool}),
+}
+names = [session_label(s) for s in sessions]
+for session in sessions:
+    session.llm_samples.append(LLMSample(
+        sample_id=sample_id, seed=seed, drawn_at=drawn_at,
+        criteria=dict(criteria), sessions=list(names),
+        population=len(pool), population_digest=digest, size=len(drawn),
+        papers=[
+            {"paper_id": pid, "status": d.status.value,
+             "source": source_value(d), "confidence": d.llm_confidence}
+            for name, pid, d in drawn
+            if name == session_label(session)
+        ],
+    ))
+@
+
+<<llm review imports>>=
+import math
+import random
+import uuid
+from statistics import NormalDist
+<<llm review constants>>=
+SAMPLE_ID_DIGITS = 12
+@
+
+The id of a sample has to be unique, not only readable.  The time and
+the seed alone are not enough: a [[--discarded]] and a [[--kept]] draw
+started in the same second with the same seed would share an id, and
+then [[sample_reports]] would add the kept rows to the discard rate and
+the concurrent merge, which keeps one sample per id, would drop one of
+them.  So the id ends in random hexadecimal digits from [[uuid4]].  The
+id needs no reproducibility of its own: what makes the draw
+reproducible is the seed, the criteria and the population, all of which
+are stored beside it.
+
+The draw is checked on three properties: the same seed over the same
+population gives the same papers whatever order the sessions come in,
+only eligible decisions are drawn, and each session records its own
+share of the sample under one id:
+
+<<test functions>>=
+class TestDrawLLMSample:
+    <<draw sample test methods>>
+
+<<draw sample test methods>>=
+def _sessions(self):
+    def session(name, rows):
+        s = ReviewSession(
+            query=name, providers=["p"], timestamp=datetime(2026, 11, 18),
+            name=name,
+        )
+        for i, (status, source, confidence) in enumerate(rows):
+            s.decisions.append(ReviewDecision(
+                paper=Paper(title=f"{name} {i}", authors=["A"],
+                            doi=f"10.5555/draw-{name}-{i}"),
+                provider="p", status=status, tags=["t"], source=source,
+                llm_confidence=confidence,
+            ))
+        return s
+
+    llm, human = ReviewSource.LLM_UNREVIEWED, ReviewSource.HUMAN
+    out, kept = DecisionStatus.DISCARDED, DecisionStatus.KEPT
+    return [
+        session("draw-a", [(out, llm, 0.9)] * 6 + [(out, human, None)]
+                + [(kept, llm, 0.9), (out, llm, 0.2), (out, llm, None)]),
+        session("draw-b", [(out, llm, 0.95)] * 6
+                + [(out, ReviewSource.LLM_REVIEWED, 0.9)]),
+    ]
+
+def test_reproducible_and_eligible_only(self):
+    first = draw_llm_sample(
+        self._sessions(), statuses={"discarded"}, min_confidence=0.8,
+        size=5, seed=42,
+    )
+    again = draw_llm_sample(
+        list(reversed(self._sessions())), statuses={"discarded"},
+        min_confidence=0.8, size=5, seed=42,
+    )
+    titles = [d.paper.title for _, d in first.drawn]
+    assert titles == [d.paper.title for _, d in again.drawn]
+    assert first.population == 12 and len(titles) == 5
+    other = draw_llm_sample(
+        self._sessions(), statuses={"discarded"}, min_confidence=0.8,
+        size=5, seed=43,
+    )
+    assert [d.paper.title for _, d in other.drawn] != titles
+    for _, decision in first.drawn:
+        assert decision.source == ReviewSource.LLM_UNREVIEWED
+        assert decision.status == DecisionStatus.DISCARDED
+        assert decision.llm_confidence >= 0.8
+
+def test_each_session_records_its_share(self):
+    from datetime import timezone
+
+    sessions = self._sessions()
+    draw = draw_llm_sample(
+        sessions, statuses={"discarded", "kept"}, size=20, seed=1,
+        now=datetime(2026, 11, 18, 12, 0, tzinfo=timezone.utc),
+    )
+    assert draw.population == len(draw.drawn) == 15
+    a, b = (s.llm_samples[0] for s in sessions)
+    assert a.sample_id == b.sample_id == draw.sample_id
+    assert a.sample_id.startswith("2026-11-18T12:00:00+00:00/seed=1/")
+    assert a.sessions == ["draw-a", "draw-b"] and a.size == 15
+    assert len(a.papers) == 9 and len(b.papers) == 6
+    assert a.criteria["population_sources"] == ["llm"]
+    assert {p["status"] for p in a.papers} == {"discarded", "kept"}
+
+def test_nothing_eligible_draws_nothing(self):
+    sessions = self._sessions()
+    with pytest.raises(ValueError, match="No unreviewed"):
+        draw_llm_sample(
+            sessions, statuses={"kept"}, min_confidence=0.99, size=3,
+            seed=1,
+        )
+    assert all(s.llm_samples == [] for s in sessions)
+@
+
+Two draws in the same second with the same seed but different criteria
+are two samples: each gets its own id and its own report, and a
+process that saves one of them does not drop the other, saved by a
+process that loaded the session before it.
+
+<<draw sample test methods>>=
+def test_same_second_same_seed_draws_stay_apart(self):
+    from datetime import timezone
+    from scholar.review import load_session, save_session
+
+    sessions = self._sessions()
+    for session in sessions:
+        save_session(session)
+    when = datetime(2026, 11, 18, 12, 0, tzinfo=timezone.utc)
+    first = [load_session(s.name) for s in sessions]
+    second = [load_session(s.name) for s in sessions]
+    discards = draw_llm_sample(
+        first, statuses={"discarded"}, size=3, seed=9, now=when
+    )
+    for session in first:
+        save_session(session)
+    inclusions = draw_llm_sample(
+        second, statuses={"kept"}, size=3, seed=9, now=when
+    )
+    for session in second:
+        save_session(session)
+    assert discards.sample_id != inclusions.sample_id
+
+    final = [load_session(s.name) for s in sessions]
+    reports = {r.sample_id: r for r in sample_reports(final)}
+    assert set(reports) == {discards.sample_id, inclusions.sample_id}
+    assert reports[discards.sample_id].size == 3
+    assert reports[inclusions.sample_id].size == 1
+    assert reports[inclusions.sample_id].criteria["statuses"] == ["kept"]
+@
+
+The draw itself is pinned.  The point of drawing with [[random()]]
+alone is that the same seed over the same population gives the same
+papers on any Python version, so a change to the drawing method, or a
+Python release that broke the promise, must fail a test rather than
+silently draw other papers for a recorded seed.  The expected papers
+were computed separately, with Python's [[random]] module alone, from
+the rule above (the twelve eligible
+papers in sorted order, a key from [[random.Random(42).random()]] for
+each, the five smallest), without this module.
+
+<<draw sample test methods>>=
+def test_golden_draw(self):
+    draw = draw_llm_sample(
+        self._sessions(), statuses={"discarded"}, min_confidence=0.8,
+        size=5, seed=42,
+    )
+    assert [d.paper.title for _, d in draw.drawn] == [
+        "draw-a 1", "draw-b 3", "draw-b 1", "draw-b 4", "draw-a 3"
+    ]
+@
+
+\subsection{The disagreement rate and its interval}
+
+Once some of the sampled decisions have been reviewed, the sample
+yields a proportion: of the $n$ reviewed, the reviewer changed the
+status of $x$.  A decision counts as reviewed when it is decided and
+its source is no longer an unreviewed machine one; a reviewer who sets
+a sampled paper back to pending has not reviewed it yet.  It counts as
+changed when its status now differs from the status recorded in the
+sample, which is the machine's.  Tags are not compared: the question
+the rate answers is whether the screening put a paper on the wrong
+side, which is what a wrong exclusion is.
+
+The point estimate $x/n$ alone would overstate what a small sample
+shows, so the report gives a 95\,\% confidence interval with it.  We
+use the Wilson score interval.  Brown, Cai and DasGupta, in their
+comparison of intervals for a binomial proportion (\enquote{Interval
+Estimation for a Binomial Proportion}, \emph{Statistical Science}
+16(2):101--133, 2001, \url{https://doi.org/10.1214/ss/1009213286}),
+show that the standard interval $\hat p \pm z\sqrt{\hat p(1-\hat p)/n}$
+has erratic coverage even for large~$n$, and \enquote{recommend the
+Wilson interval or the equal-tailed Jeffreys prior interval for small
+n and the interval suggested in Agresti and Coull for larger n}
+(abstract, p.~101); for larger $n$ they find the three comparable
+(p.~115).  The samples a reviewer can afford are small, and of the
+recommended intervals the Wilson interval is the one with a closed form,
+their equation~(4) on p.~107, with $\kappa = z_{\alpha/2}$, $\hat p =
+X/n$ and $\hat q = 1 - \hat p$:
+\[
+  \frac{X + \kappa^2/2}{n + \kappa^2}
+  \pm \frac{\kappa n^{1/2}}{n + \kappa^2}
+      \left(\hat p \hat q + \frac{\kappa^2}{4n}\right)^{1/2}.
+\]
+The quantile $\kappa$ is computed from the standard normal
+distribution rather than written as 1.96.
+
+The same authors qualify the Wilson interval: its coverage \enquote{has
+downward spikes when $p$ is very near 0 or 1} (Section~4.1.1, p.~112).
+That is exactly where a disagreement rate lives when the screening
+works, so we report their \emph{modified} Wilson interval, which
+removes those spikes.  For an observed $x$ with $1 \le x \le x^*$, the
+lower bound of the Wilson interval is \enquote{replaced by a lower
+bound of $\lambda_x/n$ where $\lambda_x$ solves}
+\[
+  e^{-\lambda}\left(\frac{\lambda^0}{0!} + \frac{\lambda^1}{1!}
+    + \cdots + \frac{\lambda^{x-1}}{(x-1)!}\right) = 1 - \alpha
+\]
+(their equation~(10), p.~112), and \enquote{a symmetric prescription}
+modifies the upper bound for $x$ near~$n$, which we read as
+$1 - \lambda_{n-x}/n$ for $n - x^* \le x \le n - 1$.  For $1 - \alpha =
+0.95$ they give $x^* = 2$ for $n < 50$ and $x^* = 3$ for $51 \le n \le
+100+$ (p.~112).  They leave $n = 50$ unassigned; we use $x^* = 2$
+there, the smaller change, and $x^* = 3$ for every $n$ above 50, which
+is how we read \enquote{100+}.  Their recommendation is for the 95\,\%
+level only, so the modified interval is offered at that level only.
+We compute $\lambda_x$ from equation~(10) by bisection rather than
+copying their Table~4 (p.~107), whose three decimals would be the only
+inexact part of the bound; the table then serves as the check.
+
+<<llm review constants>>=
+MODIFIED_WILSON_CONFIDENCE = 0.95
+<<llm review sampling>>=
+def poisson_lower_lambda(x: int, confidence: float) -> float:
+    """Return the lambda with P(Poisson(lambda) <= x - 1) = `confidence`.
+
+    This is the lambda_x of Brown, Cai and DasGupta's equation (10).
+    """
+    def tail(lam: float) -> float:
+        term, total = math.exp(-lam), 0.0
+        for k in range(x):
+            total += term
+            term *= lam / (k + 1)
+        return total
+
+    low, high = 0.0, float(x) + 50.0
+    for _ in range(200):
+        middle = (low + high) / 2
+        if tail(middle) > confidence:
+            low = middle
+        else:
+            high = middle
+    return (low + high) / 2
+
+
+def modified_wilson_interval(
+    successes: int, trials: int
+) -> tuple[float, float]:
+    """Return the 95% modified Wilson interval of Brown, Cai & DasGupta.
+
+    The Wilson interval, with the lower bound replaced by lambda_x/n for
+    1 <= x <= x* and the upper bound by 1 - lambda_(n-x)/n for
+    n - x* <= x <= n - 1, where x* is 2 for n <= 50 and 3 above.
+    """
+    low, high = wilson_interval(
+        successes, trials,
+        z=NormalDist().inv_cdf(1 - (1 - MODIFIED_WILSON_CONFIDENCE) / 2),
+    )
+    x_star = 2 if trials <= 50 else 3
+    if 1 <= successes <= x_star:
+        low = poisson_lower_lambda(
+            successes, MODIFIED_WILSON_CONFIDENCE
+        ) / trials
+    failures = trials - successes
+    if 1 <= failures <= x_star:
+        high = 1 - poisson_lower_lambda(
+            failures, MODIFIED_WILSON_CONFIDENCE
+        ) / trials
+    return low, high
+@
+
+<<llm review constants>>=
+WILSON_Z_95 = NormalDist().inv_cdf(0.975)
+<<llm review sampling>>=
+def wilson_interval(
+    successes: int, trials: int, z: float = WILSON_Z_95
+) -> tuple[float, float]:
+    """Return the Wilson score interval for `successes` out of `trials`.
+
+    Raises:
+        ValueError: `trials` is not positive, or `successes` is outside
+            0..`trials`.
+    """
+    if trials < 1 or not 0 <= successes <= trials:
+        raise ValueError(f"No interval for {successes} of {trials}")
+    p = successes / trials
+    denominator = trials + z * z
+    centre = (successes + z * z / 2) / denominator
+    half_width = (
+        z * math.sqrt(trials) / denominator
+        * math.sqrt(p * (1 - p) + z * z / (4 * trials))
+    )
+    return max(0.0, centre - half_width), min(1.0, centre + half_width)
+@
+
+The interval is checked on what the formula implies rather than on a
+copy of it: with no successes the lower bound is 0 and the upper bound
+is $\kappa^2/(n + \kappa^2)$, with all successes the bounds mirror
+those, the interval for $x$ mirrors the one for $n - x$, it always
+contains $x/n$, and it narrows as $n$ grows.
+
+<<test functions>>=
+class TestWilsonInterval:
+    def test_properties(self):
+        z2 = WILSON_Z_95 ** 2
+        low, high = wilson_interval(0, 10)
+        assert (low, high) == pytest.approx((0.0, z2 / (10 + z2)))
+        low, high = wilson_interval(10, 10)
+        assert (low, high) == pytest.approx((10 / (10 + z2), 1.0))
+        low, high = wilson_interval(3, 20)
+        mirror = wilson_interval(17, 20)
+        assert (low, high) == pytest.approx((1 - mirror[1], 1 - mirror[0]))
+        assert low < 3 / 20 < high
+        wide, narrow = wilson_interval(3, 20), wilson_interval(30, 200)
+        assert narrow[1] - narrow[0] < wide[1] - wide[0]
+        assert WILSON_Z_95 == pytest.approx(1.959964, abs=1e-6)
+        with pytest.raises(ValueError):
+            wilson_interval(0, 0)
+@
+
+The modified interval is checked against the paper.  $\lambda_x$
+reproduces every entry of Table~4 to its three decimals.  The interval
+itself is compared with values worked out from equation~(4) and
+equation~(10) outside this code: at $x = 0$ it is the Wilson
+interval, at $x = 1$ and at $x = n - 1$ the Poisson bound replaces one
+end, at a mid value nothing changes, and $x = 3$ is modified for
+$n = 60$ but not for $n = 40$.
+
+<<test functions>>=
+class TestModifiedWilsonInterval:
+    def test_lambda_reproduces_table_4(self):
+        table_4 = {
+            0.90: (0.105, 0.532, 1.102),
+            0.95: (0.051, 0.355, 0.818),
+            0.99: (0.010, 0.149, 0.436),
+        }
+        for confidence, row in table_4.items():
+            for x, value in enumerate(row, start=1):
+                assert poisson_lower_lambda(x, confidence) \
+                    == pytest.approx(value, abs=5e-4), (confidence, x)
+
+    def test_bounds_against_the_paper(self):
+        cases = {
+            (0, 20): (0.0, 0.161125),
+            (1, 20): (0.002565, 0.236131),
+            (10, 20): (0.299298, 0.700702),
+            (19, 20): (0.763869, 0.997435),
+            (3, 60): (0.013628, 0.137005),
+        }
+        for (x, n), expected in cases.items():
+            assert modified_wilson_interval(x, n) \
+                == pytest.approx(expected, abs=1e-6), (x, n)
+        assert modified_wilson_interval(3, 40) == pytest.approx(
+            wilson_interval(3, 40)
+        )
+@
+
+\subsection{Reporting a sample}
+
+A sample drawn over several sessions is stored in each of them, so the
+report groups the stored samples by id and adds up what it finds in
+the sessions it was given; a sample stored twice in one session is
+counted once there.  A session that the sample names but that
+was not given, or a sampled paper no longer in its session (re-keyed
+by a later DOI, say), is not counted, and the report says how many
+such papers there were instead of treating them as unreviewed or as
+agreed.
+
+<<llm review sampling>>=
+@dataclass
+class SampleReport:
+    """What a sample shows so far, over the sessions it was reported on.
+
+    `changed` counts reviewed decisions whose status differs from the
+    machine's; `interval` is the 95% modified Wilson interval of
+    `changed` out of `reviewed`, or `None` while nothing is reviewed.
+    """
+    sample_id: str
+    seed: int
+    drawn_at: str
+    criteria: dict
+    sessions: list[str]
+    population: int
+    size: int
+    reviewed: int = 0
+    changed: int = 0
+    not_found: int = 0
+    unreviewed: list[tuple[str, str]] = field(default_factory=list)
+    interval: tuple[float, float] | None = None
+
+    @property
+    def rate(self) -> float | None:
+        """Return the share of reviewed decisions the reviewer changed."""
+        return self.changed / self.reviewed if self.reviewed else None
+
+
+def sample_reports(sessions: list[ReviewSession]) -> list[SampleReport]:
+    """Report every sample stored in `sessions`, oldest first."""
+    from scholar.notes import get_paper_id
+
+    reports: dict[str, SampleReport] = {}
+    for session in sessions:
+        name = session_label(session)
+        current = {get_paper_id(d.paper): d for d in session.decisions}
+        counted_here: set[str] = set()
+        for sample in session.llm_samples:
+            if sample.sample_id in counted_here:
+                continue
+            counted_here.add(sample.sample_id)
+            report = reports.setdefault(sample.sample_id, SampleReport(
+                sample_id=sample.sample_id, seed=sample.seed,
+                drawn_at=sample.drawn_at, criteria=dict(sample.criteria),
+                sessions=list(sample.sessions),
+                population=sample.population, size=sample.size,
+            ))
+            for entry in sample.papers:
+                <<count one sampled decision>>
+    for report in reports.values():
+        <<count the papers of sessions not given>>
+        if report.reviewed:
+            report.interval = modified_wilson_interval(
+                report.changed, report.reviewed
+            )
+    return sorted(reports.values(), key=lambda r: r.drawn_at)
+@
+
+<<count one sampled decision>>=
+decision = current.get(entry["paper_id"])
+if decision is None:
+    report.not_found += 1
+elif decision.is_decided and not is_unreviewed_machine(decision):
+    report.reviewed += 1
+    if decision.status.value != entry["status"]:
+        report.changed += 1
+else:
+    report.unreviewed.append((name, entry["paper_id"]))
+@
+
+The sessions not given are known only by name, so how many of the
+sample's papers they hold is what remains of the sample's size after
+the papers that were found in the given ones.
+
+<<count the papers of sessions not given>>=
+counted = report.reviewed + len(report.unreviewed) + report.not_found
+report.not_found += max(0, report.size - counted)
+@
+
+The TUI queues a sample for review through [[sampled_for_review]]:
+the session's sampled decisions that still wait for a human, in the
+order they were drawn, each once even when two samples drew it.
+
+<<llm review sampling>>=
+def sampled_for_review(session: ReviewSession) -> list[ReviewDecision]:
+    """Return the sampled decisions of `session` not yet reviewed."""
+    from scholar.notes import get_paper_id
+
+    current = {get_paper_id(d.paper): d for d in session.decisions}
+    queue: list[ReviewDecision] = []
+    queued: set[str] = set()
+    for sample in session.llm_samples:
+        for entry in sample.papers:
+            decision = current.get(entry["paper_id"])
+            if (
+                decision is not None
+                and is_unreviewed_machine(decision)
+                and entry["paper_id"] not in queued
+            ):
+                queue.append(decision)
+                queued.add(entry["paper_id"])
+    return queue
+@
+
+<<test functions>>=
+class TestSampledForReview:
+    def test_queue_holds_unreviewed_sampled_decisions_once(self):
+        first, second = TestSampleReports()._setup()
+        assert sampled_for_review(first) == []
+        second.llm_samples.append(second.llm_samples[0])
+        assert sampled_for_review(second) == second.decisions
+@
+
+One sentence states a sample for a report.  It says what was drawn,
+from what, when and with which seed, and then only what the review has
+shown so far: no rate before anything is reviewed, the number still
+unreviewed when the review is incomplete, and the number not found.
+While part of the sample is unreviewed, the sentence also says that the
+rate covers only the reviewed part.  That part is a random sample of
+the population only if which papers got reviewed had nothing to do
+with the papers themselves; a reviewer who skips the hard cases makes
+the rate look better than it is, and the reader should be told that
+the rate depends on it.
+
+<<llm review sampling>>=
+def describe_sample_criteria(criteria: dict) -> str:
+    """Describe a sample's population in words, e.g. 'unreviewed LLM discards'."""
+    sources = criteria.get("population_sources") or ["llm"]
+    machine = "LLM" if set(sources) <= {"llm"} else "LLM and agent"
+    statuses = set(criteria.get("statuses") or ())
+    what = (
+        "discards" if statuses == {"discarded"}
+        else "inclusions" if statuses == {"kept"}
+        else "decisions"
+    )
+    text = f"unreviewed {machine} {what}"
+    if criteria.get("min_confidence") is not None:
+        text += f" with a confidence of at least {criteria['min_confidence']:g}"
+    return text
+
+
+def sample_sentence(report: SampleReport) -> str:
+    """State a sample and what its review has shown so far, in one sentence."""
+    sessions = len(report.sessions)
+    text = (
+        f"A random sample of {report.size} of the {report.population} "
+        f"{describe_sample_criteria(report.criteria)} in {sessions} "
+        f"session{'s' if sessions != 1 else ''} was drawn on "
+        f"{report.drawn_at[:10]} (seed {report.seed}) for human review"
+    )
+    if not report.reviewed:
+        text += "; none of it has been reviewed yet"
+    else:
+        low, high = report.interval
+        text += (
+            f"; of the {report.reviewed} reviewed so far, the reviewer "
+            f"changed {report.changed} ({report.rate:.1%}; 95% modified "
+            f"Wilson interval {low:.1%} to {high:.1%})"
+        )
+        if report.unreviewed:
+            text += (
+                f", and {len(report.unreviewed)} are not yet reviewed; the "
+                "rate covers only the reviewed part, and if papers were "
+                "skipped rather than reviewed in the drawn order it may be "
+                "biased"
+            )
+    if report.not_found:
+        text += (
+            f"; {report.not_found} sampled decisions were not found in the "
+            "sessions reported on and are not counted"
+        )
+    return text + "."
+@
+
+A sample of four over two sessions is reviewed in part: in the first
+session one decision is confirmed and one changed, in the second the
+only one is still unreviewed, and one more sampled paper has left its
+session.  Reported over the first session alone, the second session's
+paper is not found; reported over both, it is unreviewed.
+
+<<test functions>>=
+class TestSampleReports:
+    def _setup(self):
+        from scholar.review import LLMSample
+
+        def decision(i, status, source):
+            return ReviewDecision(
+                paper=Paper(title=f"S{i}", authors=["A"],
+                            doi=f"10.5555/sample-report-{i}"),
+                provider="p", status=status, tags=["t"], source=source,
+            )
+
+        out, kept = DecisionStatus.DISCARDED, DecisionStatus.KEPT
+        first = ReviewSession(query="a", providers=["p"],
+                              timestamp=datetime(2026, 11, 18), name="a")
+        second = ReviewSession(query="b", providers=["p"],
+                               timestamp=datetime(2026, 11, 18), name="b")
+        first.decisions = [
+            decision(0, out, ReviewSource.LLM_REVIEWED),
+            decision(1, kept, ReviewSource.LLM_REVIEWED),
+        ]
+        second.decisions = [decision(2, out, ReviewSource.LLM_UNREVIEWED)]
+        common = dict(
+            sample_id="2026-11-18T12:00:00+00:00/seed=5", seed=5,
+            drawn_at="2026-11-18T12:00:00+00:00",
+            criteria={"statuses": ["discarded"], "min_confidence": 0.8,
+                      "population_sources": ["llm"]},
+            sessions=["a", "b"], population=40, population_digest="d",
+            size=4,
+        )
+        entry = lambda i: {"paper_id": f"doi:10.5555/sample-report-{i}",
+                           "status": "discarded", "source": "llm",
+                           "confidence": 0.9}
+        first.llm_samples = [
+            LLMSample(**common, papers=[entry(0), entry(1), entry(9)])
+        ]
+        second.llm_samples = [LLMSample(**common, papers=[entry(2)])]
+        return first, second
+
+    def test_both_sessions(self):
+        first, second = self._setup()
+        (report,) = sample_reports([first, second])
+        assert (report.reviewed, report.changed, report.not_found) == (2, 1, 1)
+        assert report.unreviewed == [("b", "doi:10.5555/sample-report-2")]
+        assert report.rate == 0.5
+        assert report.interval == modified_wilson_interval(1, 2)
+        assert report.interval != wilson_interval(1, 2)
+        sentence = sample_sentence(report)
+        assert sentence.startswith(
+            "A random sample of 4 of the 40 unreviewed LLM discards with "
+            "a confidence of at least 0.8 in 2 sessions was drawn on "
+            "2026-11-18 (seed 5) for human review; of the 2 reviewed so "
+            "far, the reviewer changed 1 (50.0%; 95% modified Wilson interval"
+        )
+        assert "and 1 are not yet reviewed; the rate covers only the " \
+            "reviewed part" in sentence
+        assert "1 sampled decisions were not found" in sentence
+
+    def test_one_session_counts_the_other_as_not_found(self):
+        first, _ = self._setup()
+        (report,) = sample_reports([first])
+        assert (report.reviewed, report.not_found) == (2, 2)
+        assert report.unreviewed == []
+
+    def test_sample_stored_twice_in_a_session_counts_once(self):
+        _, second = self._setup()
+        second.llm_samples.append(second.llm_samples[0])
+        (report,) = sample_reports([second])
+        assert len(report.unreviewed) == 1 and report.not_found == 3
+
+    def test_nothing_reviewed_states_no_rate(self):
+        _, second = self._setup()
+        (report,) = sample_reports([second])
+        assert report.interval is None
+        assert "none of it has been reviewed yet" in sample_sentence(report)
+        assert "%" not in sample_sentence(report)
+@
+
+\subsection{The screening paragraphs of the report}
+
+The review report describes the LLM step through
+[[build_llm_screening_latex]], which the report calls in one line
+(\cref{sec:report-llm-screening} in the review module).  It states how
+many decisions an LLM made, with the models, the prompt versions and
+the dates the decisions record, how many of them saw a truncated
+abstract, and for how many none of this was recorded; then one
+sentence per sample stored in the session.  A session without LLM
+decisions and without samples gets nothing, so the report never
+describes a step that did not happen.  The truncation is stated from
+each decision's own [[llm_abstract_truncated]], without a number of
+characters: the limit is today's [[MAX_ABSTRACT_CHARS]], but a decision
+made under an earlier limit was cut at that one, and only its prompt
+version records which.
+
+A sample pooled over several sessions is reported over all of them:
+the function loads the other sessions it names, read-only, through
+[[load]] (by default the review module's [[load_session]]), and a
+session it cannot load is counted under \enquote{not found} by
+[[sample_reports]].
+
+<<llm review sampling>>=
+LLM_SOURCES = frozenset({"llm", "llm_reviewed"})
+
+
+def llm_screening_sentence(session: ReviewSession) -> str | None:
+    """Describe the LLM decisions of `session` and what they record."""
+    from collections import Counter
+
+    rows = [d for d in session.decisions if source_value(d) in LLM_SOURCES]
+    if not rows:
+        return None
+    recorded = [d for d in rows if d.llm_model]
+    text = (
+        f"{len(rows)} of the decisions "
+        f"{'was' if len(rows) == 1 else 'were'} first made by an LLM"
+    )
+    if recorded:
+        models = Counter(d.llm_model for d in recorded)
+        versions = {d.llm_prompt_version for d in recorded} - {None}
+        dates = sorted(d.llm_decided_at[:10] for d in recorded
+                       if d.llm_decided_at)
+        text += " (model " + ", ".join(
+            f"{model}: {count}" for model, count in sorted(models.items())
+        )
+        if versions:
+            text += (
+                f"; {len(versions)} prompt version"
+                f"{'s' if len(versions) != 1 else ''}: "
+                + ", ".join(sorted(versions))
+            )
+        if dates:
+            text += (
+                f"; on {dates[0]}" if dates[0] == dates[-1]
+                else f"; between {dates[0]} and {dates[-1]}"
+            )
+        text += ")"
+        truncated = sum(1 for d in recorded if d.llm_abstract_truncated)
+        if truncated:
+            text += (
+                f"; for {truncated} of them the model saw a truncated "
+                "abstract"
+            )
+    missing = len(rows) - len(recorded)
+    if missing:
+        text += (
+            f"; for {missing} of them the model, date and prompt were not "
+            "recorded"
+        )
+    return text + "."
+
+
+def build_llm_screening_latex(
+    session: ReviewSession,
+    *,
+    heading_command: str = r"\section",
+    load: Callable[[str], ReviewSession | None] | None = None,
+) -> list[str]:
+    """Build the report's paragraphs on the LLM screening and its samples."""
+    from scholar.review import escape_latex, load_session
+
+    sentences = []
+    screening = llm_screening_sentence(session)
+    if screening:
+        sentences.append(screening)
+    if session.llm_samples:
+        load = load or load_session
+        own = session_label(session)
+        others = {
+            name for sample in session.llm_samples for name in sample.sessions
+        } - {own}
+        pooled = [session] + [
+            loaded for loaded in (load(name) for name in sorted(others))
+            if loaded is not None
+        ]
+        own_ids = {sample.sample_id for sample in session.llm_samples}
+        sentences.extend(
+            sample_sentence(report) for report in sample_reports(pooled)
+            if report.sample_id in own_ids
+        )
+    if not sentences:
+        return []
+    lines = [f"{heading_command}{{LLM screening}}", ""]
+    for sentence in sentences:
+        lines.extend([escape_latex(sentence), ""])
+    return lines
+@
+
+The paragraphs say only what the session records: an old LLM decision
+is counted as not recorded, a fresh one names its model, prompt version
+and date, and a session with neither LLM decisions nor samples gets no
+section at all.
+
+<<test functions>>=
+class TestLLMScreeningLatex:
+    def test_recorded_and_unrecorded_decisions(self):
+        session = ReviewSession(query="q", providers=["p"],
+                                timestamp=datetime(2026, 11, 18), name="q")
+        llm = ReviewSource.LLM_UNREVIEWED
+        session.decisions = [
+            ReviewDecision(
+                paper=Paper(title=f"L{i}", authors=["A"],
+                            doi=f"10.5555/screening-{i}"),
+                provider="p", status=DecisionStatus.DISCARDED, tags=["t"],
+                source=llm, llm_model=model, llm_prompt_version=version,
+                llm_decided_at=when, llm_abstract_truncated=cut,
+            )
+            for i, (model, version, when, cut) in enumerate([
+                ("m-1", "v1", "2026-11-17T10:00:00+00:00", True),
+                ("m-1", "v1", "2026-11-18T10:00:00+00:00", False),
+                (None, None, None, None),
+            ])
+        ] + [ReviewDecision(
+            paper=Paper(title="H", authors=["A"], doi="10.5555/screening-h"),
+            provider="p", status=DecisionStatus.KEPT,
+        )]
+        lines = build_llm_screening_latex(session)
+        assert lines[0] == r"\section{LLM screening}"
+        assert lines[2] == (
+            "3 of the decisions were first made by an LLM (model m-1: 2; "
+            "1 prompt version: v1; between 2026-11-17 and 2026-11-18); for "
+            "1 of them the model saw a truncated abstract; for 1 of "
+            "them the model, date and prompt were not recorded."
+        )
+
+    def test_one_decision_is_singular(self):
+        session = ReviewSession(query="q", providers=["p"],
+                                timestamp=datetime(2026, 11, 18))
+        session.decisions = [ReviewDecision(
+            paper=Paper(title="L", authors=["A"], doi="10.5555/screening-1"),
+            provider="p", status=DecisionStatus.DISCARDED, tags=["t"],
+            source=ReviewSource.LLM_UNREVIEWED,
+        )]
+        assert llm_screening_sentence(session).startswith(
+            "1 of the decisions was first made by an LLM"
+        )
+
+    def test_no_llm_step_no_section(self):
+        session = ReviewSession(query="q", providers=["p"],
+                                timestamp=datetime(2026, 11, 18))
+        session.decisions = [ReviewDecision(
+            paper=Paper(title="H", authors=["A"], doi="10.5555/screening-0"),
+            provider="p", status=DecisionStatus.KEPT,
+        )]
+        assert build_llm_screening_latex(session) == []
+
+    def test_pooled_sample_loads_the_other_sessions(self):
+        first, second = TestSampleReports()._setup()
+        lines = build_llm_screening_latex(
+            first, load={"b": second}.get, heading_command=r"\subsection"
+        )
+        assert lines[0] == r"\subsection{LLM screening}"
+        sample = next(line for line in lines if "random sample" in line)
+        assert "changed 1" in sample
+        assert "1 sampled decisions were not found" in sample
 @
 
 
