@@ -271,6 +271,19 @@ show "failed". The keyed REST providers (S2/WoS/IEEE) set the generic
 OpenAlex (+ source-pinned), HAL and arXiv set specific reasons. A new
 provider should do the same.
 
+OpenAlex (#150, #151): a limiter refusal sets `last_error` to its
+reason; a refusal or failed request after some pages keeps those pages
+(`PagesCutShort` from the paging loop → `N, incomplete (reason)`,
+uncached). A refused request records `HTTP <code>: <message>` from the
+JSON body (`message`, else `error`; `openalex_error_message`, shortened
+to `OPENALEX_REASON_MAX_CHARS` = 120), plus `; no API key: set
+OPENALEX_API_KEY` when keyless and the refusal is a 503 or a
+budget-spent 429; `providers check` gives the same detail. The
+constructor sets `pyalex.config.retry_http_codes = []`: pyalex's
+default (`max_retries=0` with 429/500/503 listed) retried nothing but
+turned those statuses into a `RetryError` without a response, so no
+search ever saw a real 429 or 503 body.
+
 ### Provider Health Checks
 
 Because search errors degrade silently, `scholar providers check` probes each
@@ -986,7 +999,8 @@ requests/day and each `scholar` run is a fresh process.
   `record_response`, a keyed probe also reads `/rate-limit` for the
   detail column, and a search 429 that spends the budget becomes a
   quota block until `X-RateLimit-Reset` (`_note_http_error`), logged
-  with the reset time and a key hint.
+  with the reset time and a key hint (`_warn_budget_spent`, shared with
+  `openalex-semantic`).
   `openalex-semantic` (1 request/s) passes the group limiter and then
   a second limiter of its own, `get_limiter("oa-semantic",
   Limits(per_second=1.0))`: the group's 10/s cannot be lowered for one
