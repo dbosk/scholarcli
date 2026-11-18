@@ -134,10 +134,11 @@ Providers self-register via `register_provider()` at module load time.
   recorded, links already share the key (`search_width`: None/0 =
   all; legacy records never count as wider).
   `ReviewSession.add_search_record(record)` carries records over whole.
-  All record rules are one total order, `preferred_record(a, b)`
-  (`review.py`): answer beats failure outright; wider limit beats
-  narrower (legacy limits unknown); a partial with more hits beats an
-  answer with fewer, else the answer; later `searched_at`; tie `a`.
+  All record rules are one sort key, `record_rank(r)` =
+  `(answered, width, hits, complete, searched_at)` (legacy width,
+  unknown hits and unknown dates rank lowest); `preferred_record(a, b)`
+  keeps the higher, `a` on equal keys (a total preorder: no cycles, no
+  order dependence).
   `create_review_session` (new run first) and
   `merge_concurrent_changes` (own record first, for a shared key) both
   use it.

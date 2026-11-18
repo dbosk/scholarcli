@@ -2697,13 +2697,37 @@ meanwhile (\cref{sec:session-integrity}).  Applied in one place only,
 the other undid them: a process still holding the narrow record of
 [[-l 5]] saved it over the [[-l 0]] record another process had just
 saved, with fifty papers linked to it.  So the rules are one function,
-[[preferred_record]], which both places call.  It is a total order: an
-answer beats a failure outright; then, of two records that know their
-limits, the wider one wins; then a partial answer with more hits beats
-an answer with fewer, and otherwise the answer wins; and of two records
-still equal, the later run wins.  When even the run times cannot tell,
-the first argument wins, so the caller decides: the new run here, the
-process's own record in a save.
+[[preferred_record]], which both places call.
+
+The function compares one sort key per record, [[record_rank]], rather
+than going through cases.  A first version went through cases (an
+answer over a failure, then the wider limit, then a partial answer
+with more hits over an answer with fewer, then the later run), and
+cases interact: an undated record tied with a dated one, so which
+survived a concurrent save depended on which process saved last, and
+three records could beat each other in a circle (ten hits on 18
+November over a partial twenty on 10 November over thirty on
+1 November over the first).  A key compared lexicographically cannot
+do either: it orders all records, a total preorder, and the outcome of
+a comparison does not depend on the order of the arguments, except
+between records whose keys are equal.  The key is, in order of weight:
+\begin{description}
+\item[Answered] An answer, also a partial one, beats a failure
+  outright ([[failed_outright]]).
+\item[Width] The wider limit wins, no limit ([[None]] or 0) the widest
+  (\cref{sec:wider-record}).  A legacy record's limit is unknown, not
+  unlimited, so it ranks below every known limit: a re-run that
+  answered replaces it, as the legacy rule says
+  (\cref{sec:legacy-records}).
+\item[Hits] More hits win: a partial re-run that brought more papers
+  than the earlier answer counts accounts for more of the session's
+  papers.  An unknown count ranks below every count.
+\item[Complete] Of equal counts, the one without an error wins.
+\item[Run] The later run wins, and a dated record beats an undated one.
+\end{description}
+Two records with equal keys are a true tie, and the first argument
+wins, so the caller decides: the new run here, the process's own record
+in a save.
 
 <<keep the preferred record of each search>>=
 for i, current in enumerate(session.search_records):
@@ -2723,30 +2747,31 @@ def failed_outright(record: SearchRecord) -> bool:
     return bool(record.error) and not record.hits
 
 
+def record_rank(record: SearchRecord) -> tuple:
+    """The sort key by which a session keeps one of two records.
+
+    `(answered, width, hits, complete, searched_at)`: higher is better;
+    a legacy record's width, an unknown hit count and an unknown run
+    time rank lowest.
+    """
+    width = (
+        float("-inf") if record.is_legacy else search_width(record.limit)
+    )
+    return (
+        0 if failed_outright(record) else 1,
+        width,
+        -1 if record.hits is None else record.hits,
+        0 if record.error else 1,
+        record.searched_at or "",
+    )
+
+
 def preferred_record(a: SearchRecord, b: SearchRecord) -> SearchRecord:
     """Of two records of one search, the one a session keeps.
 
-    In order: an answer beats a failure outright; the wider limit wins
-    (unless a record is legacy, whose limit is unknown); a partial
-    answer with more hits beats an answer with fewer, else the answer
-    wins; the later `searched_at` wins. On a tie, `a`.
+    The one with the higher `record_rank`; on equal ranks, `a`.
     """
-    if failed_outright(a) != failed_outright(b):
-        return b if failed_outright(a) else a
-    if not a.is_legacy and not b.is_legacy:
-        width_a, width_b = search_width(a.limit), search_width(b.limit)
-        if width_a != width_b:
-            return a if width_a > width_b else b
-    if bool(a.error) != bool(b.error):
-        partial, answer = (a, b) if a.error else (b, a)
-        if partial.hits and (
-            answer.hits is None or partial.hits > answer.hits
-        ):
-            return partial
-        return answer
-    if a.searched_at and b.searched_at and a.searched_at != b.searched_at:
-        return a if a.searched_at > b.searched_at else b
-    return a
+    return a if record_rank(a) >= record_rank(b) else b
 @
 
 <<test functions>>=
@@ -2771,11 +2796,51 @@ class TestPreferredRecord:
         assert preferred_record(answer, partial) is partial
         assert preferred_record(partial, self._r(hits=30)).hits == 30
         old = self._r(hits=3, searched_at="2026-10-01T00:00:00+00:00")
-        new = self._r(hits=4, searched_at="2026-11-01T00:00:00+00:00")
+        new = self._r(hits=3, searched_at="2026-11-01T00:00:00+00:00")
         assert preferred_record(old, new) is new
         assert preferred_record(new, old) is new
-        undated = self._r(hits=1)
-        assert preferred_record(undated, self._r(hits=2)) is undated
+        tie, same = self._r(hits=1), self._r(hits=1)
+        assert preferred_record(tie, same) is tie
+        assert preferred_record(same, tie) is same
+
+    def test_dated_beats_undated_in_both_orders(self):
+        undated = self._r(hits=5)
+        dated = self._r(hits=5, searched_at="2026-11-18T09:00:00+00:00")
+        assert preferred_record(undated, dated) is dated
+        assert preferred_record(dated, undated) is dated
+
+    def test_former_cycle_is_ordered(self):
+        ten = self._r(hits=10, searched_at="2026-11-18T00:00:00+00:00")
+        twenty = self._r(hits=20, error="cut short",
+                         searched_at="2026-11-10T00:00:00+00:00")
+        thirty = self._r(hits=30, searched_at="2026-11-01T00:00:00+00:00")
+        for a, b in [(ten, twenty), (twenty, thirty), (thirty, ten)]:
+            assert preferred_record(a, b) is preferred_record(b, a)
+        import functools
+        import itertools
+        winners = {
+            id(functools.reduce(preferred_record, order))
+            for order in itertools.permutations([ten, twenty, thirty])
+        }
+        assert winners == {id(thirty)}
+
+    def test_symmetric_and_transitive_on_a_generated_set(self):
+        import itertools
+        records = [
+            self._r(limit=limit, hits=hits, error=error, searched_at=when)
+            for limit in (5, 100, None)
+            for hits, error in ((None, None), (0, None), (0, "HTTP 503"),
+                                (5, None), (5, "cut"), (20, "cut"))
+            for when in (None, "2026-10-01T00:00:00+00:00",
+                         "2026-11-01T00:00:00+00:00")
+        ] + [SearchRecord("q", "p", hits=None)]
+        for a, b in itertools.product(records, repeat=2):
+            if record_rank(a) != record_rank(b):
+                assert preferred_record(a, b) is preferred_record(b, a)
+        for a, b, c in itertools.product(records[::3], repeat=3):
+            if (preferred_record(a, b) is a
+                    and preferred_record(b, c) is b):
+                assert record_rank(a) >= record_rank(c)
 
     def test_legacy_limit_is_unknown(self):
         legacy = SearchRecord("q", "p", hits=None)
