@@ -8199,7 +8199,8 @@ AUDIT_STRINGS: dict[str, dict] = {
         "search_failed": "failed for {n} of {total} {queries}",
         "search_incomplete": "incomplete for {n} of {total} {queries}",
         "search_failed_merged": (
-            "failed for {n} of {total} {queries}, in a merged record"
+            "failed or incomplete for {n} of {total} {queries},"
+            " in a merged record"
         ),
         "search_capped": "capped at the limit for {n} of {total} {queries}",
         "searched_range": "Searched {start} to {end}.",
@@ -8281,7 +8282,8 @@ AUDIT_STRINGS: dict[str, dict] = {
         "search_failed": "misslyckades för {n} av {total} {queries}",
         "search_incomplete": "ofullständig för {n} av {total} {queries}",
         "search_failed_merged": (
-            "misslyckades för {n} av {total} {queries}, i en sammanslagen post"
+            "misslyckades eller ofullständig för {n} av {total}"
+            " {queries}, i en sammanslagen post"
         ),
         "search_capped": "nådde träffgränsen för {n} av {total} {queries}",
         "searched_range": "Sökt {start} till {end}.",
@@ -9037,8 +9039,9 @@ def audit_databases_sentence(
         for provider in row.providers:
             if provider not in used and provider not in RANKED_SHORT_NAMES:
                 used.append(provider)
-    for short, (failed, _, total, merged_failed, _) in shortfalls.items():
-        if failed + merged_failed < total and short not in used:
+    for short, tally in shortfalls.items():
+        failed, total, merged_outright = tally[0], tally[2], tally[5]
+        if failed + merged_outright < total and short not in used:
             used.append(short)
     names: list[str] = []
     for key, short in PROVIDER_SHORT_NAMES.items():
@@ -9095,15 +9098,22 @@ the answer, so the wording stays as it is.
 
 A merged record from before searches were recorded per provider
 (\cref{sec:merged-records}) counts as one query for each of its
-providers, but its outcome cannot be split, so it marks none of them
-failed or incomplete.  That used to be the bug of
-\url{https://github.com/dbosk/scholar/issues/164}: one DBLP failure in
-a merged record made OpenAlex, IEEE and arXiv read \enquote{incomplete}
-as well, although they had answered.  The exception is a record in
-which every provider failed: no papers, and an error naming each of
-its providers (the merge prefixes each error with its provider).  Then
-the failure is each provider's, and it is counted apart, so the note
-can say that it comes from a merged record.
+providers.  Its count cannot be split, but its error can be read: the
+merge prefixed each provider's error with the provider
+([[dblp: non-JSON response]]), so the error names the providers that
+failed (\cref{sec:search-result-error} in the [[scholar]] module).
+Before \url{https://github.com/dbosk/scholar/issues/164} the caption
+charged every provider of the record with its failure, and OpenAlex,
+IEEE and arXiv read \enquote{incomplete} when only DBLP had failed;
+a first repair marked none of them unless all had failed, which hid
+the failure in 61 of the 62 merged records with errors in real
+sessions.  So each provider the error names is marked, and only it
+([[merged_record_failures]]).  Whether it failed outright or part-way
+is not recorded per provider, so the note says \enquote{failed or
+incomplete \dots, in a merged record}.  A record with no papers at all
+tells more: every provider it names failed outright, and such a
+provider counts as not searched for that query when the caption
+decides whether to name it.
 
 A search that answered can still have stopped at its limit, and the
 coverage statement should not let a reader take it for the whole
@@ -9114,15 +9124,19 @@ the limit for 2 of 5 queries}.  It is the same test as the
 \enquote{capped at} of [[count_label]] in the [[scholar]] module.
 
 <<review report generation>>=
-def merged_record_failed_everywhere(record: SearchRecord) -> bool:
-    """Whether every provider of a merged record failed outright."""
-    if not record.is_merged or not record.error or record.hits:
-        return False
+def merged_record_failures(record: SearchRecord) -> list[str]:
+    """The providers of a merged record that its error names as failed.
+
+    The merge prefixes each provider's error with the provider, as in
+    "dblp: non-JSON response; scopus: HTTP 500".
+    """
+    if not record.is_merged or not record.error:
+        return []
     named = {
         segment.split(":", 1)[0].strip()
         for segment in record.error.split("; ") if ":" in segment
     }
-    return set(record.merged_providers) <= named
+    return [p for p in record.merged_providers if p in named]
 
 
 def search_was_capped(record: SearchRecord) -> bool:
@@ -9140,19 +9154,26 @@ def search_was_capped(record: SearchRecord) -> bool:
 
 def audit_search_shortfalls(
     records: list[SearchRecord],
-) -> dict[str, tuple[int, int, int, int, int]]:
-    """Count searches per provider code that failed, ended incomplete,
-    all of them, failed inside a merged record, and were capped."""
+) -> dict[str, tuple[int, int, int, int, int, int]]:
+    """Count searches per provider code: failed, incomplete, all, failed
+    or incomplete inside a merged record, capped, and failed outright
+    inside a merged record without papers."""
     counts: dict[str, list[int]] = {}
     for record in records:
         if is_ranked_provider(record.provider):
             continue
+        failed_here = {
+            short for name in merged_record_failures(record)
+            for short in provider_short_names(name)
+        }
         for short in provider_short_names(record.provider):
-            tally = counts.setdefault(short, [0, 0, 0, 0, 0])
+            tally = counts.setdefault(short, [0, 0, 0, 0, 0, 0])
             tally[2] += 1
             if record.is_merged:
-                if merged_record_failed_everywhere(record):
+                if short in failed_here:
                     tally[3] += 1
+                    if not record.hits:
+                        tally[5] += 1
             elif record.error and record.hits:
                 tally[1] += 1
             elif record.error:
@@ -9163,13 +9184,13 @@ def audit_search_shortfalls(
 
 
 def audit_search_notes(
-    shortfall: tuple[int, int, int, int, int] | None, strings: dict
+    shortfall: tuple[int, int, int, int, int, int] | None, strings: dict
 ) -> list[str]:
     """Localised notes on a database's failed, incomplete and capped
     searches."""
     if not shortfall:
         return []
-    failed, incomplete, total, merged_failed, capped = shortfall
+    failed, incomplete, total, merged_failed, capped, _ = shortfall
     queries = strings["query"] if total == 1 else strings["queries"]
     notes = []
     for count, template in (
@@ -9286,8 +9307,11 @@ class TestAuditDatabasesFailures:
             assert expected in text
 @
 
-A merged record charges no provider with another's failure, and one
-in which every provider failed is reported as such, in both languages:
+A merged record charges only the providers its error names, and says
+that the failure comes from a merged record, in both languages; a
+provider whose every query failed in a merged record without papers is
+not named.  (The first test asserted, before this was repaired, that a
+DBLP failure in a merged record marked no provider at all.)
 
 <<test functions>>=
 class TestAuditMergedRecords:
@@ -9296,12 +9320,15 @@ class TestAuditMergedRecords:
     ROWS = [AuditRow("t", "2020", ["OA", "DBLP"], DecisionStatus.KEPT,
                      "r", 0)]
 
-    def test_one_failure_marks_no_provider(self):
+    def test_one_failure_marks_only_its_provider(self):
         records = [SearchRecord("q | q", "openalex, dblp", None, 100,
                                 hits=25, error="dblp: non-JSON response")]
         assert audit_databases_sentence(
             self.ROWS, AUDIT_STRINGS["en"], records
-        ) == "Databases: OpenAlex (OA; not open access), DBLP."
+        ) == (
+            "Databases: OpenAlex (OA; not open access), DBLP (failed or "
+            "incomplete for 1 of 1 query, in a merged record)."
+        )
 
     def test_all_failed_says_merged(self):
         records = [
@@ -9314,7 +9341,8 @@ class TestAuditMergedRecords:
         assert audit_databases_sentence(
             rows, AUDIT_STRINGS["en"], records
         ) == (
-            "Databases: DBLP (failed for 1 of 2 queries, in a merged record)."
+            "Databases: DBLP (failed or incomplete for 1 of 2 queries, "
+            "in a merged record)."
         )
         assert "i en sammanslagen post" in audit_databases_sentence(
             rows, AUDIT_STRINGS["sv"], records

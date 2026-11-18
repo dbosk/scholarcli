@@ -99,8 +99,10 @@ Providers self-register via `register_provider()` at module load time.
   `q | q`) load unchanged: `SearchRecord.is_merged`,
   `search_outcome_label` ("merged record (providers …): outcome cannot
   be split"); the audit caption counts them as a query of each provider
-  but marks a failure only when every provider in them failed
-  (`merged_record_failed_everywhere`, "…, in a merged record").
+  and marks each provider their error names (the merge prefixed each
+  error with its provider; `merged_record_failures`) as "failed or
+  incomplete for k of n queries, in a merged record"; providers named
+  in a merged record without papers count as not searched for it.
 - Totals and caps (#166). Providers set `last_total` (+
   `last_total_estimated`) from the field they already page on
   (OpenAlex `meta.count`, DBLP `@total`, WoS `total`/`RecordsFound`,
