@@ -3304,7 +3304,7 @@ order = sorted(range(len(pool)), key=lambda i: (keys[i], i))
 drawn = [pool[i] for i in order[:size]]
 <<record the sample in each session>>=
 drawn_at = (now or datetime.now(timezone.utc)).isoformat(timespec="seconds")
-sample_id = f"{drawn_at}/seed={seed}"
+sample_id = f"{drawn_at}/seed={seed}/{uuid.uuid4().hex[:SAMPLE_ID_DIGITS]}"
 digest = hashlib.sha256(
     "\n".join(f"{name}\t{pid}" for name, pid, _ in pool).encode("utf-8")
 ).hexdigest()[:PROMPT_VERSION_DIGITS]
@@ -3331,8 +3331,21 @@ for session in sessions:
 <<llm review imports>>=
 import math
 import random
+import uuid
 from statistics import NormalDist
+<<llm review constants>>=
+SAMPLE_ID_DIGITS = 12
 @
+
+The id of a sample has to be unique, not only readable.  The time and
+the seed alone are not enough: a [[--discarded]] and a [[--kept]] draw
+started in the same second with the same seed would share an id, and
+then [[sample_reports]] would add the kept rows to the discard rate and
+the concurrent merge, which keeps one sample per id, would drop one of
+them.  So the id ends in random hexadecimal digits from [[uuid4]].  The
+id needs no reproducibility of its own: what makes the draw
+reproducible is the seed, the criteria and the population, all of which
+are stored beside it.
 
 The draw is checked on three properties: the same seed over the same
 population gives the same papers whatever order the sessions come in,
@@ -3401,7 +3414,7 @@ def test_each_session_records_its_share(self):
     assert draw.population == len(draw.drawn) == 15
     a, b = (s.llm_samples[0] for s in sessions)
     assert a.sample_id == b.sample_id == draw.sample_id
-    assert a.sample_id == "2026-11-18T12:00:00+00:00/seed=1"
+    assert a.sample_id.startswith("2026-11-18T12:00:00+00:00/seed=1/")
     assert a.sessions == ["draw-a", "draw-b"] and a.size == 15
     assert len(a.papers) == 9 and len(b.papers) == 6
     assert a.criteria["population_sources"] == ["llm"]
@@ -3415,6 +3428,63 @@ def test_nothing_eligible_draws_nothing(self):
             seed=1,
         )
     assert all(s.llm_samples == [] for s in sessions)
+@
+
+Two draws in the same second with the same seed but different criteria
+are two samples: each gets its own id and its own report, and a
+process that saves one of them does not drop the other, saved by a
+process that loaded the session before it.
+
+<<draw sample test methods>>=
+def test_same_second_same_seed_draws_stay_apart(self):
+    from datetime import timezone
+    from scholar.review import load_session, save_session
+
+    sessions = self._sessions()
+    for session in sessions:
+        save_session(session)
+    when = datetime(2026, 11, 18, 12, 0, tzinfo=timezone.utc)
+    first = [load_session(s.name) for s in sessions]
+    second = [load_session(s.name) for s in sessions]
+    discards = draw_llm_sample(
+        first, statuses={"discarded"}, size=3, seed=9, now=when
+    )
+    for session in first:
+        save_session(session)
+    inclusions = draw_llm_sample(
+        second, statuses={"kept"}, size=3, seed=9, now=when
+    )
+    for session in second:
+        save_session(session)
+    assert discards.sample_id != inclusions.sample_id
+
+    final = [load_session(s.name) for s in sessions]
+    reports = {r.sample_id: r for r in sample_reports(final)}
+    assert set(reports) == {discards.sample_id, inclusions.sample_id}
+    assert reports[discards.sample_id].size == 3
+    assert reports[inclusions.sample_id].size == 1
+    assert reports[inclusions.sample_id].criteria["statuses"] == ["kept"]
+@
+
+The draw itself is pinned.  The point of drawing with [[random()]]
+alone is that the same seed over the same population gives the same
+papers on any Python version, so a change to the drawing method, or a
+Python release that broke the promise, must fail a test rather than
+silently draw other papers for a recorded seed.  The expected papers
+were computed separately, with Python's [[random]] module alone, from
+the rule above (the twelve eligible
+papers in sorted order, a key from [[random.Random(42).random()]] for
+each, the five smallest), without this module.
+
+<<draw sample test methods>>=
+def test_golden_draw(self):
+    draw = draw_llm_sample(
+        self._sessions(), statuses={"discarded"}, min_confidence=0.8,
+        size=5, seed=42,
+    )
+    assert [d.paper.title for _, d in draw.drawn] == [
+        "draw-a 1", "draw-b 3", "draw-b 1", "draw-b 4", "draw-a 3"
+    ]
 @
 
 \subsection{The disagreement rate and its interval}
@@ -3449,15 +3519,82 @@ X/n$ and $\hat q = 1 - \hat p$:
   \pm \frac{\kappa n^{1/2}}{n + \kappa^2}
       \left(\hat p \hat q + \frac{\kappa^2}{4n}\right)^{1/2}.
 \]
-The same authors qualify it: the coverage of the Wilson interval has
-downward spikes \enquote{when $p$ is very near 0 or 1} (Section~4.1.1,
-p.~112), which a modified interval with a Poisson-based bound for
-$x$ near 0 or $n$ removes.  A screening step that works will have a
-disagreement rate near~0, which is where those spikes are, so this is
-a known limitation of the interval reported here; the report names the
-interval so that a reader can judge it.  The quantile $\kappa$ is
-computed from the standard normal distribution rather than written
-as 1.96.
+The quantile $\kappa$ is computed from the standard normal
+distribution rather than written as 1.96.
+
+The same authors qualify the Wilson interval: its coverage \enquote{has
+downward spikes when $p$ is very near 0 or 1} (Section~4.1.1, p.~112).
+That is exactly where a disagreement rate lives when the screening
+works, so we report their \emph{modified} Wilson interval, which
+removes those spikes.  For an observed $x$ with $1 \le x \le x^*$, the
+lower bound of the Wilson interval is \enquote{replaced by a lower
+bound of $\lambda_x/n$ where $\lambda_x$ solves}
+\[
+  e^{-\lambda}\left(\frac{\lambda^0}{0!} + \frac{\lambda^1}{1!}
+    + \cdots + \frac{\lambda^{x-1}}{(x-1)!}\right) = 1 - \alpha
+\]
+(their equation~(10), p.~112), and \enquote{a symmetric prescription}
+modifies the upper bound for $x$ near~$n$, which we read as
+$1 - \lambda_{n-x}/n$ for $n - x^* \le x \le n - 1$.  For $1 - \alpha =
+0.95$ they give $x^* = 2$ for $n < 50$ and $x^* = 3$ for $51 \le n \le
+100+$ (p.~112).  They leave $n = 50$ unassigned; we use $x^* = 2$
+there, the smaller change, and $x^* = 3$ for every $n$ above 50, which
+is how we read \enquote{100+}.  Their recommendation is for the 95\,\%
+level only, so the modified interval is offered at that level only.
+We compute $\lambda_x$ from equation~(10) by bisection rather than
+copying their Table~4 (p.~107), whose three decimals would be the only
+inexact part of the bound; the table then serves as the check.
+
+<<llm review constants>>=
+MODIFIED_WILSON_CONFIDENCE = 0.95
+<<llm review sampling>>=
+def poisson_lower_lambda(x: int, confidence: float) -> float:
+    """Return the lambda with P(Poisson(lambda) <= x - 1) = `confidence`.
+
+    This is the lambda_x of Brown, Cai and DasGupta's equation (10).
+    """
+    def tail(lam: float) -> float:
+        term, total = math.exp(-lam), 0.0
+        for k in range(x):
+            total += term
+            term *= lam / (k + 1)
+        return total
+
+    low, high = 0.0, float(x) + 50.0
+    for _ in range(200):
+        middle = (low + high) / 2
+        if tail(middle) > confidence:
+            low = middle
+        else:
+            high = middle
+    return (low + high) / 2
+
+
+def modified_wilson_interval(
+    successes: int, trials: int
+) -> tuple[float, float]:
+    """Return the 95% modified Wilson interval of Brown, Cai & DasGupta.
+
+    The Wilson interval, with the lower bound replaced by lambda_x/n for
+    1 <= x <= x* and the upper bound by 1 - lambda_(n-x)/n for
+    n - x* <= x <= n - 1, where x* is 2 for n <= 50 and 3 above.
+    """
+    low, high = wilson_interval(
+        successes, trials,
+        z=NormalDist().inv_cdf(1 - (1 - MODIFIED_WILSON_CONFIDENCE) / 2),
+    )
+    x_star = 2 if trials <= 50 else 3
+    if 1 <= successes <= x_star:
+        low = poisson_lower_lambda(
+            successes, MODIFIED_WILSON_CONFIDENCE
+        ) / trials
+    failures = trials - successes
+    if 1 <= failures <= x_star:
+        high = 1 - poisson_lower_lambda(
+            failures, MODIFIED_WILSON_CONFIDENCE
+        ) / trials
+    return low, high
+@
 
 <<llm review constants>>=
 WILSON_Z_95 = NormalDist().inv_cdf(0.975)
@@ -3508,11 +3645,49 @@ class TestWilsonInterval:
             wilson_interval(0, 0)
 @
 
+The modified interval is checked against the paper.  $\lambda_x$
+reproduces every entry of Table~4 to its three decimals.  The interval
+itself is compared with values worked out from equation~(4) and
+equation~(10) outside this code: at $x = 0$ it is the Wilson
+interval, at $x = 1$ and at $x = n - 1$ the Poisson bound replaces one
+end, at a mid value nothing changes, and $x = 3$ is modified for
+$n = 60$ but not for $n = 40$.
+
+<<test functions>>=
+class TestModifiedWilsonInterval:
+    def test_lambda_reproduces_table_4(self):
+        table_4 = {
+            0.90: (0.105, 0.532, 1.102),
+            0.95: (0.051, 0.355, 0.818),
+            0.99: (0.010, 0.149, 0.436),
+        }
+        for confidence, row in table_4.items():
+            for x, value in enumerate(row, start=1):
+                assert poisson_lower_lambda(x, confidence) \
+                    == pytest.approx(value, abs=5e-4), (confidence, x)
+
+    def test_bounds_against_the_paper(self):
+        cases = {
+            (0, 20): (0.0, 0.161125),
+            (1, 20): (0.002565, 0.236131),
+            (10, 20): (0.299298, 0.700702),
+            (19, 20): (0.763869, 0.997435),
+            (3, 60): (0.013628, 0.137005),
+        }
+        for (x, n), expected in cases.items():
+            assert modified_wilson_interval(x, n) \
+                == pytest.approx(expected, abs=1e-6), (x, n)
+        assert modified_wilson_interval(3, 40) == pytest.approx(
+            wilson_interval(3, 40)
+        )
+@
+
 \subsection{Reporting a sample}
 
 A sample drawn over several sessions is stored in each of them, so the
 report groups the stored samples by id and adds up what it finds in
-the sessions it was given.  A session that the sample names but that
+the sessions it was given; a sample stored twice in one session is
+counted once there.  A session that the sample names but that
 was not given, or a sampled paper no longer in its session (re-keyed
 by a later DOI, say), is not counted, and the report says how many
 such papers there were instead of treating them as unreviewed or as
@@ -3524,8 +3699,8 @@ class SampleReport:
     """What a sample shows so far, over the sessions it was reported on.
 
     `changed` counts reviewed decisions whose status differs from the
-    machine's; `interval` is the 95% Wilson interval of `changed` out of
-    `reviewed`, or `None` while nothing is reviewed.
+    machine's; `interval` is the 95% modified Wilson interval of
+    `changed` out of `reviewed`, or `None` while nothing is reviewed.
     """
     sample_id: str
     seed: int
@@ -3551,24 +3726,28 @@ def sample_reports(sessions: list[ReviewSession]) -> list[SampleReport]:
     from scholar.notes import get_paper_id
 
     reports: dict[str, SampleReport] = {}
-    seen: dict[str, set[str]] = {}
     for session in sessions:
         name = session_label(session)
         current = {get_paper_id(d.paper): d for d in session.decisions}
+        counted_here: set[str] = set()
         for sample in session.llm_samples:
+            if sample.sample_id in counted_here:
+                continue
+            counted_here.add(sample.sample_id)
             report = reports.setdefault(sample.sample_id, SampleReport(
                 sample_id=sample.sample_id, seed=sample.seed,
                 drawn_at=sample.drawn_at, criteria=dict(sample.criteria),
                 sessions=list(sample.sessions),
                 population=sample.population, size=sample.size,
             ))
-            seen.setdefault(sample.sample_id, set()).add(name)
             for entry in sample.papers:
                 <<count one sampled decision>>
     for report in reports.values():
         <<count the papers of sessions not given>>
         if report.reviewed:
-            report.interval = wilson_interval(report.changed, report.reviewed)
+            report.interval = modified_wilson_interval(
+                report.changed, report.reviewed
+            )
     return sorted(reports.values(), key=lambda r: r.drawn_at)
 @
 
@@ -3631,6 +3810,12 @@ One sentence states a sample for a report.  It says what was drawn,
 from what, when and with which seed, and then only what the review has
 shown so far: no rate before anything is reviewed, the number still
 unreviewed when the review is incomplete, and the number not found.
+While part of the sample is unreviewed, the sentence also says that the
+rate covers only the reviewed part.  That part is a random sample of
+the population only if which papers got reviewed had nothing to do
+with the papers themselves; a reviewer who skips the hard cases makes
+the rate look better than it is, and the reader should be told that
+the rate depends on it.
 
 <<llm review sampling>>=
 def describe_sample_criteria(criteria: dict) -> str:
@@ -3664,11 +3849,16 @@ def sample_sentence(report: SampleReport) -> str:
         low, high = report.interval
         text += (
             f"; of the {report.reviewed} reviewed so far, the reviewer "
-            f"changed {report.changed} ({report.rate:.1%}; 95% Wilson "
-            f"score interval {low:.1%} to {high:.1%})"
+            f"changed {report.changed} ({report.rate:.1%}; 95% modified "
+            f"Wilson interval {low:.1%} to {high:.1%})"
         )
         if report.unreviewed:
-            text += f", and {len(report.unreviewed)} are not yet reviewed"
+            text += (
+                f", and {len(report.unreviewed)} are not yet reviewed; the "
+                "rate covers only the reviewed part, and if papers were "
+                "skipped rather than reviewed in the drawn order it may be "
+                "biased"
+            )
     if report.not_found:
         text += (
             f"; {report.not_found} sampled decisions were not found in the "
@@ -3728,15 +3918,17 @@ class TestSampleReports:
         assert (report.reviewed, report.changed, report.not_found) == (2, 1, 1)
         assert report.unreviewed == [("b", "doi:10.5555/sample-report-2")]
         assert report.rate == 0.5
-        assert report.interval == wilson_interval(1, 2)
+        assert report.interval == modified_wilson_interval(1, 2)
+        assert report.interval != wilson_interval(1, 2)
         sentence = sample_sentence(report)
         assert sentence.startswith(
             "A random sample of 4 of the 40 unreviewed LLM discards with "
             "a confidence of at least 0.8 in 2 sessions was drawn on "
             "2026-11-18 (seed 5) for human review; of the 2 reviewed so "
-            "far, the reviewer changed 1 (50.0%; 95% Wilson score interval"
+            "far, the reviewer changed 1 (50.0%; 95% modified Wilson interval"
         )
-        assert "and 1 are not yet reviewed" in sentence
+        assert "and 1 are not yet reviewed; the rate covers only the " \
+            "reviewed part" in sentence
         assert "1 sampled decisions were not found" in sentence
 
     def test_one_session_counts_the_other_as_not_found(self):
@@ -3744,6 +3936,12 @@ class TestSampleReports:
         (report,) = sample_reports([first])
         assert (report.reviewed, report.not_found) == (2, 2)
         assert report.unreviewed == []
+
+    def test_sample_stored_twice_in_a_session_counts_once(self):
+        _, second = self._setup()
+        second.llm_samples.append(second.llm_samples[0])
+        (report,) = sample_reports([second])
+        assert len(report.unreviewed) == 1 and report.not_found == 3
 
     def test_nothing_reviewed_states_no_rate(self):
         _, second = self._setup()
@@ -3763,7 +3961,11 @@ the dates the decisions record, how many of them saw a truncated
 abstract, and for how many none of this was recorded; then one
 sentence per sample stored in the session.  A session without LLM
 decisions and without samples gets nothing, so the report never
-describes a step that did not happen.
+describes a step that did not happen.  The truncation is stated from
+each decision's own [[llm_abstract_truncated]], without a number of
+characters: the limit is today's [[MAX_ABSTRACT_CHARS]], but a decision
+made under an earlier limit was cut at that one, and only its prompt
+version records which.
 
 A sample pooled over several sessions is reported over all of them:
 the function loads the other sessions it names, read-only, through
@@ -3783,7 +3985,10 @@ def llm_screening_sentence(session: ReviewSession) -> str | None:
     if not rows:
         return None
     recorded = [d for d in rows if d.llm_model]
-    text = f"{len(rows)} of the decisions were first made by an LLM"
+    text = (
+        f"{len(rows)} of the decisions "
+        f"{'was' if len(rows) == 1 else 'were'} first made by an LLM"
+    )
     if recorded:
         models = Counter(d.llm_model for d in recorded)
         versions = {d.llm_prompt_version for d in recorded} - {None}
@@ -3807,8 +4012,8 @@ def llm_screening_sentence(session: ReviewSession) -> str | None:
         truncated = sum(1 for d in recorded if d.llm_abstract_truncated)
         if truncated:
             text += (
-                f"; for {truncated} of them the model saw only the first "
-                f"{MAX_ABSTRACT_CHARS} characters of the abstract"
+                f"; for {truncated} of them the model saw a truncated "
+                "abstract"
             )
     missing = len(rows) - len(recorded)
     if missing:
@@ -3888,9 +4093,20 @@ class TestLLMScreeningLatex:
         assert lines[2] == (
             "3 of the decisions were first made by an LLM (model m-1: 2; "
             "1 prompt version: v1; between 2026-11-17 and 2026-11-18); for "
-            "1 of them the model saw only the first "
-            f"{MAX_ABSTRACT_CHARS} characters of the abstract; for 1 of "
+            "1 of them the model saw a truncated abstract; for 1 of "
             "them the model, date and prompt were not recorded."
+        )
+
+    def test_one_decision_is_singular(self):
+        session = ReviewSession(query="q", providers=["p"],
+                                timestamp=datetime(2026, 11, 18))
+        session.decisions = [ReviewDecision(
+            paper=Paper(title="L", authors=["A"], doi="10.5555/screening-1"),
+            provider="p", status=DecisionStatus.DISCARDED, tags=["t"],
+            source=ReviewSource.LLM_UNREVIEWED,
+        )]
+        assert llm_screening_sentence(session).startswith(
+            "1 of the decisions was first made by an LLM"
         )
 
     def test_no_llm_step_no_section(self):

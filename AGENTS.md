@@ -856,7 +856,8 @@ A human review leaves them untouched (they are the model's record).
   discard without tags, confidence missing/non-numeric/outside [0, 1])
   gets `LLMDecision.answer_problem`, triggers the single retry, and is
   then withheld with the category-rule ones (`LLMDecision.problem`);
-  `llm classify` lists them under "Left pending, no usable answer".
+  `llm classify` and `rq` list them (`print_withheld_papers`) under
+  "Left pending, no usable answer".
   Answers without a valid `paper_index` are skipped (never index 0).
 - **Abstracts.** `MAX_ABSTRACT_CHARS` = 4000 for papers to classify
   (marked `[abstract truncated]` in the prompt), `EXAMPLE_ABSTRACT_CHARS`
@@ -871,18 +872,24 @@ A human review leaves them untouched (they are the model's record).
   stable across versions) and takes the N smallest; it stores a
   `review.LLMSample` (seed, criteria, UTC date, population size and
   digest, this session's papers with the machine's status) in every
-  pooled session (`ReviewSession.llm_samples`, merged by `sample_id`).
+  pooled session (`ReviewSession.llm_samples`, merged by `sample_id`,
+  which ends in uuid4 digits so two draws in one second never collide).
+  `test_golden_draw` pins the drawn papers for seed 42.
   The TUI filter `s` (`sampled_for_review`) queues the unreviewed ones;
   `sessions decide` reviews them. `--report [-f json]`
   (`sample_reports`): a sampled decision counts as reviewed when decided
   and no longer an unreviewed machine source, as changed when its
-  status differs from the recorded one; the rate gets a 95% Wilson
-  score interval (`wilson_interval`, Brown, Cai & DasGupta 2001, eq. 4;
-  its coverage dips for p near 0, noted in `llm_review.nw`).
+  status differs from the recorded one; the rate gets the 95% modified
+  Wilson interval (`modified_wilson_interval`, Brown, Cai & DasGupta
+  2001, eq. 4 with the Poisson bound of eq. 10, p. 112, for x <= x*,
+  x* = 2 for n <= 50 else 3), because plain Wilson coverage dips near
+  p = 0, where disagreement rates live. The sentence says the rate
+  covers only the reviewed part while some is unreviewed.
 - **Report.** `build_review_provenance_latex` calls
   `llm_review.build_llm_screening_latex` (one local import + call): an
   "LLM screening" section with models, prompt versions, dates, the
-  truncated and unrecorded counts, and `sample_sentence` per sample
+  truncated (from each decision's flag, no character count) and
+  unrecorded counts, and `sample_sentence` per sample
   (other pooled sessions are loaded read-only). Nothing when the
   session has no LLM decisions and no samples.
 
