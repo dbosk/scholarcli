@@ -3514,6 +3514,233 @@ def _convert_paper(self, paper_data: dict) -> Paper:
     )
 @
 
+\subsection{The snippet search: a second check for sessions}
+\label{sec:s2-snippets}
+
+[[sessions check]] holds a search by meaning against review sessions,
+to find what their keyword searches missed (\cref{sec:sessions-check}
+in the CLI chapter).
+Its first backend is OpenAlex's semantic search
+(\cref{sec:openalex-semantic}), which embeds title, abstract and venue.
+Semantic Scholar offers one that also reads the full text: the snippet
+search, [[/graph/v1/snippet/search]].
+The API description (\url{https://api.semanticscholar.org/graph/v1/swagger.json},
+read 18~November 2026) says it returns \enquote{the text snippets that
+most closely match the query}, excerpts \enquote{drawn from a paper's
+title, abstract, and body text, but excluding figure captions and the
+bibliography}, \enquote{the highest ranked snippet first}.
+Its limits: \enquote{You must include a query}, \enquote{If you don't
+set a limit, it will automatically return 10 results}, and \enquote{The
+max limit allowed is 1000}.
+In the review behind issue~\#161 it returned, in second place, the
+study that the keyword queries had missed; the recording below, made
+for the same question, has it in second place too.
+
+A snippet is a passage, not a work, and a work can have many: the
+recorded question returned 1000 snippets from 677 works.
+The check lists works, so [[s2_snippet_works]] keeps each work once,
+at the place of its best snippet, with that snippet's [[score]], until
+it has as many works as the check's limit.
+To find as many works as it can, the request always asks for the
+maximum of 1000 snippets; it asks for the snippet's kind only
+([[fields=snippet.snippetKind]]), since the passages themselves are
+not used and would make the answer several times larger.
+The answer is returned as a [[RankedPapers]], the list the semantic
+search returns (\cref{sec:openalex-semantic}), with the scores and the
+time of the fetch, so [[sessions check]] reports it the same way.
+
+What a snippet says about its paper is little: the description's
+[[paper]] schema has [[corpusId]], [[title]], [[authors]] (names, as
+strings) and [[openAccessInfo]], and the recorded answer had exactly
+these.
+There is no DOI and no year, so the sessions are searched for these
+works by title and first author (\cref{sec:semantic-check} in the
+review chapter), and the year column of the check stays empty.
+
+<<semantic scholar helpers>>=
+def s2_snippet_works(
+    snippets: list, limit: int, fetched_at: str | None = None
+) -> "RankedPapers":
+    """The works of ranked snippets, each once, at its best snippet."""
+    works, scores, seen = [], [], set()
+    for snippet in snippets:
+        paper = (snippet or {}).get("paper") or {}
+        key = paper.get("corpusId") or paper.get("title")
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        works.append(Paper(
+            title=paper.get("title") or "",
+            authors=[
+                name for name in paper.get("authors") or []
+                if isinstance(name, str) and name
+            ],
+            sources=["s2"],
+        ))
+        scores.append(snippet.get("score"))
+        if len(works) >= limit:
+            break
+    return RankedPapers(works, scores=scores, fetched_at=fetched_at)
+<<semantic scholar constants>>=
+S2_SNIPPET_URL = "https://api.semanticscholar.org/graph/v1/snippet/search"
+S2_SNIPPET_MAX = 1000          # "The max limit allowed is 1000"
+S2_SNIPPET_FIELDS = "snippet.snippetKind"
+@
+
+The backend is a provider object, so that [[sessions check]] runs it
+exactly as it runs the semantic search: [[search()]],
+[[last_error]], [[last_retries]] and [[last_from_cache]].
+It subclasses the Semantic Scholar provider for the request: the key,
+the retries and the pacing of [[_request]] and [[_send]].
+[[QUOTA_GROUP]] puts it on the [[s2]] limiter, since the documented
+rate is one request a second \enquote{on all endpoints}
+(\cref{sec:semantic-scholar}).
+Its name, [[s2-snippets]], gives it a cache file of its own, so that
+snippet answers never share one with keyword results.
+It is not registered: a search by passages returns a ranked list of
+works, not a count of matches, and it is meant as a check, not as a
+database in a session's query table.
+[[sessions check]] builds it when asked to.
+
+<<semantic scholar provider>>=
+class SemanticScholarSnippetSearch(SemanticScholarProvider):
+    """Semantic Scholar's snippet search: works ranked by passages."""
+
+    name = "s2-snippets"
+    QUOTA_GROUP = "s2"
+    RANKED_LIST = True
+    default_enabled = False
+    MAX_LIMIT = S2_SNIPPET_MAX
+
+    def __init__(self, api_key: str | None = None):
+        """Initialize as the Semantic Scholar provider, with its own cache."""
+        super().__init__(api_key=api_key)
+        self.last_from_cache = False
+
+    def search(
+        self,
+        query: str,
+        limit: int = 50,
+        filters: SearchFilters | None = None,
+    ) -> list[Paper]:
+        """Return the works whose passages best match `query`, ranked."""
+        self.last_error = None
+        self.last_retries = 0
+        self.last_from_cache = False
+        if filters and not filters.is_empty():
+            self.last_error = "the snippet search takes no filters"
+            return []
+        cache_key = (query, limit)
+        if cache_key in self._cache:
+            self.last_from_cache = True
+            return self._cache[cache_key]
+        works, cacheable = self._snippet_search(query, limit)
+        if cacheable:
+            self._cache[cache_key] = works
+        else:
+            self.last_error = SEARCH_CUT_SHORT
+        return works
+
+    def _snippet_search(self, query: str, limit: int):
+        """Send one snippet search: ``(works, cacheable)``."""
+        params = {
+            "query": query,
+            "limit": S2_SNIPPET_MAX,
+            "fields": S2_SNIPPET_FIELDS,
+        }
+        try:
+            response = self._request(S2_SNIPPET_URL, params)
+            if self._page_refused(response):
+                return RankedPapers(), False
+            response.raise_for_status()
+            fetched_at = datetime.datetime.now(
+                datetime.timezone.utc
+            ).isoformat(timespec="seconds")
+            snippets = response.json().get("data") or []
+            return s2_snippet_works(snippets, limit, fetched_at), True
+        except RateLimited:
+            return RankedPapers(), False
+        except requests.exceptions.HTTPError as e:
+            logger.warning("s2: snippet search HTTP error: %s", e)
+            return RankedPapers(), False
+        except Exception as e:
+            logger.warning("s2: snippet search: %s", e)
+            return RankedPapers(), False
+@
+
+The request is tested against a recorded answer: one request on
+2026-11-18, with an API key, to [[S2_SNIPPET_URL]] with the question
+in [[S2_SNIPPET_QUESTION]], [[limit=1000]] and [[fields]] set to
+[[S2_SNIPPET_FIELDS]].
+It answered with 1000 snippets from 677 works and a
+[[retrievalVersion]] of [[pa1-v1]].
+The recording keeps the first eight snippets (eight different works),
+each with its score, the paper's [[corpusId]] and title, and the
+licence and status of [[openAccessInfo]]; the author names are
+replaced by placeholders.
+Since none of the eight repeat a work, keeping a work once is tested
+on top of the recording, with a snippet added that repeats the first
+work further down.
+
+<<test functions>>=
+S2_SNIPPET_QUESTION = (
+  "an attacker uses account recovery or a weaker fallback login "
+  "to get around multi-factor authentication"
+)
+S2_SNIPPET_RECORDING = {
+  "retrievalVersion": "pa1-v1",
+  "data": [
+    <<recorded snippet search>>
+  ],
+}
+
+
+class TestS2SnippetSearch:
+  """The snippet search returns works, ranked, each once."""
+
+  def test_request_and_works(self, monkeypatch):
+    sent = _replay_s2(monkeypatch, [S2_SNIPPET_RECORDING])
+    search = SemanticScholarSnippetSearch(api_key=None)
+
+    works = search.search(S2_SNIPPET_QUESTION, limit=50)
+
+    [(url, params)] = sent
+    assert url == S2_SNIPPET_URL
+    assert params == {
+      "query": S2_SNIPPET_QUESTION, "limit": "1000",
+      "fields": "snippet.snippetKind",
+    }
+    assert len(works) == 8
+    assert works[1].title.startswith('"We\'ve Disabled MFA for You"')
+    assert works[0].doi is None and works[0].authors
+    assert works.scores[0] == S2_SNIPPET_RECORDING["data"][0]["score"]
+    assert works.fetched_at
+    assert search.last_error is None and not search.last_from_cache
+
+    assert search.search(S2_SNIPPET_QUESTION, limit=50) == works
+    assert len(sent) == 1 and search.last_from_cache
+
+  def test_a_work_is_kept_once_at_its_best_snippet(self):
+    snippets = S2_SNIPPET_RECORDING["data"] + [
+      dict(S2_SNIPPET_RECORDING["data"][0], score=0.1),
+    ]
+    works = s2_snippet_works(snippets, limit=50)
+    assert len(works) == 8
+    assert works.scores[0] == S2_SNIPPET_RECORDING["data"][0]["score"]
+    assert len(s2_snippet_works(snippets, limit=3)) == 3
+
+  def test_shares_the_s2_limiter(self):
+    search = SemanticScholarSnippetSearch(api_key=None)
+    assert search._limiter is SemanticScholarProvider()._limiter
+
+  def test_a_refusal_is_a_failure_not_an_empty_list(self, monkeypatch):
+    _replay_s2(monkeypatch, [(400, {"error": "bad query"})])
+    search = SemanticScholarSnippetSearch(api_key=None)
+    assert search.search("q", limit=50) == []
+    assert search.last_error == SEARCH_CUT_SHORT
+    assert ("q", 50) not in search._cache
+@
+
 The recorded answers, in the order the tests above name them:
 
 <<recorded bulk search, the issue's query>>=
@@ -3660,6 +3887,64 @@ The recorded answers, in the order the tests above name them:
              {'authorId': None, 'name': 'Author 3-2'},
              {'authorId': None, 'name': 'Author 3-3'}],
  'abstract': 'Abstract replaced by the recording.'},
+<<recorded snippet search>>=
+{'score': 0.6105436479044393,
+ 'paper': {'corpusId': '198339981',
+           'title': 'Two Factor Authentication Framework Using OTP-SMS '
+                    'Based on Blockchain',
+           'authors': ['Author 1-1', 'Author 1-2'],
+           'openAccessInfo': {'license': 'CCBY', 'status': 'GOLD'}},
+ 'snippet': {'snippetKind': 'body'}},
+{'score': 0.5588400080549598,
+ 'paper': {'corpusId': '259188103',
+           'title': '"We\'ve Disabled MFA for You": An Evaluation of the '
+                    'Security and Usability of Multi-Factor '
+                    'Authentication Recovery Deployments',
+           'authors': ['Author 2-1', 'Author 2-2', 'Author 2-3'],
+           'openAccessInfo': {'license': 'other-oa', 'status': 'HYBRID'}},
+ 'snippet': {'snippetKind': 'abstract'}},
+{'score': 0.5146342027008242,
+ 'paper': {'corpusId': '279303992',
+           'title': 'Mobile Banking Security Risks: An Analysis',
+           'authors': ['Author 3-1'],
+           'openAccessInfo': {'license': None, 'status': 'GOLD'}},
+ 'snippet': {'snippetKind': 'body'}},
+{'score': 0.5054324638527671,
+ 'paper': {'corpusId': '268531701',
+           'title': 'Is It Really You Who Forgot the Password? When '
+                    'Account Recovery Meets Risk-Based Authentication',
+           'authors': ['Author 4-1', 'Author 4-2', 'Author 4-3'],
+           'openAccessInfo': {'license': None, 'status': 'GREEN'}},
+ 'snippet': {'snippetKind': 'body'}},
+{'score': 0.5005481690321318,
+ 'paper': {'corpusId': '274000848',
+           'title': 'Cybersecurity Threats and Vulnerabilities in Online '
+                    'Banking Systems',
+           'authors': ['Author 5-1'],
+           'openAccessInfo': {'license': 'CCBY', 'status': 'GOLD'}},
+ 'snippet': {'snippetKind': 'body'}},
+{'score': 0.4975118458642869,
+ 'paper': {'corpusId': '278764572',
+           'title': 'SoK: Web Authentication and Recovery in the Age of '
+                    'End-to-End Encryption',
+           'authors': ['Author 6-1', 'Author 6-2', 'Author 6-3'],
+           'openAccessInfo': {'license': 'CCBY', 'status': 'HYBRID'}},
+ 'snippet': {'snippetKind': 'body'}},
+{'score': 0.4927168339869612,
+ 'paper': {'corpusId': '209897579',
+           'title': 'A Multi-Layered Security Model for Learning '
+                    'Management System',
+           'authors': ['Author 7-1', 'Author 7-2', 'Author 7-3'],
+           'openAccessInfo': {'license': 'CCBY', 'status': 'GOLD'}},
+ 'snippet': {'snippetKind': 'body'}},
+{'score': 0.4880384748004992,
+ 'paper': {'corpusId': '277575622',
+           'title': 'ANALYSIS OF AUTHENTICATION VULNERABILITIES AND '
+                    'TESTING OF DATA PROTECTION MECHANISMS IN WEB '
+                    'APPLICATIONS',
+           'authors': ['Author 8-1', 'Author 8-2', 'Author 8-3'],
+           'openAccessInfo': {'license': 'CCBYNCND', 'status': 'HYBRID'}},
+ 'snippet': {'snippetKind': 'body'}},
 @
 
 \subsection{Auto-registration}

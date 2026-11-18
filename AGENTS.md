@@ -255,7 +255,15 @@ refusal sets `last_error` (else it would read as 0 works).
   same number, "up to 50 works" (largest) when they differ or some do
   not say, "the works" when none does.
 - **`scholar sessions check S [S ...] -s Q [-s Q2] [-k DOI|title-part]
-  [-l N≤50] [-f table|csv|json] [-o DIR]`**: per question one
+  [-l N≤50] [-f table|csv|json] [-o DIR] [-b openalex|s2-snippets]`**:
+  `-b s2-snippets` uses `SemanticScholarSnippetSearch` (providers.nw
+  `sec:s2-snippets`; unregistered, name `s2-snippets`, own cache,
+  `QUOTA_GROUP = "s2"`): one `/graph/v1/snippet/search` request with
+  `limit=1000`, `fields=snippet.snippetKind`, reduced by
+  `s2_snippet_works` to works (each once, at its best snippet, score
+  kept) in a `RankedPapers`; snippets carry no DOI or year, so works
+  match by title and first author. The 2000-character question limit
+  applies to `openalex` only. Per question one
   provider search (quota pre-check → failed with the limiter's reason),
   then `review.check_against_sessions(papers, sessions, known)` →
   `(CheckRow[], KnownRow[])`. `session_match_index` keys: `Paper.id`
