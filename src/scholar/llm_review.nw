@@ -2276,7 +2276,13 @@ def apply_llm_decisions(
 \subsection{Marking Decisions as Reviewed}
 
 When a user reviews an LLM decision, we update its source and potentially
-mark it as an example if the user made corrections.
+mark it as an example if the user made corrections.  An AI agent's
+decisions ([[AGENT_UNREVIEWED]], recorded by [[sessions decide --source
+agent]]) are reviewed the same way: the TUI and [[sessions decide]] both
+call this function for any unreviewed machine decision.  The reviewed
+source keeps the machine's name ([[ReviewSource.reviewed]]), so the
+report can still tell a confirmed agent decision from a confirmed LLM
+one.
 
 <<llm review decision application>>=
 def mark_as_reviewed(
@@ -2286,7 +2292,7 @@ def mark_as_reviewed(
     new_tags: list[str] | None = None,
 ) -> None:
     """
-    Mark an LLM decision as reviewed by user.
+    Mark an LLM or agent decision as reviewed by user.
 
     If the user changed the decision (disagrees), the paper becomes a
     training example for future LLM rounds.
@@ -2297,11 +2303,12 @@ def mark_as_reviewed(
         new_status: New status if user disagrees (ignored if agrees)
         new_tags: New tags if user disagrees (ignored if agrees)
     """
-    if decision.source != ReviewSource.LLM_UNREVIEWED:
-        logger.warning("Decision is not LLM_UNREVIEWED, nothing to mark")
+    if not decision.source.is_unreviewed:
+        logger.warning("Decision is not an unreviewed machine decision, "
+                       "nothing to mark")
         return
 
-    decision.source = ReviewSource.LLM_REVIEWED
+    decision.source = decision.source.reviewed
 
     if not user_agrees:
         # User corrected the LLM - this becomes an example
@@ -2473,6 +2480,9 @@ class TestDecisionApplication:
 \label{sec:review-statistics}
 
 Provide an overview of the review session's LLM-related statistics.
+The agent's decisions are counted apart from the LLM's: [[scholar llm
+status]] is where a user checks what is still waiting for them, and an
+agent's proposals wait just as an LLM's do.
 
 <<llm review statistics>>=
 def get_review_statistics(session: ReviewSession) -> dict[str, int]:
@@ -2487,6 +2497,8 @@ def get_review_statistics(session: ReviewSession) -> dict[str, int]:
         - human: Decisions made by human directly
         - llm_unreviewed: LLM decisions pending review
         - llm_reviewed: LLM decisions reviewed by user
+        - agent_unreviewed: AI agent decisions pending review
+        - agent_reviewed: AI agent decisions reviewed by user
         - examples: Papers marked as training examples
         - pending: Papers not yet decided
         - total: Total papers in session
@@ -2495,6 +2507,8 @@ def get_review_statistics(session: ReviewSession) -> dict[str, int]:
         "human": 0,
         "llm_unreviewed": 0,
         "llm_reviewed": 0,
+        "agent_unreviewed": 0,
+        "agent_reviewed": 0,
         "examples": 0,
         "pending": 0,
         "total": len(session.decisions),
@@ -2509,6 +2523,10 @@ def get_review_statistics(session: ReviewSession) -> dict[str, int]:
             stats["llm_unreviewed"] += 1
         elif decision.source == ReviewSource.LLM_REVIEWED:
             stats["llm_reviewed"] += 1
+        elif decision.source == ReviewSource.AGENT_UNREVIEWED:
+            stats["agent_unreviewed"] += 1
+        elif decision.source == ReviewSource.AGENT_REVIEWED:
+            stats["agent_reviewed"] += 1
 
         if decision.is_example:
             stats["examples"] += 1
@@ -2582,6 +2600,51 @@ class TestStatistics:
         assert stats["pending"] == 1
         assert stats["examples"] == 1
         assert stats["total"] == 7
+@
+
+An agent's decisions are counted and reviewed apart from the LLM's:
+
+<<test functions>>=
+class TestAgentDecisionReview:
+    def _decision(self, status=DecisionStatus.KEPT):
+        return ReviewDecision(
+            paper=Paper(title="T", authors=["A"], year=2024),
+            provider="p", status=status,
+            source=ReviewSource.AGENT_UNREVIEWED, llm_confidence=0.7,
+        )
+
+    def test_confirmation_keeps_the_agent_name(self):
+        decision = self._decision()
+        mark_as_reviewed(decision, user_agrees=True)
+        assert decision.source == ReviewSource.AGENT_REVIEWED
+        assert decision.is_example is False
+
+    def test_correction_is_an_example(self):
+        decision = self._decision()
+        mark_as_reviewed(
+            decision, user_agrees=False,
+            new_status=DecisionStatus.DISCARDED, new_tags=["off-topic"],
+        )
+        assert decision.source == ReviewSource.AGENT_REVIEWED
+        assert decision.is_example is True
+        assert decision.status == DecisionStatus.DISCARDED
+
+    def test_a_human_decision_is_left_alone(self):
+        decision = self._decision()
+        decision.source = ReviewSource.HUMAN
+        mark_as_reviewed(decision, user_agrees=True)
+        assert decision.source == ReviewSource.HUMAN
+
+    def test_statistics_count_the_agent_apart(self):
+        session = ReviewSession(
+            query="q", providers=["p"], timestamp=datetime(2026, 11, 18),
+        )
+        reviewed = self._decision()
+        reviewed.source = ReviewSource.AGENT_REVIEWED
+        session.decisions = [self._decision(), reviewed]
+        stats = get_review_statistics(session)
+        assert (stats["agent_unreviewed"], stats["agent_reviewed"]) == (1, 1)
+        assert (stats["human"], stats["llm_unreviewed"]) == (0, 0)
 @
 
 
@@ -3819,8 +3882,18 @@ def parse_report_abstract(response_text: str) -> str:
     if abstract is None:
         abstract = response_text.strip()
     return re.sub(r"\s+", " ", abstract).strip()
+@
 
+The provenance section's summary counts the decisions by source, as the
+review report does (\cref{sec:review-source}): a synthesis built on
+papers an agent or a model kept without a human reading them must say
+so where it gives the numbers (issue~\#163).  The rows come from
+[[decision_source_items]], so the synthesis and the report use the same
+wording.
 
+<<llm review imports>>=
+from scholar.review import decision_source_items, escape_latex
+<<llm review synthesis>>=
 def build_research_question_section_markdown(
     session: ReviewSession,
     included_kept_papers: int,
@@ -3844,6 +3917,10 @@ def build_research_question_section_markdown(
     lines.append(f"- Kept: {len(session.kept_papers())}")
     lines.append(f"- Discarded: {len(session.discarded_papers())}")
     lines.append(f"- Pending: {len(session.pending_papers())}")
+    lines.extend(
+        f"- Decided ({label}): {count}"
+        for label, count in decision_source_items(session.decisions)
+    )
     if included_kept_papers != total_kept_papers:
         lines.append(
             f"- Included kept papers: {included_kept_papers}/{total_kept_papers} "
@@ -3900,6 +3977,10 @@ def build_research_question_section_latex(
             f"\\item[Pending] {len(session.pending_papers())}",
         ]
     )
+    lines.extend(
+        f"\\item[Decided: {escape_latex(label)}] {count}"
+        for label, count in decision_source_items(session.decisions)
+    )
     if included_kept_papers != total_kept_papers:
         lines.append(
             f"\\item[Included kept papers] {included_kept_papers}/{total_kept_papers}"
@@ -3932,8 +4013,41 @@ def build_research_question_section_latex(
         lines.extend([r"\bottomrule", r"\end{longtable}", ""])
 
     return "\n".join(lines)
+@
 
+Both forms of the summary carry the same rows:
 
+<<test functions>>=
+class TestSynthesisDecisionSources:
+    def _session(self):
+        session = ReviewSession(
+            query="q", providers=["p"], timestamp=datetime(2026, 11, 18),
+        )
+        session.decisions = [
+            ReviewDecision(
+                paper=Paper(title=f"T{i}", authors=["A"], year=2024),
+                provider="p", status=DecisionStatus.KEPT, source=source,
+            )
+            for i, source in enumerate([
+                ReviewSource.HUMAN, ReviewSource.AGENT_UNREVIEWED,
+                ReviewSource.AGENT_UNREVIEWED, ReviewSource.LLM_REVIEWED,
+            ])
+        ]
+        return session
+
+    def test_markdown_summary(self):
+        text = build_research_question_section_markdown(self._session(), 4, 4)
+        assert "- Decided (human): 1\n" in text
+        assert "- Decided (LLM, reviewed by a human): 1\n" in text
+        assert "- Decided (agent, unreviewed): 2\n" in text
+
+    def test_latex_summary(self):
+        text = build_research_question_section_latex(self._session(), 4, 4)
+        assert "\\item[Decided: human] 1\n" in text
+        assert "\\item[Decided: agent, unreviewed] 2\n" in text
+@
+
+<<llm review synthesis>>=
 def _build_references_markdown(
     kept_decisions: list[ReviewDecision],
     citation_keys: dict[str, tuple[str, str]],
