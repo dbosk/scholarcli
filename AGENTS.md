@@ -564,7 +564,13 @@ context (#107). `review.save_session` now:
 `scholar enrich` saves after every `ENRICH_SAVE_EVERY` (50) papers
 (`cli.nw`, `sec:enrich-chunks`): enrich → Crossref check → assign →
 `migrate_paper_id` for adoptions → `save_session`, per chunk. After such
-a run `.bak` holds only the state before the last chunk. Ctrl-C (and
+a run `.bak` holds only the state before the last chunk, so before the
+first chunk (only when there is something to enrich and the file
+exists) `review.keep_copy_before_run` copies the saved file to
+`<name>.json.pre-enrich.bak` (atomic, under the session lock; the next
+run replaces it) and the end-of-run and interrupt messages print its
+path. The name does not end in `.json`, so the `*.json` globs of
+`list_sessions` and `sessions_mentioning` skip it (tested). Ctrl-C (and
 SIGTERM, turned into `KeyboardInterrupt` while the loop runs, so the
 atexit cache save still happens) prints `Interrupted: saved K of N
 papers; run again to continue` and exits 130.

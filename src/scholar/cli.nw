@@ -2619,9 +2619,13 @@ which the reports below use.
 <<enrich and save chunk by chunk>>=
 from rich.progress import Progress
 from scholar.notes import get_paper_id, migrate_paper_id
+from scholar.review import keep_copy_before_run
 
 originals: list = []
 processed: list = []
+pre_run_copy = (
+    keep_copy_before_run(session_data, "pre-enrich") if selected else None
+)
 try:
     with sigterm_as_keyboard_interrupt(), Progress() as progress:
         task = progress.add_task("[cyan]Enriching...", total=len(selected))
@@ -2633,7 +2637,27 @@ except KeyboardInterrupt:
         f"[yellow]Interrupted: saved {len(processed)} of {len(selected)} "
         f"{scope}; run again to continue.[/yellow]"
     )
+    <<say where the pre-run copy is>>
     raise typer.Exit(130)
+@
+
+Since [[.bak]] ends up holding only the state before the last chunk, we
+first keep a copy of the session as it was before the run
+([[keep_copy_before_run]], \cref{sec:session-integrity}), unless there is
+nothing to enrich and so no save to follow.
+It is the way back from the whole run, which matters because enrichment
+replaces metadata, and, when it adopts a preprint, a paper's id.
+The copy is made once and the next run replaces it.
+The final report and the interrupt message both name it, with the path
+written out so that it can be pasted into a [[cp]] command.
+
+<<say where the pre-run copy is>>=
+if pre_run_copy is not None:
+    console.print(
+        "[dim]Session as it was before this run: "
+        f"{escape(str(pre_run_copy))}[/dim]",
+        soft_wrap=True,
+    )
 @
 
 Within a chunk the order matters: the Crossref check reads the DOI the
@@ -2782,6 +2806,7 @@ enriched_count = sum(
     or (new.pdf_url and orig.pdf_url != new.pdf_url)
 )
 console.print(f"[green]Enriched {enriched_count} papers.[/green]")
+<<say where the pre-run copy is>>
 @
 
 
@@ -3323,6 +3348,101 @@ def test_interrupt_keeps_finished_chunks(self, tmp_path, monkeypatch):
   saved = self._saved(name)
   assert saved["10.1/c137-0"].paper.abstract == "Enriched."
   assert saved["10.1/c137-1"].paper.abstract is None
+@
+
+\subsection{The copy from before the run}
+
+[[.bak]] cannot serve as the way back from a whole run
+(\cref{sec:enrich-chunks}), so the command keeps its own copy.
+The tests run the real command with chunks of one paper, so that the
+[[.bak]] differs from the pre-run copy, and check that the copy is the
+file as it was, that the next run replaces it, that no copy is made
+when there is nothing to enrich, that both the final and the interrupt
+message name it, and that the commands which read every session file
+do not mistake it for a session.
+
+<<test functions>>=
+class TestEnrichPreRunBackup:
+  """A copy of the session from before the run (#153)."""
+
+  @staticmethod
+  def _prepare(tmp_path, monkeypatch, count=2):
+    monkeypatch.setattr("scholar.cli.ENRICH_SAVE_EVERY", 1)
+    name = TestEnrichSelectionAndSaving._session(
+      tmp_path, monkeypatch, count, name="prerun"
+    )
+    return name, tmp_path / "review_sessions" / f"{name}.json"
+
+  @staticmethod
+  def _enrich(papers, **kwargs):
+    return TestEnrichSelectionAndSaving._enriched(papers)
+
+  def test_copy_is_the_session_as_it_was(self, tmp_path, monkeypatch):
+    name, path = self._prepare(tmp_path, monkeypatch)
+    before = path.read_bytes()
+
+    result = TestEnrichSelectionAndSaving._invoke([name], self._enrich)
+    assert result.exit_code == 0, result.stdout
+
+    copy = path.with_name(f"{name}.json.pre-enrich.bak")
+    assert copy.read_bytes() == before
+    assert path.read_bytes() != before
+    # one chunk per paper: .bak holds the state before the last chunk
+    assert path.with_name(f"{name}.json.bak").read_bytes() != before
+    assert "pre-enrich.bak" in "".join(result.stdout.split())
+
+  def test_next_run_replaces_the_copy(self, tmp_path, monkeypatch):
+    name, path = self._prepare(tmp_path, monkeypatch)
+    copy = path.with_name(f"{name}.json.pre-enrich.bak")
+    copy.write_text("stale")
+    before = path.read_bytes()
+
+    result = TestEnrichSelectionAndSaving._invoke([name], self._enrich)
+    assert result.exit_code == 0, result.stdout
+    assert copy.read_bytes() == before
+
+  def test_nothing_to_enrich_makes_no_copy(self, tmp_path, monkeypatch):
+    from scholar.review import DecisionStatus, load_session, save_session
+
+    name, path = self._prepare(tmp_path, monkeypatch)
+    session = load_session(name)
+    for decision in session.decisions:
+      decision.status = DecisionStatus.KEPT
+      decision.tags = ["t"]
+    save_session(session)
+
+    result = TestEnrichSelectionAndSaving._invoke(
+      [name, "--pending-only"], self._enrich
+    )
+    assert result.exit_code == 0, result.stdout
+    assert not path.with_name(f"{name}.json.pre-enrich.bak").exists()
+
+  def test_interrupt_names_the_copy(self, tmp_path, monkeypatch):
+    name, path = self._prepare(tmp_path, monkeypatch)
+    calls = []
+
+    def enrich(papers, **kwargs):
+      calls.append(papers)
+      if len(calls) == 2:
+        raise KeyboardInterrupt
+      return TestEnrichSelectionAndSaving._enriched(papers)
+
+    before = path.read_bytes()
+    result = TestEnrichSelectionAndSaving._invoke([name], enrich)
+    assert result.exit_code == 130
+    assert "pre-enrich.bak" in "".join(result.stdout.split())
+    assert path.with_name(f"{name}.json.pre-enrich.bak").read_bytes() == before
+
+  def test_the_copy_is_not_a_session(self, tmp_path, monkeypatch):
+    from scholar.review import list_sessions, sessions_mentioning
+
+    name, path = self._prepare(tmp_path, monkeypatch)
+    result = TestEnrichSelectionAndSaving._invoke([name], self._enrich)
+    assert result.exit_code == 0, result.stdout
+    assert path.with_name(f"{name}.json.pre-enrich.bak").exists()
+
+    assert [s["name"] for s in list_sessions()] == [name]
+    assert [s.name for s in sessions_mentioning("10.1/c137-0")] == [name]
 @
 
 A time limit ends a process with SIGTERM, whose default action ends
