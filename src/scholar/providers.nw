@@ -2989,7 +2989,8 @@ key and [[mailto]] as real searches---a probe without the key would
 report \enquote{rate limited} while searches succeed.  With a key, a 401
 or 403 means the key was rejected, so [[authenticated]] follows the key.
 The probe's response headers go to the limiter, which keeps the
-persisted credit count current, and a healthy keyed probe is followed by
+persisted credit count current (except while prepaid credit is left,
+\cref{sec:openalex-prepaid}), and a healthy keyed probe is followed by
 one call to the rate-limit endpoint so the health table can show how
 much of the day's budget is left and when it resets.  Without a key the
 detail column says so, since the key is the one setting that changes
@@ -3025,7 +3026,7 @@ def _probe(self, params: dict) -> tuple[str, str]:
             HEALTH_QUOTA_EXHAUSTED,
             f"daily budget spent; resets {format_retry(retry_at)}",
         )
-    self._limiter.record_response(response)
+    self._record_response(response)
     return classify_check_response(
         response, authenticated=bool(self.api_key), expect_json=True
     )
@@ -3071,8 +3072,35 @@ def budget(self) -> dict | None:
     except (RateLimited, requests.RequestException, ValueError):
         return None
 
+@
+
+\paragraph{Prepaid and one-time credit.}
+The day's allowance is not the whole budget.
+OpenAlex sells prepaid usage on top of it, which \enquote{is only drawn
+down after your free daily budget runs out} and expires three months
+after the latest purchase
+(\url{https://help.openalex.org/access/pricing/}, read 2026-11-18).
+A key that has spent its day but still holds prepaid credit therefore
+keeps working, and a health table that said only \enquote{\$0.045 of
+\$1.00 daily budget left} made an orchestrator wait for the reset when
+it need not have (issue \#138).
+
+The report recorded on 2026-11-18 (in the tests below) carries the
+prepaid credit as [[prepaid_remaining_usd]] with an expiry
+[[prepaid_expires_at]], and also a count of
+[[onetime_credits_remaining]] with [[onetime_credits_expires_at]].
+The documentation does not mention one-time credits.
+In that report they had the same expiry as the prepaid credit and stood
+at 50000 while the daily allowance was reported both as \$1 and as 10000
+credits, so they may be the same \$5 counted in credits; since nothing
+says so, the message shows each as reported, in its own unit, rather
+than adding them up or hiding one.
+Each is shown only when it is positive, so a key without such credit
+gets exactly the message it got before.
+
+<<openalex budget reporting>>=
 def _budget_message(self) -> str:
-    """Describe the key and daily budget for the health table."""
+    """Describe the key and the budget left for the health table."""
     if not self.api_key:
         note = f"no API key ({OPENALEX_API_KEY_VAR}): keyless daily budget"
         if not pyalex.config.email:
@@ -3082,20 +3110,109 @@ def _budget_message(self) -> str:
     if not report:
         return "API key configured"
     message = "API key configured"
-    remaining = report.get("daily_remaining_usd")
-    total = report.get("daily_budget_usd")
-    if remaining is not None and total is not None:
-        message += f"; ${remaining:.3f} of ${total:.2f} daily budget left"
+    left = self._budget_left(report)
+    if left:
+        message += f"; {left}"
     resets_in = report.get("resets_in_seconds")
     if resets_in is not None:
         message += f"; resets {format_retry(time.time() + resets_in)}"
     return message
+
+@staticmethod
+def _budget_left(report: dict) -> str | None:
+    """Phrase the daily allowance and any credit beyond it."""
+    remaining = report.get("daily_remaining_usd")
+    total = report.get("daily_budget_usd")
+    daily = None
+    if remaining is not None and total is not None:
+        daily = f"${remaining:.3f} of ${total:.2f} daily"
+    extra = []
+    prepaid = _positive_number(report.get("prepaid_remaining_usd"))
+    if prepaid:
+        extra.append(
+            f"${prepaid:.2f} prepaid"
+            + _expiry_note(report.get("prepaid_expires_at"))
+        )
+    onetime = _positive_number(report.get("onetime_credits_remaining"))
+    if onetime:
+        extra.append(
+            f"{onetime:.0f} one-time credits"
+            + _expiry_note(report.get("onetime_credits_expires_at"))
+        )
+    if not extra:
+        return f"{daily} budget left" if daily else None
+    return " + ".join(([daily] if daily else []) + extra) + " left"
 @
 
+The expiry dates arrive in JavaScript's [[Date.toString]] form,
+\enquote{Tue Feb 16 2027 14:16:51 GMT+0000 (Coordinated Universal
+Time)}, unlike the ISO 8601 [[resets_at]] of the same report.
+The message shows the ISO date.
+The month is matched against English abbreviations rather than parsed
+with [[strptime]]'s [[%b]], which follows the user's locale, and an ISO
+timestamp is accepted too in case OpenAlex aligns the two fields.
+Anything else is shown as received: an odd date is better than a
+missing one, and a parse error must not cost the health check.
+
+<<openalex helpers>>=
+def _positive_number(value) -> float | None:
+    """Return `value` as a float if it is a positive number, else `None`."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value) if value > 0 else None
+
+
+def _expiry_note(text) -> str:
+    """Return ` (expires <date>)` for an OpenAlex expiry, or `""`."""
+    if not text:
+        return ""
+    return f" (expires {openalex_date(text)})"
+
+
+def openalex_date(text: str) -> str:
+    """Return an OpenAlex timestamp as an ISO date, or unchanged.
+
+    Accepts JavaScript's `Date.toString()` form ("Tue Feb 16 2027
+    14:16:51 GMT+0000 (...)") and ISO 8601; the date is the one written
+    in the timestamp, in its own offset.
+    """
+    match = JS_DATE_PATTERN.match(text) if isinstance(text, str) else None
+    if match and match["month"] in MONTH_ABBREVIATIONS:
+        try:
+            return datetime.date(
+                int(match["year"]),
+                MONTH_ABBREVIATIONS.index(match["month"]) + 1,
+                int(match["day"]),
+            ).isoformat()
+        except ValueError:
+            return text
+    try:
+        return datetime.datetime.fromisoformat(
+            text.replace("Z", "+00:00")
+        ).date().isoformat()
+    except (AttributeError, TypeError, ValueError):
+        return str(text)
+<<openalex constants>>=
+JS_DATE_PATTERN = re.compile(
+    r"[A-Z][a-z]{2} (?P<month>[A-Z][a-z]{2}) (?P<day>\d{1,2})"
+    r" (?P<year>\d{4})\b"
+)
+MONTH_ABBREVIATIONS = (
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+)
+<<openalex imports>>=
+import datetime
+import re
+
+from requests.structures import CaseInsensitiveDict
+@
+
+\paragraph{When a 429 means the budget is spent.}
 A 429 from OpenAlex means one of two things: too many requests per
 second, which the [[Retry-After]] header resolves in seconds, or a spent
-daily budget, which the [[X-RateLimit-Remaining-USD]] header reports as
-zero.  The second case used to surface as a bare \enquote{429} warning
+budget, which lasts until the reset at midnight UTC.
+The second case used to surface as a bare \enquote{429} warning
 and, worse, was retried on the next command.  Feeding the response to
 the limiter syncs the headers and starts the cooldown; a spent budget is
 then escalated to a quota block that lasts until the reset the
@@ -3104,24 +3221,73 @@ provider instead of burning a request to learn the same thing.  The
 warning names the reset time and, when no key is configured, the one
 change that would have avoided the block.
 
+Telling the two apart used to rest on [[X-RateLimit-Remaining-USD]]
+alone, and that header counts only the day's allowance: on 2026-11-18 a
+keyed [[GET /works?search=test&per-page=1]] answered with
+[[X-RateLimit-Remaining-USD: 0.0186]] next to
+[[X-RateLimit-Prepaid-Remaining-USD: 5]] and
+[[X-RateLimit-Onetime-Remaining: 50000]].
+A per-second 429 that happened to arrive after the day's allowance was
+used up would thus have blocked a key with prepaid credit until
+midnight.
+OpenAlex's error documentation
+(\url{https://help.openalex.org/api/errors/}, read 2026-11-18) gives the
+deciding signal: a 429 body has a [[reason]], and
+[[daily_budget]] means \enquote{Today's budget (and any prepaid usage)
+is spent}, while the other reasons ([[requests_per_second]] and the
+query-shape limits) leave the budget alone.
+When the body names a reason, that decides, and it decides for the
+whole response: a reason other than [[daily_budget]] says the budget was
+not what ran out, so that response's [[X-RateLimit-Remaining]] does not
+reach the limiter either (\cref{sec:openalex-prepaid}).
+Otherwise a per-second 429 that reported a daily count of zero would
+start a short [[Retry-After]] cooldown and, once that had passed, leave
+the stored zero to block the quota group until midnight after all.
+Should the day really be spent, the next request costs nothing (see
+below) and its [[daily_budget]] answer blocks properly.
+When the body has no reason (the documentation also mentions rare 429s
+without one), the headers decide, and the budget counts as spent only
+when the daily allowance is zero \emph{and} neither prepaid nor one-time
+credit is reported.
+The headers are read with the limiter's own [[_get_header]], which also
+tries the lower-case name, so a plain dictionary from a test or another
+caller is read like the case-insensitive headers of a real response.
+Counting the undocumented one-time credits as credit errs towards not
+blocking, which is the cheaper mistake: the documentation says error
+responses cost nothing, so a wrong guess costs one refused request per
+[[Retry-After]], whereas the opposite mistake silences the provider
+until midnight.
+
 <<openalex budget reporting>>=
 def _record_429(self, response) -> bool:
-    """Persist a 429; return whether it was a spent daily budget."""
-    self._limiter.record_response(response)
-    headers = response.headers or {}
-    try:
-        spent = float(headers.get("X-RateLimit-Remaining-USD")) <= 0
-    except (TypeError, ValueError):
-        spent = False
+    """Persist a 429; return whether the whole budget was spent."""
+    reason = _rejection_reason(response)
+    spent = self._budget_spent(response, reason)
+    self._record_response(
+        response, daily_count_applies=reason is None or spent
+    )
     if spent:
+        reset = _openalex_header(response, "X-RateLimit-Reset")
         try:
-            until = time.time() + float(headers.get("X-RateLimit-Reset"))
+            until = time.time() + float(reset)
         except (TypeError, ValueError):
             until = None
         self._limiter.record_limit_hit(
             until=until, reason="daily budget spent", exhausted_daily=True
         )
     return spent
+
+@staticmethod
+def _budget_spent(response, reason: str | None) -> bool:
+    """Whether a 429 says the daily and any prepaid budget are spent."""
+    if reason is not None:
+        return reason == OPENALEX_BUDGET_SPENT_REASON
+    remaining_usd = _openalex_header(response, "X-RateLimit-Remaining-USD")
+    try:
+        daily_spent = float(remaining_usd) <= 0
+    except (TypeError, ValueError):
+        return False
+    return daily_spent and not _credit_beyond_daily(response)
 
 def _note_http_error(self, error: requests.HTTPError) -> None:
     """Log an HTTP failure, translating a spent budget into a reset time."""
@@ -3144,6 +3310,81 @@ def _note_http_error(self, error: requests.HTTPError) -> None:
             "%s: rate limited (HTTP 429); retry %s",
             self.name, format_retry(retry_at),
         )
+<<openalex helpers>>=
+def _rejection_reason(response) -> str | None:
+    """Return the `reason` of an OpenAlex error body, if it has one."""
+    try:
+        body = response.json()
+    except ValueError:
+        return None
+    reason = body.get("reason") if isinstance(body, dict) else None
+    return reason if isinstance(reason, str) else None
+
+
+def _openalex_header(response, name: str):
+    """Return header `name` of `response`, in either spelling, or `None`."""
+    return ratelimit._get_header(response.headers or {}, name)
+
+
+def _credit_beyond_daily(response) -> bool:
+    """Whether the response reports prepaid or one-time credit left."""
+    for name in (OPENALEX_PREPAID_HEADER, OPENALEX_ONETIME_HEADER):
+        try:
+            if float(_openalex_header(response, name)) > 0:
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+<<openalex constants>>=
+OPENALEX_BUDGET_SPENT_REASON = "daily_budget"
+OPENALEX_PREPAID_HEADER = "X-RateLimit-Prepaid-Remaining-USD"
+OPENALEX_ONETIME_HEADER = "X-RateLimit-Onetime-Remaining"
+@
+
+\paragraph{Keeping the daily count out of the limiter.}
+\label{sec:openalex-prepaid}
+The same blind spot sat in the header sync.
+The limiter stores [[X-RateLimit-Remaining]] and treats a zero as a
+provider-reported quota block until [[X-RateLimit-Reset]]
+(\cref{sec:ratelimit-record-response}).
+For OpenAlex that header is the day's allowance in credits (186 in the
+response above, next to 50000 one-time credits), so a probe answered
+after the allowance ran out would have blocked the whole quota group
+while prepaid credit paid for every request.
+The fix belongs here, not in the limiter: what a provider's
+[[X-RateLimit-Remaining]] counts is the provider's business, and for
+Scopus it is the whole weekly quota.
+So, while the headers report credit beyond the day, and for a 429 whose
+reason says the budget is untouched, the OpenAlex provider hands the
+limiter the response without that one header; the reset and a 429's
+[[Retry-After]] still get through.
+The number is dropped rather than corrected because summing it with the
+one-time credits would assume a conversion the documentation does not
+give.
+The price is in [[scholar providers limits]]: while prepaid or one-time
+credit is reported, its remaining column gets no fresh count.
+It shows the count synced before the credit appeared, if any, until the
+reset clears it, and nothing after that.
+
+A count of zero stored \emph{before} the credit was bought is not undone
+by this: [[check_provider]] reports the block without probing, so
+nothing reaches the sync until the reset.
+[[scholar providers limits --reset openalex]] clears it at once.
+
+<<openalex budget reporting>>=
+def _record_response(
+    self, response, daily_count_applies: bool = True
+) -> None:
+    """Hand a response to the limiter, minus a daily-only count."""
+    if not daily_count_applies or _credit_beyond_daily(response):
+        headers = CaseInsensitiveDict(response.headers or {})
+        headers.pop("X-RateLimit-Remaining", None)
+        response = SimpleNamespace(
+            status_code=response.status_code, headers=headers
+        )
+    self._limiter.record_response(response)
+<<openalex imports>>=
+from types import SimpleNamespace
 @
 
 Let's verify the key reaches [[pyalex]] and the probe, that the probe
@@ -3232,6 +3473,240 @@ class TestOpenAlexApiKey:
         assert availability.ok is False
         assert availability.quota is True
         assert availability.retry_at > time.time() + 3000
+@
+
+Prepaid credit (\cref{sec:openalex-prepaid}) is tested on what OpenAlex
+actually sent.
+[[OPENALEX_RECORDED_REPORT]] is the body of a keyed
+[[GET https://api.openalex.org/rate-limit]] on 2026-11-18, with the key
+removed and the [[rate_limit]] object trimmed to the fields the message
+reads; the account had spent most of its day and held \$5 of prepaid
+credit.
+[[OPENALEX_RECORDED_HEADERS]] are the [[X-RateLimit-*]] headers of a
+keyed [[GET https://api.openalex.org/works?search=test&per-page=1]] a
+few seconds later, lower-case as they arrived over HTTP/2.
+They go into real [[requests.Response]] objects rather than the
+[[Mock]]s above, so the header lookups meet the case-insensitive
+dictionary that [[requests]] really hands over.
+No 429 was recorded: spending the budget on purpose costs money, so the
+429s below are the recorded headers with the day's allowance set to zero
+and, where the reason matters, a body shaped like the examples in
+OpenAlex's error documentation.
+
+<<test functions>>=
+OPENALEX_RECORDED_REPORT = (
+    b'{"rate_limit": {"daily_budget_usd": 1, "daily_remaining_usd": 0.0196,'
+    b' "prepaid_remaining_usd": 5, "prepaid_expires_at": "Tue Feb 16 2027'
+    b' 14:16:51 GMT+0000 (Coordinated Universal Time)",'
+    b' "resets_in_seconds": 31242, "onetime_credits_remaining": 50000,'
+    b' "onetime_credits_expires_at": "Tue Feb 16 2027 14:16:51 GMT+0000'
+    b' (Coordinated Universal Time)"}}'
+)
+OPENALEX_RECORDED_HEADERS = {
+    "content-type": "application/json",
+    "x-ratelimit-cost-usd": "0.001",
+    "x-ratelimit-credits-used": "10",
+    "x-ratelimit-limit": "10000",
+    "x-ratelimit-limit-usd": "1",
+    "x-ratelimit-onetime-remaining": "50000",
+    "x-ratelimit-prepaid-remaining-usd": "5",
+    "x-ratelimit-remaining": "186",
+    "x-ratelimit-remaining-usd": "0.0186",
+    "x-ratelimit-reset": "31231",
+}
+DAILY_ALLOWANCE_SPENT = {
+    "x-ratelimit-remaining": "0", "x-ratelimit-remaining-usd": "0",
+}
+NO_CREDIT_BEYOND_DAILY = {
+    "x-ratelimit-prepaid-remaining-usd": "0",
+    "x-ratelimit-onetime-remaining": "0",
+}
+
+
+def openalex_response(status, headers, body=b"{}"):
+    """A real `requests.Response` carrying recorded OpenAlex headers."""
+    response = requests.Response()
+    response.status_code = status
+    response.headers = requests.structures.CaseInsensitiveDict(headers)
+    response._content = body
+    response.url = OPENALEX_API_URL
+    return response
+
+
+class TestOpenAlexPrepaidCredit:
+    """Prepaid credit in the health message, the 429s and the header sync."""
+
+    <<openalex prepaid credit test methods>>
+@
+
+The message must show the prepaid credit next to the day's allowance,
+and the one-time credits as reported; without them it stays as it was
+(the budget test in [[TestOpenAlexApiKey]] pins that wording).
+
+<<openalex prepaid credit test methods>>=
+@staticmethod
+def check_with_report(monkeypatch, report):
+    monkeypatch.setenv("OPENALEX_API_KEY", "k-123")
+    provider = OpenAlexProvider()
+    responses = [
+        openalex_response(200, OPENALEX_RECORDED_HEADERS),
+        openalex_response(
+            200, {"content-type": "application/json"}, report
+        ),
+    ]
+    with patch("requests.get", side_effect=responses):
+        return provider.check()
+
+def test_recorded_report_shows_prepaid_and_onetime_credit(
+        self, monkeypatch):
+    status, message = self.check_with_report(
+        monkeypatch, OPENALEX_RECORDED_REPORT
+    )
+    assert status == HEALTH_OK
+    assert message.startswith(
+        "API key configured; $0.020 of $1.00 daily"
+        " + $5.00 prepaid (expires 2027-02-16)"
+        " + 50000 one-time credits (expires 2027-02-16) left; resets "
+    )
+
+def test_unparseable_expiry_is_shown_as_received(self, monkeypatch):
+    report = OPENALEX_RECORDED_REPORT.replace(
+        b'"prepaid_expires_at": "Tue Feb 16 2027',
+        b'"prepaid_expires_at": "sometime in February", "x": "',
+    ).replace(
+        b'"onetime_credits_remaining": 50000',
+        b'"onetime_credits_remaining": 0',
+    )
+    _, message = self.check_with_report(monkeypatch, report)
+    assert (
+        "daily + $5.00 prepaid (expires sometime in February) left"
+        in message
+    )
+    assert "one-time" not in message
+@
+
+The expiry parser is checked on its own for the two forms it accepts and
+for a date that matches the pattern but does not exist:
+
+<<openalex prepaid credit test methods>>=
+@pytest.mark.parametrize("text, expected", [
+    ("Tue Feb 16 2027 14:16:51 GMT+0000 (Coordinated Universal Time)",
+     "2027-02-16"),
+    ("2026-11-19T00:00:00.000Z", "2026-11-19"),
+    ("Tue Feb 30 2027 14:16:51 GMT+0000",
+     "Tue Feb 30 2027 14:16:51 GMT+0000"),
+])
+def test_openalex_date(self, text, expected):
+    assert openalex_date(text) == expected
+@
+
+A probe answered after the day's allowance ran out must not block the
+quota group while prepaid credit is reported, and must block it, as
+before, when nothing is left beyond the day.
+
+<<openalex prepaid credit test methods>>=
+@pytest.mark.parametrize("beyond_daily, blocked", [
+    ({}, False), (NO_CREDIT_BEYOND_DAILY, True),
+], ids=["prepaid-left", "nothing-left"])
+def test_probe_sync_blocks_only_when_nothing_is_left(
+        self, monkeypatch, beyond_daily, blocked):
+    monkeypatch.delenv("OPENALEX_API_KEY", raising=False)
+    provider = OpenAlexProvider()
+    headers = {
+        **OPENALEX_RECORDED_HEADERS, **DAILY_ALLOWANCE_SPENT,
+        **beyond_daily,
+    }
+    with patch(
+        "requests.get", return_value=openalex_response(200, headers)
+    ):
+        provider.check()
+    availability = provider._limiter.check_available()
+    assert availability.ok is not blocked
+    assert availability.quota is blocked
+@
+
+A 429 with the day spent and prepaid credit left is a rate limit: a
+short cooldown and a \enquote{rate limited} warning, not a block until
+midnight.
+With nothing left beyond the day it is the quota block it always was.
+When the body names a reason, the reason decides, even against the
+headers.
+
+<<openalex prepaid credit test methods>>=
+@pytest.mark.parametrize("beyond_daily, body, spent", [
+    ({}, b"{}", False),
+    (NO_CREDIT_BEYOND_DAILY, b"{}", True),
+    ({}, b'{"reason": "daily_budget"}', True),
+    (NO_CREDIT_BEYOND_DAILY, b'{"reason": "requests_per_second"}', False),
+], ids=["prepaid-left", "nothing-left", "reason-daily-budget",
+        "reason-per-second"])
+def test_429_blocks_only_when_the_budget_is_spent(
+        self, monkeypatch, caplog, beyond_daily, body, spent):
+    monkeypatch.delenv("OPENALEX_API_KEY", raising=False)
+    provider = OpenAlexProvider()
+    headers = {
+        **OPENALEX_RECORDED_HEADERS, **DAILY_ALLOWANCE_SPENT,
+        **beyond_daily, "retry-after": "30",
+    }
+    response = openalex_response(429, headers, body)
+    error = requests.HTTPError(response=response)
+    with caplog.at_level(logging.WARNING):
+        with patch.object(
+            provider, "_search_uncached", side_effect=error
+        ):
+            assert provider.search("prepaid test") == []
+    availability = provider._limiter.check_available()
+    assert availability.ok is False
+    assert availability.quota is spent
+    if spent:
+        assert availability.retry_at > time.time() + 30000
+        assert "daily budget spent" in caplog.text
+    else:
+        assert availability.retry_at < time.time() + 60
+        assert "rate limited (HTTP 429)" in caplog.text
+    after_cooldown = time.time() + 61
+    monkeypatch.setattr(ratelimit, "_now", lambda: after_cooldown)
+    assert provider._limiter.check_available().ok is not spent
+@
+
+The last two lines matter for the rate-limit cases: the [[Retry-After]]
+cooldown alone would hide a daily count of zero synced from the same
+429, which would surface only once the cooldown had passed.
+
+Callers that pass plain dictionaries (as the [[Mock]]s in
+[[TestOpenAlexApiKey]] do) must get the same answer as a real response,
+whatever the spelling of the header names:
+
+<<openalex prepaid credit test methods>>=
+@staticmethod
+def plain_response(status_code, headers):
+    response = Mock(status_code=status_code, ok=status_code < 400,
+                    headers=dict(headers))
+    response.json.return_value = {}
+    return response
+
+def test_plain_lower_case_prepaid_header_is_read(self, monkeypatch):
+    monkeypatch.delenv("OPENALEX_API_KEY", raising=False)
+    provider = OpenAlexProvider()
+    response = self.plain_response(200, {
+        **DAILY_ALLOWANCE_SPENT, "x-ratelimit-reset": "31231",
+        "x-ratelimit-prepaid-remaining-usd": "5",
+    })
+    with patch("requests.get", return_value=response):
+        assert provider.check()[0] == HEALTH_OK
+    assert provider._limiter.check_available().ok is True
+
+def test_plain_lower_case_spent_budget_is_read(self, monkeypatch):
+    monkeypatch.delenv("OPENALEX_API_KEY", raising=False)
+    provider = OpenAlexProvider()
+    response = self.plain_response(429, {
+        **DAILY_ALLOWANCE_SPENT, **NO_CREDIT_BEYOND_DAILY,
+        "x-ratelimit-reset": "31231",
+    })
+    assert provider._record_429(response) is True
+    availability = provider._limiter.check_available()
+    assert availability.quota is True
+    assert availability.retry_at > time.time() + 30000
 @
 
 \subsubsection{Applying filters}
@@ -3646,6 +4121,453 @@ def get_paper_by_doi(self, doi: str | None) -> Paper | None:
     except Exception as e:
         logger.warning("openalex: DOI lookup failed: %s", e)
         return None
+@
+
+\subsubsection{Many DOIs in one request}
+\label{sec:openalex-doi-batch}
+
+[[get_paper_by_doi]] costs one request per paper, and enriching a
+session of a few thousand papers therefore costs a few thousand
+requests against the metered budget of \cref{sec:openalex-budget}
+(\url{https://github.com/dbosk/scholar/issues/137}).
+OpenAlex can answer many DOIs at once: its documentation
+(\url{https://help.openalex.org/how-to-use-the-api/get-lists-of-entities/filter-entity-lists},
+read 2026-11-18) says that the pipe [[|]] combines up to 100 values
+of one filter with OR, gives
+[[/works?filter=doi:https://doi.org/...|https://doi.org/...]]
+as its example of fetching two works by DOI in one request, and
+advises [[per_page=100]] to get all results.
+[[pyalex]] builds that filter with [[filter_or]] (its own lookup of a
+list of OpenAlex ids does the same), quoting each value but not the
+pipes between them.
+
+[[prefetch_dois]] uses this to \emph{fill the cache} that
+[[get_paper_by_doi]] reads, rather than to return papers.
+That keeps the enrichment loop (\cref{enrich-module}) unchanged:
+it still asks provider after provider for one DOI at a time, and the
+OpenAlex step simply finds its answer in the cache.
+A batch of 50 values stays well under the documented 100, and a page
+of 100 results leaves room for DOIs that match more than one work.
+
+What the batch may cache is narrower than what a single lookup
+caches, because the two answer different questions.
+[[get_paper_by_doi]] asks OpenAlex for \emph{the} work under a DOI,
+and OpenAlex picks one; the filter returns every work whose DOI
+matches.
+So we cache a DOI only when exactly one work came back for it: with
+two candidates we would be choosing for OpenAlex, possibly not the
+work its single lookup returns, and in a cache that never expires.
+For the same reason a DOI with no work in the result is not cached as
+a miss.  The singleton lookup still runs for it and caches a genuine
+404 itself (\cref{sec:openalex-refusal} and above), so the batch can
+only save requests, never change an answer.
+When the result reports more works than the page holds, some DOI's
+works may be missing from the page, and \enquote{exactly one} can no
+longer be told apart from \enquote{one of several}; that batch caches
+nothing.
+
+The cache key is the DOI spelled as the caller spelled it, as in
+[[get_paper_by_doi]].
+Several spellings of one DOI ([[10.1/ABC]] and [[10.1/abc]], or one
+with a resolver prefix) are grouped under [[Paper._normalize_doi]],
+the normalisation paper identity uses, so the DOI is requested once
+and its work is stored under every spelling.
+We leave out DOIs that cannot travel as a filter value: a comma
+separates filters, a pipe separates OR values, and a plus or
+whitespace may arrive as a space; such DOIs are rare, and the single
+lookup still handles them.
+A failure ends the prefetch: a refusal by the limiter, an HTTP error
+(logged through [[_note_http_error]], which turns a spent budget into
+a block) or anything else.
+Nothing more is cached and nothing is raised, since the singleton
+lookups that follow will meet the same condition and handle it as
+they always have.
+
+<<openalex get paper by doi>>=
+def prefetch_dois(self, dois: Iterable[str]) -> int:
+    """Look up many DOIs in a few requests and cache the answers.
+
+    Afterwards `get_paper_by_doi` answers each prefetched DOI from the
+    cache. DOIs already cached, and DOIs the OR filter cannot carry
+    (with a comma, pipe, plus or whitespace), are skipped. Only a DOI
+    that matches exactly one work is cached; misses and ambiguous
+    DOIs are left to `get_paper_by_doi`. Stops quietly at the first
+    failure.
+
+    Returns:
+        The number of cache entries written.
+    """
+    spellings = self._uncached_doi_spellings(dois)
+    keys = list(spellings)
+    cached = 0
+    for start in range(0, len(keys), OPENALEX_DOI_BATCH_SIZE):
+        batch = keys[start:start + OPENALEX_DOI_BATCH_SIZE]
+        works = self._fetch_works_by_doi(batch)
+        if works is None:
+            break
+        cached += self._cache_unique_works(batch, spellings, works)
+    logger.info(
+        "%s: prefetched %d of %d DOIs", self.name, cached,
+        sum(len(group) for group in spellings.values()),
+    )
+    return cached
+
+def _uncached_doi_spellings(
+    self, dois: Iterable[str]
+) -> dict[str, list[str]]:
+    """Group the uncached, filter-safe DOIs by normalised DOI."""
+    spellings: dict[str, list[str]] = {}
+    for doi in dois:
+        if not doi or OPENALEX_DOI_UNSAFE.search(doi):
+            continue
+        if ("doi", self.CACHE_VERSION, doi) in self._cache:
+            continue
+        group = spellings.setdefault(Paper._normalize_doi(doi), [])
+        if doi not in group:
+            group.append(doi)
+    return spellings
+
+def _fetch_works_by_doi(self, batch: list[str]) -> list[dict] | None:
+    """Return the works matching `batch`, or None after a failure."""
+    try:
+        self._limiter.acquire()
+        response = pyalex.Works().filter_or(
+            doi=[f"https://doi.org/{doi}" for doi in batch]
+        ).get(per_page=OPENALEX_DOI_PAGE_SIZE)
+    except RateLimited:
+        # The limiter already logged the reason once
+        return None
+    except requests.exceptions.HTTPError as e:
+        self._note_http_error(e)
+        return None
+    except Exception as e:
+        logger.warning("%s: DOI batch lookup failed: %s", self.name, e)
+        return None
+    works = list(response)
+    count = (getattr(response, "meta", None) or {}).get("count")
+    if isinstance(count, int) and count > len(works):
+        logger.debug(
+            "%s: DOI batch matched %d works, more than one page; "
+            "caching none of them", self.name, count,
+        )
+        return []
+    return works
+
+def _cache_unique_works(
+    self,
+    batch: list[str],
+    spellings: dict[str, list[str]],
+    works: list[dict],
+) -> int:
+    """Cache each DOI of `batch` that exactly one of `works` matches."""
+    by_doi: dict[str, list[dict]] = {}
+    for work in works:
+        key = Paper._normalize_doi(work.get("doi") or "")
+        by_doi.setdefault(key, []).append(work)
+    cached = 0
+    for key in batch:
+        matches = by_doi.get(key, [])
+        if len(matches) != 1:
+            continue
+        paper = self._convert_work(matches[0])
+        for doi in spellings[key]:
+            self._cache[("doi", self.CACHE_VERSION, doi)] = paper
+            cached += 1
+    return cached
+<<constants>>=
+OPENALEX_DOI_BATCH_SIZE = 50   # DOIs per request; OpenAlex allows 100
+OPENALEX_DOI_PAGE_SIZE = 100   # results per request, room for duplicates
+OPENALEX_DOI_UNSAFE = re.compile(r"[,|+\s]")
+<<openalex imports>>=
+import re
+from collections.abc import Iterable
+@
+
+To test the batch we replay a recorded OpenAlex answer through
+[[pyalex]]'s own request code, replacing only the
+[[requests.Session.get]] it calls, so the URL [[pyalex]] builds and
+its parsing of the reply are the real ones.
+The recording is one request made on 2026-11-18, without a key or
+contact email, to the URL that [[prefetch_dois]] builds (one line,
+broken here at the pipes):
+\begin{verbatim}
+https://api.openalex.org/works?filter=doi:https%3A%2F%2Fdoi.org%2F10.1371%2Fjournal.pone.0266781
+  |https%3A%2F%2Fdoi.org%2F10.1371%2Fjournal.pone.0267149
+  |https%3A%2F%2Fdoi.org%2F10.5555%2Fscholar-137-no-such-doi&per-page=100
+\end{verbatim}
+It asks for two real DOIs (the pair from the OpenAlex documentation)
+and one that does not exist.
+OpenAlex answered with [[count]] 2 and the two works.
+We kept only the fields [[_convert_work]] reads, cut each abstract
+index to its first eight words and each keyword list to three, and
+replaced the author names by placeholders.
+
+<<test functions>>=
+RECORDED_OPENALEX_DOI_BATCH = {
+  "meta": {"count": 2, "page": 1, "per_page": 100},
+  "results": [
+    {
+      "id": "https://openalex.org/W4224016882",
+      "doi": "https://doi.org/10.1371/journal.pone.0266781",
+      "title": "6 month serologic response to the Pfizer-BioNTech "
+               "COVID-19 vaccine among healthcare workers",
+      "publication_year": 2022,
+      "authorships": [{"author": {"display_name": "Author A"}},
+                      {"author": {"display_name": "Author B"}}],
+      "primary_location": {
+        "source": {"display_name": "PLoS ONE"},
+        "pdf_url": "https://journals.plos.org/plosone/article/file"
+                   "?id=10.1371/journal.pone.0266781&type=printable",
+        "landing_page_url":
+          "https://doi.org/10.1371/journal.pone.0266781",
+      },
+      "open_access": {
+        "oa_url": "https://journals.plos.org/plosone/article/file"
+                  "?id=10.1371/journal.pone.0266781&type=printable",
+      },
+      "abstract_inverted_index": {
+        "AIM:": [0], "Healthcare": [1], "workers": [2], "(HCWs)": [3],
+        "were": [4], "among": [5], "the": [6], "first": [7],
+      },
+      "keywords": [{"display_name": "BNT162b2"},
+                   {"display_name": "COVID-19 vaccines"},
+                   {"display_name": "SARS-CoV-2"}],
+    },
+    {
+      "id": "https://openalex.org/W4223895588",
+      "doi": "https://doi.org/10.1371/journal.pone.0267149",
+      "title": "Refractive and visual function changes in twilight "
+               "conditions",
+      "publication_year": 2022,
+      "authorships": [{"author": {"display_name": "Author A"}},
+                      {"author": {"display_name": "Author B"}}],
+      "primary_location": {
+        "source": {"display_name": "PLoS ONE"},
+        "pdf_url": "https://journals.plos.org/plosone/article/file"
+                   "?id=10.1371/journal.pone.0267149&type=printable",
+        "landing_page_url":
+          "https://doi.org/10.1371/journal.pone.0267149",
+      },
+      "open_access": {
+        "oa_url": "https://journals.plos.org/plosone/article/file"
+                  "?id=10.1371/journal.pone.0267149&type=printable",
+      },
+      "abstract_inverted_index": {
+        "PURPOSE:": [0], "We": [1], "investigated": [2], "the": [3],
+        "effect": [4], "of": [5], "luminance": [6], "on": [7],
+      },
+      "keywords": [{"display_name": "twilight vision"},
+                   {"display_name": "low luminance"},
+                   {"display_name": "refraction"}],
+    },
+  ],
+}
+RECORDED_DOI_A = "10.1371/journal.pone.0266781"
+RECORDED_DOI_B = "10.1371/journal.pone.0267149"
+RECORDED_DOI_MISSING = "10.5555/scholar-137-no-such-doi"
+
+
+def openalex_reply(status=200, payload=None, headers=None):
+  """Build the `requests.Response` OpenAlex would send."""
+  import json
+
+  response = requests.models.Response()
+  response.status_code = status
+  response._content = json.dumps(
+    payload if payload is not None else {}
+  ).encode()
+  response.headers.update(
+    {"Content-Type": "application/json", **(headers or {})}
+  )
+  response.url = "https://api.openalex.org/works"
+  return response
+
+
+@pytest.fixture
+def openalex_replay(monkeypatch):
+  """Answer pyalex's requests from `replies`, recording each URL.
+
+  The last reply is repeated once the others are used up.
+  """
+  urls, replies = [], []
+
+  def fake_get(session, url, **kwargs):
+    urls.append(url)
+    return replies.pop(0) if len(replies) > 1 else replies[0]
+
+  monkeypatch.setattr(requests.Session, "get", fake_get)
+  return urls, replies
+
+
+class TestOpenAlexPrefetchDois:
+  """Batched DOI lookups fill the cache `get_paper_by_doi` reads."""
+
+  <<openalex prefetch test methods>>
+@
+
+One request carries all three DOIs, as an OR filter on [[doi]];
+afterwards the two found DOIs are answered from the cache, while the
+missing one still gets its own lookup, whose 404 that lookup caches.
+
+<<openalex prefetch test methods>>=
+def test_one_request_then_cache_hits(self, openalex_replay):
+  urls, replies = openalex_replay
+  replies.append(openalex_reply(payload=RECORDED_OPENALEX_DOI_BATCH))
+  provider = OpenAlexProvider(api_key=None)
+  dois = [RECORDED_DOI_A, RECORDED_DOI_B, RECORDED_DOI_MISSING]
+
+  assert provider.prefetch_dois(dois) == 2
+  assert len(urls) == 1
+  assert "filter=doi:" in urls[0]
+  assert urls[0].count("|") == 2
+  assert "journal.pone.0266781" in urls[0]
+  assert "per-page=100" in urls[0]
+
+  paper = provider.get_paper_by_doi(RECORDED_DOI_A)
+  assert paper.title.startswith("6 month serologic response")
+  assert paper.abstract.startswith("AIM: Healthcare workers")
+  assert provider.get_paper_by_doi(RECORDED_DOI_B).year == 2022
+  assert len(urls) == 1
+
+  replies[:] = [openalex_reply(404, {"error": "not found"})]
+  assert provider.get_paper_by_doi(RECORDED_DOI_MISSING) is None
+  assert len(urls) == 2
+@
+
+A DOI may reach us in any case, and the cache is keyed by the
+spelling the caller uses.  Two spellings of one DOI are requested once
+and both are cached:
+
+<<openalex prefetch test methods>>=
+def test_spellings_requested_once_cached_each(self, openalex_replay):
+  urls, replies = openalex_replay
+  replies.append(openalex_reply(payload=RECORDED_OPENALEX_DOI_BATCH))
+  provider = OpenAlexProvider(api_key=None)
+  upper = RECORDED_DOI_A.upper()
+
+  assert provider.prefetch_dois([upper, RECORDED_DOI_A]) == 2
+  assert urls[0].count("|") == 0
+  assert provider.get_paper_by_doi(upper).doi == RECORDED_DOI_A
+  assert provider.get_paper_by_doi(RECORDED_DOI_A) is not None
+  assert len(urls) == 1
+@
+
+Two works under one DOI leave that DOI uncached, while the other DOI
+of the batch is cached as usual:
+
+<<openalex prefetch test methods>>=
+def test_duplicate_works_not_cached(self, openalex_replay):
+  import copy
+
+  urls, replies = openalex_replay
+  payload = copy.deepcopy(RECORDED_OPENALEX_DOI_BATCH)
+  twin = copy.deepcopy(payload["results"][0])
+  twin["id"] = "https://openalex.org/W1"
+  payload["results"].append(twin)
+  payload["meta"]["count"] = 3
+  replies.append(openalex_reply(payload=payload))
+  provider = OpenAlexProvider(api_key=None)
+
+  assert provider.prefetch_dois([RECORDED_DOI_A, RECORDED_DOI_B]) == 1
+  key = ("doi", provider.CACHE_VERSION, RECORDED_DOI_A)
+  assert key not in provider._cache
+  assert ("doi", provider.CACHE_VERSION, RECORDED_DOI_B) in provider._cache
+@
+
+When OpenAlex reports more matches than the page holds, a DOI that
+appears once on the page may have a twin on the next, so the batch
+caches nothing:
+
+<<openalex prefetch test methods>>=
+def test_truncated_page_caches_nothing(self, openalex_replay):
+  import copy
+
+  urls, replies = openalex_replay
+  payload = copy.deepcopy(RECORDED_OPENALEX_DOI_BATCH)
+  payload["meta"]["count"] = 150
+  replies.append(openalex_reply(payload=payload))
+  provider = OpenAlexProvider(api_key=None)
+
+  assert provider.prefetch_dois([RECORDED_DOI_A, RECORDED_DOI_B]) == 0
+  assert not any(key[0] == "doi" for key in provider._cache)
+@
+
+A failed request caches nothing and raises nothing; a spent budget
+(a 429) and a server error alike end the prefetch after one request,
+however many batches were left:
+
+<<openalex prefetch test methods>>=
+@pytest.mark.parametrize("status", [429, 500])
+def test_failure_caches_nothing(self, openalex_replay, status):
+  urls, replies = openalex_replay
+  replies.append(openalex_reply(status, {"error": "failed"}))
+  provider = OpenAlexProvider(api_key=None)
+  dois = [f"10.5555/fail-{i}" for i in range(120)]
+
+  assert provider.prefetch_dois(dois) == 0
+  assert len(urls) == 1
+  assert not any(key[0] == "doi" for key in provider._cache)
+@
+
+A DOI holding a comma, a pipe, a plus or whitespace would break the
+filter, so it never reaches a request:
+
+<<openalex prefetch test methods>>=
+def test_unsafe_dois_excluded(self, openalex_replay):
+  urls, replies = openalex_replay
+  replies.append(openalex_reply(payload={"meta": {}, "results": []}))
+  provider = OpenAlexProvider(api_key=None)
+  unsafe = ["10.1/a,b", "10.1/a|b", "10.1/a+b", "10.1/a b"]
+
+  assert provider.prefetch_dois(unsafe) == 0
+  assert urls == []
+@
+
+Batches hold at most 50 DOIs, and DOIs already in the cache are not
+asked for again:
+
+<<openalex prefetch test methods>>=
+def test_batches_of_fifty(self, openalex_replay):
+  urls, replies = openalex_replay
+  replies.append(openalex_reply(payload={"meta": {}, "results": []}))
+  provider = OpenAlexProvider(api_key=None)
+
+  provider.prefetch_dois([f"10.5555/many-{i}" for i in range(120)])
+  assert [url.count("|") + 1 for url in urls] == [50, 50, 20]
+
+def test_cached_dois_not_requested(self, openalex_replay):
+  urls, replies = openalex_replay
+  replies.append(openalex_reply(payload=RECORDED_OPENALEX_DOI_BATCH))
+  provider = OpenAlexProvider(api_key=None)
+  provider.prefetch_dois([RECORDED_DOI_A, RECORDED_DOI_B])
+
+  assert provider.prefetch_dois([RECORDED_DOI_A, RECORDED_DOI_B]) == 0
+  assert len(urls) == 1
+@
+
+Finally, a live check that the batch and the single lookup still
+agree: with [[--run-live]] it fetches the two recorded DOIs once as a
+batch and once each, three requests in all.
+
+<<openalex prefetch test methods>>=
+@pytest.mark.integration
+def test_batch_matches_single_lookup(self):
+  provider = OpenAlexProvider()
+  dois = [RECORDED_DOI_A, RECORDED_DOI_B]
+  for doi in dois:
+    provider._cache.pop(("doi", provider.CACHE_VERSION, doi), None)
+  if provider.prefetch_dois(dois) != 2:
+    pytest.skip("OpenAlex batch lookup unavailable")
+  batched = {
+    doi: provider._cache.pop(("doi", provider.CACHE_VERSION, doi))
+    for doi in dois
+  }
+  for doi in dois:
+    single = provider.get_paper_by_doi(doi)
+    assert single is not None
+    for field in ("title", "authors", "year", "doi", "abstract",
+                  "venue", "pdf_url", "tags"):
+      assert getattr(batched[doi], field) == getattr(single, field)
 @
 
 \subsubsection{Preprint locations of a work}
@@ -11082,6 +12004,8 @@ class ScopusProvider:
         )
         self.view_mode = scopus_view_mode(view)
         self._complete_ok: bool | None = None
+        self._complete_doubt: str | None = None
+        self._doubt_reported = False
         self._cache: dict = load_cache(self.name)
         register_cache(self.name, self._cache)
         self._limiter = limiter_for(self)
@@ -11293,7 +12217,26 @@ logger.info(
 if self.view_mode != "standard" and complete_key in self._cache:
     return self._cache[complete_key]
 if standard_key in self._cache and not self._complete_confirmed():
+    <<warn once that the cached standard view may be outdated>>
     return self._cache[standard_key]
+@
+
+Serving on after an inconclusive probe is silent no longer: the
+reason the probe left in [[_complete_doubt]] (a refusal leaves none,
+since that is the expected off-campus answer) goes into one warning per
+process.  The remedy it names is explained in
+\cref{sec:scopus-cache-doubt}.
+
+<<warn once that the cached standard view may be outdated>>=
+if self._complete_doubt and not self._doubt_reported:
+    self._doubt_reported = True
+    logger.warning(
+        "scopus: serving cached standard-view results (no abstracts, "
+        "first author only) because the COMPLETE view could not be "
+        "confirmed (%s). If this network is entitled to it, run "
+        "`scholar cache clear --provider scopus` and search again.",
+        self._complete_doubt,
+    )
 <<scopus provider>>=
 
     def _complete_confirmed(self) -> bool:
@@ -11302,13 +12245,15 @@ if standard_key in self._cache and not self._complete_confirmed():
             return self.view_mode == "complete"
         if self._complete_ok is None and self.api_key:
             try:
-                self._get_best_view(
+                response = self._get_best_view(
                     self._headers(),
                     dict(SCOPUS_PROBE_PARAMS),
                     retry=False,
                 )
-            except (RateLimited, requests.exceptions.RequestException):
-                pass
+                if self._complete_ok is None:
+                    self._complete_doubt = f"HTTP {response.status_code}"
+            except (RateLimited, requests.exceptions.RequestException) as e:
+                self._complete_doubt = type(e).__name__
         return self._complete_ok is True
 
     def _headers(self) -> dict:
@@ -11994,6 +12939,134 @@ def test_check_reports_the_view(self):
     assert "SCOPUS_VIEW=complete" in message
 @
 
+\subsection{Serving a cached standard view without knowing the entitlement}
+\label{sec:scopus-cache-doubt}
+
+A standard-view entry is the right answer off campus and the wrong one
+on campus, and the probe is what tells the two apart.
+It has three outcomes.
+A refusal is the ordinary off-campus case and needs no comment; success
+makes the entry unreachable; but anything else (a throttled or failing
+server, a spent quota, no network) leaves the question open, and the
+entry is then served as the only data at hand.
+That is the case where a user on the subscribing network can get
+abstract-less results without any sign of it, which is what
+\url{https://github.com/dbosk/scholar/issues/139} reports.
+We keep the behaviour, since a cache that vanished with the network would
+be worse, but [[_complete_confirmed]] records why it could not decide in
+[[_complete_doubt]], and the search says so, with how to refresh.
+While the question stays open the probe is repeated on the next search
+that finds a standard-view entry, but the warning is given only once
+per process: one is enough to explain every such result of the run.
+We do not key the cache on the route (direct or through a proxy), as the
+issue also suggests: what changes the data is the view the route
+entitles us to, and the view is already part of the key.
+The remedy is [[scholar cache clear --provider scopus]] followed by a
+search on the entitled network: the next search then fetches the
+COMPLETE view and caches it under its own key.
+
+The tests seed a standard-view cache with the fake service of
+[[TestScopusView]], then let the probe of a second \enquote{process}
+fail in each of the ways the code distinguishes.  The fake probe
+answers are hand-written because the live service cannot be asked to
+throttle on demand and Scopus is not to be queried by tests
+(the 429 and 5xx bodies are never read, only the status code).
+
+<<test functions>>=
+class TestScopusInconclusiveProbe:
+  """Serving cached standard-view results when COMPLETE is unconfirmed."""
+
+  REMEDY = "cache clear --provider scopus"
+
+  @staticmethod
+  def seeded_cache() -> dict:
+    """A cache holding one standard-view entry, as left off campus."""
+    cache = {}
+    with patch("requests.get", TestScopusView.service(False, [])):
+      TestScopusView.process(cache).search("q", limit=5)
+    assert len(cache) == 1
+    return cache
+
+  @staticmethod
+  def answering(status: int):
+    """A fake `requests.get` answering every request with `status`."""
+    response = Mock(status_code=status, ok=False, headers={}, text="")
+    return lambda *args, **kwargs: response
+
+  @pytest.mark.parametrize("status", [429, 503])
+  def test_unanswered_probe_warns_once(self, status, caplog):
+    """A throttled probe still serves the cache, and says so, once."""
+    import logging
+
+    provider = TestScopusView.process(self.seeded_cache())
+    with patch("requests.get", self.answering(status)):
+      with caplog.at_level(logging.WARNING):
+        first = provider.search("q", limit=5)
+        second = provider.search("q", limit=5)
+    assert first[0].abstract is None and len(second) == 1
+    warnings = [
+        r for r in caplog.records
+        if r.levelno == logging.WARNING and r.name == "scholar.providers"
+    ]
+    assert len(warnings) == 1
+    assert f"HTTP {status}" in warnings[0].getMessage()
+    assert self.REMEDY in warnings[0].getMessage()
+    assert "abstract" in warnings[0].getMessage()
+
+  def test_refused_probe_is_the_normal_case(self, caplog):
+    """Off campus the probe is refused: standard is right, no warning."""
+    import logging
+
+    provider = TestScopusView.process(self.seeded_cache())
+    with patch("requests.get", TestScopusView.service(False, [])):
+      with caplog.at_level(logging.WARNING):
+        papers = provider.search("q", limit=5)
+    assert papers[0].abstract is None
+    assert caplog.records == [] or all(
+        r.levelno < logging.WARNING for r in caplog.records
+    )
+
+  def test_standard_mode_never_warns(self, caplog):
+    """`SCOPUS_VIEW=standard` asked for this view: nothing to warn of."""
+    import logging
+
+    provider = TestScopusView.process(self.seeded_cache(), view="standard")
+    with patch("requests.get", self.answering(503)):
+      with caplog.at_level(logging.WARNING):
+        assert len(provider.search("q", limit=5)) == 1
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+  def test_probe_that_cannot_be_made_warns(self, caplog):
+    """A spent quota or a missing network is named by its class."""
+    import logging
+
+    cache = self.seeded_cache()
+    cases = [
+        ("RateLimited", None),
+        ("ConnectionError", requests.exceptions.ConnectionError()),
+    ]
+    for word, error in cases:
+      caplog.clear()
+      provider = TestScopusView.process(cache)
+      if error is None:
+        # the limiter is shared by all instances: patch, then restore
+        patched = patch.object(
+            provider._limiter, "acquire",
+            side_effect=RateLimited("scopus", "weekly quota spent"),
+        )
+      else:
+        patched = patch("requests.get", side_effect=error)
+      with patched, caplog.at_level(logging.WARNING):
+        assert len(provider.search("q", limit=5)) == 1
+      warnings = [
+          r.getMessage() for r in caplog.records
+          if r.levelno == logging.WARNING and r.name == "scholar.providers"
+      ]
+      assert len(warnings) == 1, word
+      assert word in warnings[0]
+      assert self.REMEDY in warnings[0]
+@
+
 \subsection{Auto-registration}
 
 <<scopus provider>>=
@@ -12399,6 +13472,7 @@ logger = logging.getLogger(__name__)
 # Provider constants
 DEFAULT_LIMIT = 100
 <<openalex constants>>
+<<openalex helpers>>
 <<dblp constants>>
 <<wos constants>>
 <<ieee constants>>

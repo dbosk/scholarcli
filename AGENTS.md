@@ -238,6 +238,13 @@ part. COMPLETE results are served to everyone (unless
 `SCOPUS_VIEW=standard`); default-view results only when COMPLETE is not
 available, which a new process learns from one `count=1` probe
 (`_complete_confirmed()`); a failed probe still serves the cache.
+When it is served because the probe was inconclusive (HTTP 429/5xx/403,
+a bad key, `RateLimited`, a network error; a *refusal* is the normal
+off-campus case and silent, and so is `SCOPUS_VIEW=standard`), the
+provider logs one WARNING per process naming the reason and the remedy
+`scholar cache clear --provider scopus` (#139). The route (proxy or
+direct) is deliberately not part of the key: what changes the data is
+the view the route entitles, and that is already keyed.
 
 `ScopusProvider.get_paper_by_doi()` (a one-result `DOI("...")` search)
 makes Scopus the *last* entry of `ENRICHMENT_PROVIDERS`. It returns
@@ -319,6 +326,28 @@ whenever `pdf_url` is among the requested fields, so `scholar enrich`,
 `Open access: N of M checked papers (K with PDF link)` tally (or a
 `set SCHOLAR_EMAIL` hint). `Paper.is_open_access` (checked status, else
 `bool(pdf_url)`) backs the client-side `--open-access` filter.
+
+`scholar enrich` flags (#137): `--pending-only` restricts everything
+(metadata, Unpaywall, preprint adoption, Crossref check, tally) to
+decisions whose stored status is pending; decided papers are saved
+unchanged. `--fields abstract,pdf_url,keywords` (the default) is checked
+against `enrich.ENRICHMENT_FIELD_NAMES` (unknown name: exit 2);
+leaving out `pdf_url` also skips Unpaywall and the preprint fallback
+(`--fields abstract` is the cheap run). The Crossref check always runs.
+
+**Batched OpenAlex DOI lookups.** `OpenAlexProvider.prefetch_dois(dois)`
+(`sec:openalex-doi-batch`) fills the `("doi", CACHE_VERSION, doi)` cache
+that `get_paper_by_doi` reads, 50 DOIs per request via
+`pyalex.Works().filter_or(doi=[...]).get(per_page=100)` (OR with `|`,
+documented max 100 values). It caches a DOI only when exactly one work
+matches (never misses: the singleton lookup caches a real 404), keys by
+each caller spelling grouped under `Paper._normalize_doi`, skips DOIs
+with `,|+` or whitespace, and stops quietly at the first failure.
+`enrich_papers` calls it before its loop when `openalex` is in the
+provider order, for the DOIs (or derived arXiv DOIs) of papers that
+`needs_enrichment`. S2 comes first in `ENRICHMENT_PROVIDERS` and is
+paced at 1 request / 3 s without a key, so
+`--enrich-providers openalex,s2,...` is the fast path.
 
 ### Currency / Retraction Checks
 
@@ -428,6 +457,14 @@ context (#107). `review.save_session` now:
 - **writes atomically**: `utils.atomic_write_text` (temp file in the
   same directory, fsync, `os.replace`), keeping the previous file as
   `<name>.json.bak` (one generation).
+
+`scholar enrich` saves after every `ENRICH_SAVE_EVERY` (50) papers
+(`cli.nw`, `sec:enrich-chunks`): enrich → Crossref check → assign →
+`migrate_paper_id` for adoptions → `save_session`, per chunk. After such
+a run `.bak` holds only the state before the last chunk. Ctrl-C (and
+SIGTERM, turned into `KeyboardInterrupt` while the loop runs, so the
+atexit cache save still happens) prints `Interrupted: saved K of N
+papers; run again to continue` and exits 130.
 
 `load_session(..., strict=True)` raises `SessionFileError` for a file
 that exists but does not parse. `create_review_session` uses it, so
@@ -632,6 +669,26 @@ invalid afterwards gets no decision (stays pending) and is listed in
 `LLMBatchResult.withheld`, which `llm classify` prints at the end.
 Sessions without category tags are classified as before.
 
+### Snowball and Tuxedo Subcommands (lazy)
+
+`scholar snowball` and `scholar tuxedo` come from the git submodules
+(do not edit them) through their `register_commands(app)` hooks, but are
+imported only when they run (#130): importing them (pandas, Textual,
+openai) at startup made every command 2.3-2.8 s slower. `app` is created
+with `cls=LazySubcommandGroup` (`cli.nw`, `<<lazy subcommand group>>`),
+which lists a `LazySubcommandStub` per name in `LAZY_SUBCOMMANDS` (name →
+help text, a copy guarded by a drift test) when `find_submodule()` finds
+a spec (`scholar.<name>`, then `<name>`; nothing imported), so help and
+first-word completion import nothing. `resolve_command` (dispatch and
+completion descent) swaps the stub for `load_lazy_subcommand(name)`, the
+command the hook registers on a scratch Typer app. A failing import is a
+one-line usage error (exit 2); under completion it completes to nothing.
+There is no `register_submodules()` any more; tests need no setup. Keep
+heavy imports out of `cli.py`'s module level (`scholar.crossref` loads
+its cache on import): `TestLazySubcommands` runs `main()` in a child
+interpreter and fails if `--help` imports tuxedo, snowball, openai or
+`scholar.crossref`.
+
 ### Interactive Tutorials (`scholar tutorial`)
 
 `scholar tutorial list|run|review` is [pytorial](https://github.com/dbosk/pytorial)
@@ -697,8 +754,13 @@ shared registry let one test's titles leak into the next), and
 `fresh_rate_limiters` returns the limiter registry to its import-time
 state after every test (test-created limiters dropped, the others'
 limits, last request and warning flag reset). It restores rather than
-empties: `providers limits` lists Crossref/Unpaywall only because their
-import registered limiters. No test needs to pop `ratelimit._LIMITERS`.
+empties: `providers limits` lists Crossref/Unpaywall only because
+importing `scholar.crossref`/`scholar.unpaywall` registers their
+limiters. `scholar.cli` imports Unpaywall lazily, so the fixture imports
+`scholar.providers`, `crossref` and `unpaywall` itself (inside the
+fixture, never at conftest level, #132) before taking its snapshot;
+otherwise the first test to trigger the import lost the registration at
+teardown (#131). No test needs to pop `ratelimit._LIMITERS`.
 
 Per-test fixtures cannot protect state touched at import or at exit:
 provider caches load when their module is imported (during collection)
@@ -750,7 +812,15 @@ synthesis prose of `scholar llm synthesize`, paid model output that
 never goes stale) and says how many it kept; `cache info` lists them on
 their own line. `clear_cache()` also empties the in-memory copy of each
 deleted cache in `CACHE_REGISTRY`, else the exit hook would write it
-back (the CLI loads `crossref.pkl` at import).
+back (any cache whose module the process has imported is in memory;
+since #130 the CLI no longer imports `scholar.crossref` at startup,
+only in the commands that use it).
+
+`scholar cache clear --provider NAME` (repeatable) deletes only
+`NAME.pkl` (`clear_cache(providers=[...])`), also emptying its in-memory
+cache. Valid names are the registered providers plus `crossref` and
+`unpaywall`; an unknown one exits 2 listing them. It cannot be combined
+with `--include-llm` (exit 2 / `ValueError`).
 
 Environment variable: `SCHOLAR_CACHE_DIR` to override cache location.
 
@@ -800,9 +870,26 @@ requests/day and each `scholar` run is a fresh process.
   comes from OpenAlex: the health probe's
   `X-RateLimit-Remaining`/`X-RateLimit-Reset` headers are synced via
   `record_response`, a keyed probe also reads `/rate-limit` for the
-  detail column, and a search 429 with `X-RateLimit-Remaining-USD: 0`
-  becomes a quota block until `X-RateLimit-Reset` (`_note_http_error`),
-  logged with the reset time and a key hint.
+  detail column, and a search 429 that spends the budget becomes a
+  quota block until `X-RateLimit-Reset` (`_note_http_error`), logged
+  with the reset time and a key hint.
+- OpenAlex prepaid credit (#138) is drawn after the daily allowance,
+  and `X-RateLimit-Remaining(-USD)` count the allowance only (recorded
+  2026-11-18); prepaid/one-time credit come as
+  `X-RateLimit-Prepaid-Remaining-USD`/`X-RateLimit-Onetime-Remaining`.
+  So: the detail column adds `+ $5.00 prepaid (expires …) + N one-time
+  credits` when positive; a 429 is "spent" iff its body `reason` is
+  `daily_budget` (documented: daily and prepaid spent), else iff
+  `-Remaining-USD` ≤ 0 with no prepaid/one-time credit (headers read
+  via `ratelimit._get_header`, either case);
+  `OpenAlexProvider._record_response` drops `X-RateLimit-Remaining`
+  before the limiter sync while such credit is reported, and for a 429
+  whose `reason` is not `daily_budget`, so neither a spent day nor a
+  per-second 429 blocks the quota group. Consequence: while prepaid
+  credit is reported, `providers limits` gets no fresh remaining
+  count (an earlier one until the reset, then none). A zero stored
+  before the purchase stays until the reset
+  (`providers limits --reset openalex`).
 - Pacing is the limiter's job: S2 (`LIMITS` anonymous 1/3 per second,
   `KEYED_LIMITS` 1.0; `_acquire()` re-declares per request because a
   rejected key changes the rate), OpenAlex and arXiv (a
