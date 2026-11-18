@@ -2410,8 +2410,7 @@ def create_review_session(
     if previous_session:
         current_run = list(session.search_records)
         for record in previous_session.search_records:
-            <<keep an earlier answer over a failed re-run>>
-            <<keep a wider earlier search over a narrower re-run>>
+            <<keep the preferred record of each search>>
             <<let a re-run replace a legacy record>>
             session.add_search_record(record)
     
@@ -2463,7 +2462,23 @@ before hits were stored ([[None]]) counts nothing, so a partial re-run
 with papers replaces it.  A wider earlier record still wins over a
 narrower re-run (\cref{sec:wider-record}).
 
-<<keep an earlier answer over a failed re-run>>=
+These rules, and the one for limits below (\cref{sec:wider-record}),
+decide between two records of one search, and they are needed in two
+places: here, between this run's record and the session's, and when a
+save meets a record of the same search that another process saved
+meanwhile (\cref{sec:session-integrity}).  Applied in one place only,
+the other undid them: a process still holding the narrow record of
+[[-l 5]] saved it over the [[-l 0]] record another process had just
+saved, with fifty papers linked to it.  So the rules are one function,
+[[preferred_record]], which both places call.  It is a total order: an
+answer beats a failure outright; then, of two records that know their
+limits, the wider one wins; then a partial answer with more hits beats
+an answer with fewer, and otherwise the answer wins; and of two records
+still equal, the later run wins.  When even the run times cannot tell,
+the first argument wins, so the caller decides: the new run here, the
+process's own record in a save.
+
+<<keep the preferred record of each search>>=
 for i, current in enumerate(session.search_records):
     same_search = current.key == record.key or (
         record.is_legacy
@@ -2471,13 +2486,76 @@ for i, current in enumerate(session.search_records):
         and (current.query, current.provider)
         == (record.query, record.provider)
     )
-    outdone = bool(current.hits) and (
-        record.hits is None or current.hits > record.hits
-    )
-    if same_search and current.error and not record.error and not outdone:
+    if same_search and preferred_record(current, record) is record:
         session.search_records[i] = record
         if current.key != record.key:
             replaced_links[current.key] = record.key
+<<review session functions>>=
+def failed_outright(record: SearchRecord) -> bool:
+    """Whether the search failed without a single paper."""
+    return bool(record.error) and not record.hits
+
+
+def preferred_record(a: SearchRecord, b: SearchRecord) -> SearchRecord:
+    """Of two records of one search, the one a session keeps.
+
+    In order: an answer beats a failure outright; the wider limit wins
+    (unless a record is legacy, whose limit is unknown); a partial
+    answer with more hits beats an answer with fewer, else the answer
+    wins; the later `searched_at` wins. On a tie, `a`.
+    """
+    if failed_outright(a) != failed_outright(b):
+        return b if failed_outright(a) else a
+    if not a.is_legacy and not b.is_legacy:
+        width_a, width_b = search_width(a.limit), search_width(b.limit)
+        if width_a != width_b:
+            return a if width_a > width_b else b
+    if bool(a.error) != bool(b.error):
+        partial, answer = (a, b) if a.error else (b, a)
+        if partial.hits and (
+            answer.hits is None or partial.hits > answer.hits
+        ):
+            return partial
+        return answer
+    if a.searched_at and b.searched_at and a.searched_at != b.searched_at:
+        return a if a.searched_at > b.searched_at else b
+    return a
+@
+
+<<test functions>>=
+class TestPreferredRecord:
+    """The one order of two records of a search."""
+
+    @staticmethod
+    def _r(limit=100, hits=None, error=None, searched_at=None, **kw):
+        return SearchRecord("q", "p", None, limit, hits=hits, error=error,
+                            searched_at=searched_at, **kw)
+
+    def test_order(self):
+        answer = self._r(hits=12)
+        failed = self._r(hits=0, error="HTTP 503")
+        assert preferred_record(failed, answer) is answer
+        assert preferred_record(answer, failed) is answer
+        wide = self._r(limit=10_000, hits=50)
+        narrow = self._r(limit=5, hits=5)
+        assert preferred_record(narrow, wide) is wide
+        assert preferred_record(wide, narrow) is wide
+        partial = self._r(hits=20, error="cut short")
+        assert preferred_record(answer, partial) is partial
+        assert preferred_record(partial, self._r(hits=30)).hits == 30
+        old = self._r(hits=3, searched_at="2026-10-01T00:00:00+00:00")
+        new = self._r(hits=4, searched_at="2026-11-01T00:00:00+00:00")
+        assert preferred_record(old, new) is new
+        assert preferred_record(new, old) is new
+        undated = self._r(hits=1)
+        assert preferred_record(undated, self._r(hits=2)) is undated
+
+    def test_legacy_limit_is_unknown(self):
+        legacy = SearchRecord("q", "p", hits=None)
+        current = self._r(limit=5, hits=5)
+        assert preferred_record(current, legacy) is current
+        failed = self._r(limit=5, hits=0, error="HTTP 503")
+        assert preferred_record(failed, legacy) is legacy
 @
 
 \label{sec:legacy-records}
@@ -2519,19 +2597,12 @@ search returns it, which is what the link claims.)
 the widest; [[-l 0]] is stored as the large internal cap and so is
 wide already.  A legacy record's missing limit means \emph{unknown},
 not unlimited, so a legacy record is never wider; it has its own rule
-below.  The rule needs the wider record to have answered, since a failed
-wider record does not stand in for a narrower answer; the narrower
-re-run may have failed, outright or part-way, and the wider answer
-still wins.
+below.  A wider record that failed outright does not stand in for a
+narrower answer; otherwise the wider record wins, also over a narrower
+re-run that failed part-way with more papers than it counts (the wider
+record then shows fewer hits than the papers linked to it, a known and
+accepted case).  [[preferred_record]] above applies the rule.
 
-<<keep a wider earlier search over a narrower re-run>>=
-for i, current in enumerate(session.search_records):
-    if (current.key == record.key
-            and any(current is c for c in current_run)
-            and not record.is_legacy
-            and not record.error
-            and search_width(record.limit) > search_width(current.limit)):
-        session.search_records[i] = record
 <<review session functions>>=
 def search_width(limit: int | None) -> float:
     """How many results a search with `limit` may fetch; no limit is all."""
@@ -2633,6 +2704,76 @@ class TestWiderRecordKept:
         record = load_session("totals").search_records[0]
         assert (record.total, record.total_estimated) == (None, False)
         assert search_outcome_label(record) == "5 (capped at 5)"
+@
+
+The same order must hold when a save meets the other process's record
+of the same search (\cref{sec:session-integrity}).  The reviewer's
+case: the session is at [[-l 5]]; process~B re-runs with [[-l 0]] and
+saves fifty hits; process~A, still holding the [[-l 5]] record, saves
+a decision.  The file must keep B's wide record with its dates.  And the
+mirror: A holds the wide re-run when B saves its narrow copy, and A's
+wide record must survive A's save.
+
+<<test functions>>=
+class TestConcurrentRecordOrder:
+    """A save keeps the preferred record of a shared search."""
+
+    WIDE = 10_000
+
+    @staticmethod
+    def _result(papers, limit, when):
+        from scholar.scholar import SearchResult
+        return SearchResult(
+            query="q", provider="openalex", timestamp="t", papers=papers,
+            limit=limit, total=50, searched_at=when, fetched_at=when,
+            from_cache=False,
+        )
+
+    @staticmethod
+    def _papers(n):
+        return [Paper(title=f"P{i}", authors=["A"], doi=f"10.1/cro-{i}")
+                for i in range(n)]
+
+    def _narrow_session(self, name):
+        save_session(create_review_session(
+            [self._result(self._papers(5), 5, "2026-10-01T00:00:00+00:00")],
+            "q", session_name=name,
+        ))
+
+    def test_stale_narrow_save_keeps_the_wide_record(self):
+        self._narrow_session("cro")
+        stale = load_session("cro")
+        save_session(create_review_session(
+            [self._result(self._papers(50), self.WIDE,
+                          "2026-11-18T09:00:00+00:00")],
+            "q", session_name="cro",
+        ))
+        stale.decisions[0].status = DecisionStatus.KEPT
+        save_session(stale)
+        session = load_session("cro")
+        assert [(r.limit, r.hits, r.searched_at)
+                for r in session.search_records] == [
+            (self.WIDE, 50, "2026-11-18T09:00:00+00:00"),
+        ]
+        assert len(session.decisions) == 50
+        assert session.decisions[0].status == DecisionStatus.KEPT
+
+    def test_own_wide_record_survives_a_narrow_file(self):
+        self._narrow_session("cro-mirror")
+        wide = create_review_session(
+            [self._result(self._papers(50), self.WIDE,
+                          "2026-11-18T09:00:00+00:00")],
+            "q", session_name="cro-mirror",
+        )
+        other = load_session("cro-mirror")
+        other.decisions[0].status = DecisionStatus.KEPT
+        save_session(other)
+        save_session(wide)
+        session = load_session("cro-mirror")
+        assert [(r.limit, r.hits) for r in session.search_records] == [
+            (self.WIDE, 50),
+        ]
+        assert session.decisions[0].status == DecisionStatus.KEPT
 @
 
 <<let a re-run replace a legacy record>>=
@@ -4221,7 +4362,16 @@ the same ids.)  Search records and snowball rounds only
 ever accumulate, so we add any that only the file has; a record is the
 file's own when no record here has its key (query, provider and
 filters, \cref{sec:search-record-key}), so a run of the same query with
-other filters in another process is kept beside ours.  So do a paper's
+other filters in another process is kept beside ours.  When both hold a
+record of the same search, the two are not merged field by field but
+one is kept, by the same rules as when a search is re-run
+([[preferred_record]], \cref{sec:wider-record}): without that, a
+process still holding the narrow record of a [[-l 5]] run saved it over
+the [[-l 0]] record another process had saved meanwhile, and fifty
+papers linked to a search that returns five.  This needs no baseline,
+since the rules judge the records themselves; when they cannot tell the
+two apart, ours is kept, as before.  The links need no repointing,
+since both records have the same key.  So do a paper's
 links to the searches that returned it ([[found_by]],
 \cref{sec:review-found-by}): each is a fact about a search that ran, not
 a judgement, so the links the file holds for a paper are added to the
@@ -4331,9 +4481,14 @@ def merge_concurrent_changes(
 
     <<merge research context from disk>>
 
-    own_keys = {r.key for r in session.search_records}
+    own_index = {r.key: i for i, r in enumerate(session.search_records)}
     for record in on_disk.search_records:
-        if record.key not in own_keys and record.key not in replaced:
+        if record.key in own_index:
+            i = own_index[record.key]
+            session.search_records[i] = preferred_record(
+                session.search_records[i], record
+            )
+        elif record.key not in replaced:
             session.search_records.append(record)
     own_rounds = {r.timestamp for r in session.snowball_rounds}
     for snowball_round in on_disk.snowball_rounds:

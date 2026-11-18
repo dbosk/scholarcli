@@ -121,9 +121,13 @@ Providers self-register via `register_provider()` at module load time.
   recorded, links already share the key (`search_width`: None/0 =
   all; legacy records never count as wider).
   `ReviewSession.add_search_record(record)` carries records over whole.
-  The keep-the-earlier-answer rule protects an answered record only
-  against a re-run that failed outright (no papers); a partial re-run
-  (error + papers) with more hits replaces it and stays "incomplete".
+  All record rules are one total order, `preferred_record(a, b)`
+  (`review.py`): answer beats failure outright; wider limit beats
+  narrower (legacy limits unknown); a partial with more hits beats an
+  answer with fewer, else the answer; later `searched_at`; tie `a`.
+  `create_review_session` (new run first) and
+  `merge_concurrent_changes` (own record first, for a shared key) both
+  use it.
 - Search dates (#167). `SearchResult`/`SearchRecord` have `searched_at`
   (UTC ISO, the run; `utils.utc_now_iso`), `fetched_at` (when the
   service answered; for a cache hit the original fetch, `None` =
