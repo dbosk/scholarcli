@@ -659,8 +659,13 @@ shared registry let one test's titles leak into the next), and
 `fresh_rate_limiters` returns the limiter registry to its import-time
 state after every test (test-created limiters dropped, the others'
 limits, last request and warning flag reset). It restores rather than
-empties: `providers limits` lists Crossref/Unpaywall only because their
-import registered limiters. No test needs to pop `ratelimit._LIMITERS`.
+empties: `providers limits` lists Crossref/Unpaywall only because
+importing `scholar.crossref`/`scholar.unpaywall` registers their
+limiters. `scholar.cli` imports Unpaywall lazily, so the fixture imports
+`scholar.providers`, `crossref` and `unpaywall` itself (inside the
+fixture, never at conftest level, #132) before taking its snapshot;
+otherwise the first test to trigger the import lost the registration at
+teardown (#131). No test needs to pop `ratelimit._LIMITERS`.
 
 Per-test fixtures cannot protect state touched at import or at exit:
 provider caches load when their module is imported (during collection)
