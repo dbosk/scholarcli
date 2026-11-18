@@ -95,7 +95,7 @@ Providers self-register via `register_provider()` at module load time.
 
 | Provider | Name | API | Auth |
 |----------|------|-----|------|
-| Semantic Scholar | `s2` | `semanticscholar` client | `S2_API_KEY` (optional) |
+| Semantic Scholar | `s2` | REST API (`requests`) | `S2_API_KEY` (optional) |
 | OpenAlex | `openalex` | `pyalex` client | `OPENALEX_API_KEY` (optional, 10x daily budget), `SCHOLAR_EMAIL` (optional) |
 | DBLP | `dblp` | REST API | None required |
 | Web of Science | `wos` | REST API | `WOS_API_KEY` (required) |
@@ -954,7 +954,15 @@ requests/day and each `scholar` run is a fresh process.
 - State: one JSON file per quota group in
   `$SCHOLAR_DATA_DIR/rate_limits/` (data dir, NOT the cache dir —
   `scholar cache clear` must not erase quota memory). Written
-  atomically on every change; fail-open on corruption. Daily quotas
+  atomically on every change; fail-open on corruption. Every
+  read-modify-write (`acquire`, `record_limit_hit`, the header sync)
+  runs in `RateLimiter._exclusive`: the limiter's `threading.RLock`
+  plus `utils.file_lock` on the state file (`.<group>.json.lock`), so
+  threads and processes take turns and no count is lost (#148). The
+  locks are never held across a sleep: `acquire` loops (lock, load,
+  refuse/pace check, stamp+save or unlock-sleep-reload) and waits again
+  if someone else stamped while it slept. Stamps are wall-clock
+  (`_now`), shared across processes. Daily quotas
   bucket on the UTC calendar day and self-correct via the provider's
   own rejection if the guess is wrong.
 - `Search.execute` pre-checks `check_available()` and **skips** a
@@ -1006,7 +1014,9 @@ requests/day and each `scholar` run is a fresh process.
   before the purchase stays until the reset
   (`providers limits --reset openalex`).
 - Pacing is the limiter's job: S2 (`LIMITS` anonymous 1/3 per second,
-  `KEYED_LIMITS` 1.0; `_acquire()` re-declares per request because a
+  our own conservative choice: S2 documents only a shared 1000 RPS
+  anonymous pool; `KEYED_LIMITS` 0.9, a margin under the documented
+  1 RPS on all endpoints; `_acquire()` re-declares per request because a
   rejected key changes the rate), OpenAlex and arXiv (a
   `PacedArxivClient` subclass overrides the package's `_parse_feed`, with
   `delay_seconds=0`) and DBLP (`per_second=0.5`: its FAQ says 1-2 s
@@ -1028,16 +1038,33 @@ requests/day and each `scholar` run is a fresh process.
   `WebOfScienceProvider._get`; Scopus has no extended methods and all its
   requests already go through `ScopusProvider._get`. IEEE, HAL and WoS
   probes are counted too, and `pdf.resolve_doi_s2` uses the `s2` limiter.
-- Remaining (not done): urllib3 `Retry` back-off inside
-  S2/Crossref/Unpaywall sessions is not counted by the limiter (only
-  the request that reaches it is).
+- S2 has no urllib3 `Retry` (#148): `SemanticScholarProvider._send`
+  (used by `_request`, so search, DOI lookup, citations/references and
+  the 403 fallback) retries 429/500/502/503/504 and connection errors
+  up to `MAX_RETRIES`, each attempt through `_acquire()`, backing off
+  `RETRY_BACKOFF * 2**attempt` (at least `Retry-After`) via
+  `ratelimit._sleep`. Like DBLP it records no mid-loop 429; when the
+  retries run out (or `Retry-After` exceeds `MAX_RETRY_WAIT`) `_pause`
+  calls `record_limit_hit`, so every path gets the cooldown;
+  connection errors (incl. `SSLError`/`ProxyError`) that persist pause
+  it for `CONNECTION_PAUSE` (60 s), so an unreachable S2 or a broken
+  proxy fails fast instead of 14 s of back-off per call. Every retry
+  adds to `last_retries`, which `search()` resets with `last_error`,
+  so a page answered after a 500 shows "N after 1 retry". The
+  offline tests in `TestS2OneRequestPerSecond` time arrivals at a
+  loopback server (`s2_loopback` rewrites the host in
+  `HTTPAdapter.send`), threads and two subprocesses included.
+- Remaining (not done): urllib3 `Retry` back-off inside the
+  Crossref/Unpaywall sessions is not counted by the limiter (only the
+  request that reaches it is).
 
 ## Dependencies
 
 - `requests` - HTTP client (PySocks, optional, for `socks5h://` proxies)
 - `typer` - CLI framework
 - `rich` - Terminal formatting
-- `semanticscholar`, `pyalex` - Provider-specific clients
+- `pyalex`, `arxiv` - Provider-specific clients (Semantic Scholar is
+  called directly with `requests`)
 - `cachetools` - Caching with decorators
 - `pytorial` - Interactive tutorial runner behind `scholar tutorial`
 - `llm` and its plugins (`llm-openai-plugin`, `llm-anthropic`, `llm-gemini`, `llm-mistral`, `llm-azure`, `llm-github-copilot`, `llm-gpt4all`, `llm-openai-via-codex`) - model access for `scholar rq` and `scholar llm`
