@@ -805,7 +805,7 @@ search_in: Annotated[
 ] = None
 <<cli imports>>=
 from enum import Enum
-from scholar.scholar import SEARCH_IN_CHOICES
+from scholar.scholar import SEARCH_IN_CHOICES, filter_flags
 <<constants>>=
 SearchIn = Enum(
     "SearchIn",
@@ -826,11 +826,15 @@ class TestSearchInOption:
   """search --in title-abstract reaches the provider and the session."""
 
   class _FieldsProvider:
-    """A provider fake that remembers the filters of each search."""
+    """A provider fake that remembers the filters of each search.
+
+    It honours `--in` (like OpenAlex), so its records keep it.
+    """
     name = "fake"
     MAX_LIMIT = None
     last_error = None
     last_retries = 0
+    HONOURS_SEARCH_IN = True
 
     def __init__(self, papers):
       self.papers = papers
@@ -905,6 +909,47 @@ class TestSearchInOption:
       "scholar search q -p fake",
       "scholar search q -p fake --in title-abstract",
     ]
+
+  def test_rq_passes_it_to_the_provider(self, tmp_path, monkeypatch):
+    """rq shares the filter options, so --in must reach its searches."""
+    import sys
+    import types
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+    paper = Paper(title="P", authors=["A"], doi="10.1/rq-in",
+                  abstract="Abstract.")
+    fake = self._install(monkeypatch, [paper])
+
+    class Answer:
+      def __init__(self, text):
+        self._text = text
+
+      def text(self):
+        return self._text
+
+    class Model:
+      """Stands in for the language model rq asks (no service)."""
+      model_id = "dummy"
+
+      def prompt(self, prompt):
+        if "Papers to Classify" in prompt:
+          return Answer(json.dumps({"classifications": [{
+            "paper_index": 0, "decision": "kept", "tags": ["t"],
+            "confidence": 0.9, "reasoning": "r",
+          }]}))
+        return Answer(json.dumps(
+          {"queries": [{"provider": "fake", "query": "rq query"}]}
+        ))
+
+    llm_mod = types.ModuleType("llm")
+    llm_mod.get_model = lambda model_id=None: Model()
+    monkeypatch.setitem(sys.modules, "llm", llm_mod)
+
+    result = runner.invoke(app, [
+      "rq", "Does rq pass --in?", "--provider", "fake", "--count", "1",
+      "--no-enrich", "--in", "title-abstract",
+    ])
+    assert result.exit_code == 0, result.output
+    assert [f.search_in for f in fake.seen] == ["title-abstract"]
 @
 
 \subsection{Executing the search}
@@ -1603,7 +1648,7 @@ from scholar.providers import (
     get_provider,
     expand_provider_names,
 )
-from scholar.scholar import SearchResult, provider_outcome
+from scholar.scholar import SearchResult, provider_outcome, applied_filters
 from scholar.review import create_review_session, save_session
 from scholar.llm_review import (
     classify_papers_with_llm,
@@ -1684,13 +1729,14 @@ for pname in provider_names:
     q = provider_queries.get(pname, rq_text)
     papers = p.search(q, limit=effective_limit, filters=filters)
     error, retries = provider_outcome(p)
+    applied = applied_filters(p, q, filters)
     results.append(
         SearchResult(
             query=q,
             provider=pname,
             timestamp=timestamp,
             papers=papers,
-            filters=filters.as_dict() if filters else None,
+            filters=applied.as_dict() if applied else None,
             limit=effective_limit,
             error=error,
             retries=retries,
@@ -9638,9 +9684,10 @@ double-quoting is not enough: inside double quotes a shell still expands [[$]]
 and backticks, so a query like [[term $(rm -rf x)]] would \emph{execute} on
 paste rather than be searched for.  We therefore delegate to [[shlex.quote]],
 which renders any string as a single shell token (single-quoted when needed,
-left bare when already safe) with no metacharacter left live.  Both arguments
-share this one [[_quote_arg]] helper so the two call sites cannot drift in how
-they escape.
+left bare when already safe) with no metacharacter left live.  The query
+goes through the [[_quote_arg]] helper below, the venue through
+[[filter_flags]] (\cref{sec:filter-flags} in the [[scholar]] module), and
+both are [[shlex.quote]], so the two cannot drift in how they escape.
 
 <<formatter classes>>=
 def _quote_arg(value: str) -> str:
@@ -9648,7 +9695,10 @@ def _quote_arg(value: str) -> str:
     return shlex.quote(value)
 @
 
-The filters and limit turn back into the flags that produced them.  We take
+The filters and limit turn back into the flags that produced them; the
+filters through [[filter_flags]] of the [[scholar]] module
+(\cref{sec:filter-flags}), which the review report shares, and the limit
+here.  We take
 them as a plain dict and an integer rather than off a result object, because two
 callers reconstruct flags from different sources: the [[bibtex+prov]] formatter
 reads them off a live [[SearchResult]], while [[prov found-via]] reads them off
@@ -9662,20 +9712,7 @@ the found set.
 <<formatter classes>>=
 def _search_flags(filters: dict | None, limit: int | None) -> list[str]:
     """Reconstruct the filter and limit CLI flags from a filters dict."""
-    flags = []
-    filters = filters or {}
-    if filters.get("year"):
-        flags.append(f"--year {filters['year']}")
-    if filters.get("open_access"):
-        flags.append("--open-access")
-    if filters.get("venue"):
-        flags.append(f"--venue {_quote_arg(filters['venue'])}")
-    if filters.get("min_citations") is not None:
-        flags.append(f"--min-citations {filters['min_citations']}")
-    for pub_type in filters.get("pub_types") or []:
-        flags.append(f"--type {pub_type}")
-    if filters.get("search_in"):
-        flags.append(f"--in {filters['search_in']}")
+    flags = filter_flags(filters)
     if limit is not None and limit != DEFAULT_SEARCH_LIMIT:
         shown = 0 if limit >= UNLIMITED_PROVIDER_LIMIT else limit
         flags.append(f"--limit {shown}")

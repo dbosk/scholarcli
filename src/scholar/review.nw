@@ -107,7 +107,7 @@ import unicodedata
 from cachetools import cachedmethod
 
 from scholar.scholar import Paper, SearchFilters, merge_version_of
-from scholar.scholar import filters_key
+from scholar.scholar import filters_key, filter_flags
 from scholar.scholar import hits_label, result_outcome
 from scholar.notes import (
     get_paper_id, get_query_hash, get_data_dir,
@@ -190,7 +190,27 @@ holds exactly one record with that query and provider
 nothing was recorded: decisions saved before the link existed, and
 papers added by snowballing, which no search returned.
 
+An old link without filters says only that \emph{some} search of its
+query and provider returned the paper (\cref{sec:session-persistence}).
+Once the paper also has a resolved link for that query and provider, the
+old one adds nothing a reader can use: found-via would print the
+resolved command and, beside it, a \enquote{not reproducible} note about
+the same query.  So a resolved link supersedes the unresolved links of
+its query and provider ([[without_superseded_links]]), whenever a link
+is recorded and when a file is read.
+
 <<review data structures>>=
+def without_superseded_links(
+    links: list[tuple[str, str, str | None]],
+) -> list[tuple[str, str, str | None]]:
+    """Drop each unresolved link whose query and provider have a resolved one."""
+    resolved = {(q, p) for q, p, key in links if key is not None}
+    return [
+        link for link in links
+        if link[2] is not None or link[:2] not in resolved
+    ]
+
+
 @dataclass
 class ReviewDecision:
     """
@@ -238,7 +258,9 @@ class ReviewDecision:
         an old link that names no filters.
         """
         if (query, provider, key) not in self.found_by:
-            self.found_by.append((query, provider, key))
+            self.found_by = without_superseded_links(
+                self.found_by + [(query, provider, key)]
+            )
 
     @property
     def is_decided(self) -> bool:
@@ -473,7 +495,39 @@ class SearchRecord:
     def key(self) -> tuple[str, str, str]:
         """The `(query, provider, filters key)` identifying the search."""
         return (self.query, self.provider, filters_key(self.filters))
+
+    @property
+    def is_legacy(self) -> bool:
+        """Whether the record predates stored filters, which are unknown.
+
+        Such records have neither filters nor a limit; every search
+        recorded since stores its limit.
+        """
+        return self.filters is None and self.limit is None
 @
+
+One kind of record cannot take part in that key.  Sessions written
+before filters were stored (\url{https://github.com/dbosk/scholar/issues/61},
+June 2026) kept only the pairs of query and provider; loading them, or
+records that later saves copied from them, gives records whose
+[[filters]] is [[None]] because the filters are \emph{unknown}, not
+because there were none.  Their key would claim an unfiltered search.
+They can be told apart: the change that started storing filters
+(commit [[1e02d34]], \#61) stored the limit with them, in the same new
+[[SearchRecord]], and since \#55 (commit [[e478a05]], the same day)
+[[Search.execute]] gives every result its limit, as [[rq]] does with
+[[effective_limit]].  So a record from a search always has a limit,
+and one with neither filters nor limit is a legacy record
+([[is_legacy]]).  Code outside scholar that builds a [[SearchResult]]
+without a limit, like the workaround in
+\url{https://github.com/dbosk/scholar/issues/135}, makes records that
+look legacy too; they are then treated as the older searches are.
+
+A legacy record is handled as before filters joined the key: a new run
+of its query on its provider replaces it, whatever the new run's
+filters (\cref{sec:legacy-records}).  Keeping it beside the new record
+would make [[found-via]] print, for it, a command without filters that
+may never have been run.
 
 
 \subsection{Review Session}
@@ -1369,9 +1423,12 @@ def create_review_session(
         )
 
     # Merge with previous session's searches (if any), preserving their filters
+    replaced_links: dict[tuple, tuple] = {}
     if previous_session:
+        current_run = list(session.search_records)
         for record in previous_session.search_records:
             <<keep an earlier answer over a failed re-run>>
+            <<let a re-run replace a legacy record>>
             session.add_query_provider_pair(
                 record.query, record.provider, record.filters, record.limit,
                 hits=record.hits, error=record.error, retries=record.retries,
@@ -1389,6 +1446,7 @@ def create_review_session(
     
     # Convert search results to review decisions, merging with previous
     <<convert search results to decisions>>
+    <<point links at the records that replaced theirs>>
     
     logger.info("Created session with %d papers (%d kept, %d discarded, %d pending)",
                len(session.decisions), len(session.kept_papers()),
@@ -1411,9 +1469,54 @@ happened, and the session keeps the answer that its papers came from.
 
 <<keep an earlier answer over a failed re-run>>=
 for i, current in enumerate(session.search_records):
-    same_search = current.key == record.key
+    same_search = current.key == record.key or (
+        record.is_legacy
+        and any(current is c for c in current_run)
+        and (current.query, current.provider)
+        == (record.query, record.provider)
+    )
     if same_search and current.error and not record.error:
         session.search_records[i] = record
+        if current.key != record.key:
+            replaced_links[current.key] = record.key
+@
+
+\label{sec:legacy-records}
+A legacy record (\cref{sec:search-record-key}) is one search of its
+query and provider with unknown filters.  When this run searched the
+same query on the same provider, we do what was done before filters
+joined the key: the new record replaces it, whatever its filters
+(unless the new run failed and the legacy one answered, which the
+rule above already settled the old way).  The comparison is with this
+run's own records only ([[current_run]]); a record that an earlier
+session added is no evidence about the legacy search.
+
+The papers of the replaced search keep their links, which now point at
+the record that replaced it.  That is what the session said before
+filters joined the key: its one record of the pair stood for every run
+of it.  [[replaced_links]] maps each replaced key to its successor, and
+once all decisions are built every link is moved
+([[<<point links at the records that replaced theirs>>]]); duplicates
+that the move creates are merged, keeping the first.
+
+<<let a re-run replace a legacy record>>=
+if record.is_legacy:
+    successor = next(
+        (r for r in current_run
+         if (r.query, r.provider) == (record.query, record.provider)),
+        None,
+    )
+    if successor is not None:
+        kept = any(r is record for r in session.search_records)
+        if not kept and successor.key != record.key:
+            replaced_links[record.key] = successor.key
+        continue
+<<point links at the records that replaced theirs>>=
+if replaced_links:
+    for decision in session.decisions:
+        decision.found_by = without_superseded_links(list(dict.fromkeys(
+            replaced_links.get(link, link) for link in decision.found_by
+        )))
 @
 
 Let's verify both halves: a failed search is recorded as failed, with
@@ -1636,6 +1739,120 @@ class TestOldTwoPartLinks:
         save_session(session)
         saved = json.loads(path.read_text())["decisions"][0]["found_by"]
         assert saved == [{"query": "Q", "provider": "openalex"}]
+@
+
+The case the legacy rule is for: a session saved before filters were
+stored, with one record of [[Q]] on OpenAlex and a two-part link, then
+searched again with [[--year 2020-2024]].  The new run replaces the
+legacy record, and the old paper's link moves to it.  Without the rule
+the session held two records and [[found-via]] printed, for the old
+paper, an unfiltered command that may never have been run.  A run of
+another query leaves the legacy record alone, and a resolved link
+supersedes an unresolved one of the same query and provider.
+
+<<test functions>>=
+class TestLegacyRecords:
+    """Records from before filters were stored behave as before #140."""
+
+    @staticmethod
+    def _old_session(records, decisions):
+        import json
+        from scholar.review import _get_sessions_dir
+        data = {
+            "query": "Q", "name": "legacy", "providers": ["openalex"],
+            "timestamp": datetime.now().isoformat(),
+            "query_provider_pairs": records,
+            "decisions": [{
+                "paper_id": f"doi:{doi}", "provider": "openalex",
+                "status": "kept", "tags": [], "source": "human",
+                "found_by": links,
+                "paper": {"title": doi, "authors": ["A"], "doi": doi,
+                          "sources": ["openalex"]},
+            } for doi, links in decisions],
+        }
+        (_get_sessions_dir() / "legacy.json").write_text(json.dumps(data))
+
+    @staticmethod
+    def _rerun(papers, filters, query="Q"):
+        from scholar.scholar import SearchResult
+        return create_review_session([SearchResult(
+            query=query, provider="openalex", timestamp="t",
+            papers=papers, filters=filters, limit=1000,
+        )], query, session_name="legacy")
+
+    def test_a_rerun_replaces_the_legacy_record(self):
+        self._old_session(
+            [["Q", "openalex"]],
+            [("10.1/legacy-old", [{"query": "Q", "provider": "openalex"}])],
+        )
+        new = Paper(title="New", authors=["B"], doi="10.1/legacy-new")
+        session = self._rerun([new], {"year": "2020-2024"})
+        save_session(session)
+        session = load_session("legacy")
+        year = filters_key({"year": "2020-2024"})
+        assert [r.key for r in session.search_records] == [
+            ("Q", "openalex", year)
+        ]
+        links = {d.paper.doi: d.found_by for d in session.decisions}
+        assert links == {
+            "10.1/legacy-old": [("Q", "openalex", year)],
+            "10.1/legacy-new": [("Q", "openalex", year)],
+        }
+
+    def test_another_query_leaves_it_alone(self):
+        self._old_session([["Q", "openalex"]], [])
+        session = self._rerun([], {"year": "2020-2024"}, query="R")
+        assert sorted(r.query for r in session.search_records) == ["Q", "R"]
+        legacy = session.search_record("Q", "openalex")
+        assert legacy.is_legacy
+
+    def test_a_record_with_a_limit_is_not_legacy(self):
+        assert SearchRecord("Q", "p", None, None).is_legacy
+        assert not SearchRecord("Q", "p", None, 1000).is_legacy
+        assert not SearchRecord("Q", "p", {"year": "2020"}, None).is_legacy
+
+
+class TestSupersededLinks:
+    """A resolved link replaces an unresolved one of its query and provider."""
+
+    def test_recording_a_resolved_link_drops_the_unresolved_one(self):
+        decision = ReviewDecision(
+            paper=Paper(title="T", authors=["A"]), provider="openalex",
+            found_by=[("Q", "openalex", None), ("R", "openalex", None)],
+        )
+        decision.record_search("Q", "openalex", "y:2020")
+        assert decision.found_by == [
+            ("R", "openalex", None), ("Q", "openalex", "y:2020"),
+        ]
+        decision.record_search("Q", "openalex", None)
+        assert ("Q", "openalex", None) not in decision.found_by
+
+    def test_loading_drops_superseded_links(self):
+        import json
+        from scholar.review import _get_sessions_dir
+        data = {
+            "query": "Q", "name": "sup", "providers": ["openalex"],
+            "timestamp": datetime.now().isoformat(),
+            "search_records": [
+                {"query": "Q", "provider": "openalex", "filters": f,
+                 "limit": 100, "hits": 1, "error": None, "retries": 0}
+                for f in ({"year": "2020"}, {"year": "2021"})
+            ],
+            "decisions": [{
+                "paper_id": "doi:10.1/sup", "provider": "openalex",
+                "status": "kept", "tags": [], "source": "human",
+                "found_by": [
+                    {"query": "Q", "provider": "openalex"},
+                    {"query": "Q", "provider": "openalex",
+                     "filters": "y:2020"},
+                ],
+                "paper": {"title": "T", "authors": ["A"],
+                          "doi": "10.1/sup", "sources": ["openalex"]},
+            }],
+        }
+        (_get_sessions_dir() / "sup.json").write_text(json.dumps(data))
+        session = load_session("sup")
+        assert session.decisions[0].found_by == [("Q", "openalex", "y:2020")]
 @
 
 Papers from the previous session that do not appear in the current search
@@ -2300,10 +2517,10 @@ def read_session_file(session_path: Path) -> ReviewSession:
                 source = ReviewSource.HUMAN
             is_example = dec_data.get("is_example", False) or False
             llm_confidence = dec_data.get("llm_confidence")
-            found_by = [
+            found_by = without_superseded_links([
                 _load_found_by_link(session, link)
                 for link in dec_data.get("found_by") or []
-            ]
+            ])
 
             session.decisions.append(
                 ReviewDecision(
@@ -2597,6 +2814,7 @@ def merge_concurrent_changes(
     base = session._baseline
     base_states = base.decisions if base else {}
     disk_decisions = {get_paper_id(d.paper): d for d in on_disk.decisions}
+    <<find the legacy records this session replaced>>
 
     own_ids = set()
     for decision in session.decisions:
@@ -2605,7 +2823,7 @@ def merge_concurrent_changes(
         theirs = disk_decisions.get(paper_id)
         if theirs is not None:
             for link in theirs.found_by:
-                decision.record_search(*link)
+                decision.record_search(*replaced.get(link, link))
         if theirs is None or paper_id not in base_states:
             continue
         mine, base_state = decision_state(decision), base_states[paper_id]
@@ -2628,7 +2846,7 @@ def merge_concurrent_changes(
 
     own_keys = {r.key for r in session.search_records}
     for record in on_disk.search_records:
-        if record.key not in own_keys:
+        if record.key not in own_keys and record.key not in replaced:
             session.search_records.append(record)
     own_rounds = {r.timestamp for r in session.snowball_rounds}
     for snowball_round in on_disk.snowball_rounds:
@@ -2636,6 +2854,31 @@ def merge_concurrent_changes(
             session.snowball_rounds.append(snowball_round)
 
     session._invalidate_cache()
+@
+
+A legacy record in the file (\cref{sec:search-record-key}) that this
+session no longer has was replaced by a re-run of its query
+(\cref{sec:legacy-records}): legacy records come only from old files and
+are never created again, so the only way to lose one is to replace it.
+Adding it back from the file, as the rule for records only the file has
+would, would undo the replacement on every save; and the file's links to
+it would come back with it.  So a file's legacy record is left out when
+this session has a record of the same query and provider, and the file's
+links to it are moved to that record, as the replacement moved ours.
+
+<<find the legacy records this session replaced>>=
+replaced: dict[tuple, tuple] = {}
+own_keys_now = {r.key for r in session.search_records}
+for record in on_disk.search_records:
+    if not record.is_legacy or record.key in own_keys_now:
+        continue
+    successor = next(
+        (r for r in session.search_records
+         if (r.query, r.provider) == (record.query, record.provider)),
+        None,
+    )
+    if successor is not None:
+        replaced[record.key] = successor.key
 <<merge research context from disk>>=
 theirs_context = on_disk.research_context
 if base is not None:
@@ -4654,15 +4897,50 @@ also when every provider ran the base query but one of them failed, and
 it gains a hits column whenever at least one outcome is known; a report
 built from an old session therefore looks exactly as it did.
 
+A query can also be run twice on one provider with different filters,
+say once over the full text and once with [[--in title-abstract]]
+(\cref{sec:search-record-key}).  Those are two searches with two
+counts, and a table of query and provider alone would show two rows
+that look the same.  So each row carries the search's filter flags,
+written as [[scholar search]] takes them ([[filter_flags]],
+\cref{sec:filter-flags} in the [[scholar]] module), in a column that
+appears when any search had filters; and the table appears whenever two
+searches share their query and provider ([[search_table_needed]]),
+since only the table tells them apart.
+
 <<review report generation>>=
-def search_outcomes(session: ReviewSession) -> list[tuple[str, str, str]]:
-    """Return `(query, provider, outcome label)` for each recorded search."""
+def search_outcomes(
+    session: ReviewSession,
+) -> list[tuple[str, str, str, str]]:
+    """Return `(query, provider, flags, outcome label)` for each search.
+
+    `flags` are the filter flags of the search, as `scholar search`
+    takes them (empty when it had none).
+    """
     if not session.search_records:
-        return [(q, p, "") for q, p in get_query_provider_pairs(session)]
+        return [(q, p, "", "") for q, p in get_query_provider_pairs(session)]
     return [
-        (r.query, r.provider, hits_label(r.hits, r.error, r.retries))
+        (
+            r.query, r.provider, " ".join(filter_flags(r.filters)),
+            hits_label(r.hits, r.error, r.retries),
+        )
         for r in session.search_records
     ]
+
+
+def searches_share_query(session: ReviewSession) -> bool:
+    """Whether two recorded searches have the same query and provider."""
+    pairs = [(r.query, r.provider) for r in session.search_records]
+    return len(pairs) != len(set(pairs))
+
+
+def search_table_needed(session: ReviewSession) -> bool:
+    """Whether the report needs its table of provider searches."""
+    return (
+        provider_queries_differ(session)
+        or any_search_failed(session)
+        or searches_share_query(session)
+    )
 
 
 def any_search_failed(session: ReviewSession) -> bool:
@@ -4676,7 +4954,9 @@ The research context and the search parameters exist in a Markdown and a
 given above; the provider table only appears when at least one provider
 ran a query different from the base query, since otherwise it would
 repeat the base query once per provider---or when a search failed,
-since the failure must be visible either way.
+since the failure must be visible either way, or when two searches
+share their query and provider, since only the table's filters column
+tells them apart.
 
 <<review report generation>>=
 def build_research_context_markdown(
@@ -4712,23 +4992,35 @@ def build_search_parameters_markdown(
         "",
     ]
 
-    if provider_queries_differ(session) or any_search_failed(session):
+    if search_table_needed(session):
         heading2 = "#" * (heading_level + 1)
         outcomes = search_outcomes(session)
-        with_hits = any(label for _, _, label in outcomes)
+        with_hits = any(label for *_, label in outcomes)
+        with_flags = any(flags for _, _, flags, _ in outcomes)
+        columns = ["Provider", "Query"]
+        columns += ["Filters"] if with_flags else []
+        columns += ["Hits"] if with_hits else []
         lines.extend([
             f"{heading2} Provider-specific queries",
             "",
-            "| Provider | Query | Hits |" if with_hits
-            else "| Provider | Query |",
-            "| --- | --- | --- |" if with_hits else "| --- | --- |",
+            "| " + " | ".join(columns) + " |",
+            "|" + " --- |" * len(columns),
         ])
-        for query, provider, label in outcomes:
-            hits_cell = f" {label} |" if with_hits else ""
-            lines.append(f"| {provider} | {query} |{hits_cell}")
+        for query, provider, flags, label in outcomes:
+            cells = [provider, query]
+            cells += [f"`{flags}`" if flags else ""] if with_flags else []
+            cells += [label] if with_hits else []
+            lines.append("| " + " | ".join(cells) + " |")
         lines.append("")
 
     return lines
+
+
+def latex_flags(flags: str) -> str:
+    """Typeset command-line flags in typewriter, keeping `--` two hyphens."""
+    if not flags:
+        return ""
+    return r"\texttt{" + escape_latex(flags).replace("--", "-{}-") + "}"
 
 
 def build_research_context_latex(
@@ -4763,26 +5055,34 @@ def build_search_parameters_latex(
         ]
     )
 
-    if provider_queries_differ(session) or any_search_failed(session):
+    if search_table_needed(session):
         outcomes = search_outcomes(session)
-        with_hits = any(label for _, _, label in outcomes)
+        with_hits = any(label for *_, label in outcomes)
+        with_flags = any(flags for _, _, flags, _ in outcomes)
+        spec = "lp{8cm}" if with_hits else "lp{10cm}"
+        header = ["Provider", "Query"]
+        if with_flags:
+            spec = "lp{6cm}p{3.5cm}" if with_hits else "lp{7cm}p{3.5cm}"
+            header.append("Filters")
+        if with_hits:
+            spec += "p{3.5cm}"
+            header.append("Hits")
         lines.extend(
             [
                 f"{sub_heading(heading_command)}{{Provider-specific queries}}",
-                r"\begin{longtable}{lp{8cm}p{3.5cm}}" if with_hits
-                else r"\begin{longtable}{lp{10cm}}",
+                rf"\begin{{longtable}}{{{spec}}}",
                 r"\toprule",
-                r"Provider & Query & Hits \\" if with_hits
-                else r"Provider & Query \\",
+                " & ".join(header) + r" \\",
                 r"\midrule",
             ]
         )
-        for query, provider, label in outcomes:
-            hits_cell = f" & {escape_latex(label)}" if with_hits else ""
-            lines.append(
-                f"{escape_latex(provider)} & {escape_latex(query)}"
-                f"{hits_cell} \\\\"
-            )
+        for query, provider, flags, label in outcomes:
+            cells = [escape_latex(provider), escape_latex(query)]
+            if with_flags:
+                cells.append(latex_flags(flags))
+            if with_hits:
+                cells.append(escape_latex(label))
+            lines.append(" & ".join(cells) + r" \\")
         lines.extend(
             [
                 r"\bottomrule",
@@ -4792,6 +5092,52 @@ def build_search_parameters_latex(
         )
 
     return lines
+@
+
+Let's verify the table for one query run twice on OpenAlex, over the
+full text and with [[--in title-abstract]] (the counts are those of the
+live check in \cref{sec:openalex-search-in} of the [[providers]]
+module): both formats show the table although the queries equal the
+base query and nothing failed, and each row shows its own flags and
+hits.
+
+<<test functions>>=
+class TestReportShowsSearchFilters:
+    """Two searches of one query differ in the report by their flags."""
+
+    @staticmethod
+    def _session():
+        session = ReviewSession(
+            query="Q", providers=["openalex"], timestamp=datetime.now(),
+        )
+        session.search_records = [
+            SearchRecord("Q", "openalex", None, 1000, hits=2130),
+            SearchRecord("Q", "openalex", {"search_in": "title-abstract"},
+                         1000, hits=192),
+        ]
+        return session
+
+    def test_markdown(self):
+        lines = build_search_parameters_markdown(self._session())
+        assert "| Provider | Query | Filters | Hits |" in lines
+        assert "| openalex | Q |  | 2130 |" in lines
+        assert "| openalex | Q | `--in title-abstract` | 192 |" in lines
+
+    def test_latex(self):
+        text = "\n".join(build_search_parameters_latex(self._session()))
+        assert r"Provider & Query & Filters & Hits \\" in text
+        assert r"openalex & Q &  & 2130 \\" in text
+        assert (
+            r"openalex & Q & \texttt{-{}-in title-abstract} & 192 \\"
+        ) in text
+
+    def test_no_table_for_one_plain_search(self):
+        session = self._session()
+        session.search_records = session.search_records[:1]
+        assert not any(
+            "Provider-specific" in line
+            for line in build_search_parameters_markdown(session)
+        )
 @
 
 The provider table must nest under the search-parameters heading rather

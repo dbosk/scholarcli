@@ -66,7 +66,17 @@ Providers self-register via `register_provider()` at module load time.
   unknown keys as sorted JSON; `""` for no filters. A failed re-run of
   the same key does not overwrite an earlier answered record. The audit
   caption counts each record as one query (two filter sets = two
-  queries, on purpose).
+  queries, on purpose). Legacy records (`SearchRecord.is_legacy`:
+  `filters` and `limit` both `None`; written before #61, which stored
+  both together, while every search since records a limit) have
+  unknown filters: a re-run of their (query, provider) replaces them
+  whatever its filters, their links move to the new key
+  (`replaced_links` in `create_review_session`), and
+  `merge_concurrent_changes` does not re-add a legacy record from disk
+  that the session replaced. The report's provider table has a
+  Filters column (`filter_flags`, `scholar.py`, shared with
+  `_search_flags`) and appears also when two records share
+  (query, provider).
 
 ### Search Flow
 
@@ -114,7 +124,16 @@ fills it).
 (#135; values in `SEARCH_IN_CHOICES`, a Typer `Enum` in the CLI so a bad
 value is a usage error). It is a filter: in `as_dict`/`cache_key` only
 when set (old cache keys unchanged), in the session record's key, and
-rendered back by `_search_flags` as `--in title-abstract`. Per provider
+rendered back by `filter_flags` as `--in title-abstract`. A search
+records the filters its provider *applied*
+(`scholar.applied_filters(provider, query, filters)`, used by
+`Search.execute` and rq): a provider's own `applied_filters(query,
+filters)` method if it has one (Scopus), else `search_in` is kept only
+when `HONOURS_SEARCH_IN is True` (OpenAlex and subclasses, WoS).
+Provider cache keys still use the requested filters (an ignoring
+provider caches an `--in` search separately; harmless).
+`SearchResult.merge` keeps `search_in` when the inputs differ only in
+it, since a merged record stands for the whole command. Per provider
 (docs cited in `providers.nw`, section "Searching title and abstract
 only"; `scholar syntax` has a "Default Search Fields" table):
 - OpenAlex + source-pinned servers: scoped parameter
@@ -126,7 +145,10 @@ only"; `scholar syntax` has a "Default Search Fields" table):
   works (its docs: >60% of 2022 works have one, ~45% pre-2000), so this
   is not the same search as in WoS/Scopus.
 - Scopus: query wrapped as `TITLE-ABS-KEY(...)` unless it already has a
-  field code (`SCOPUS_FIELD_CODE`; then a warning). WoS: nothing to do
+  field code (`SCOPUS_FIELD_CODE`, case-insensitive over the explicit
+  `SCOPUS_FIELD_CODES` list from Elsevier's search tips, plus
+  `PUBYEAR`/`REFPUBYEAR` with an operator); then it warns and does not
+  record `search_in`. WoS: nothing to do
   (`TS=` = title, abstract, author keywords, Keywords Plus).
 - S2, DBLP, IEEE, arXiv, HAL: `warn_search_in_ignored()` logs
   "`<name>: --in title-abstract not supported, ignoring`" and searches
@@ -522,7 +544,9 @@ decision, persisted as `found_by` in the session JSON
 disk by `merge_concurrent_changes` (#128). Old two-part links (no
 `"filters"`) are resolved at load when exactly one record has that
 query and provider; otherwise they stay `(q, p, None)` and are saved
-back without `"filters"`. `ReviewSession.search_record(q, p, key)`
+back without `"filters"`. A resolved link supersedes the unresolved
+links of its (q, p) (`without_superseded_links`, on record and on
+load). `ReviewSession.search_record(q, p, key)`
 matches the full key; with `key=None` it answers only a unique
 (q, p). `prov found-via` prints one
 command per resolved link via `search_record` and
