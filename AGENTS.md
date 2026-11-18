@@ -906,7 +906,7 @@ is process-global, so tests that load sessions should use unique DOIs or
 
 The `bibtex+prov` export format wraps each entry in a provenance comment
 block (`% === provenance: <key> ===` + `CLAIM`/`FOUND-VIA`/`PICKED`/`QUOTE`/
-`VERIFIED`/`DATE`). `scholar prov` keeps those blocks in sync with `scholar
+`VERIFIED`/`COUNTER`/`DATE`). `scholar prov` keeps those blocks in sync with `scholar
 notes`:
 
 - `scholar prov import refs.bib` parses each entry's block(s) into that
