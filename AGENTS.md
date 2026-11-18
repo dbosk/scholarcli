@@ -141,10 +141,13 @@ Providers self-register via `register_provider()` at module load time.
   all; legacy records never count as wider).
   `ReviewSession.add_search_record(record)` carries records over whole.
   All record rules are one sort key, `record_rank(r)` =
-  `(answered, width, hits, complete, searched_at)` (legacy width,
-  unknown hits and unknown dates rank lowest); `preferred_record(a, b)`
+  `(answered, width, searched_at, hits, complete)` (legacy width,
+  unknown dates and unknown hits rank lowest); `preferred_record(a, b)`
   keeps the higher, `a` on equal keys (a total preorder: no cycles, no
-  order dependence).
+  order dependence). So a search's record is its latest answered run of
+  the widest scope, with that run's own outcome (a newer partial run
+  reads "incomplete"); the date beats hits because PRISMA asks when each
+  source was last searched; older runs' links stay on the same key.
   `create_review_session` (new run first) and
   `merge_concurrent_changes` (own record first, for a shared key) both
   use it.
