@@ -132,9 +132,12 @@ Providers self-register via `register_provider()` at module load time.
   `providers.py` (`start_answer`, `answer_from_cache`, `fetching_now`,
   `cache_answer`) at each `search()`'s reset, cache hit, fetch and
   store. The fetch time and total of a cached answer live in a side
-  table of the same cache dict, `cache[FETCH_META_KEY]`
-  (`cache.fetch_meta` / `remember_fetch`): old entries keep loading
-  and read as "fetch date unknown"; no CACHE_VERSION bump.
+  entry of the same cache dict, `cache[(FETCH_META_KEY, key)]`
+  (`cache.fetch_meta` / `remember_fetch` / `is_fetch_meta_key`): one
+  top-level entry per answer, assigned via `__setitem__`, so the
+  `PersistentCache` marks it changed and the merge-on-save keeps other
+  processes' facts; reading never marks the cache changed. Old entries
+  keep loading and read as "fetch date unknown"; no CACHE_VERSION bump.
   `search_dates_label` ("searched 2026-11-18, cached answer fetched
   2026-10-02") in `sessions show`; `search_source_date` feeds the audit
   caption's "Searched A to B." (+ "Search date unknown for k of n
@@ -616,12 +619,50 @@ confirmation goes to stderr so `-f json`/`-f bibtex` stdout stays pure.
 `sessions show` prints each paper's id (`doi:…`/`hash:…`, the value
 `--paper-id` takes) under its title, and `show -f json` carries `doi` and
 `paper_id`, so a decision never needs a CSV detour.
-`--source llm` stores the decision as an unreviewed LLM decision
-(agent-driven screening that the TUI still queues for confirmation),
-with `--confidence/-c 0..1` in `llm_confidence` like `llm classify`
-(validated; ignored with a note for human decisions); a
-human `decide` on such a row marks it `llm_reviewed`, with `is_example`
-set when the status changed, mirroring the TUI.
+`--source human|agent|llm` says who decided (#162). It defaults to
+`human` only when stdin is a terminal; otherwise (scripts, agents) a
+missing `--source` exits 2 before loading the session. `agent` (an AI
+agent's own verdict) and `llm` (a classifier's verdict relayed) store
+unreviewed decisions (`ReviewSource.AGENT_UNREVIEWED`/`LLM_UNREVIEWED`,
+values `agent`/`llm`) that the TUI queues for confirmation, with
+`--confidence/-c 0..1` in `llm_confidence` like `llm classify`
+(validated; ignored with a note for human decisions; a machine decision
+without `-c` gets None, never an earlier run's number); a human `decide`
+(or TUI confirm) on such a row marks it `agent_reviewed`/`llm_reviewed`
+(`ReviewSource.reviewed`), with `is_example` set when the status
+changed. Ask a source `is_unreviewed` / `is_machine` instead of
+listing members. A machine `decide` also calls
+`review.clear_machine_audit(decision)`, which sets every field named in
+`review.MACHINE_AUDIT_FIELDS` to None (empty here; classifier audit
+fields register there so a replaced decision does not keep the old
+run's model/prompt/reason). A machine `decide` never replaces a decided
+paper whose source is `human`, `llm_reviewed` or `agent_reviewed`:
+the batch is refused unsaved (exit 2, each conflict named) unless
+`--force`. When `decide` changes a record's status, only its old
+category tags (`AUDIT_CATEGORIES`) are dropped before the new `--tag`s
+are added (`review.tags_after_status_change`, #177); themes,
+motivations and notes stay (dropping motivations lost themes on
+keep→discard→keep). Same status: tags append as before.
+**Unknown stored sources** (e.g. `manual`, which no Scholar version
+wrote, or a hand-edited `Agent`) load as `ReviewSource` pseudo-members
+via `_missing_` (`is_unknown`; value kept verbatim on save), count as
+unreviewed (never cited, not in `example_papers`, queued in the TUI;
+a human review makes them `human`), are shown as "unknown source
+'<value>'", and are warned about once per file and process
+(`warn_about_unknown_sources`).
+**Old installs:** a Scholar older than this change reads `agent`,
+`agent_reviewed` (and any unknown source) as `human` and writes that
+back on its next save. Reinstall every scholar installation (pipx,
+other venvs) before anyone uses `--source agent`.
+Who decided is shown everywhere decisions are counted (#163): the
+LaTeX report (summary "Decided: <source>" rows, abstract sentence,
+"(agent, unreviewed)" marks in the paper lists and overview table),
+`llm synthesize` (both formats' summary), `sessions show` ("Decided
+by:", marks after titles; JSON `source` per decision and
+`decision_sources`), `llm status` (Agent rows) and the export's
+confirmed/changed table (`machine_review_rows`, LLM and agent apart).
+Labels come from `review.DECISION_SOURCE_LABELS` /
+`decision_source_items` (decided papers only).
 Together these let scripted/agent-driven systematic reviews produce the same
 session record and `sessions export` audit trail as TUI reviews.
 
@@ -808,8 +849,10 @@ report body builders (`build_review_provenance_latex`,
   (`author_surname`; a blank author gives an empty surname) reduced to case-folded letters and digits, year ignored; joined
   provider strings like `openalex; dblp` are split, mapped to codes and
   deduplicated; the best-placed decision wins). The *last* category tag
-  is the decision (`decide -t` appends); confidence is shown for
-  unreviewed and human-confirmed LLM rows, not for changed ones, and
+  is the decision (`decide -t` appends while the status stays the
+  same; a status change replaces the old category, #177); confidence is
+  shown for unreviewed and human-confirmed LLM or agent rows, not for
+  changed ones, and
   such a row without one shows `AUDIT_STRINGS[lang]["no_confidence"]`
   (`n/a`, `saknas`) because the caption promises a confidence. The
   escapers decode HTML entities, strip inline markup, repair
@@ -820,10 +863,11 @@ report body builders (`build_review_provenance_latex`,
   note tags (`AUDIT_STRINGS[lang]["notes"]`: `recorded-not-cited`,
   `duplicate-record-of-cited-source`, `extended-tech-report`, …) and
   theme tags (the rest; with `--theme` given, only the listed tags).
-  *Cited* = kept by a human decision (source `human` or `llm_reviewed`)
-  with a theme tag or no tags; otherwise the last category tag
-  (`audit_category`), with the confidence for unreviewed LLM rows; notes
-  are appended in parentheses, note-only rows are "other". An LLM keep
+  *Cited* = kept by a decision that is not `is_unreviewed` (source
+  `human`, `llm_reviewed` or `agent_reviewed`) with a theme tag or no
+  tags; otherwise the last category tag (`audit_category`), with the
+  confidence for unreviewed LLM or agent rows; notes are appended in
+  parentheses, note-only rows are "other". An LLM's or an agent's keep
   is a candidate, not a citation. Order: cited (0), `supports-claim` (1),
   `qualifies-claim` (2), `adjacent-subtopic` (3),
   `off-topic-false-hit` (4), pending (5), other (6). The status wins
@@ -899,6 +943,61 @@ heavy imports out of `cli.py`'s module level (`scholar.crossref` loads
 its cache on import): `TestLazySubcommands` runs `main()` in a child
 interpreter and fails if `--help` imports tuxedo, snowball, openai or
 `scholar.crossref`.
+
+### LLM Screening Record and Review Samples
+
+Each decision applied by `llm classify` records `llm_model`,
+`llm_decided_at` (UTC ISO), `llm_prompt_version` (16 hex digits:
+`classification_prompt_version`, a hash of the prompt built for a fixed
+probe plus the run options and research context; not the session's
+tags or examples), `llm_reason` (cut to `MAX_REASON_CHARS` = 500) and
+`llm_abstract_truncated` (#168). They live on `ReviewDecision`, named
+once in `review.LLM_AUDIT_FIELDS` (`llm_audit_of()`), which load, save,
+the append copy, `decision_state` and the concurrent merge all use; old
+files load them as `None` (unknown) and nothing fills them in later.
+A human review leaves them untouched (they are the model's record).
+
+- **No invented values.** `parse_llm_response` returns one entry per
+  paper; an unusable answer (no answer, decision not kept/discarded, a
+  discard without tags, confidence missing/non-numeric/outside [0, 1])
+  gets `LLMDecision.answer_problem`, triggers the single retry, and is
+  then withheld with the category-rule ones (`LLMDecision.problem`);
+  `llm classify` and `rq` list them (`print_withheld_papers`) under
+  "Left pending, no usable answer".
+  Answers without a valid `paper_index` are skipped (never index 0).
+- **Abstracts.** `MAX_ABSTRACT_CHARS` = 4000 for papers to classify
+  (marked `[abstract truncated]` in the prompt), `EXAMPLE_ABSTRACT_CHARS`
+  = 1000 for examples.
+- **Examples** are only `human`/`llm_reviewed`/`agent_reviewed` decisions
+  (`CONFIRMED_SOURCES`, compared by value); `--include-llm-examples`
+  adds unreviewed `llm`/`agent` ones after them.
+- **Samples (#173).** `scholar llm sample S [S...] --discarded|--kept
+  [--min-confidence C] -n N --seed SEED` pools unreviewed `llm`/`agent`
+  decisions, sorts them by (session, paper id), keys each with
+  `random.Random(seed).random()` (the only call Python promises to keep
+  stable across versions) and takes the N smallest; it stores a
+  `review.LLMSample` (seed, criteria, UTC date, population size and
+  digest, this session's papers with the machine's status) in every
+  pooled session (`ReviewSession.llm_samples`, merged by `sample_id`,
+  which ends in uuid4 digits so two draws in one second never collide).
+  `test_golden_draw` pins the drawn papers for seed 42.
+  The TUI filter `s` (`sampled_for_review`) queues the unreviewed ones;
+  `sessions decide` reviews them. `--report [-f json]`
+  (`sample_reports`): a sampled decision counts as reviewed when decided
+  and no longer an unreviewed machine source, as changed when its
+  status differs from the recorded one; the rate gets the 95% modified
+  Wilson interval (`modified_wilson_interval`, Brown, Cai & DasGupta
+  2001, eq. 4 with the Poisson bound of eq. 10, p. 112, for x <= x*,
+  x* = 2 for n <= 50 else 3), because plain Wilson coverage dips near
+  p = 0, where disagreement rates live. The sentence says the rate
+  covers only the reviewed part while some is unreviewed.
+- **Report.** `build_review_provenance_latex` calls
+  `llm_review.build_llm_screening_latex` (one local import + call): an
+  "LLM screening" section with models, prompt versions, dates, the
+  truncated (from each decision's flag, no character count) and
+  unrecorded counts, and `sample_sentence` per sample
+  (other pooled sessions are loaded read-only). Nothing when the
+  session has no LLM decisions and no samples.
 
 ### Interactive Tutorials (`scholar tutorial`)
 
@@ -1039,6 +1138,41 @@ cache. Valid names are the registered providers plus `crossref` and
 with `--include-llm` (exit 2 / `ValueError`).
 
 Environment variable: `SCHOLAR_CACHE_DIR` to override cache location.
+
+**Concurrent processes** (#175: two processes racing emptied the real
+cache). `load_cache` returns a `PersistentCache` (a `dict` subclass with
+a `changed` flag set by every mutating method). `save_cache` (and so the
+`atexit` hook `save_all_caches`):
+
+- skips a `PersistentCache` that was not changed (plain dicts are always
+  saved), so read-only processes never write. The flag does not see
+  changes *inside* a value: to add to a cached entry, reassign the key
+  (`cache[k] = {**cache[k], "field": x}`), as the synthesis does for
+  its report abstract;
+- under `utils.file_lock` on `.<name>.pkl.lock`, re-reads the file and
+  writes the union (in-memory wins on a shared key) with
+  `utils.atomic_write_bytes` (temp file, fsync, `os.replace`), so a
+  reader never sees a partial file and a save never drops another
+  process's entries. Cache saves wait up to `CACHE_LOCK_TIMEOUT` (60 s,
+  not the sessions' 10 s: a save re-reads and writes the whole file,
+  0.6 s for 6 MB). Past it the save runs unlocked: still atomic, never
+  truncated, but entries can be lost if another process replaces the
+  file in between;
+- never writes over a file it cannot read (`read_cache_file` catches
+  any unpickling error; `load_cache` warns with the path and returns an
+  empty cache): the file is kept and the entries go to a unique
+  `<name>.pkl.unmerged-<UTC time>-<random>` beside it (mkstemp), with a
+  warning. Nothing merges it back; `cache info` lists these files with
+  a hint and `cache clear` deletes them by the caches' rules
+  (`--provider`, LLM caches kept without `--include-llm`).
+
+The files stay plain pickled dicts, readable by older versions.
+`clear_cache` deletes each file under the same lock, but a process
+running at the time keeps its loaded entries in memory and writes them
+back at exit if it changes its cache (union cannot tell deleted from
+lost entries); clear again once the other processes have ended.
+Not covered: an older scholar without the lock writing in place, and
+processes on different machines.
 
 The keyed REST providers cache manually (search wrapper +
 `_search_uncached` returning `(papers, cacheable)`) instead of via
