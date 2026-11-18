@@ -90,7 +90,10 @@ Providers self-register via `register_provider()` at module load time.
   `searched_providers` lists only providers that answered at least one
   search; skipped / failed-outright ones go to "Not searched: ieee
   (skipped: …)" (`unsearched_providers`, `provider_failure`, which
-  splits merged errors at their provider prefixes). Failed and skipped
+  splits merged errors at their provider prefixes); a provider a merged
+  record with papers names as failed is listed with "(failed or
+  incomplete in a merged record)", as in the caption
+  (`searched_providers_text`). Failed and skipped
   records have no `search_source_date` and stay out of the periods.
 - One record per provider search (#164). `SearchResult.parts` /
   `found_in` (not compared): `merge` keeps the single-provider results
