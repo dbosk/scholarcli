@@ -289,7 +289,10 @@ exception text, shortened, without the `HTTP <code>:` prefix. The
 constructor sets `pyalex.config.retry_http_codes =
 []`: pyalex's default (`max_retries=0` with 429/500/503 listed) retried
 nothing but turned those statuses into a `RetryError` without a
-response, so no search ever saw a real 429 or 503 body.
+response, so no search ever saw a real 429 or 503 body. The per-paper
+lookups (`get_paper_by_doi`, `get_preprint_locations`,
+`search_preprints_by_title`) hand an `HTTPError` to
+`_note_http_error(e, during=...)`, so a 429 there starts a cooldown.
 
 Keys in messages (#159): `network.redact_secrets(text)` hides the
 values of `api_key`/`apikey`/`api-key`/`key` URL parameters (any

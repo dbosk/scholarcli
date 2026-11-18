@@ -4168,14 +4168,23 @@ def _budget_spent(response, reason: str | None) -> bool:
         return False
     return daily_spent and not _credit_beyond_daily(response)
 
-def _note_http_error(self, error: requests.HTTPError) -> None:
-    """Log an HTTP failure, translating a spent budget into a reset time."""
+def _note_http_error(
+    self, error: requests.HTTPError, during: str | None = None
+) -> None:
+    """Log an HTTP failure, translating a spent budget into a reset time.
+
+    `during` names the operation for the log line ("DOI lookup for
+    ..."); every 429 is recorded on the limiter, whatever the operation.
+    """
     response = getattr(error, "response", None)
-    if response is None:
-        logger.warning("%s: %s", self.name, error)
-        return
-    if response.status_code != 429:
-        logger.warning("%s: %s", self.name, self._refusal_reason(response))
+    if response is None or response.status_code != 429:
+        reason = (
+            self._refusal_reason(response) if response is not None
+            else network.redact_secrets(error)
+        )
+        if during:
+            reason = f"{during} failed: {reason}"
+        logger.warning("%s: %s", self.name, reason)
         return
     if self._record_429(response):
         self._warn_budget_spent()
@@ -4914,6 +4923,53 @@ def test_probe_detail_of_recorded_400_is_shortened(self, monkeypatch):
   assert len(detail) <= len("HTTP 400: ") + OPENALEX_REASON_MAX_CHARS
 @
 
+\paragraph{The lookups.}
+With the responses let through, a 429 can also reach the lookups that
+enrichment makes one paper at a time: [[get_paper_by_doi]],
+[[get_preprint_locations]] and [[search_preprints_by_title]]
+(\cref{sec:preprint-lookups}).
+They logged an [[HTTPError]] and returned nothing, but never showed the
+response to the limiter.
+A 429 there started no cooldown, so the next paper's lookup asked
+again at once, and the one after that, through a whole session.
+Each now hands the error to [[_note_http_error]], as the DOI batch
+already did: a 429 starts the cooldown its [[Retry-After]] asks for, or
+the quota block of a spent budget, and the lookup still returns its
+empty answer and caches nothing.
+The [[during]] argument keeps the operation in the log line.
+
+The test answers one lookup with a 429 and [[Retry-After: 30]] and then
+makes a DOI lookup: the limiter refuses it, and no second request
+reaches the stand-in.
+
+<<test functions>>=
+class TestOpenAlexLookupCooldown:
+  """A 429 on a lookup pauses the lookups that follow."""
+
+  PACE_429 = (
+    429,
+    b'{"error": "Rate limit exceeded", "reason": "requests_per_second"}',
+    {"Retry-After": "30"},
+  )
+
+  @pytest.mark.parametrize("first_lookup", [
+    lambda p: p.get_paper_by_doi(RECORDED_DOI_A),
+    lambda p: p.get_preprint_locations(RECORDED_DOI_A),
+    lambda p: p.search_preprints_by_title("Refractive changes at dusk"),
+  ], ids=["doi", "preprint-locations", "preprint-title"])
+  def test_429_pauses_the_next_lookup(self, openalex_loopback, caplog,
+                                      first_lookup):
+    openalex_loopback.plan.append(self.PACE_429)
+    provider = OpenAlexProvider(api_key=None)
+    cached_before = dict(provider._cache)
+    assert not first_lookup(provider)
+    with caplog.at_level(logging.WARNING):
+      assert provider.get_paper_by_doi(RECORDED_DOI_B) is None
+    assert len(openalex_loopback.paths) == 1
+    assert "rate limited" in caplog.text
+    assert dict(provider._cache) == cached_before
+@
+
 \subsubsection{Applying filters}
 
 OpenAlex supports filtering via its query builder. We chain filter calls:
@@ -5321,10 +5377,12 @@ def get_paper_by_doi(self, doi: str | None) -> Paper | None:
             logger.debug("openalex: no work for DOI %s", doi)
             self._cache[cache_key] = None
             return None
-        logger.warning("openalex: DOI lookup failed: %s", e)
+        self._note_http_error(e, during=f"DOI lookup for {doi}")
         return None
     except Exception as e:
-        logger.warning("openalex: DOI lookup failed: %s", e)
+        logger.warning(
+            "openalex: DOI lookup failed: %s", network.redact_secrets(e)
+        )
         return None
 @
 
@@ -5443,10 +5501,13 @@ def _fetch_works_by_doi(self, batch: list[str]) -> list[dict] | None:
         # The limiter already logged the reason once
         return None
     except requests.exceptions.HTTPError as e:
-        self._note_http_error(e)
+        self._note_http_error(e, during="DOI batch lookup")
         return None
     except Exception as e:
-        logger.warning("%s: DOI batch lookup failed: %s", self.name, e)
+        logger.warning(
+            "%s: DOI batch lookup failed: %s",
+            self.name, network.redact_secrets(e),
+        )
         return None
     works = list(response)
     count = (getattr(response, "meta", None) or {}).get("count")
@@ -5829,15 +5890,14 @@ def get_preprint_locations(self, doi: str | None) -> list[dict]:
             logger.debug("openalex: no work for DOI %s", doi)
             self._cache[cache_key] = []
             return []
-        logger.warning(
-            "openalex: preprint-location lookup failed for %s: %s",
-            doi, e,
+        self._note_http_error(
+            e, during=f"preprint-location lookup for {doi}"
         )
         return []
     except Exception as e:
         logger.warning(
             "openalex: preprint-location lookup failed for %s: %s",
-            doi, e,
+            doi, network.redact_secrets(e),
         )
         return []
 
@@ -5940,9 +6000,13 @@ def search_preprints_by_title(
     except RateLimited:
         # The limiter already logged the reason once
         return []
+    except requests.exceptions.HTTPError as e:
+        self._note_http_error(e, during="preprint title search")
+        return []
     except Exception as e:
         logger.warning(
-            "openalex: preprint title search failed: %s", e
+            "openalex: preprint title search failed: %s",
+            network.redact_secrets(e),
         )
         return []
 
@@ -12437,11 +12501,13 @@ def _record_429(self, response) -> bool:
     )
     return False
 
-def _note_http_error(self, error: requests.HTTPError) -> None:
+def _note_http_error(
+    self, error: requests.HTTPError, during: str | None = None
+) -> None:
     """Log a failure; a pace 429 names the semantic limiter's retry."""
     response = getattr(error, "response", None)
     if response is None or response.status_code != 429:
-        return super()._note_http_error(error)
+        return super()._note_http_error(error, during)
     if self._record_429(response):
         self._warn_budget_spent()
     else:
