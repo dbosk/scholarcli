@@ -24,7 +24,7 @@ This enables clean testing (mock objects just work), future extensibility
 (third-party providers need not depend on Scholar), and explicit contracts
 that static type checkers can verify.
 
-The chapter covers fifteen providers:
+The chapter covers sixteen providers:
 \begin{description}
 \item[Semantic Scholar] AI-powered research database with 200M+ papers.
   Uses the official [[semanticscholar]] client library.
@@ -43,6 +43,9 @@ The chapter covers fifteen providers:
   Archive---seven servers without usable search APIs of their own,
   each provided as an OpenAlex search pinned to that server
   (\cref{sec:preprint-sources}).
+\item[OpenAlex semantic search] OpenAlex's search by meaning: a
+  ranked list of at most fifty works, a check on keyword searches
+  rather than a database search (\cref{sec:openalex-semantic}).
 \item[HAL] The French national open archive.
   Direct REST API (Solr) with JSON responses.
 \item[Scopus] Elsevier's abstract and citation database.
@@ -113,6 +116,7 @@ itself with the provider registry on import.
 <<paced arxiv client>>
 <<arxiv provider>>
 <<preprint source provider>>
+<<openalex semantic provider>>
 <<hal provider>>
 <<scopus provider>>
 @
@@ -127,6 +131,7 @@ The test file collects all distributed test chunks:
 
 <<test [[providers.py]]>>=
 """Tests for the providers module."""
+import json
 import logging
 
 import pytest
@@ -9751,6 +9756,487 @@ class TestPreprintSourceIntegration:
 @
 
 
+\section{OpenAlex Semantic Search Provider}
+\label{sec:openalex-semantic}
+
+A keyword search finds the works whose text contains the words of the
+query.  Its record shows what was found, but it cannot show what was
+missed: a study that speaks of \enquote{recovery procedures} is
+invisible to the query \enquote{account recovery}.  That is how a
+literature review that searched five databases without a limit missed
+a study bearing directly on its question (issue~\#136).  A search by
+\emph{meaning} can serve as a check on such a record.  OpenAlex offers
+one, the [[search.semantic]] parameter of its works endpoint,
+documented at \url{https://help.openalex.org/api/semantic-search/}
+(read 2026-11-18; the page says it was last updated on 2026-11-03).
+OpenAlex \enquote{embeds the title, abstract and venue name of every
+work} and returns the works closest to the embedded question.
+
+The page sets the limits this provider has to keep:
+\begin{description}
+\item[At most 50 results] \enquote{Max results: 50 per query}.  The
+  page mentions no paging, and the provider asks for no more than one
+  page.
+\item[2\,000 characters of input] \enquote{Up to 2,000 characters are
+  used for matching; longer input is truncated.}
+\item[One request a second] \enquote{Rate limit: 1 request per
+  second}, against the ten of the ordinary search
+  (\cref{sec:openalex}).
+\item[One search parameter] \enquote{Only one search parameter is
+  allowed per request: search, search.exact, or search.semantic.}
+  Semantic search \enquote{works with 17 filters}; any other filter
+  \enquote{returns a 400 error}.
+\end{description}
+
+\subsection{A provider, not a filter}
+
+The semantic search could have been an option of the [[openalex]]
+provider.  It is a provider of its own, [[openalex-semantic]], because
+a review session identifies a search by its query and provider: under
+the [[openalex]] name, a semantic run of a question would be
+indistinguishable in the record from a keyword run of the same text,
+and the session would merge the two.  Under its own name it is
+recorded as its own kind of search, reproducible as
+[[scholar search "..." -p openalex-semantic]], and the views can show
+its result for what it is: a ranked list of fixed length, not a count
+of matches (\cref{sec:ranked-list}).
+[[RANKED_LIST]] declares this on the class; the session code reads the
+same fact from [[RANKED_PROVIDERS]] in the scholar module, which a test
+below keeps in step with the registry.
+
+It is a check, not a database search.  An unscoped search must not run
+it ([[default_enabled = False]], \cref{sec:default-providers}): its
+fifty works would be merged into the keyword results, and the table of
+hits per query and provider would no longer be a table of counts.
+
+\subsection{The provider class}
+
+Everything except the request is the OpenAlex provider's: the key and
+email, the cache (named after [[self.name]], so semantic results never
+share a cache file with keyword results), the conversion of works, and
+the handling of 429s and spent budgets.  The quota group is
+[[openalex]] too, since the requests draw on the same key and the same
+daily budget.
+
+<<openalex semantic provider>>=
+class OpenAlexSemanticProvider(OpenAlexProvider):
+    """OpenAlex semantic search: a ranked list of at most 50 works."""
+
+    name = "openalex-semantic"
+    default_enabled = False
+    MAX_LIMIT = OPENALEX_SEMANTIC_MAX_RESULTS
+    RANKED_LIST = True
+
+    def __init__(
+        self, email: str | None = None, api_key: str | None = None
+    ):
+        """Initialize as the OpenAlex provider, plus the 1/s pacing."""
+        super().__init__(email=email, api_key=api_key)
+        <<create the semantic search limiter>>
+
+    <<semantic search request>>
+    <<semantic search check method>>
+@
+
+\subsection{Pacing at one request a second}
+
+The shared [[openalex]] limiter paces at ten requests a second, the
+rate of the ordinary search, and it has to: the keyword provider and
+the preprint servers draw on it as well.  Lowering its rate would slow
+every OpenAlex request.  Declaring [[LIMITS]] at one a second on this
+class would do nothing, because [[get_limiter]] honours limits only
+when a quota group's limiter is first created
+(\cref{sec:ratelimit-registry}) and the [[openalex]] provider creates
+it first.  Re-declaring the limits before each request, as Semantic
+Scholar does (\cref{sec:ratelimit-redeclare}), would slow the other
+members of the group whenever they follow a semantic request.
+
+So the provider passes a \emph{second} limiter of its own in addition
+to the group's: [[get_limiter]] under a name of its own, declared at
+one request a second.  This needs no change to the rate-limit module,
+it paces only semantic requests, and since a limiter persists its last
+request, two [[scholar]] processes started in the same second are
+spaced as well.  It shows the semantic requests on a line of their own
+in [[scholar providers limits]]; the budget stays the group's.
+That line is why the name is the short [[oa-semantic]] rather than the
+provider's: the limits table has to fit 80 columns, its provider
+column is otherwise as narrow as [[unpaywall]], and the seventeen
+characters of [[openalex-semantic]] cut the status column down until
+\enquote{quota exhausted} lost its last letters.
+The group's [[acquire()]] comes first: when the day's budget is spent
+it refuses before the semantic limiter has counted, or waited for, a
+request that will not be made.
+
+<<create the semantic search limiter>>=
+self._semantic_limiter = get_limiter(
+    OPENALEX_SEMANTIC_LIMITER,
+    Limits(per_second=OPENALEX_SEMANTIC_PER_SECOND),
+)
+<<openalex semantic constants>>=
+OPENALEX_SEMANTIC_MAX_RESULTS = 50     # "Max results: 50 per query"
+OPENALEX_SEMANTIC_MAX_CHARS = 2000     # longer input is truncated
+OPENALEX_SEMANTIC_PER_SECOND = 1.0     # "1 request per second"
+OPENALEX_SEMANTIC_LIMITER = "oa-semantic"  # its own pacing, not a quota
+@
+
+\subsection{The request}
+
+The search is one request, [[pyalex]]'s [[Works().similar(query)]],
+which sets [[search.semantic]].  The method first appears in [[pyalex]]
+0.21 (the 0.19 and 0.20 releases on PyPI do not have it), hence the
+version floor in [[pyproject.toml]].  There is no [[paginate()]], since
+there is nothing beyond the fifty, and a limit of zero
+(\enquote{unlimited}) or above fifty asks for the fifty.
+
+Two inputs are refused rather than sent:
+\begin{description}
+\item[A question over 2\,000 characters] OpenAlex would not refuse it
+  but cut it, and match on its first 2\,000 characters only.  The
+  session would then record a question that is not the one that was
+  matched, a false provenance.  Refusing makes the user shorten the
+  question to what is actually used.
+\item[Any filter] Semantic search accepts 17 of OpenAlex's filters,
+  but not all that [[SearchFilters]] translates to: the minimum
+  citation count becomes [[cited_by_count]], which the documentation
+  names among the filters that return 400.  Rather than keep a second
+  list of which filter works where, the provider takes none.  The
+  semantic search is a check on a keyword search, and a check
+  narrowed by year or type checks less.
+\end{description}
+Both are raised as [[ValueError]] inside [[_search_uncached]], so the
+inherited [[search()]] does what it does with any failure: it logs the
+reason, sets [[last_error]] (a session records the search as failed,
+with that reason), and caches nothing.  The CLI refuses both before
+searching (\cref{sec:search-semantic-checks}), so this check is the
+guard for every other caller.
+
+<<semantic search request>>=
+def _search_uncached(
+    self,
+    query: str,
+    limit: int,
+    filters: SearchFilters | None,
+) -> list[Paper]:
+    """Send one semantic search; refuse filters and over-long input."""
+    if filters and filters.cache_key():
+        raise ValueError("semantic search takes no filters")
+    if len(query) > OPENALEX_SEMANTIC_MAX_CHARS:
+        raise ValueError(
+            f"question of {len(query)} characters; semantic search "
+            f"matches at most {OPENALEX_SEMANTIC_MAX_CHARS}"
+        )
+    per_page = (
+        min(limit, self.MAX_LIMIT) if limit and limit > 0
+        else self.MAX_LIMIT
+    )
+    self._limiter.acquire()
+    self._semantic_limiter.acquire()
+    works = pyalex.Works().similar(query).get(per_page=per_page)
+    return [self._convert_work(work) for work in works]
+@
+
+\subsection{Health check}
+
+The probe sends a one-result semantic search through the shared
+[[_probe]] (\cref{sec:openalex}), so it carries the key and email and
+records the rate-limit headers like the [[openalex]] probe.  It passes
+the semantic limiter first, since it is a semantic request.  Like the
+preprint servers' probes it does not report the budget again.
+
+<<semantic search check method>>=
+def check(self) -> tuple[str, str]:
+    """Probe the works endpoint with a one-result semantic search."""
+    try:
+        self._semantic_limiter.acquire()
+    except RateLimited as e:
+        return HEALTH_RATE_LIMITED, str(e)
+    status, message = self._probe({"search.semantic": "test", "per-page": 1})
+    if status != HEALTH_OK:
+        return status, message
+    return status, "shares the openalex key and budget; 1 request/s"
+<<openalex semantic provider>>=
+register_provider(OpenAlexSemanticProvider())
+@
+
+\subsection{Testing the semantic search provider}
+
+The request is tested against a recorded response.  One live request
+was made on 2026-11-18, without a key, to
+\url{https://api.openalex.org/works}, with [[search.semantic]] set to
+the question in [[QUESTION]] below and [[per-page]] set to 5.
+It answered with five works.  The recording keeps a subset of the
+fields [[_convert_work]] reads: the identifiers, title, year, venue,
+open-access link, and the first institution of the first author.
+Abstracts and keywords are dropped for size, and the author names are
+replaced by a placeholder, since a test has no use for real names.
+The [[relevance_score]] is kept because it shows the ranking.  The
+[[meta]] is worth a look: its [[count]] was 50 although [[per_page]]
+was 5, so even the API's own count of a semantic search is the length
+of the list, not a number of matches.
+
+The stub sits at the HTTP adapter, below [[pyalex]] and below
+scholar's session (\cref{ch:network}), so the request is built by the
+real [[pyalex]] code and the test can assert the URL that would have
+gone out.
+
+<<test functions>>=
+def _semantic_work(work_id, doi, title, year, score, institution, venue,
+                   oa_url=None):
+  """One work of the recording, in the shape OpenAlex returns."""
+  return {
+    "id": f"https://openalex.org/{work_id}",
+    "doi": f"https://doi.org/{doi}",
+    "title": title,
+    "publication_year": year,
+    "relevance_score": score,
+    "authorships": [{
+      "author": {"display_name": "Author One"},
+      "institutions": [{"display_name": institution}],
+    }],
+    "primary_location": {
+      "source": {"display_name": venue},
+      "landing_page_url": f"https://doi.org/{doi}",
+    },
+    "open_access": {"oa_url": oa_url},
+  }
+
+
+OPENALEX_SEMANTIC_RECORDING = {
+  "meta": {"count": 50, "page": 1, "per_page": 5},
+  "results": [
+    <<recorded semantic search works>>
+  ],
+}
+
+
+def _replay_semantic(sent, payload=None, now=None):
+  """Patch the HTTP adapter to answer every request with the recording.
+
+  Each request's URL, and with `now` the time it went out, is appended
+  to `sent`.
+  """
+  body = json.dumps(payload or OPENALEX_SEMANTIC_RECORDING).encode()
+
+  def send(adapter, request, **kwargs):
+    sent.append((request.url, now() if now else None))
+    response = requests.Response()
+    response.status_code = 200
+    response.headers["Content-Type"] = "application/json"
+    response._content = body
+    response.url = request.url
+    response.request = request
+    return response
+
+  return patch("requests.adapters.HTTPAdapter.send", new=send)
+<<recorded semantic search works>>=
+_semantic_work(
+  "W1989085188", "10.1145/2382196.2382240",
+  "Strengthening user authentication through opportunistic "
+  "cryptographic identity assertions",
+  2012, 0.9335, "University of Washington",
+  "ACM SIGSAC Conference on Computer and Communications Security (CCS)"),
+_semantic_work(
+  "W2110695853", "10.1145/1518701.1519003",
+  "It's not what you know, but who you know: a social approach to "
+  "last-resort authentication",
+  2009, 0.9042, "Microsoft (United States)",
+  "CHI Conference on Human Factors in Computing Systems"),
+_semantic_work(
+  "W2172042037", "10.1109/msp.2011.1",
+  "When the Password Doesn't Work: Secondary Authentication for Websites",
+  2011, 0.9005, "Microsoft (United States)", "IEEE Security & Privacy"),
+_semantic_work(
+  "W3177361167", "10.1007/978-3-030-79997-7_28",
+  "Exploring Understanding and Usage of Two-Factor Authentication "
+  "Account Recovery",
+  2021, 0.863, "Old Dominion University",
+  "Lecture notes in networks and systems"),
+_semantic_work(
+  "W4409749280", "10.1145/3706598.3714245",
+  "\"They are responsible for ensuring that I can continue to use the "
+  "service.\" Investigating Users' Expectations Towards 2FA Recovery in "
+  "Germany",
+  2025, 0.8497, "University of Bonn",
+  "CHI Conference on Human Factors in Computing Systems",
+  oa_url="https://doi.org/10.1145/3706598.3714245"),
+@
+
+Let's verify the request and the conversion: one GET to the works
+endpoint carrying [[search.semantic]] and [[per-page]], with no
+[[search]] parameter and no paging cursor, and the works converted in
+the order of the ranking, credited to [[openalex-semantic]].
+
+<<test functions>>=
+class TestOpenAlexSemanticProvider:
+  """Tests for the OpenAlex semantic search provider."""
+
+  <<semantic provider test methods>>
+<<semantic provider test methods>>=
+QUESTION = (
+  "How do users regain access to an account after losing their "
+  "password or second authentication factor?"
+)
+
+def test_one_request_with_the_semantic_parameter(self):
+  provider = OpenAlexSemanticProvider()
+  sent = []
+  with _replay_semantic(sent):
+    papers = provider.search(self.QUESTION, limit=5)
+  assert provider.last_error is None
+  assert len(sent) == 1
+  url = sent[0][0]
+  assert url.startswith("https://api.openalex.org/works?")
+  assert "search.semantic=How+do+users+regain" in url
+  assert "per-page=5" in url
+  assert "cursor" not in url
+  assert "?search=" not in url and "&search=" not in url
+  assert len(papers) == 5
+  assert [p.doi for p in papers][:2] == [
+    "10.1145/2382196.2382240", "10.1145/1518701.1519003",
+  ]
+  assert all(p.sources == ["openalex-semantic"] for p in papers)
+  assert papers[2].venue == "IEEE Security & Privacy"
+@
+
+A limit above fifty, or zero for \enquote{unlimited}, asks for the
+fifty that exist.  A filter or an over-long question is a failure with
+a reason; it makes no request and leaves nothing in the cache, so the
+same search asks again once it is fixed.  A question of exactly 2\,000
+characters is still sent.
+
+<<semantic provider test methods>>=
+@pytest.mark.parametrize("limit", [500, 0])
+def test_limit_is_capped_at_fifty(self, limit):
+  provider = OpenAlexSemanticProvider()
+  sent = []
+  with _replay_semantic(sent):
+    provider.search(f"capped at fifty {limit}", limit=limit)
+  assert "per-page=50" in sent[0][0]
+
+@pytest.mark.parametrize("query, filters, reason", [
+  ("filtered question", SearchFilters(year="2020-2024"), "no filters"),
+  ("x" * 2001, None, "2001 characters"),
+])
+def test_refused_input_fails_uncached(self, query, filters, reason):
+  provider = OpenAlexSemanticProvider()
+  cached_before = dict(provider._cache)
+  sent = []
+  with _replay_semantic(sent):
+    assert provider.search(query, limit=10, filters=filters) == []
+  assert reason in provider.last_error
+  assert sent == []
+  assert dict(provider._cache) == cached_before
+
+def test_question_of_exactly_the_limit_is_sent(self):
+  provider = OpenAlexSemanticProvider()
+  sent = []
+  with _replay_semantic(sent):
+    provider.search("y" * 2000, limit=5)
+  assert provider.last_error is None
+  assert len(sent) == 1
+@
+
+Two searches in a row go out a second apart, although the [[openalex]]
+group allows ten a second.  The clock is the rate-limit module's
+[[_now]]/[[_sleep]] seam: sleeping advances it, and the stub notes the
+time each request goes out.
+
+<<semantic provider test methods>>=
+def test_two_searches_are_a_second_apart(self, monkeypatch):
+  clock = {"now": 1_800_000_000.0}
+
+  def sleep(seconds):
+    clock["now"] += seconds
+
+  monkeypatch.setattr(ratelimit, "_now", lambda: clock["now"])
+  monkeypatch.setattr(ratelimit, "_sleep", sleep)
+  provider = OpenAlexSemanticProvider()
+  sent = []
+  with _replay_semantic(sent, now=lambda: clock["now"]):
+    provider.search("first paced question", limit=5)
+    provider.search("second paced question", limit=5)
+  (_, first), (_, second) = sent
+  assert second - first >= 1.0
+
+def test_shares_the_openalex_quota_group(self):
+  provider = OpenAlexSemanticProvider()
+  assert ratelimit.limiter_for(provider) is \
+    ratelimit.limiter_for(get_provider("openalex"))
+  assert provider._semantic_limiter is not provider._limiter
+@
+
+The provider is registered and out of the default set, and the ranked
+providers named in the scholar module are exactly the registered ones
+that declare [[RANKED_LIST]].  The probe is a semantic search that
+carries the key.
+
+<<semantic provider test methods>>=
+def test_registered_but_not_default(self):
+  assert get_provider("openalex-semantic") is not None
+  default_names = [p.name for p in get_default_providers()]
+  assert "openalex-semantic" not in default_names
+  assert "openalex" in default_names
+
+def test_ranked_providers_match_the_registry(self):
+  declared = {
+    p.name for p in get_all_providers()
+    if getattr(p, "RANKED_LIST", False) is True
+  }
+  assert declared == set(RANKED_PROVIDERS)
+
+def test_check_probes_a_semantic_search(self, monkeypatch):
+  monkeypatch.setenv("OPENALEX_API_KEY", "k-123")
+  provider = OpenAlexSemanticProvider()
+  response = Mock(status_code=200, ok=True, headers={})
+  with patch("requests.get", return_value=response) as mock_get:
+    status, message = provider.check()
+  assert status == HEALTH_OK
+  params = mock_get.call_args.kwargs["params"]
+  assert params["search.semantic"] == "test"
+  assert params["api_key"] == "k-123"
+  assert "1 request/s" in message
+@
+
+The recording goes stale if OpenAlex changes the shape of its answer.
+The live test repeats the request for three results and checks what
+the conversion and the tests depend on: every recorded field is still
+there, the works have titles, the relevance score does not increase
+down the list, and [[meta.count]] is at most the fifty.  It needs the
+network, so it carries the [[integration]] mark.
+
+<<test functions>>=
+class TestOpenAlexSemanticIntegration:
+  """Drift check of the recorded semantic search response."""
+
+  @pytest.mark.integration
+  def test_live_shape_matches_the_recording(self):
+    try:
+      response = requests.get(
+        OPENALEX_API_URL,
+        params={
+          "search.semantic": TestOpenAlexSemanticProvider.QUESTION,
+          "per-page": 3,
+        },
+        timeout=60,
+      )
+    except requests.RequestException as e:
+      pytest.skip(f"OpenAlex unavailable: {e}")
+    if response.status_code == 429:
+      pytest.skip("OpenAlex rate limit")
+    assert response.status_code == 200
+    data = response.json()
+    assert 0 < data["meta"]["count"] <= OPENALEX_SEMANTIC_MAX_RESULTS
+    works = data["results"]
+    assert 0 < len(works) <= 3
+    recorded = OPENALEX_SEMANTIC_RECORDING["results"][0]
+    for work in works:
+      assert set(recorded) <= set(work), set(recorded) - set(work)
+      assert work["title"]
+    scores = [work["relevance_score"] for work in works]
+    assert scores == sorted(scores, reverse=True)
+@
+
+
 \section{HAL Provider}
 \label{sec:hal}
 
@@ -12019,6 +12505,7 @@ from scholar.ratelimit import (
     Limits,
     RateLimited,
     format_retry,
+    get_limiter,
     limiter_for,
 )
 <<semantic scholar imports>>
@@ -12041,5 +12528,6 @@ DEFAULT_LIMIT = 100
 <<scopus helpers>>
 <<arxiv constants>>
 <<preprint source constants>>
+<<openalex semantic constants>>
 <<hal constants>>
 @
