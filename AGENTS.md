@@ -561,17 +561,25 @@ inner `save_session` takes it again), loads fresh, folds every
 -- pending, untagged, human, no confidence or `LLM_AUDIT_FIELDS` -- into
 the other, or two equal decisions: `decision_state` includes source and
 audit fields, so a fold never relabels a source; not if both ids have
-notes), saves, and only then moves notes with `migrate_paper_id`. Each
-fold leaves a tombstone in `ReviewSession.folded` (`{old_id: new_id}`,
+notes), saves, and only then moves notes: `move_stranded_notes` moves
+every tombstoned id's note whose new id has none, so a re-run repairs a
+failed note write or a note a stale process saved under the old id.
+`--dry-run` runs `reconcile_copies` in memory without saving, so it
+lists exactly what a real run folds. Each fold leaves a tombstone in `ReviewSession.folded` (`{old_id: new_id}`,
 the DOI-less id always the old one; saved as `"folded"` only when
 non-empty, united with the file's on save). `merge_concurrent_changes`
-calls `apply_tombstones`: an in-memory decision under a tombstoned id
-is dropped (links/provider united into the target) when it is
-unscreened or equal to the target, moves its decision to an unscreened
-target, and otherwise stays beside it (a conflict). `repoint_folded_ids`
+calls `apply_tombstones` AFTER the three-way decision merge and the
+disk additions (so a target has the file's newer decision, and a disk
+target the session loaded and renamed is not re-added): an in-memory
+decision under a tombstoned id is dropped (links, provider and
+`merge_version_of` metadata united into the target) when it is
+unscreened or equal to the target, moves its decision to a target
+unscreened in the merged state, and otherwise stays beside it (a
+conflict). Tested with real subprocesses. `repoint_folded_ids`
 repoints snowball `source_papers` and LLM sample `paper_id`s;
 `create_review_session` routes a result under a tombstoned id to its
-target. The drop guard allows only for decided copies the file holds
+target, unless `plausibly_same_work` rules it out (a namesake goes to
+`same_id_copies`). The drop guard allows only for decided copies the file holds
 under a tombstoned id that the session no longer holds.
 Nothing unreconciled is silent: `foldable_copies` (counted with the
 reconcile hint), `conflicting_copies` (pairs with different statuses,

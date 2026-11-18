@@ -2863,6 +2863,9 @@ for result in results:
         folded_to = resolve_folded_id(session.folded, paper_id)
         if folded_to != paper_id and folded_to in decision_lookup:
             target = decision_lookup[folded_to]
+            if not plausibly_same_work(paper, target.paper):
+                target.note_same_id_copy(paper, result.provider)
+                continue
             target.paper = merge_version_of(target.paper, paper)
             target.record_search(*link)
             continue
@@ -3281,9 +3284,20 @@ if absorbed.provider and absorbed.provider not in names:
 @
 
 The command's side: lock, load fresh, fold, save, then move the notes.
-A dry run only lists.  A save that fails raises before any note has
-moved, so the notes still match the file, which still holds both
-copies.
+A dry run makes the same folds in memory and writes nothing, so it
+lists exactly what a real run would fold, the pairs skipped for their
+notes included.  A save that fails raises before any note has moved,
+so the notes still match the file, which still holds both copies.
+
+The notes are moved from the tombstones, not only from this run's
+folds ([[move_stranded_notes]]): every folded-away id that still has a
+note, whose new id has none, gets it moved.  So a reconcile can be run
+again to repair what its notes step left undone: a note write that
+failed after the session was saved, or a note that a process which had
+loaded the session before the reconcile saved under the old id
+afterwards.  When both ids have a note the old one stays, as
+[[migrate_paper_id]] would otherwise drop it, and it is still found:
+[[has_note]] looks a DOI paper's note up under its legacy hash id too.
 
 <<review session functions>>=
 def reconcile_session(
@@ -3300,19 +3314,33 @@ def reconcile_session(
     if session is None:
         raise FileNotFoundError(f"Session not found: {name}")
     if dry_run:
-        return [
-            (get_paper_id(bare.paper), get_paper_id(with_doi.paper))
-            for bare, with_doi in foldable_copies(session)
-        ]
+        return reconcile_copies(session)
     with file_lock(session_file_path(session)):
         session = load_session(name, strict=True)
         folds = reconcile_copies(session)
-        if not folds:
-            return []
-        save_session(session)
-    for old_id, new_id in folds:
-        migrate_paper_id(old_id, resolve_folded_id(session.folded, new_id))
+        if folds:
+            save_session(session)
+    move_stranded_notes(session)
     return folds
+
+
+def move_stranded_notes(session: ReviewSession) -> list[tuple[str, str]]:
+    """Move notes left under folded-away ids to their new id.
+
+    Only when the new id has no note. Returns the moves made.
+    """
+    if not session.folded:
+        return []
+    noted = {note.paper_id for note in list_papers_with_notes()}
+    moves = []
+    for old_id in session.folded:
+        new_id = resolve_folded_id(session.folded, old_id)
+        if old_id in noted and new_id not in noted:
+            migrate_paper_id(old_id, new_id)
+            noted.discard(old_id)
+            noted.add(new_id)
+            moves.append((old_id, new_id))
+    return moves
 @
 
 \paragraph{Tombstones.}
@@ -3325,12 +3353,25 @@ file (\cref{sec:session-integrity}) applies it.  The map is united with
 the file's on every save, like the search records, so a stale process
 cannot drop it either.  [[apply_tombstones]] then looks at each
 decision this process holds under a folded-away id and settles it
-against the decision under the new id (this process's, or the file's
-when this process does not hold it):
+against the decision under the new id.  It runs \emph{after} the
+three-way merge of the decisions, against the merged state: a stale
+process still holds the target as it loaded it, unscreened, and a
+newer decision on the target that the file holds must be in before
+the copy is compared with it.  Run first, it once gave a stale
+DOI-less copy's decision to a target that another process had
+meanwhile discarded, and the discard survived only as a warning.  The
+target is the decision under the new id in the merged session; a
+target only the file holds is in it only if the merge added it, which
+it does not when this process loaded that id and then gave it another
+(a preprint adoption renames a paper), so no rename is undone by a
+duplicate.  Without a target, the copy stays and is listed again.
 \begin{description}
 \item[Nothing to keep] The copy is unscreened, or equal to the target:
-  it is dropped, and its search links, other-work notes and provider go
-  to the target.  This is the stale process of the race above.
+  it is dropped, and its search links, other-work notes, provider and
+  metadata go to the target, the metadata filling gaps only
+  ([[merge_version_of]]) as in a fold, so an abstract a stale process
+  added to its copy is not lost.  This is the stale process of the
+  race above.
 \item[A decision for an unscreened target] Its decision moves to the
   target, which nobody has screened, and the copy is dropped.
 \item[Two decisions] The target is decided too, differently: someone
@@ -3341,7 +3382,11 @@ when this process does not hold it):
 An append ([[create_review_session]]) routes a search result that
 arrives under a folded-away id to its target directly, recording the
 search there, so a re-run of an old search does not bring the copy back
-even in memory.  Paper ids stored elsewhere in the session---the source
+even in memory.  The folded-away id is a DOI-less hash, so it is shared
+by namesakes (\cref{sec:session-copies}); a result whose year is
+implausible for the target is a namesake of the folded copy, not the
+copy, and is noted in the target's [[same_id_copies]] instead, as a
+namesake of a held paper is.  Paper ids stored elsewhere in the session---the source
 papers of a snowballing round, the drawn papers of an LLM review
 sample---are repointed to the new id ([[repoint_folded_ids]]), so that
 they still name a decision of the session.  A chain of folds (an id
@@ -3375,24 +3420,19 @@ def repoint_folded_ids(session: ReviewSession) -> None:
                 )
 
 
-def apply_tombstones(
-    session: ReviewSession, disk_decisions: dict[str, ReviewDecision]
-) -> None:
-    """Settle the decisions `session` holds under folded-away ids."""
+def apply_tombstones(session: ReviewSession) -> None:
+    """Settle the decisions `session` holds under folded-away ids.
+
+    Called on the merged session, so each target has its newest state.
+    """
     if not session.folded:
         return
     by_id = {get_paper_id(d.paper): d for d in session.decisions}
     dropped: set[int] = set()
     for paper_id, decision in list(by_id.items()):
         target_id = resolve_folded_id(session.folded, paper_id)
-        if target_id == paper_id:
-            continue
         target = by_id.get(target_id)
-        if target is None and target_id in disk_decisions:
-            target = disk_decisions[target_id]
-            session.decisions.append(target)
-            by_id[target_id] = target
-        if target is None:
+        if target_id == paper_id or target is None:
             continue
         if is_unscreened(decision) or (
             decision_state(decision) == decision_state(target)
@@ -3423,6 +3463,7 @@ def copy_decision(source: ReviewDecision, target: ReviewDecision) -> None:
 @
 
 <<unite the links of [[decision]] into [[target]]>>=
+target.paper = merge_version_of(target.paper, decision.paper)
 for link in decision.found_by:
     target.record_search(*link)
 for copy in decision.same_id_copies:
@@ -3570,10 +3611,13 @@ The tests go through the real [[create_review_session]],
 [[reconcile_session]], save and load, with the notes and session files
 in the test's own data directory.  First the namesakes: an editorial of
 2018, kept, and one of 2023 under the same id; then the copies: a DBLP
-record without a DOI and the OpenAlex record with it.  The races are
+record without a DOI and the OpenAlex record with it.  Most races are
 played out in one process with two session objects, one loaded before
-the other process's save, which is what a second process amounts to for
-the merge.
+the other's save, which is what a second process amounts to for the
+merge; the race that the re-review found with real processes (a stale
+process against a fresh decision on the DOI copy) is run in real
+subprocesses, so that it tests the files and the lock, not the paper
+registry that one process shares between its session objects.
 
 <<test functions>>=
 class TestSessionCopies:
@@ -3840,6 +3884,183 @@ class TestSessionCopies:
     with caplog.at_level(logging.WARNING):
       save_session(session)
     assert "reduces the decided papers from 3 to 2" in caplog.text
+
+  def test_a_fresh_decision_on_the_doi_copy_survives_a_stale_process(self):
+    """The re-review's sequence, in real processes: P loads, both copies
+    unscreened; the reconcile folds them; Q discards the DOI copy and
+    saves; P keeps the DOI-less copy and saves."""
+    import subprocess
+    import sys
+    import textwrap
+    pending = (DecisionStatus.PENDING, [])
+    bare, with_doi = self._two_copies(pending, pending)
+    stale = subprocess.Popen(
+      [sys.executable, "-c", textwrap.dedent("""
+        import sys
+        from scholar.review import DecisionStatus, load_session, save_session
+        session = load_session("copies")
+        print("loaded", flush=True)
+        sys.stdin.readline()
+        for decision in session.decisions:
+          if not decision.paper.doi:
+            decision.status, decision.tags = DecisionStatus.KEPT, ["p"]
+        save_session(session)
+      """)],
+      stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+    )
+    try:
+      assert stale.stdout.readline().strip() == "loaded"
+
+      def run(code):
+        subprocess.run([sys.executable, "-c", textwrap.dedent(code)],
+                       check=True, timeout=120)
+
+      run("""
+        from scholar.review import reconcile_session
+        assert len(reconcile_session("copies")) == 1
+      """)
+      run("""
+        from scholar.review import DecisionStatus, load_session, save_session
+        session = load_session("copies")
+        [decision] = session.decisions
+        decision.status, decision.tags = DecisionStatus.DISCARDED, ["q"]
+        save_session(session)
+      """)
+      stale.communicate("go\n", timeout=120)
+    finally:
+      if stale.poll() is None:
+        stale.kill()
+    assert stale.returncode == 0
+    assert self._states() == {
+      "doi:10.1145/race": (DecisionStatus.DISCARDED, ["q"]),
+      bare.id: (DecisionStatus.KEPT, ["p"]),
+    }
+
+  def test_a_decision_goes_to_an_unscreened_target(self):
+    pending = (DecisionStatus.PENDING, [])
+    bare, with_doi = self._two_copies(pending, pending)
+    stale = load_session("copies")
+    reconcile_session("copies")
+    for decision in stale.decisions:
+      if not decision.paper.doi:
+        decision.status, decision.tags = DecisionStatus.DISCARDED, ["x"]
+    save_session(stale)
+    assert self._states() == {
+      "doi:10.1145/race": (DecisionStatus.DISCARDED, ["x"]),
+    }
+
+  def test_a_stale_copy_gives_its_metadata_to_the_target(self):
+    pending, kept = (DecisionStatus.PENDING, []), (DecisionStatus.KEPT, ["ml"])
+    bare, with_doi = self._two_copies(pending, kept)
+    stale = load_session("copies")
+    reconcile_session("copies")
+    for decision in stale.decisions:
+      if not decision.paper.doi:
+        decision.paper = Paper(title="A Work", authors=["Ada Lovelace"],
+                               year=2021, abstract="Enriched.")
+    save_session(stale)
+    [saved] = self._saved_papers()
+    assert (saved["doi"], saved["abstract"]) == ("10.1145/race", "Enriched.")
+
+  def test_a_renamed_target_gets_no_duplicate(self):
+    pending, kept = (DecisionStatus.PENDING, []), (DecisionStatus.KEPT, ["ml"])
+    bare, with_doi = self._two_copies(pending, kept)
+    stale = load_session("copies")
+    reconcile_session("copies")
+    preprint = Paper(
+      title="A Work", authors=["Ada Lovelace"], year=2021,
+      doi="10.48550/arXiv.2101.00001", venue="arXiv",
+      published_versions=[{"doi": "10.1145/race", "relation": "preprint-of"}],
+    )
+    for decision in stale.decisions:
+      if decision.paper.doi:
+        decision.paper = preprint
+    save_session(stale)
+    assert set(self._states()) == {bare.id, preprint.id}
+
+  def test_a_namesake_is_not_routed_into_the_target(self):
+    pending, kept = (DecisionStatus.PENDING, []), (DecisionStatus.KEPT, ["ml"])
+    bare, with_doi = self._two_copies(pending, kept)
+    reconcile_session("copies")
+    namesake = Paper(title="A Work", authors=["Ada Lovelace"], year=2008,
+                     abstract="Another work.")
+    session = create_review_session(
+      [self._result("dblp", [namesake], query="q2")], "q2",
+      session_name="copies",
+    )
+    [decision] = session.decisions
+    assert decision.paper.abstract is None
+    assert decision.same_id_copies == [
+      {"year": 2008, "venue": None, "provider": "dblp"},
+    ]
+    assert all(link[0] != "q2" for link in decision.found_by)
+
+  def test_a_rerun_moves_a_note_whose_move_failed(self, monkeypatch):
+    import scholar.review
+    from scholar.notes import save_note
+    pending, kept = (DecisionStatus.PENDING, []), (DecisionStatus.KEPT, ["ml"])
+    bare, with_doi = self._two_copies(pending, kept)
+    save_note(bare, "read the DBLP copy")
+
+    def fail(*args, **kwargs):
+      raise OSError("notes file locked")
+
+    with monkeypatch.context() as patched:
+      patched.setattr(scholar.review, "migrate_paper_id", fail)
+      with pytest.raises(OSError):
+        reconcile_session("copies")
+    assert len(self._saved_papers()) == 1
+    assert self._noted_ids() == {bare.id}
+    assert reconcile_session("copies") == []
+    assert self._noted_ids() == {"doi:10.1145/race"}
+
+  def test_a_rerun_moves_a_note_saved_late_under_the_old_id(self):
+    from scholar.notes import save_note
+    pending, kept = (DecisionStatus.PENDING, []), (DecisionStatus.KEPT, ["ml"])
+    bare, with_doi = self._two_copies(pending, kept)
+    reconcile_session("copies")
+    save_note(bare, "written by a process that loaded before")
+    assert self._noted_ids() == {bare.id}
+    assert reconcile_session("copies") == []
+    assert self._noted_ids() == {"doi:10.1145/race"}
+
+  def test_the_dry_run_lists_what_a_real_run_folds(self):
+    from scholar.notes import save_note
+    papers = [
+      Paper(title=title, authors=["Ada Lovelace"], year=2021, doi=doi)
+      for title in ("Noted", "Plain") for doi in (None, f"10.1/{title}")
+    ]
+    session = ReviewSession(query="q", providers=["p"],
+                            timestamp=datetime.now(), name="copies")
+    session.decisions = [
+      ReviewDecision(paper=paper, provider="p",
+                     status=(DecisionStatus.KEPT if paper.doi
+                             else DecisionStatus.PENDING))
+      for paper in papers
+    ]
+    save_session(session)
+    save_note(papers[1], "DOI note")
+    save_note(papers[0], "DBLP note")
+    dry = reconcile_session("copies", dry_run=True)
+    assert dry == [(papers[2].id, "doi:10.1/plain")]
+    assert reconcile_session("copies") == dry
+
+  def test_llm_samples_are_repointed(self):
+    from scholar.review import LLMSample
+    pending, kept = (DecisionStatus.PENDING, []), (DecisionStatus.KEPT, ["ml"])
+    bare, with_doi = self._two_copies(pending, kept)
+    session = load_session("copies")
+    session.llm_samples.append(LLMSample(
+      sample_id="s1", seed=1, drawn_at="2026-11-18T00:00:00+00:00",
+      criteria={}, sessions=["copies"], population=1,
+      population_digest="d", size=1,
+      papers=[{"paper_id": bare.id, "status": "pending", "source": "llm",
+               "confidence": None}],
+    ))
+    save_session(session)
+    reconcile_session("copies")
+    [sample] = load_session("copies").llm_samples
+    assert sample.papers[0]["paper_id"] == "doi:10.1145/race"
 
   def test_a_stale_decision_on_the_folded_copy_is_kept_apart(self):
     """B loaded before the reconcile and discards the DOI-less copy."""
@@ -4632,13 +4853,14 @@ links to the searches that returned it ([[found_by]],
 a judgement, so the links the file holds for a paper are added to the
 links this process holds, whatever the decision rules decide.  The
 same goes for the other works a search returned under a paper's id
-([[same_id_copies]], \cref{sec:session-copies}).  Before any of this,
-the tombstones of folded copies are united with the file's and applied
-([[apply_tombstones]], \cref{sec:session-copies}), so that a copy that
-[[sessions reconcile]] folded after this process loaded the session is
-settled against the decision it was folded into instead of being
-written back; the paper ids that snowballing rounds and LLM review
-samples store are repointed after the union.
+([[same_id_copies]], \cref{sec:session-copies}).  After the
+decisions are merged, the tombstones of folded copies are united with
+the file's and applied ([[apply_tombstones]], \cref{sec:session-copies}),
+so that a copy that [[sessions reconcile]] folded after this process
+loaded the session is settled against the merged decision it was
+folded into instead of being written back; the paper ids that
+snowballing rounds and LLM review samples store are repointed at the
+end.
 
 The baseline keeps one comparable state per paper id.  We compare the
 whole decision state rather than the status alone, because a change of
@@ -4712,8 +4934,6 @@ def merge_concurrent_changes(
     base = session._baseline
     base_states = base.decisions if base else {}
     disk_decisions = {get_paper_id(d.paper): d for d in on_disk.decisions}
-    session.folded = {**on_disk.folded, **session.folded}
-    apply_tombstones(session, disk_decisions)
     <<find the legacy records this session replaced>>
 
     own_ids = set()
@@ -4745,6 +4965,8 @@ def merge_concurrent_changes(
     for paper_id, theirs in disk_decisions.items():
         if paper_id not in own_ids and paper_id not in base_states:
             session.decisions.append(theirs)
+    session.folded = {**on_disk.folded, **session.folded}
+    apply_tombstones(session)
 
     <<merge research context from disk>>
 
