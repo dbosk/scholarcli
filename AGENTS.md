@@ -207,6 +207,13 @@ part. COMPLETE results are served to everyone (unless
 `SCOPUS_VIEW=standard`); default-view results only when COMPLETE is not
 available, which a new process learns from one `count=1` probe
 (`_complete_confirmed()`); a failed probe still serves the cache.
+When it is served because the probe was inconclusive (HTTP 429/5xx/403,
+a bad key, `RateLimited`, a network error; a *refusal* is the normal
+off-campus case and silent, and so is `SCOPUS_VIEW=standard`), the
+provider logs one WARNING per process naming the reason and the remedy
+`scholar cache clear --provider scopus` (#139). The route (proxy or
+direct) is deliberately not part of the key: what changes the data is
+the view the route entitles, and that is already keyed.
 
 `ScopusProvider.get_paper_by_doi()` (a one-result `DOI("...")` search)
 makes Scopus the *last* entry of `ENRICHMENT_PROVIDERS`. It returns
@@ -713,6 +720,12 @@ never goes stale) and says how many it kept; `cache info` lists them on
 their own line. `clear_cache()` also empties the in-memory copy of each
 deleted cache in `CACHE_REGISTRY`, else the exit hook would write it
 back (the CLI loads `crossref.pkl` at import).
+
+`scholar cache clear --provider NAME` (repeatable) deletes only
+`NAME.pkl` (`clear_cache(providers=[...])`), also emptying its in-memory
+cache. Valid names are the registered providers plus `crossref` and
+`unpaywall`; an unknown one exits 2 listing them. It cannot be combined
+with `--include-llm` (exit 2 / `ValueError`).
 
 Environment variable: `SCHOLAR_CACHE_DIR` to override cache location.
 
