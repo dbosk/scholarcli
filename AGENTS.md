@@ -391,7 +391,7 @@ identity of every outgoing request:
   for SOCKS) and exits 2 on a bad one, since a broken proxy would
   otherwise make every provider silently return nothing. Recommend
   `socks5h://` (DNS at the proxy).
-- **Identity**: `scholar/<version> (+https://github.com/dbosk/scholar)`,
+- **Identity**: `scholar/<version> (+https://github.com/dbosk/scholarcli)`,
   overridable by `SCHOLAR_USER_AGENT`. No email in it on purpose: the
   UA goes to every host (publishers included); OpenAlex/Crossref/
   Unpaywall get `SCHOLAR_EMAIL` via their own parameters. A
