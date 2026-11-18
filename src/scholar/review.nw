@@ -1531,6 +1531,19 @@ dropped ([[supersede_merged_records]]).  A merged record that only some
 providers have re-run stays: dropping it would lose the only record of
 the others.
 
+A record covers only if it can stand in for the provider's part of the
+merged search.  It must have answered: a skipped search or an HTTP~500
+says nothing about what the provider holds, and dropping the merged
+record for it would turn an answered search into a failed one.  And it
+must have asked for at least as much: a re-run with [[-l 5]] cannot
+stand in for a merged search with [[-l 100]], whose papers it may not
+include.  A merged record whose limit is unknown (the merge of two
+different limits stores none) is covered by any answered record, since
+nothing is known to compare with.  Without these two conditions a plain
+load and save of real sessions dropped merged records that no answered
+search covered; with them, a merged record is dropped only where it
+really counted a search twice.
+
 The papers linked to the merged record keep a link to the search, now
 per provider.  A paper that the new run returned already has links to
 the records of the providers that returned it ([[found_in]],
@@ -1555,7 +1568,9 @@ def merged_record_cover(
     """The per-provider records that supersede a merged `record`, or None.
 
     One record of the same query and filters is needed for each
-    provider the merged record names; None if any is missing.
+    provider the merged record names, one that answered and asked for
+    at least the merged record's limit (any limit when that is
+    unknown); None if any is missing.
     """
     if not record.is_merged:
         return None
@@ -1566,12 +1581,21 @@ def merged_record_cover(
             return None
         queries = queries[:1] * len(providers)
     key = filters_key(record.filters)
+
+    def wide_enough(other: SearchRecord) -> bool:
+        if record.limit is None:
+            return True
+        return other.limit is not None and (
+            search_width(other.limit) >= search_width(record.limit)
+        )
+
     cover = []
     for provider, query in zip(providers, queries):
         match = next((
             r for r in records
             if not r.is_merged and r.provider == provider
             and r.query == query and filters_key(r.filters) == key
+            and not failed_outright(r) and wide_enough(r)
         ), None)
         if match is None:
             return None
@@ -1617,6 +1641,43 @@ drops it again.
 <<test functions>>=
 class TestSupersededMergedRecords:
     """Per-provider re-runs supersede an old merged record."""
+
+    MERGED = SearchRecord("q | q", "openalex, dblp", None, 100, hits=7)
+
+    def _covered(self, dblp, merged=None):
+        openalex = SearchRecord("q", "openalex", None, 100, hits=4)
+        return merged_record_cover(merged or self.MERGED, [openalex, dblp])
+
+    def test_answered_cover(self):
+        dblp = SearchRecord("q", "dblp", None, 100, hits=3)
+        assert self._covered(dblp) is not None
+        assert self._covered(SearchRecord("q", "dblp", None, 1000, hits=3))
+
+    def test_failed_or_skipped_cover_does_not_count(self):
+        for error in ("HTTP 500", "skipped: daily quota spent; resets 01:00"):
+            dblp = SearchRecord("q", "dblp", None, 100, hits=0, error=error)
+            assert self._covered(dblp) is None
+        partial = SearchRecord("q", "dblp", None, 100, hits=2, error="cut")
+        assert self._covered(partial) is not None
+
+    def test_narrower_cover_does_not_count(self):
+        dblp = SearchRecord("q", "dblp", None, 5, hits=3)
+        assert self._covered(dblp) is None
+        unknown = SearchRecord("q | q", "openalex, dblp", {"year": "2020"},
+                               None, hits=7)
+        assert merged_record_cover(unknown, [
+            SearchRecord("q", "openalex", {"year": "2020"}, 5, hits=4),
+            SearchRecord("q", "dblp", {"year": "2020"}, 5, hits=3),
+        ]) is not None
+
+    def test_other_filters_or_query_do_not_count(self):
+        dblp = SearchRecord("q", "dblp", {"year": "2020"}, 100, hits=3)
+        assert self._covered(dblp) is None
+        merged = SearchRecord("q | r", "openalex, dblp", None, 100, hits=7)
+        dblp = SearchRecord("q", "dblp", None, 100, hits=3)
+        assert self._covered(dblp, merged) is None
+        assert self._covered(SearchRecord("r", "dblp", None, 100, hits=3),
+                             merged) is not None
 
     @staticmethod
     def _old_session(name):
@@ -1675,6 +1736,22 @@ class TestSupersededMergedRecords:
         assert links["10.1/sm-old"] == [
             ("q", "openalex", ""), ("q", "dblp", ""),
         ]
+
+    def test_failed_cover_keeps_record_and_links(self):
+        self._old_session("sm-failed")
+        merged = self._result("openalex", ["10.1/sm-again"]).merge(
+            self._result("dblp", [])
+        )
+        merged.parts[1].error = "HTTP 500"
+        save_session(create_review_session([merged], "q",
+                                           session_name="sm-failed"))
+        session = load_session("sm-failed")
+        assert sorted(r.provider for r in session.search_records) == [
+            "dblp", "openalex", "openalex, dblp",
+        ]
+        old = next(d for d in session.decisions
+                   if d.paper.doi == "10.1/sm-old")
+        assert old.found_by == [("q | q", "openalex, dblp", "")]
 
     def test_partial_cover_keeps_the_merged_record(self):
         self._old_session("sm-part")

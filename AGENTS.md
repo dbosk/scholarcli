@@ -110,7 +110,10 @@ Providers self-register via `register_provider()` at module load time.
   in a merged record without papers count as not searched for it.
   A merged record is superseded once per-provider records of the same
   query (positional `q1 | q2` ↔ providers) and filters exist for every
-  provider it names (`merged_record_cover`); `supersede_merged_records`
+  provider it names (`merged_record_cover`; the covering record must
+  have answered, not failed outright or been skipped, and have a limit
+  at least the merged one's unless that is unknown);
+  `supersede_merged_records`
   (end of `create_review_session` and of `merge_concurrent_changes`)
   drops it, drops its links where the paper links to a covering record,
   else links the paper to all covering records. Partly covered: kept.
