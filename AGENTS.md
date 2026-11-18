@@ -567,10 +567,16 @@ context (#107). `review.save_session` now:
 a run `.bak` holds only the state before the last chunk, so before the
 first chunk (only when there is something to enrich and the file
 exists) `review.keep_copy_before_run` copies the saved file to
-`<name>.json.pre-enrich.bak` (atomic, under the session lock; the next
-run replaces it) and the end-of-run and interrupt messages print its
-path. The name does not end in `.json`, so the `*.json` globs of
-`list_sessions` and `sessions_mentioning` skip it (tested). Ctrl-C (and
+`<name>.json.pre-enrich-<UTC YYYYMMDDTHHMMSSZ>.bak` (atomic, under the
+session lock). Each run adds a copy and the newest
+`RUN_COPIES_KEPT` (3) are kept, so continuing an interrupted run does
+not overwrite the original; `review._utcnow` is the test seam for the
+time. The end-of-run and interrupt messages print the new path. The copy
+covers the session file only: preprint adoption also rewrites the notes
+and decision stores (`migrate_paper_id`), which a restore does not undo
+(the report says so when a run adopted one). The name does not end in
+`.json`, so the `*.json` globs of `list_sessions` and
+`sessions_mentioning` skip it (tested). Ctrl-C (and
 SIGTERM, turned into `KeyboardInterrupt` while the loop runs, so the
 atexit cache save still happens) prints `Interrupted: saved K of N
 papers; run again to continue` and exits 130.
