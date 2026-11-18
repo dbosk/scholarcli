@@ -6139,10 +6139,7 @@ def generate_literature_synthesis(
             total_kept_papers=total_kept_papers,
         )
 
-    # Persist the report abstract so a cache hit can reuse it.
-    SYNTHESIS_CONCLUSION_CACHE[conclusion_cache_key][
-        "report_abstract"
-    ] = report_abstract
+    <<store the report abstract in the conclusion cache entry>>
 
     return SynthesisResult(
         synthesis=synthesis_text,
@@ -6155,6 +6152,125 @@ def generate_literature_synthesis(
         conclusion=conclusion_text,
         bibtex=bibtex_content,
     )
+@
+
+The report abstract shares the conclusion's cache entry, so a later run
+that hits the conclusion can reuse the abstract too.
+It is stored by assigning the entry anew, never by changing the stored
+dictionary in place.
+The cache saves only what it sees change (\cref{sec:cache-concurrency}),
+and it sees an assignment to one of its keys, not a change inside a
+value.
+An in-place update therefore went unsaved whenever the conclusion came
+from the cache and the abstract did not---an entry written before
+abstracts were cached, or a run that ended between the two---and every
+later run paid for the same abstract again.
+When the entry already holds this abstract we leave it alone, so a run
+that changed nothing does not rewrite the cache file.
+
+<<store the report abstract in the conclusion cache entry>>=
+conclusion_entry = SYNTHESIS_CONCLUSION_CACHE[conclusion_cache_key]
+if conclusion_entry.get("report_abstract") != report_abstract:
+    SYNTHESIS_CONCLUSION_CACHE[conclusion_cache_key] = {
+        **conclusion_entry,
+        "report_abstract": report_abstract,
+    }
+@
+
+Let's verify that through the synthesis itself.
+The first run fills both caches; we then take the abstract out of the
+stored entry, as an older entry lacks it, and reload the module so that
+its caches come from the files, unchanged, like in a new process.
+The second run must ask the model for the abstract only, and the third,
+again in a fresh module, must ask for nothing: the second run saved the
+abstract.
+
+<<test functions>>=
+class TestSynthesisSavesAbstractOfACachedConclusion:
+    """A report abstract added to a cached conclusion reaches the disk."""
+
+    def fake_llm(self):
+        class FakeResponse:
+            def __init__(self, text):
+                self._text = text
+
+            def text(self):
+                return self._text
+
+        class FakeModel:
+            model_id = "fake-model"
+            calls = 0
+
+            def prompt(self, prompt):
+                self.calls += 1
+                if "Return your answer in four marked blocks" in prompt:
+                    return FakeResponse(
+                        "===TITLE_START===\nPrivacy methods\n"
+                        "===TITLE_END===\n\n"
+                        "===SUBQUESTIONS_START===\n- What is privacy?\n"
+                        "===SUBQUESTIONS_END===\n\n"
+                        "===SECTION_ABSTRACT_START===\nSection abstract.\n"
+                        "===SECTION_ABSTRACT_END===\n\n"
+                        "===SECTION_START===\n### privacy\n\n"
+                        "Theme synthesis [Smith, 2024].\n"
+                        "===SECTION_END===\n\n"
+                        "===SUMMARY_START===\nSummary [Smith, 2024].\n"
+                        "===SUMMARY_END==="
+                    )
+                if "Return your answer as a marked block" in prompt:
+                    return FakeResponse(
+                        "===REPORT_ABSTRACT_START===\nOverall abstract.\n"
+                        "===REPORT_ABSTRACT_END==="
+                    )
+                return FakeResponse(
+                    "===SECTION_START===\nConclusion [Smith, 2024].\n"
+                    "===SECTION_END==="
+                )
+
+        model = FakeModel()
+
+        class FakeLLMModule:
+            def get_model(self, _model_id=None):
+                return model
+
+        return FakeLLMModule(), model
+
+    def test_abstract_is_saved_when_the_conclusion_was_cached(
+        self, monkeypatch
+    ):
+        import importlib
+        import scholar.llm_review as llm_review
+
+        fake_llm, model = self.fake_llm()
+        monkeypatch.setattr(llm_review, "llm", fake_llm, raising=False)
+        session = ReviewSession(
+            query="test", providers=["test"], timestamp=datetime.now(),
+            research_context="Test question",
+        )
+        session.decisions.append(ReviewDecision(
+            paper=Paper(title="Privacy in ML", authors=["Alice Smith"],
+                        year=2024, abstract="This paper studies privacy."),
+            provider="test", status=DecisionStatus.KEPT, tags=["privacy"],
+        ))
+        llm_review.SYNTHESIS_THEME_CACHE.clear()
+        llm_review.SYNTHESIS_CONCLUSION_CACHE.clear()
+        llm_review.generate_literature_synthesis(session, model_id="fake")
+        for key, entry in list(llm_review.SYNTHESIS_CONCLUSION_CACHE.items()):
+            llm_review.SYNTHESIS_CONCLUSION_CACHE[key] = {
+                k: v for k, v in entry.items() if k != "report_abstract"
+            }
+        save_all_caches()
+
+        llm_review = importlib.reload(llm_review)
+        model.calls = 0
+        llm_review.generate_literature_synthesis(session, model_id="fake")
+        assert model.calls == 1
+        save_all_caches()
+
+        llm_review = importlib.reload(llm_review)
+        model.calls = 0
+        llm_review.generate_literature_synthesis(session, model_id="fake")
+        assert model.calls == 0
 @
 
 
