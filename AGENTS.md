@@ -744,7 +744,9 @@ synthesis prose of `scholar llm synthesize`, paid model output that
 never goes stale) and says how many it kept; `cache info` lists them on
 their own line. `clear_cache()` also empties the in-memory copy of each
 deleted cache in `CACHE_REGISTRY`, else the exit hook would write it
-back (the CLI loads `crossref.pkl` at import).
+back (any cache whose module the process has imported is in memory;
+since #130 the CLI no longer imports `scholar.crossref` at startup,
+only in the commands that use it).
 
 `scholar cache clear --provider NAME` (repeatable) deletes only
 `NAME.pkl` (`clear_cache(providers=[...])`), also emptying its in-memory
