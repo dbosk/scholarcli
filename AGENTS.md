@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-Scholar is a CLI tool for searching academic papers across multiple providers (Semantic Scholar, OpenAlex, DBLP, Web of Science, IEEE Xplore, Scopus, arXiv, HAL, and — via OpenAlex source pinning — the preprint servers SSRN, bioRxiv, medRxiv, ChemRxiv, Research Square, Preprints.org, and IACR Cryptology ePrint).
+Scholar is a CLI tool for searching academic papers across multiple providers (Semantic Scholar, OpenAlex, DBLP, Web of Science, IEEE Xplore, Scopus, arXiv, HAL, and — via OpenAlex source pinning — the preprint servers SSRN, bioRxiv, medRxiv, ChemRxiv, Research Square, Preprints.org, and IACR Cryptology ePrint), plus OpenAlex's semantic search (`openalex-semantic`) as a check on keyword searches.
 
 ## Architecture
 
@@ -89,6 +89,7 @@ Providers self-register via `register_provider()` at module load time.
 | Research Square | `researchsquare` | OpenAlex (`pyalex`), source-pinned | `SCHOLAR_EMAIL` (optional) |
 | Preprints.org | `preprintsorg` | OpenAlex (`pyalex`), source-pinned | `SCHOLAR_EMAIL` (optional) |
 | IACR ePrint | `iacr` | OpenAlex (`pyalex`), source-pinned | `SCHOLAR_EMAIL` (optional) |
+| OpenAlex semantic search | `openalex-semantic` | OpenAlex `search.semantic` (`pyalex>=0.21` `Works().similar`), opt-in, ranked top 50 | as `openalex` |
 
 **Key arguments.** The keyed constructors (`SemanticScholarProvider`,
 `OpenAlexProvider`, `IEEEXploreProvider`, `ScopusProvider`) treat
@@ -119,6 +120,57 @@ arxiv, hal, ssrn, biorxiv, medrxiv, chemrxiv, researchsquare,
 preprintsorg, iacr. Groups are aliases, not registered providers, so
 they never appear in `providers list/check` and provenance stays
 per-server. TechRxiv is a known gap: no API and not in OpenAlex.
+
+### Semantic Search Check (#136)
+
+A keyword search's record cannot show what it missed; a search by
+meaning can check it. `OpenAlexSemanticProvider` (`openalex-semantic`,
+providers.nw `sec:openalex-semantic`; limits from
+https://help.openalex.org/api/semantic-search/: 50 results, 2000
+characters, 1 request/s, one search parameter per request) is one
+request `pyalex.Works().similar(q).get(per_page=min(limit, 50))`, no
+paging (`limit` 0 → 50). `default_enabled = False`, `MAX_LIMIT = 50`,
+`RANKED_LIST = True`, quota group `openalex`. It refuses (failed, not
+cached, via the inherited `search()` catch-all) any filter and any
+question over 2000 characters (OpenAlex would truncate, so the recorded
+question would not be the one matched).
+
+- **Ranked, not a count.** `scholar.RANKED_PROVIDERS` (a test keeps it
+  equal to registered providers with `RANKED_LIST`) and
+  `is_ranked_provider()` (joined strings: ranked only if every part
+  is); `hits_label(..., ranked=True)` → "top 50, ranked (not a count)"
+  (failed/incomplete unchanged). Every call site passes `ranked=`;
+  `sessions show` drops the "hits:" prefix for such records.
+- **CLI search** (`<<refuse what a semantic search cannot do>>`, right
+  after provider names are resolved): with `openalex-semantic` it must
+  be the only provider, without filters, query ≤ 2000 (each exit 2);
+  the limit is lowered to 50 before the search, so the record (and
+  `prov found-via`) says `--limit 50`. The filter test there repeats the
+  filter-option list of the filters block; a new filter option must be
+  added to both.
+- **Audit table**: ranked records/rows are left out of the
+  "Databases:" sentence and of `audit_search_shortfalls`; code `OA-sem`;
+  `audit_semantic_sentence` adds `AUDIT_STRINGS[lang]["semantic"]` (en,
+  sv) after it, with "the 50" from the records' limit.
+- **`scholar sessions check S [S ...] -s Q [-s Q2] [-k DOI|title-part]
+  [-l N≤50] [-f table|csv|json] [-o DIR]`**: per question one
+  provider search (quota pre-check → failed with the limiter's reason),
+  then `review.check_against_sessions(papers, sessions, known)` →
+  `(CheckRow[], KnownRow[])`. `session_match_index` keys: `Paper.id`
+  (not for a DOI-less untitled paper), version-link DOIs
+  (`preprint_versions`/`published_versions`) and
+  `audit_work_key` when its title is non-empty; `matched_by` `doi` or
+  `title+author`. Buckets (`CHECK_BUCKETS`, the work takes the first any
+  match has): bearing (supports/qualifies), adjacent, other topic,
+  excluded (discarded with a bearing or no category: status wins, #89),
+  unclassified (no category tag), not in any session. `--known`: exact
+  DOI if it normalises to `10.`, else case-insensitive title part; a
+  known study not returned is still looked up in the sessions. Exit 1
+  for a missing/unreadable session (before any request) or a failed
+  question; usage errors exit 2. Strictly read-only (test: session file
+  byte-identical). `-o DIR` writes `<n>.json` (question, provider,
+  limit, date, error, the works as `Paper.to_dict()`, not raw OpenAlex
+  JSON) and `<n>.txt` (the table-format text).
 
 ### Error Handling
 
@@ -765,6 +817,11 @@ requests/day and each `scholar` run is a fresh process.
   detail column, and a search 429 with `X-RateLimit-Remaining-USD: 0`
   becomes a quota block until `X-RateLimit-Reset` (`_note_http_error`),
   logged with the reset time and a key hint.
+  `openalex-semantic` (1 request/s) passes the group limiter and then
+  a second limiter of its own, `get_limiter("oa-semantic",
+  Limits(per_second=1.0))`: the group's 10/s cannot be lowered for one
+  member (`get_limiter` honours limits only on creation). The short
+  name keeps the `providers limits` table within 80 columns.
 - Pacing is the limiter's job: S2 (`LIMITS` anonymous 1/3 per second,
   `KEYED_LIMITS` 1.0; `_acquire()` re-declares per request because a
   rejected key changes the rate), OpenAlex and arXiv (a
