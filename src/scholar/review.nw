@@ -1813,6 +1813,44 @@ class TestLegacyRecords:
         assert not SearchRecord("Q", "p", {"year": "2020"}, None).is_legacy
 
 
+class TestStaleLegacyRecord:
+    """A stale process does not bring back a legacy record replaced meanwhile.
+
+    Process A loads a session with a legacy record; process B re-runs its
+    query with --year and saves; then A saves a decision.
+    """
+
+    def test_stale_save_keeps_the_replacement(self):
+        from scholar.scholar import SearchResult
+        TestLegacyRecords._old_session(
+            [["Q", "openalex"]],
+            [(doi, [{"query": "Q", "provider": "openalex"}])
+             for doi in ("10.1/stale-a", "10.1/stale-b")],
+        )
+        stale = load_session("legacy")
+        save_session(create_review_session([SearchResult(
+            query="Q", provider="openalex", timestamp="t",
+            papers=[Paper(title="N", authors=["B"], doi="10.1/stale-n")],
+            filters={"year": "2020"}, limit=100,
+        )], "Q", session_name="legacy"))
+        stale.decisions[0].tags = ["x"]
+        save_session(stale)
+
+        session = load_session("legacy")
+        year = filters_key({"year": "2020"})
+        assert [r.key for r in session.search_records] == [
+            ("Q", "openalex", year)
+        ]
+        links = {d.paper.doi: d.found_by for d in session.decisions}
+        assert links == {
+            "10.1/stale-a": [("Q", "openalex", year)],
+            "10.1/stale-b": [("Q", "openalex", year)],
+            "10.1/stale-n": [("Q", "openalex", year)],
+        }
+        tagged = {d.paper.doi: d.tags for d in session.decisions}
+        assert tagged["10.1/stale-a"] == ["x"]
+
+
 class TestSupersededLinks:
     """A resolved link replaces an unresolved one of its query and provider."""
 
@@ -2780,6 +2818,7 @@ class SessionBaseline:
     """
     decisions: dict[str, tuple]
     research_context: str | None
+    record_keys: frozenset = frozenset()
 
     @classmethod
     def of(cls, session: "ReviewSession") -> "SessionBaseline":
@@ -2790,8 +2829,14 @@ class SessionBaseline:
                 for d in session.decisions
             },
             research_context=session.research_context,
+            record_keys=frozenset(r.key for r in session.search_records),
         )
 @
+
+The baseline also keeps the keys of the session's search records.  The
+merge needs them for one case only: to tell a legacy record that another
+process replaced from one this process still holds
+(\cref{sec:legacy-records}).
 
 The merge itself applies the three rules.  A session that was never
 loaded (constructed in code, or created by an append to a session that did
@@ -2857,15 +2902,32 @@ def merge_concurrent_changes(
     session._invalidate_cache()
 @
 
-A legacy record in the file (\cref{sec:search-record-key}) that this
-session no longer has was replaced by a re-run of its query
-(\cref{sec:legacy-records}): legacy records come only from old files and
-are never created again, so the only way to lose one is to replace it.
-Adding it back from the file, as the rule for records only the file has
-would, would undo the replacement on every save; and the file's links to
-it would come back with it.  So a file's legacy record is left out when
-this session has a record of the same query and provider, and the file's
-links to it are moved to that record, as the replacement moved ours.
+A legacy record (\cref{sec:search-record-key}) is replaced by a re-run
+of its query (\cref{sec:legacy-records}), and the replacement can
+happen in either process.  Legacy records come only from old files and
+are never created again, so the only way to lose one is to replace it,
+and a save must not bring it back from the other side.
+\begin{description}
+\item[This process replaced it.]  The file still has the legacy record
+  and we do not.  Adding it back, as the rule for records only the file
+  has would, would undo the replacement on every save, and the file's
+  links to it would come back with it.  So a file's legacy record is
+  left out when this session has a record of the same query and
+  provider, and the file's links to it are moved to that record, as the
+  replacement moved ours.
+\item[Another process replaced it.]  We still hold the legacy record,
+  loaded before the other process saved its re-run, and the file no
+  longer has it but has a record of the same query and provider.  If we
+  kept ours, the file would get the legacy record back beside its
+  replacement, with our papers still linked to it.  We can tell this
+  apart from a legacy record the file never had because the record is
+  in our baseline ([[SessionBaseline.record_keys]]): we loaded it from
+  the file, and it has gone from there since.  So we drop it and move
+  our links to the file's record of that query and provider, preferring
+  one we did not load (the re-run), as the other process moved its own.
+\end{description}
+[[replaced]] maps each dropped legacy key to its successor; the file's
+links pass through it as they are added, and ours are moved afterwards.
 
 <<find the legacy records this session replaced>>=
 replaced: dict[tuple, tuple] = {}
@@ -2880,6 +2942,30 @@ for record in on_disk.search_records:
     )
     if successor is not None:
         replaced[record.key] = successor.key
+<<drop our legacy records that the file replaced>>
+<<drop our legacy records that the file replaced>>=
+disk_keys = {r.key for r in on_disk.search_records}
+base_keys = base.record_keys if base else frozenset()
+for record in list(session.search_records):
+    if (not record.is_legacy or record.key not in base_keys
+            or record.key in disk_keys):
+        continue
+    same_pair = [
+        r for r in on_disk.search_records
+        if (r.query, r.provider) == (record.query, record.provider)
+    ]
+    if not same_pair:
+        continue
+    successor = next(
+        (r for r in same_pair if r.key not in base_keys), same_pair[0]
+    )
+    session.search_records.remove(record)
+    replaced[record.key] = successor.key
+for decision in session.decisions:
+    if any(link in replaced for link in decision.found_by):
+        decision.found_by = without_superseded_links(list(dict.fromkeys(
+            replaced.get(link, link) for link in decision.found_by
+        )))
 <<merge research context from disk>>=
 theirs_context = on_disk.research_context
 if base is not None:

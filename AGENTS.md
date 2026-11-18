@@ -72,8 +72,12 @@ Providers self-register via `register_provider()` at module load time.
   unknown filters: a re-run of their (query, provider) replaces them
   whatever its filters, their links move to the new key
   (`replaced_links` in `create_review_session`), and
-  `merge_concurrent_changes` does not re-add a legacy record from disk
-  that the session replaced. The report's provider table has a
+  `merge_concurrent_changes` guards both directions: it does not re-add
+  a legacy record from disk that this session replaced, and it drops
+  this session's own legacy record when the file replaced it (the key is
+  in `SessionBaseline.record_keys`, gone from the file, and the file has
+  a record of that (query, provider)); links move to the successor.
+  `OpenAlexSemanticProvider` sets `HONOURS_SEARCH_IN = False`. The report's provider table has a
   Filters column (`filter_flags`, `scholar.py`, shared with
   `_search_flags`) and appears also when two records share
   (query, provider).
