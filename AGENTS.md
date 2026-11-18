@@ -562,20 +562,24 @@ inner `save_session` takes it again), loads fresh, folds every
 the other, or two equal decisions: `decision_state` includes source and
 audit fields, so a fold never relabels a source; not if both ids have
 notes), saves, and only then moves notes: `move_stranded_notes` moves
-every tombstoned id's note whose new id has none, so a re-run repairs a
-failed note write or a note a stale process saved under the old id.
+every tombstoned id's note whose new id has none and whose old id the
+session no longer holds (a copy kept apart keeps its note), so a re-run
+repairs a failed note write or a note a stale process saved under the
+old id.
 `--dry-run` runs `reconcile_copies` in memory without saving, so it
 lists exactly what a real run folds. Each fold leaves a tombstone in `ReviewSession.folded` (`{old_id: new_id}`,
 the DOI-less id always the old one; saved as `"folded"` only when
 non-empty, united with the file's on save). `merge_concurrent_changes`
-calls `apply_tombstones` AFTER the three-way decision merge and the
-disk additions (so a target has the file's newer decision, and a disk
-target the session loaded and renamed is not re-added): an in-memory
-decision under a tombstoned id is dropped (links, provider and
-`merge_version_of` metadata united into the target) when it is
-unscreened or equal to the target, moves its decision to a target
-unscreened in the merged state, and otherwise stays beside it (a
-conflict). Tested with real subprocesses. `repoint_folded_ids`
+calls `apply_tombstones` after the three-way decision merge and the
+disk additions (a disk target the session loaded and renamed is not
+re-added). **Folding happens only in `sessions reconcile`; a save never
+folds a decision.** `apply_tombstones` only drops an in-memory copy
+under a tombstoned id that this process left untouched: unscreened,
+unchanged since loaded, without a note, and no longer in the file (its
+links, provider and `merge_version_of` metadata go to the target).
+Every other copy stays beside its target, never copying or dropping a
+decision, and is listed as foldable or conflicting for the next
+reconcile. Races tested with real subprocesses in both save orders. `repoint_folded_ids`
 repoints snowball `source_papers` and LLM sample `paper_id`s;
 `create_review_session` routes a result under a tombstoned id to its
 target, unless `plausibly_same_work` rules it out (a namesake goes to

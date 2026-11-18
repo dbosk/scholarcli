@@ -3298,6 +3298,8 @@ loaded the session before the reconcile saved under the old id
 afterwards.  When both ids have a note the old one stays, as
 [[migrate_paper_id]] would otherwise drop it, and it is still found:
 [[has_note]] looks a DOI paper's note up under its legacy hash id too.
+A note whose old id the session still holds stays where it is: that
+copy was kept apart (below), and its note belongs to it.
 
 <<review session functions>>=
 def reconcile_session(
@@ -3327,15 +3329,17 @@ def reconcile_session(
 def move_stranded_notes(session: ReviewSession) -> list[tuple[str, str]]:
     """Move notes left under folded-away ids to their new id.
 
-    Only when the new id has no note. Returns the moves made.
+    Only when the new id has no note and the session no longer holds a
+    decision under the old id. Returns the moves made.
     """
     if not session.folded:
         return []
     noted = {note.paper_id for note in list_papers_with_notes()}
+    held = {get_paper_id(d.paper) for d in session.decisions}
     moves = []
     for old_id in session.folded:
         new_id = resolve_folded_id(session.folded, old_id)
-        if old_id in noted and new_id not in noted:
+        if old_id in noted and new_id not in noted and old_id not in held:
             migrate_paper_id(old_id, new_id)
             noted.discard(old_id)
             noted.add(new_id)
@@ -3352,33 +3356,40 @@ folded-away id to the id it was folded into, and the merge with the
 file (\cref{sec:session-integrity}) applies it.  The map is united with
 the file's on every save, like the search records, so a stale process
 cannot drop it either.  [[apply_tombstones]] then looks at each
-decision this process holds under a folded-away id and settles it
-against the decision under the new id.  It runs \emph{after} the
-three-way merge of the decisions, against the merged state: a stale
-process still holds the target as it loaded it, unscreened, and a
-newer decision on the target that the file holds must be in before
-the copy is compared with it.  Run first, it once gave a stale
-DOI-less copy's decision to a target that another process had
-meanwhile discarded, and the discard survived only as a warning.  The
-target is the decision under the new id in the merged session; a
-target only the file holds is in it only if the merge added it, which
-it does not when this process loaded that id and then gave it another
-(a preprint adoption renames a paper), so no rename is undone by a
-duplicate.  Without a target, the copy stays and is listed again.
+decision this process holds under a folded-away id.  The principle is
+strict: \emph{folding happens only in [[sessions reconcile]]; a save
+never folds a decision.}  Every attempt to let a save settle a stale
+copy against its target by comparing decisions lost a decision to some
+order of saves: with the tombstones applied before the merge, a stale
+copy's keep overwrote a discard another process had saved on the
+target; applied after it, the keep was copied onto the still
+unscreened target, and a discard saved after that won.  So a save only
+drops what this process did not touch:
 \begin{description}
-\item[Nothing to keep] The copy is unscreened, or equal to the target:
-  it is dropped, and its search links, other-work notes, provider and
-  metadata go to the target, the metadata filling gaps only
-  ([[merge_version_of]]) as in a fold, so an abstract a stale process
-  added to its copy is not lost.  This is the stale process of the
-  race above.
-\item[A decision for an unscreened target] Its decision moves to the
-  target, which nobody has screened, and the copy is dropped.
-\item[Two decisions] The target is decided too, differently: someone
-  decided the folded copy after the reconcile, in a process that had
-  loaded it before.  Neither decision is overwritten; both copies stay,
-  and the next [[sessions show]] lists them as a conflict.
+\item[Untouched] The copy is unscreened, its state is what this
+  process loaded (or, for a copy this process created, it is
+  unscreened all the same), it has no note, and the file no longer
+  holds it: the reconcile removed it there.  Nobody has screened it, so
+  it holds no decision to lose.  It is dropped, and its search links,
+  other-work notes, provider and metadata go to the target, the
+  metadata filling gaps only ([[merge_version_of]]) as in a fold, so an
+  abstract a stale process added to its copy is not lost.
+\item[Touched] This process decided it, tagged it, had an LLM classify
+  it, or gave it a note; or the copy was decided already when this
+  process loaded it; or the file still holds it, because it was kept
+  apart before.  The copy stays apart, beside its target, whatever the
+  target says.  A decided copy is never dropped by a save, even an
+  unchanged one equal to its target: that would be a fold.  [[sessions show]] lists the pair as
+  foldable or conflicting, and the next [[sessions reconcile]] settles
+  it from a fresh load under the lock.
 \end{description}
+It runs after the three-way merge of the decisions and the disk
+additions, so the target is the decision under the new id in the
+merged session; a target only the file holds is in it only if the merge
+added it, which it does not when this process loaded that id and then
+gave it another (a preprint adoption renames a paper), so no rename is
+undone by a duplicate.  Without a target, the copy stays and is listed
+again.
 An append ([[create_review_session]]) routes a search result that
 arrives under a folded-away id to its target directly, recording the
 search there, so a re-run of an old search does not bring the copy back
@@ -3420,27 +3431,43 @@ def repoint_folded_ids(session: ReviewSession) -> None:
                 )
 
 
-def apply_tombstones(session: ReviewSession) -> None:
-    """Settle the decisions `session` holds under folded-away ids.
+def apply_tombstones(
+    session: ReviewSession,
+    base_states: dict[str, tuple],
+    disk_decisions: dict[str, ReviewDecision],
+) -> None:
+    """Drop the untouched copies `session` holds under folded-away ids.
 
-    Called on the merged session, so each target has its newest state.
+    A copy is untouched when it is unscreened, unchanged since it was
+    loaded, has no note and is no longer in the file; its links and
+    metadata go to the target. Every other copy stays. Never changes or
+    drops a decision.
     """
     if not session.folded:
         return
     by_id = {get_paper_id(d.paper): d for d in session.decisions}
+    folded_held = [
+        paper_id for paper_id in by_id
+        if resolve_folded_id(session.folded, paper_id) != paper_id
+    ]
+    if not folded_held:
+        return
+    try:
+        noted = {note.paper_id for note in list_papers_with_notes()}
+    except NotesFileError:
+        return
     dropped: set[int] = set()
-    for paper_id, decision in list(by_id.items()):
-        target_id = resolve_folded_id(session.folded, paper_id)
-        target = by_id.get(target_id)
-        if target_id == paper_id or target is None:
-            continue
-        if is_unscreened(decision) or (
-            decision_state(decision) == decision_state(target)
-        ):
-            pass
-        elif is_unscreened(target):
-            copy_decision(decision, target)
-        else:
+    for paper_id in folded_held:
+        decision = by_id[paper_id]
+        target = by_id.get(resolve_folded_id(session.folded, paper_id))
+        untouched = (
+            is_unscreened(decision)
+            and base_states.get(paper_id, decision_state(decision))
+            == decision_state(decision)
+            and paper_id not in noted
+            and paper_id not in disk_decisions
+        )
+        if target is None or not untouched:
             continue
         <<unite the links of [[decision]] into [[target]]>>
         dropped.add(id(decision))
@@ -3449,17 +3476,6 @@ def apply_tombstones(session: ReviewSession) -> None:
             d for d in session.decisions if id(d) not in dropped
         ]
         session._invalidate_cache()
-
-
-def copy_decision(source: ReviewDecision, target: ReviewDecision) -> None:
-    """Give `target` the decision of `source`, audit fields included."""
-    target.status = source.status
-    target.tags = list(source.tags)
-    target.source = source.source
-    target.is_example = source.is_example
-    target.llm_confidence = source.llm_confidence
-    for name, value in llm_audit_of(source).items():
-        setattr(target, name, value)
 @
 
 <<unite the links of [[decision]] into [[target]]>>=
@@ -3857,13 +3873,20 @@ class TestSessionCopies:
     assert self._states() == {"doi:10.1145/race": kept}
     assert load_session("copies").folded == {bare.id: "doi:10.1145/race"}
 
-  def test_a_stale_save_does_not_bring_back_a_copy_that_took_the_doi(self):
+  def test_a_stale_decided_copy_stays_until_reconciled(self):
+    """The decided DOI-less copy took the DOI; the stale process left its
+    copy unchanged, but a save never drops a decided copy."""
     discarded = (DecisionStatus.DISCARDED, ["no-abstract"])
     bare, with_doi = self._two_copies(discarded, (DecisionStatus.PENDING, []))
     stale = load_session("copies")
     reconcile_session("copies")
     stale.research_context = "edited meanwhile"
     save_session(stale)
+    assert self._states() == {
+      bare.id: discarded, "doi:10.1145/race": discarded,
+    }
+    assert len(foldable_copies(load_session("copies"))) == 1
+    assert len(reconcile_session("copies")) == 1
     assert self._states() == {"doi:10.1145/race": discarded}
 
   def test_the_drop_guard_ignores_tombstones_of_kept_copies(self, caplog):
@@ -3936,18 +3959,125 @@ class TestSessionCopies:
       bare.id: (DecisionStatus.KEPT, ["p"]),
     }
 
-  def test_a_decision_goes_to_an_unscreened_target(self):
+  @staticmethod
+  def _waiting_process(body):
+    """A real process that loads the session, waits for a line on its
+    standard input, then runs `body` on the session and saves it."""
+    import subprocess
+    import sys
+    import textwrap
+    code = textwrap.dedent("""
+      import sys
+      from scholar.review import DecisionStatus, load_session, save_session
+      session = load_session("copies")
+      print("loaded", flush=True)
+      sys.stdin.readline()
+    """) + textwrap.dedent(body) + "\nsave_session(session)\n"
+    process = subprocess.Popen(
+      [sys.executable, "-c", code],
+      stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+    )
+    assert process.stdout.readline().strip() == "loaded"
+    return process
+
+  @staticmethod
+  def _release(process):
+    try:
+      process.communicate("go\n", timeout=120)
+    finally:
+      if process.poll() is None:
+        process.kill()
+    assert process.returncode == 0
+
+  @pytest.mark.parametrize("order", ["P then Q", "Q then P"])
+  def test_a_stale_keep_and_a_fresh_discard_both_survive(self, order):
+    """P and Q load; the reconcile folds the unscreened copies; P keeps
+    the DOI-less copy, Q discards the DOI copy, in either order."""
+    import subprocess
+    import sys
     pending = (DecisionStatus.PENDING, [])
     bare, with_doi = self._two_copies(pending, pending)
+    keep = self._waiting_process("""
+      for decision in session.decisions:
+        if not decision.paper.doi:
+          decision.status, decision.tags = DecisionStatus.KEPT, ["p"]
+    """)
+    discard = self._waiting_process("""
+      for decision in session.decisions:
+        if decision.paper.doi:
+          decision.status, decision.tags = DecisionStatus.DISCARDED, ["q"]
+    """)
+    subprocess.run([sys.executable, "-c",
+                    "from scholar.review import reconcile_session; "
+                    "assert len(reconcile_session('copies')) == 1"],
+                   check=True, timeout=120)
+    first, second = (keep, discard) if order == "P then Q" \
+      else (discard, keep)
+    self._release(first)
+    self._release(second)
+    expected = {
+      bare.id: (DecisionStatus.KEPT, ["p"]),
+      "doi:10.1145/race": (DecisionStatus.DISCARDED, ["q"]),
+    }
+    assert self._states() == expected
+    assert len(conflicting_copies(load_session("copies"))) == 1
+    assert reconcile_session("copies") == []
+    assert self._states() == expected
+
+  def test_a_noted_stale_copy_stays_until_reconciled(self):
+    from scholar.notes import save_note
+    pending, kept = (DecisionStatus.PENDING, []), (DecisionStatus.KEPT, ["ml"])
+    bare, with_doi = self._two_copies(pending, kept)
+    stale = load_session("copies")
+    reconcile_session("copies")
+    save_note(bare, "written by the stale process")
+    save_session(stale)
+    session = load_session("copies")
+    assert len(session.decisions) == 2
+    assert len(foldable_copies(session)) == 1
+    assert len(reconcile_session("copies")) == 1
+    assert self._noted_ids() == {"doi:10.1145/race"}
+
+  def test_a_copy_reset_by_the_stale_process_stays(self):
+    discarded = (DecisionStatus.DISCARDED, ["no-abstract"])
+    bare, with_doi = self._two_copies(discarded, (DecisionStatus.PENDING, []))
+    stale = load_session("copies")
+    reconcile_session("copies")
+    for decision in stale.decisions:
+      if not decision.paper.doi:
+        decision.status, decision.tags = DecisionStatus.PENDING, []
+    save_session(stale)
+    assert self._states() == {
+      bare.id: (DecisionStatus.PENDING, []), "doi:10.1145/race": discarded,
+    }
+
+  def test_a_copy_the_file_still_holds_is_never_dropped(self):
+    from scholar.notes import save_note, delete_note
+    pending, kept = (DecisionStatus.PENDING, []), (DecisionStatus.KEPT, ["ml"])
+    bare, with_doi = self._two_copies(pending, kept)
+    stale = load_session("copies")
+    reconcile_session("copies")
+    save_note(bare, "keeps the copy apart")
+    save_session(stale)
+    delete_note(bare)
+    later = load_session("copies")
+    later.research_context = "edited"
+    save_session(later)
+    assert set(self._states()) == {bare.id, "doi:10.1145/race"}
+
+  def test_a_note_stays_on_a_copy_kept_apart(self):
+    from scholar.notes import save_note
+    pending, kept = (DecisionStatus.PENDING, []), (DecisionStatus.KEPT, ["ml"])
+    bare, with_doi = self._two_copies(pending, kept)
     stale = load_session("copies")
     reconcile_session("copies")
     for decision in stale.decisions:
       if not decision.paper.doi:
         decision.status, decision.tags = DecisionStatus.DISCARDED, ["x"]
     save_session(stale)
-    assert self._states() == {
-      "doi:10.1145/race": (DecisionStatus.DISCARDED, ["x"]),
-    }
+    save_note(bare, "why the DBLP copy was discarded")
+    assert reconcile_session("copies") == []
+    assert self._noted_ids() == {bare.id}
 
   def test_a_stale_copy_gives_its_metadata_to_the_target(self):
     pending, kept = (DecisionStatus.PENDING, []), (DecisionStatus.KEPT, ["ml"])
@@ -4966,7 +5096,7 @@ def merge_concurrent_changes(
         if paper_id not in own_ids and paper_id not in base_states:
             session.decisions.append(theirs)
     session.folded = {**on_disk.folded, **session.folded}
-    apply_tombstones(session)
+    apply_tombstones(session, base_states, disk_decisions)
 
     <<merge research context from disk>>
 
