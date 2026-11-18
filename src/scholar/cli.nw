@@ -1278,6 +1278,219 @@ class TestSearchFailureRecorded:
         assert "failed (non-JSON response" in shown.stdout
 @
 
+The same path with two providers, one of which fails, is the situation
+of \url{https://github.com/dbosk/scholar/issues/164}.  The default
+[[--dedup]] merges the two results for display, and the session must
+still get one record per provider: the answering provider with its own
+count, the failing one marked failed, and nothing charged to the
+other.
+
+<<test functions>>=
+class TestSearchRecordsPerProvider:
+    """search -n records each provider's search on its own (#164)."""
+
+    def _providers(self, monkeypatch):
+        from scholar import providers
+
+        good = Mock()
+        good.name = "good"
+        good.MAX_LIMIT = None
+        good.search.return_value = [
+            Paper(title="Kept", authors=["A"], doi="10.1/rpp-kept"),
+        ]
+        dead = Mock()
+        dead.name = "dead"
+        dead.MAX_LIMIT = None
+        dead.search.return_value = []
+        dead.last_error = "non-JSON response"
+        dead.last_retries = 0
+        monkeypatch.setattr(
+            providers, "PROVIDERS", {"good": good, "dead": dead}
+        )
+
+    def test_each_provider_has_its_record(self, tmp_path, monkeypatch):
+        from scholar.review import load_session
+
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        self._providers(monkeypatch)
+        result = runner.invoke(app, [
+            "search", "q", "-p", "good", "-p", "dead", "-n", "two",
+            "-f", "json",
+        ])
+        assert result.exit_code == 0
+        session = load_session("two")
+        assert {
+            r.provider: (r.hits, r.error) for r in session.search_records
+        } == {"good": (1, None), "dead": (0, "non-JSON response")}
+        assert session.decisions[0].found_by == [("q", "good", "")]
+
+        shown = runner.invoke(app, ["sessions", "show", "two"])
+        assert "good: q" in shown.stdout
+        assert "hits: 1" in shown.stdout
+        assert "dead: q" in shown.stdout
+        assert "failed (non-JSON response)" in shown.stdout
+        assert "incomplete" not in shown.stdout
+
+    def test_merged_count_at_the_limit_is_not_capped(self, monkeypatch):
+        from scholar import providers
+
+        def provider(name, dois):
+            mock = Mock(last_error=None, last_retries=0, last_total=None)
+            mock.name = name
+            mock.MAX_LIMIT = None
+            mock.search.return_value = [
+                Paper(title=f"T{d}", authors=["A"], doi=f"10.1/cap-{d}")
+                for d in dois
+            ]
+            return mock
+
+        monkeypatch.setattr(providers, "PROVIDERS", {
+            "one": provider("one", [1, 2, 3]),
+            "two": provider("two", [3, 4, 5]),
+        })
+        result = runner.invoke(app, [
+            "search", "q", "-p", "one", "-p", "two", "-l", "5", "-f", "csv",
+        ])
+        assert "# Results: 5\n" in result.stdout
+        assert "# Capped at limit" not in result.stdout
+        assert "capped" not in result.stdout
+        assert "# Search: one: 3" in result.stdout
+
+        one = SearchResult(query="q", provider="one", timestamp="t",
+                           limit=5, papers=[
+                               Paper(title=f"T{d}", authors=["A"],
+                                     doi=f"10.1/cap-{d}") for d in (1, 2, 3)
+                           ])
+        two = SearchResult(query="q", provider="two", timestamp="t",
+                           limit=5, papers=[
+                               Paper(title=f"T{d}", authors=["A"],
+                                     doi=f"10.1/cap-{d}") for d in (3, 4, 5)
+                           ])
+        assert result_hits_label(one.merge(two)) == "5"
+
+    def test_csv_names_each_providers_search(self, monkeypatch):
+        self._providers(monkeypatch)
+        result = runner.invoke(app, [
+            "search", "q", "-p", "good", "-p", "dead", "-f", "csv",
+        ])
+        assert "# Search: good: 1" in result.stdout
+        assert "# Search: dead: failed (non-JSON response)" in result.stdout
+@
+
+A search cut at its limit must say so wherever its count appears
+(\url{https://github.com/dbosk/scholar/issues/166}): the CSV keeps its
+plain count and adds the reported total and the cap on lines of their
+own, and the session listing shows \enquote{1 of 2,130 (capped at 1)}.
+
+<<test functions>>=
+class TestSearchShowsTotals:
+    """A capped search shows the total and the cap (#166)."""
+
+    def _provider(self, monkeypatch):
+        from scholar import providers
+
+        mock = Mock(last_total=2130, last_total_estimated=False,
+                    last_error=None, last_retries=0)
+        mock.name = "big"
+        mock.MAX_LIMIT = None
+        mock.search.return_value = [
+            Paper(title="First", authors=["A"], doi="10.1/big-1"),
+        ]
+        monkeypatch.setattr(providers, "PROVIDERS", {"big": mock})
+
+    def test_csv_and_session(self, tmp_path, monkeypatch):
+        import json as _json
+
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        self._provider(monkeypatch)
+        result = runner.invoke(
+            app, ["search", "q", "-l", "1", "-n", "big", "-f", "csv"]
+        )
+        assert "# Results: 1\n" in result.stdout
+        assert "# Total reported: 2130" in result.stdout
+        assert "# Capped at limit: 1" in result.stdout
+
+        shown = runner.invoke(app, ["sessions", "show", "big"])
+        assert "hits: 1 of 2,130 (capped at 1)" in shown.stdout
+        data = _json.loads(runner.invoke(
+            app, ["sessions", "show", "big", "-f", "json"]
+        ).stdout)
+        assert data["search_records"][0]["total"] == 2130
+
+    def test_session_shows_the_fetch_date(self, tmp_path, monkeypatch):
+        from scholar import providers
+
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        self._provider(monkeypatch)
+        mock = providers.PROVIDERS["big"]
+        mock.last_fetched_at = "2026-10-02T08:00:00+00:00"
+        mock.last_from_cache = True
+        runner.invoke(app, ["search", "q", "-n", "dated", "-f", "csv"])
+        shown = runner.invoke(app, ["sessions", "show", "dated"])
+        assert "cached answer fetched 2026-10-02" in " ".join(
+            shown.stdout.split()
+        )
+@
+
+A provider skipped for its spent quota is a search that failed, not one
+that never happened (\url{https://github.com/dbosk/scholar/issues/165}):
+the session records it with the reason and the reset time, the search
+output says so, and a later skip does not erase an earlier answer.  The
+quota state is the real persisted limiter state, set as a spent quota
+would set it.
+
+<<test functions>>=
+class TestSkippedProviderRecorded:
+    """A quota-blocked provider is recorded as skipped (#165)."""
+
+    def _provider(self, monkeypatch):
+        from scholar import providers
+
+        mock = Mock()
+        mock.name = "blockable"
+        mock.MAX_LIMIT = None
+        mock.search.return_value = [
+            Paper(title="Answer", authors=["A"], doi="10.1/skip-answer"),
+        ]
+        monkeypatch.setattr(providers, "PROVIDERS", {"blockable": mock})
+        return mock
+
+    @staticmethod
+    def _block():
+        from scholar import ratelimit
+        ratelimit.get_limiter("blockable").record_limit_hit(
+            reason="daily quota spent", exhausted_daily=True
+        )
+
+    def test_skip_is_recorded_and_shown(self, tmp_path, monkeypatch):
+        from scholar.review import load_session
+
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        mock = self._provider(monkeypatch)
+        self._block()
+        result = runner.invoke(
+            app, ["search", "q", "-n", "skipped", "-f", "csv"]
+        )
+        mock.search.assert_not_called()
+        assert "# Results: failed (skipped: daily quota spent; resets " \
+            in result.stdout
+        record = load_session("skipped").search_records[0]
+        assert record.provider == "blockable"
+        assert record.hits == 0
+        assert record.error.startswith("skipped: daily quota spent")
+
+    def test_skip_keeps_an_earlier_answer(self, tmp_path, monkeypatch):
+        from scholar.review import load_session
+
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        self._provider(monkeypatch)
+        runner.invoke(app, ["search", "q", "-n", "kept", "-f", "csv"])
+        self._block()
+        runner.invoke(app, ["search", "q", "-n", "kept", "-f", "csv"])
+        records = load_session("kept").search_records
+        assert [(r.hits, r.error) for r in records] == [(1, None)]
+@
+
 \subsection{Semantic search: alone, unfiltered, at most fifty}
 \label{sec:search-semantic-checks}
 
@@ -1839,7 +2052,7 @@ from scholar.providers import (
     get_provider,
     expand_provider_names,
 )
-from scholar.scholar import SearchResult, provider_outcome, applied_filters
+from scholar.scholar import SearchResult, search_provider
 from scholar.review import create_review_session, save_session
 from scholar.llm_review import (
     classify_papers_with_llm,
@@ -1935,6 +2148,13 @@ provider_queries = generate_provider_queries(
 )
 @
 
+[[rq]] runs each provider's own query through [[search_provider]], the
+function behind [[Search.execute]] (\cref{sec:skipped-providers} in
+the [[scholar]] module), so a provider whose quota is spent is recorded
+as skipped, with its reason, exactly as in [[search]]
+(\url{https://github.com/dbosk/scholar/issues/165}); before, [[rq]]
+called the provider directly and never looked at the limiter first.
+
 <<execute rq provider searches>>=
 results: list[SearchResult] = []
 timestamp = datetime.now().isoformat()
@@ -1944,21 +2164,9 @@ for pname in provider_names:
         continue
 
     q = provider_queries.get(pname, rq_text)
-    papers = p.search(q, limit=effective_limit, filters=filters)
-    error, retries = provider_outcome(p)
-    applied = applied_filters(p, q, filters)
-    results.append(
-        SearchResult(
-            query=q,
-            provider=pname,
-            timestamp=timestamp,
-            papers=papers,
-            filters=applied.as_dict() if applied else None,
-            limit=effective_limit,
-            error=error,
-            retries=retries,
-        )
-    )
+    results.append(search_provider(
+        p, q, effective_limit, filters, timestamp=timestamp,
+    ))
 
 if not results:
     console.print("[yellow]No results returned[/yellow]")
@@ -2273,6 +2481,79 @@ class TestRQCommand:
             for r in data["search_records"]
         )
         assert data["decisions"][0]["source"] == "llm"
+@
+
+[[rq]] goes through the same [[search_provider]], so a provider whose
+quota is spent is recorded as skipped there too, beside the provider
+that answered.  The model is the same kind of stand-in as above: it
+writes the queries and classifies the one paper.
+
+<<test functions>>=
+class TestRQRecordsSkippedProvider:
+    """rq records a quota-blocked provider as skipped (#165)."""
+
+    def test_skipped_provider_has_a_record(self, tmp_path, monkeypatch):
+        import json
+        import sys
+        import types
+
+        from scholar import providers, ratelimit
+        from scholar.review import load_session
+
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        good, blocked = Mock(), Mock()
+        good.name, blocked.name = "good", "blocked"
+        good.search.return_value = [
+            Paper(title="Found", authors=["A"], year=2024,
+                  doi="10.1/rq-skip", abstract="Abstract."),
+        ]
+        monkeypatch.setattr(
+            providers, "PROVIDERS", {"good": good, "blocked": blocked}
+        )
+        ratelimit.get_limiter("blocked").record_limit_hit(
+            reason="daily quota spent", exhausted_daily=True
+        )
+
+        class Reply:
+            def __init__(self, data):
+                self._text = json.dumps(data)
+
+            def text(self):
+                return self._text
+
+        class Model:
+            model_id = "dummy"
+
+            def prompt(self, prompt):
+                if "Papers to Classify" in prompt:
+                    return Reply({"classifications": [{
+                        "paper_index": 0, "decision": "kept",
+                        "tags": ["theme"], "confidence": 0.9,
+                        "reasoning": "Relevant.",
+                    }]})
+                return Reply({"queries": [
+                    {"provider": "good", "query": "good query"},
+                    {"provider": "blocked", "query": "blocked query"},
+                ]})
+
+        llm_mod = types.ModuleType("llm")
+        llm_mod.get_model = lambda model_id=None: Model()
+        monkeypatch.setitem(sys.modules, "llm", llm_mod)
+
+        result = runner.invoke(app, [
+            "rq", "A question?", "-p", "good", "-p", "blocked",
+            "--count", "1", "--no-enrich", "-n", "rq-skip",
+        ])
+        assert result.exit_code == 0, result.output
+        blocked.search.assert_not_called()
+        records = {
+            r.provider: r for r in load_session("rq-skip").search_records
+        }
+        assert records["good"].hits == 1
+        assert records["blocked"].query == "blocked query"
+        assert records["blocked"].error.startswith(
+            "skipped: daily quota spent; resets "
+        )
 @
 
 A paper that [[rq]]'s classification leaves pending is listed, as
@@ -6471,7 +6752,13 @@ grid, so it is where a dead provider has to stand out.  Records from
 before outcomes were stored show nothing, since nothing is known.
 A semantic search's record shows its ranked list as one
 (\enquote{top 50, ranked (not a count)}, \cref{sec:ranked-list}) and
-without the \enquote{hits:} prefix, which would read as a count.  The
+without the \enquote{hits:} prefix, which would read as a count.  A merged record from before searches were recorded per provider
+reads as one and drops the prefix for the same reason
+(\cref{sec:merged-records} in the review module).
+The line ends with when the search ran and, for an answer served from
+the cache, when that answer was fetched---or that the cache does not
+know (\url{https://github.com/dbosk/scholar/issues/167}); the
+session's own date above is only that of its last change.  The
 JSON form marks such a record with [["ranked": true]] (and leaves the
 key out otherwise), so a script reading [[hits]] can tell the two
 apart as well.
@@ -6479,17 +6766,24 @@ apart as well.
 <<sessions command>>=
 def _record_outcome_markup(record) -> str:
     """Rich markup for a search record's outcome, or "" if unknown."""
-    ranked = is_ranked_provider(record.provider)
-    label = hits_label(
-        record.hits, record.error, record.retries, ranked=ranked
-    )
+    from scholar.review import search_outcome_label
+
+    label = search_outcome_label(record)
     if not label:
         return ""
     if record.error:
         return f" [yellow]— {escape(label)}[/yellow]"
-    if ranked:
+    if is_ranked_provider(record.provider) or record.is_merged:
         return f"[dim] — {escape(label)}[/dim]"
     return f"[dim] — hits: {escape(label)}[/dim]"
+
+
+def _record_dates_markup(record) -> str:
+    """Rich markup for when a search ran and was fetched, or ""."""
+    from scholar.review import search_dates_label
+
+    label = search_dates_label(record)
+    return f"[dim] — {escape(label)}[/dim]" if label else ""
 
 
 def session_paper_line(decision) -> str:
@@ -6566,6 +6860,11 @@ def sessions_show(
                     "hits": r.hits,
                     "error": r.error,
                     "retries": r.retries,
+                    "total": r.total,
+                    "total_estimated": r.total_estimated,
+                    "searched_at": r.searched_at,
+                    "fetched_at": r.fetched_at,
+                    "from_cache": r.from_cache,
                     **(
                         {"ranked": True}
                         if is_ranked_provider(r.provider) else {}
@@ -6636,6 +6935,7 @@ def sessions_show(
                         f"[dim]  {record.provider}: "
                         f"{escape(record.query + suffix)}[/dim]"
                         + _record_outcome_markup(record)
+                        + _record_dates_markup(record)
                     )
             else:
                 # Fallback: show providers with session query
@@ -11500,7 +11800,8 @@ gets its own line with the reason, worded by [[hits_label]] as in every
 other view, and so does one that answered only in part.
 
 <<cli imports>>=
-from scholar.scholar import hits_label, is_ranked_provider
+from scholar.scholar import hits_label, is_ranked_provider, result_total
+from scholar.scholar import result_dates
 
 <<formatter classes>>=
 class TableFormatter:
@@ -11540,17 +11841,60 @@ class TableFormatter:
             self.console.print(table)
 
             ranked = is_ranked_provider(result.provider)
-            label = hits_label(
-                len(result.papers), result.error, ranked=ranked
-            )
+            label = result_hits_label(result)
             if result.error:
                 self.console.print(
                     f"[yellow]Results: {escape(label)}[/yellow]"
                 )
             elif not result.papers:
                 self.console.print("[dim]No results found.[/dim]")
-            elif ranked:
+            elif ranked or label != str(len(result.papers)):
                 self.console.print(f"[dim]Results: {escape(label)}[/dim]")
+            for line in part_hits_lines(result):
+                self.console.print(f"[dim]{escape(line)}[/dim]")
+@
+
+A count that stopped at the limit is shown with the total the provider
+reported and the cap (\enquote{100 of 2,130 (capped at 100)},
+[[count_label]] in the [[scholar]] module), so that the table does not
+present the first page of an answer as all of it
+(\url{https://github.com/dbosk/scholar/issues/166}).  A merged result
+has no total of its own; below it, each provider's search gets a line
+with its own count, total and error
+(\url{https://github.com/dbosk/scholar/issues/164}), since the merged
+count cannot say which provider answered what.  Both views and the CSV
+share the two helpers.  Whether a search was capped is decided for each
+provider's own search, never for the merged count: the union of two
+providers' three hits each, one shared, is five, and with a limit of
+five it would read as \enquote{capped} although neither provider came
+near its limit.
+
+<<formatter classes>>=
+def result_hits_label(result) -> str:
+    """The hits label of a result, with its total and cap if known.
+
+    A merged result is never called capped: its count is the
+    deduplicated union, which can equal the limit by chance; each of
+    its parts is judged on its own (`part_hits_lines`).
+    """
+    total, estimated = result_total(result)
+    merged = bool(getattr(result, "parts", None))
+    return hits_label(
+        len(result.papers), result.error,
+        ranked=is_ranked_provider(result.provider),
+        total=total, limit=None if merged else getattr(result, "limit", None),
+        estimated=estimated,
+    )
+
+
+def part_hits_lines(result) -> list[str]:
+    """One line per provider search of a merged result; none otherwise."""
+    parts = getattr(result, "parts", None)
+    if not isinstance(parts, list) or not parts:
+        return []
+    return [
+        f"{part.provider}: {result_hits_label(part)}" for part in parts
+    ]
 @
 
 Let's verify the table formatter produces correct output:
@@ -11597,7 +11941,12 @@ provider, so it is where a failure must show: it reads
 [[failed (reason)]] instead of 0 (or [[N, incomplete (reason)]]),
 deliberately not a number, so a script that parses it stops instead of
 recording a zero.  Retries get a line of their own, which keeps the
-count of an answered search a plain number:
+count of an answered search a plain number, and so do the total the
+provider reported ([[# Total reported:]]) and a count that stopped at
+the limit ([[# Capped at limit:]]), for the same reason
+(\url{https://github.com/dbosk/scholar/issues/166}).  A merged result
+adds one [[# Search:]] line per provider with that provider's own
+outcome (\url{https://github.com/dbosk/scholar/issues/164}):
 
 <<formatter classes>>=
 class CSVFormatter:
@@ -11617,6 +11966,17 @@ class CSVFormatter:
             print(f"# Results: {label}")
             if result.retries:
                 print(f"# Retries: {result.retries}")
+            total, estimated = result_total(result)
+            if total is not None:
+                about = " (estimate)" if estimated else ""
+                print(f"# Total reported: {total}{about}")
+            if (not result.error and result.limit
+                    and not getattr(result, "parts", None)
+                    and len(result.papers) == result.limit
+                    and (total is None or total > len(result.papers))):
+                print(f"# Capped at limit: {result.limit}")
+            for line in part_hits_lines(result):
+                print(f"# Search: {line}")
             print()
 
             # Header row
@@ -11662,7 +12022,10 @@ reconstructs --- the search is fully described by its query, providers,
 filters, and limit, and JSON is the natural place to expose all four to a
 machine reader.  The [[error]] and [[retries]] of the result go along
 for the same reason: a consumer counting papers must be able to tell a
-failed provider from an empty answer.
+failed provider from an empty answer.  So do the [[total]] the provider
+reported (\url{https://github.com/dbosk/scholar/issues/166}) and, for a
+merged result, the [[searches]] it was made of, each with its own
+count, total and error (\url{https://github.com/dbosk/scholar/issues/164}).
 
 <<formatter classes>>=
 class JSONFormatter:
@@ -11680,6 +12043,20 @@ class JSONFormatter:
                 "limit": result.limit,
                 "error": result.error,
                 "retries": result.retries,
+                "total": result_total(result)[0],
+                "total_estimated": result_total(result)[1],
+                **({"searches": [
+                    {
+                        "query": part.query,
+                        "provider": part.provider,
+                        "hits": len(part.papers),
+                        "total": result_total(part)[0],
+                        "total_estimated": result_total(part)[1],
+                        "error": part.error,
+                        "retries": part.retries,
+                    }
+                    for part in result.parts
+                ]} if getattr(result, "parts", None) else {}),
                 "papers": [
                     {
                         "title": p.title,
@@ -11931,10 +12308,12 @@ def _search_flags(filters: dict | None, limit: int | None) -> list[str]:
 
 With the helpers in place, the command is just the query, the [[-p]] flags,
 and the reconstructed filter flags joined into one line.  The merged joins
-reach [[prov found-via]] too, since a session stores the merged result of a
-multi-provider [[search -n]] as one search record, so [[_search_command]]
-takes the four parts rather than a result and serves both callers;
-[[_found_via]] applies it to a live result.
+reach [[prov found-via]] too: sessions saved before
+\url{https://github.com/dbosk/scholar/issues/164} stored the merged
+result of a multi-provider [[search -n]] as one search record, and their
+papers still link to it.  So [[_search_command]] takes the four parts
+rather than a result and serves both callers; [[_found_via]] applies it
+to a live result.
 
 <<formatter classes>>=
 def _search_command(
@@ -11963,18 +12342,60 @@ def _found_via(result) -> str:
 @
 
 Each paper is preceded by the comment block and then the reused entry.  The
-[[DATE]] comes from the search timestamp already carried on the result rather
-than the wall clock: it records when the search that surfaced the paper
-actually ran, and it keeps the output deterministic under test.
+[[DATE]] is the date the database answered the search that surfaced the
+paper, not the wall clock.  It used to be the result's [[timestamp]],
+the time of the run, so an answer served from the cache was dated
+today however old it was
+(\url{https://github.com/dbosk/scholar/issues/167}).  Now it is the
+date the answer was fetched (\cref{sec:search-dates} in the [[scholar]]
+module), taken from the searches that returned this paper: for a merged
+result, the parts in its [[found_in]], so a paper only OpenAlex returned
+is dated by OpenAlex's answer.  A cached answer whose fetch date the
+cache does not know says so instead of giving a date.  Only a result
+that records no dates at all (built by code outside scholar, or by the
+tests) falls back to its timestamp's date, as before.  Several dates
+are written as a range.
 
 <<formatter classes>>=
+def _prov_date(result, paper) -> str:
+    """The DATE of a provenance block: when the answer was fetched."""
+    parts = result.search_parts() if hasattr(result, "search_parts") \
+        else [result]
+    found_in = getattr(result, "found_in", None) or []
+    if len(parts) > 1:
+        index = next(
+            (i for i, p in enumerate(result.papers) if p is paper), None
+        )
+        if index is not None and index < len(found_in) and found_in[index]:
+            parts = [parts[i] for i in found_in[index]]
+    dates, unknown = set(), False
+    for part in parts:
+        searched, fetched, cached = result_dates(part)
+        if fetched:
+            dates.add(fetched[:10])
+        elif cached:
+            unknown = True
+        elif searched:
+            dates.add(searched[:10])
+        elif part.timestamp:
+            dates.add(part.timestamp.split("T")[0])
+    if not dates:
+        return "unknown (cached answer, fetch date not recorded)" \
+            if unknown else ""
+    date = min(dates) if len(dates) == 1 else \
+        f"{min(dates)} to {max(dates)}"
+    if unknown:
+        date += "; some answers cached, fetch date not recorded"
+    return date
+
+
 class BibTeXProvFormatter(BibTeXFormatter):
     """Output BibTeX entries wrapped in a provenance comment block."""
 
     def format(self, results: list) -> None:
         """Output results as provenance-stub BibTeX."""
         for result, paper, key in _keyed_papers(results):
-            date = result.timestamp.split("T")[0] if result.timestamp else ""
+            date = _prov_date(result, paper)
             print(f"% === provenance: {key} ===")
             print("% CLAIM: TODO")
             print(f"% FOUND-VIA: {_found_via(result)}")
@@ -12024,6 +12445,62 @@ collapse those joins back into one runnable command:
             "% FOUND-VIA: scholar search test "
             "-p semantic_scholar -p dblp" in out
         )
+@
+
+The [[DATE]] of a cached answer is the date it was fetched, not the
+day of the run, and a cached answer without a known fetch date says
+so; in a merged result each paper is dated by the providers that
+returned it (\url{https://github.com/dbosk/scholar/issues/167}):
+
+<<test functions>>=
+    def test_bibtex_prov_date_is_the_fetch_date(self, capsys):
+        """DATE gives when the answer was fetched, never the run's day."""
+        cached = SearchResult(
+            query="q", provider="openalex",
+            timestamp="2026-11-18T10:00:00",
+            papers=[Paper(title="Old", authors=["Alice"], year=2024)],
+            searched_at="2026-11-18T09:00:00+00:00",
+            fetched_at="2026-10-02T08:00:00+00:00", from_cache=True,
+        )
+        unknown = SearchResult(
+            query="q", provider="dblp", timestamp="2026-11-18T10:00:00",
+            papers=[Paper(title="Older", authors=["Bob"], year=2020)],
+            searched_at="2026-11-18T09:00:00+00:00", from_cache=True,
+        )
+        BibTeXProvFormatter().format([cached, unknown])
+        out = capsys.readouterr().out
+        assert "% DATE: 2026-10-02\n" in out
+        assert (
+            "% DATE: unknown (cached answer, fetch date not recorded)"
+            in out
+        )
+        assert "2026-11-18" not in out.split("% DATE:")[1].split("\n")[0]
+
+    def test_bibtex_prov_date_follows_found_in(self, capsys):
+        """A merged paper is dated by the providers that returned it."""
+        only_oa = Paper(title="OA", authors=["Alice"], year=2024,
+                        doi="10.1/date-oa")
+        both = Paper(title="Both", authors=["Bob"], year=2024,
+                     doi="10.1/date-both")
+        oa = SearchResult(
+            query="q", provider="openalex", timestamp="t",
+            papers=[only_oa, both],
+            searched_at="2026-11-18T09:00:00+00:00",
+            fetched_at="2026-10-02T08:00:00+00:00", from_cache=True,
+        )
+        dblp = SearchResult(
+            query="q", provider="dblp", timestamp="t", papers=[both],
+            searched_at="2026-11-18T09:00:00+00:00",
+            fetched_at="2026-11-18T09:00:00+00:00", from_cache=False,
+        )
+        BibTeXProvFormatter().format([oa.merge(dblp)])
+        dates = [
+            line for line in capsys.readouterr().out.splitlines()
+            if line.startswith("% DATE:")
+        ]
+        assert dates == [
+            "% DATE: 2026-10-02", "% DATE: 2026-10-02 to 2026-11-18",
+        ]
 @
 
 A double quote in the query is preserved literally inside [[shlex.quote]]'s

@@ -80,7 +80,99 @@ Providers self-register via `register_provider()` at module load time.
   `OpenAlexSemanticProvider` sets `HONOURS_SEARCH_IN = False`. The report's provider table has a
   Filters column (`filter_flags`, `scholar.py`, shared with
   `_search_flags`) and appears also when two records share
-  (query, provider).
+  (query, provider), when the records have several queries, or when
+  any record knows its outcome or dates (then with a Date column).
+  The report's search parameters describe all records (#163, search
+  part): `search_parameter_items` (Query/Queries, Providers from
+  `searched_providers` incl. merged ones, Searched period from
+  `search_period`), and the abstract's "The search covered ..." uses
+  `searched_providers`, not `session.providers` (last append only).
+  `searched_providers` lists only providers that answered at least one
+  search; skipped / failed-outright ones go to "Not searched: ieee
+  (skipped: …)" (`unsearched_providers`, `provider_failure`, which
+  splits merged errors at their provider prefixes); a provider a merged
+  record with papers names as failed is listed with "(failed or
+  incomplete in a merged record)", as in the caption
+  (`searched_providers_text`). Failed and skipped
+  records have no `search_source_date` and stay out of the periods.
+- One record per provider search (#164). `SearchResult.parts` /
+  `found_in` (not compared): `merge` keeps the single-provider results
+  it was made of and, per merged paper, the indices of the parts that
+  returned it (`parts_returning`: same `Paper.id`, or the part's
+  provider in `sources`; computed before enrichment, which keeps the
+  order). `create_review_session` records one `SearchRecord` per part
+  (`search_parts_of`, Mock-safe) and links each paper to its parts only
+  (`paper_search_links`); the decision's `provider` names those
+  providers. Pre-#164 merged records (provider `openalex, dblp`, query
+  `q | q`) load unchanged: `SearchRecord.is_merged`,
+  `search_outcome_label` ("merged record (providers …): outcome cannot
+  be split"); the audit caption counts them as a query of each provider
+  and marks each provider their error names (the merge prefixed each
+  error with its provider; `merged_record_failures`) as "failed or
+  incomplete for k of n queries, in a merged record"; providers named
+  in a merged record without papers count as not searched for it.
+  A merged record is superseded once per-provider records of the same
+  query (positional `q1 | q2` ↔ providers) and filters exist for every
+  provider it names (`merged_record_cover`; the covering record must
+  have answered, not failed outright or been skipped, and have a limit
+  at least the merged one's unless that is unknown);
+  `supersede_merged_records`
+  (end of `create_review_session` and of `merge_concurrent_changes`)
+  drops it, drops its links where the paper links to a covering record,
+  else links the paper to all covering records. Partly covered: kept.
+- Totals and caps (#166). Providers set `last_total` (+
+  `last_total_estimated`) from the field they already page on
+  (OpenAlex `meta.count`, DBLP `@total`, WoS `total`/`RecordsFound`,
+  IEEE `total_records`, HAL `numFound`, Scopus
+  `opensearch:totalResults`, arXiv feed header; none with arXiv's
+  client-side year filter; an absent field is `None`, not 0), reset
+  next to `last_error`. `search_provider` reads them Mock-safely
+  (`provider_total`) into `SearchResult.total`/`total_estimated`,
+  stored on `SearchRecord`. `hits_label(..., total=, limit=,
+  estimated=)` / `count_label`: "100 of 2,130 (capped at 100)" (capped
+  when hits == limit and the total does not show nothing was left);
+  plain counts read as before. CSV keeps `# Results: N` numeric and
+  adds `# Total reported:` / `# Capped at limit:` / per-provider
+  `# Search:` lines; JSON adds `total` and `searches`. Audit caption:
+  "capped at the limit for k of n queries" (`search_was_capped`). A
+  narrower re-run (same key, smaller limit, both answered) never
+  replaces a wider record: the wider one is kept, nothing new is
+  recorded, links already share the key (`search_width`: None/0 =
+  all; legacy records never count as wider).
+  `ReviewSession.add_search_record(record)` carries records over whole.
+  All record rules are one sort key, `record_rank(r)` =
+  `(answered, width, searched_at, hits, complete)` (legacy width,
+  unknown dates and unknown hits rank lowest); `preferred_record(a, b)`
+  keeps the higher, `a` on equal keys (a total preorder: no cycles, no
+  order dependence). So a search's record is its latest answered run of
+  the widest scope, with that run's own outcome (a newer partial run
+  reads "incomplete"); the date beats hits because PRISMA asks when each
+  source was last searched; older runs' links stay on the same key.
+  `create_review_session` (new run first) and
+  `merge_concurrent_changes` (own record first, for a shared key) both
+  use it.
+- Search dates (#167). `SearchResult`/`SearchRecord` have `searched_at`
+  (UTC ISO, the run; `utils.utc_now_iso`), `fetched_at` (when the
+  service answered; for a cache hit the original fetch, `None` =
+  unknown) and `from_cache`. Providers report them through
+  `last_fetched_at`/`last_from_cache`, set by four helpers in
+  `providers.py` (`start_answer`, `answer_from_cache`, `fetching_now`,
+  `cache_answer`) at each `search()`'s reset, cache hit, fetch and
+  store. The fetch time and total of a cached answer live in a side
+  entry of the same cache dict, `cache[(FETCH_META_KEY, key)]`
+  (`cache.fetch_meta` / `remember_fetch` / `is_fetch_meta_key`): one
+  top-level entry per answer, assigned via `__setitem__`, so the
+  `PersistentCache` marks it changed and the merge-on-save keeps other
+  processes' facts; reading never marks the cache changed. Old entries
+  keep loading and read as "fetch date unknown"; no CACHE_VERSION bump.
+  `search_dates_label` ("searched 2026-11-18, cached answer fetched
+  2026-10-02") in `sessions show`; `search_source_date` feeds the audit
+  caption's "Searched A to B." (+ "Search date unknown for k of n
+  searches."); `bibtex+prov`'s `DATE` is the fetch date of the parts
+  that returned the paper, "unknown (cached answer, fetch date not
+  recorded)" when the cache does not know, the timestamp's date only
+  for results without any dates. The session's `timestamp` is
+  unchanged.
 
 ### Search Flow
 
@@ -579,7 +671,12 @@ unchanged since loaded, without a note, and no longer in the file (its
 links, provider and `merge_version_of` metadata go to the target).
 Every other copy stays beside its target, never copying or dropping a
 decision, and is listed as foldable or conflicting for the next
-reconcile. Races tested with real subprocesses in both save orders. `repoint_folded_ids`
+reconcile. Races tested with real subprocesses in both save orders.
+In the merge the tombstones run after the decision merge and before
+the record merge and `supersede_merged_records`, which repoints the
+links a dropped copy gave its target like all others; providers of
+folded copies are united with `united_providers` (comma-joined, as
+per-provider `found_by` records them). `repoint_folded_ids`
 repoints snowball `source_papers` and LLM sample `paper_id`s;
 `create_review_session` routes a result under a tombstoned id to its
 target, unless `plausibly_same_work` rules it out (a namesake goes to
@@ -1219,9 +1316,13 @@ requests/day and each `scholar` run is a fresh process.
   (`_now`), shared across processes. Daily quotas
   bucket on the UTC calendar day and self-correct via the provider's
   own rejection if the guess is wrong.
-- `Search.execute` pre-checks `check_available()` and **skips** a
-  blocked provider with one `logger.warning` (no `SearchResult` is
-  recorded for it). `providers check` reports `quota exhausted`
+- `search_provider()` (`scholar.py`, behind `Search.execute` and
+  `rq`) pre-checks `check_available()` and **skips** a blocked
+  provider with one `logger.warning`; its `SearchResult` has no papers
+  and `error="skipped: <reason>; resets <time>"`, so it is recorded
+  as a failed search and never overwrites an answered record (#165).
+  The search still exits 0 (as when every provider fails).
+  `providers check` reports `quota exhausted`
   (yellow, exit 0) from persisted state without burning a probe.
 - CLI: `scholar providers limits` shows usage/remaining/reset per
   quota group; `--reset <name|all>` clears state (use after a key
