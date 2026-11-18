@@ -775,8 +775,9 @@ report body builders (`build_review_provenance_latex`,
   sources", discards under an exclusion criterion
   (`audit_exclusion_criterion`: a discard with no category and no note
   tag, its first tag that is not a `--theme`; e.g. `no-abstract`) per
-  criterion as "excluded by the criterion <tag>", the rest as "other
-  hits" (all localised). Criteria are the review's own labels, so
+  criterion as "excluded by the criterion <tag>" (`no-abstract`:
+  "excluded for lack of an abstract", `AUDIT_STRINGS[lang]["criteria"]`),
+  the rest as "other hits" (all localised). Criteria are the review's own labels, so
   there is no fixed list. The caption never
   names the session (it is a `%` comment in the fragment) and ends with
   a full-name-first "Databases:" sentence built from the providers
