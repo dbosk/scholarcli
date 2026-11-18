@@ -115,6 +115,25 @@ Providers self-register via `register_provider()` at module load time.
   recorded, links already share the key (`search_width`: None/0 =
   all; legacy records never count as wider).
   `ReviewSession.add_search_record(record)` carries records over whole.
+- Search dates (#167). `SearchResult`/`SearchRecord` have `searched_at`
+  (UTC ISO, the run; `utils.utc_now_iso`), `fetched_at` (when the
+  service answered; for a cache hit the original fetch, `None` =
+  unknown) and `from_cache`. Providers report them through
+  `last_fetched_at`/`last_from_cache`, set by four helpers in
+  `providers.py` (`start_answer`, `answer_from_cache`, `fetching_now`,
+  `cache_answer`) at each `search()`'s reset, cache hit, fetch and
+  store. The fetch time and total of a cached answer live in a side
+  table of the same cache dict, `cache[FETCH_META_KEY]`
+  (`cache.fetch_meta` / `remember_fetch`): old entries keep loading
+  and read as "fetch date unknown"; no CACHE_VERSION bump.
+  `search_dates_label` ("searched 2026-11-18, cached answer fetched
+  2026-10-02") in `sessions show`; `search_source_date` feeds the audit
+  caption's "Searched A to B." (+ "Search date unknown for k of n
+  searches."); `bibtex+prov`'s `DATE` is the fetch date of the parts
+  that returned the paper, "unknown (cached answer, fetch date not
+  recorded)" when the cache does not know, the timestamp's date only
+  for results without any dates. The session's `timestamp` is
+  unchanged.
 
 ### Search Flow
 

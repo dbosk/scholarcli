@@ -79,7 +79,8 @@ from .scholar import deduplicate_versions, merge_version_of
 from .scholar import get_registry, isolated_registry
 from .scholar import hits_label, provider_outcome, result_outcome
 from .scholar import count_label, provider_total, result_total
-from .scholar import search_provider, parts_returning
+from .scholar import search_provider, parts_returning, provider_fetch
+from .scholar import result_dates
 from .scholar import applied_filters, without_search_in, filter_flags
 from .scholar import RANKED_PROVIDERS, is_ranked_provider
 from .scholar import normalize_venue
@@ -93,6 +94,8 @@ __all__ = [
     "result_total",
     "search_provider",
     "parts_returning",
+    "provider_fetch",
+    "result_dates",
     "RANKED_PROVIDERS",
     "is_ranked_provider",
     "provider_outcome",
@@ -2535,6 +2538,7 @@ class SearchResult:
     error: str | None = None
     retries: int = 0
     <<search result total>>
+    <<search result dates>>
     <<search result parts>>
 
     <<search result methods>>
@@ -2660,7 +2664,107 @@ class TestProviderTotal:
         assert provider_total(Mock(last_total=-1)) == (None, False)
 @
 
-The session code meets the same problem one step later: it is handed
+\paragraph{When a search ran and when its answer was fetched.}
+\label{sec:search-dates}
+
+A result says when its search was run, [[searched_at]], and when its
+answer was fetched from the service, [[fetched_at]], both in UTC
+(\cref{sec:utc-timestamps} in the [[utils]] module).  The two differ
+when the answer came from the cache ([[from_cache]]): run today,
+fetched in October.  [[timestamp]] stays as it is, in local time,
+because output formats print it; but it is the time of the run, and
+for a cached answer it used to be read as the date the database was
+searched (\url{https://github.com/dbosk/scholar/issues/167}).
+
+The provider says where the answer came from (\cref{sec:fetch-time} in
+the providers chapter).  [[provider_fetch]] reads that as tolerantly as
+the outcome: a provider that does not say leaves both unknown, and
+\enquote{unknown} is what a report then prints, never the run's date.
+The semantic search also carries the fetch time on its ranked list,
+which is read when the provider's attribute is missing.  A skipped
+provider was never asked, so it has a run time and no fetch.
+
+<<search result dates>>=
+searched_at: str | None = None
+fetched_at: str | None = None
+from_cache: bool | None = None
+<<functions>>=
+def provider_fetch(provider, papers=None) -> tuple[str | None, bool | None]:
+    """Return `(fetched_at, from_cache)` of the provider's last answer.
+
+    Reads the optional `last_fetched_at` (a string, else unknown; the
+    `fetched_at` of `papers` as a fallback) and `last_from_cache` (a
+    bool, else unknown).
+    """
+    fetched_at = getattr(provider, "last_fetched_at", None)
+    if not isinstance(fetched_at, str):
+        fetched_at = getattr(papers, "fetched_at", None)
+    if not isinstance(fetched_at, str) or not fetched_at:
+        fetched_at = None
+    from_cache = getattr(provider, "last_from_cache", None)
+    if not isinstance(from_cache, bool):
+        from_cache = None
+    return fetched_at, from_cache
+
+
+def result_dates(result) -> tuple[str | None, str | None, bool | None]:
+    """Return `(searched_at, fetched_at, from_cache)` of a result-like object."""
+    searched_at = getattr(result, "searched_at", None)
+    if not isinstance(searched_at, str) or not searched_at:
+        searched_at = None
+    fetched_at, from_cache = provider_fetch(SimpleNamespace(
+        last_fetched_at=getattr(result, "fetched_at", None),
+        last_from_cache=getattr(result, "from_cache", None),
+    ))
+    return searched_at, fetched_at, from_cache
+@
+
+Let's verify a fresh answer, a cached one with its original date, one
+cached before dates were kept, and a provider that says nothing:
+
+<<test functions>>=
+class TestSearchDates:
+    """search_provider records when a search ran and was fetched (#167)."""
+
+    @staticmethod
+    def _provider(**attrs):
+        provider = Mock(last_error=None, last_retries=0, **attrs)
+        provider.name = "dated"
+        provider.search.return_value = []
+        return provider
+
+    def test_fresh_answer(self):
+        result = search_provider(self._provider(
+            last_fetched_at="2026-11-18T09:00:00+00:00",
+            last_from_cache=False,
+        ), "q", 5)
+        assert result.searched_at.endswith("+00:00")
+        assert (result.fetched_at, result.from_cache) == (
+            "2026-11-18T09:00:00+00:00", False,
+        )
+
+    def test_cached_answer_keeps_its_fetch_date(self):
+        result = search_provider(self._provider(
+            last_fetched_at="2026-10-02T08:00:00+00:00",
+            last_from_cache=True,
+        ), "q", 5)
+        assert (result.fetched_at, result.from_cache) == (
+            "2026-10-02T08:00:00+00:00", True,
+        )
+
+    def test_old_cache_entry_is_unknown(self):
+        result = search_provider(self._provider(
+            last_fetched_at=None, last_from_cache=True,
+        ), "q", 5)
+        assert (result.fetched_at, result.from_cache) == (None, True)
+
+    def test_silent_provider_is_unknown(self):
+        result = search_provider(self._provider(), "q", 5)
+        assert (result.fetched_at, result.from_cache) == (None, None)
+        assert result.searched_at is not None
+@
+
+Back to the outcome.  The session code meets the same problem one step later: it is handed
 search results, and its tests hand it [[Mock]]s standing in for them.
 [[result_outcome]] reads a result's [[error]] and [[retries]] with the
 same tolerance.
@@ -3836,6 +3940,7 @@ def search_provider(
         papers=[],
         filters=applied.as_dict() if applied else None,
         limit=limit,
+        searched_at=utc_now_iso(),
     )
     availability = limiter_for(provider).check_available()
     if not availability.ok:
@@ -3850,6 +3955,9 @@ def search_provider(
     result.papers = provider.search(query, limit=limit, filters=filters)
     result.error, result.retries = provider_outcome(provider)
     result.total, result.total_estimated = provider_total(provider)
+    result.fetched_at, result.from_cache = provider_fetch(
+        provider, result.papers
+    )
     for paper in result.papers:
         clean_paper_text(paper)
     label = hits_label(
@@ -4097,6 +4205,7 @@ import re
 from types import SimpleNamespace
 
 from scholar.utils import is_preprint_paper, legacy_hash_paper_id
+from scholar.utils import utc_now_iso
 
 logger = logging.getLogger(__name__)
 @
