@@ -46,8 +46,9 @@ We use Typer for the CLI framework because it provides:
 
 The CLI is organized as subcommands to prepare for future extensions.
 Currently, the core commands are [[search]] and [[rq]].
-Later we will add [[snowball]] and [[tuxedo]] as git submodules that register
-their own commands.
+The [[snowball]] and [[tuxedo]] commands come from git submodules that
+register their own commands; Scholar imports them only when they run
+(\cref{sec:lazy-subcommands}).
 
 
 \section{Module structure}
@@ -65,6 +66,7 @@ across bibliographic databases.
 <<cli imports>>
 <<constants>>
 <<output formatters>>
+<<lazy subcommand group>>
 <<typer application>>
 <<completion functions>>
 <<session error helpers>>
@@ -84,7 +86,6 @@ across bibliographic databases.
 <<tutorial command>>
 <<llm command helpers>>
 <<llm command>>
-<<submodule registration>>
 <<main entry point>>
 @
 
@@ -133,10 +134,14 @@ from scholar.cli import (
 
 
 \section{The Typer Application}
+\label{sec:typer-application}
 
 We create a Typer application that serves as the root for all subcommands.
 The [[no_args_is_help=True]] setting ensures users see help when they run
 [[scholar]] without arguments.
+Its group class, [[LazySubcommandGroup]], adds the snowball and tuxedo
+subcommands without importing them until they run
+(\cref{sec:lazy-subcommands}).
 
 To ensure proper subcommand behavior (where users must type [[scholar search]]
 rather than just [[scholar]]), we add a callback to the main app.
@@ -148,6 +153,7 @@ app = typer.Typer(
     name="scholar",
     help="Structured literature search tool for systematic reviews.",
     no_args_is_help=True,
+    cls=LazySubcommandGroup,
 )
 
 
@@ -1877,9 +1883,13 @@ DOI-less).  Returning a sentinel rather than printing lets each caller decide
 what to do with the silent majority: [[enrich]] drops them, while [[verify]]
 still lists them as \enquote{ok} or \enquote{unknown}.
 
-<<currency reporting helpers>>=
-from scholar.crossref import currency_status
+The helper imports [[currency_status]] when it is called, like the two
+commands do, not when the CLI module is loaded: importing
+[[scholar.crossref]] loads its cache from disk, and every [[scholar]]
+command would pay for that although only these two use it
+(\cref{sec:lazy-subcommands}).
 
+<<currency reporting helpers>>=
 CURRENCY_PROBLEM_STYLES = {
     "retracted": "bold red",
     "corrected": "yellow",
@@ -1893,6 +1903,8 @@ def format_currency_warning(paper) -> Optional[Text]:
     Returns None for papers that are ok, unchecked, or lack a DOI, so callers
     can skip the silent majority.
     """
+    from scholar.crossref import currency_status
+
     status = currency_status(paper)
     style = CURRENCY_PROBLEM_STYLES.get(status)
     if style is None:
@@ -10153,59 +10165,418 @@ def test_bundled_tutorial_parses(name):
 @
 
 
-\section{Submodule Registration}
+\section{Lazily loaded subcommands}
+\label{sec:lazy-subcommands}
 
-To support future extensions like snowball and tuxedo, we provide a mechanism
-for submodules to register their commands with the main application.
+Two command groups come from separate projects, included as git
+submodules: [[scholar snowball]] (snowballing reviews) and
+[[scholar tuxedo]] (organising papers with LLMs).
+Each package offers one hook, [[register_commands(app)]], which adds its
+commands to a Typer app.
+That hook is all Scholar relies on: nothing here knows how either package
+builds its commands.
 
-Each submodule should provide a [[register_commands(app)]] function that adds
-its commands to the Typer app.
-We attempt to import each known submodule and call this function if it exists.
-We try both [[scholar.<name>]] (for nested packages) and [[<name>]] (for
-sibling packages installed separately) to support different installation
-configurations:
+Both packages are expensive to import.
+Importing [[tuxedo]] imports the [[openai]] client, and importing
+[[snowball]] imports [[pandas]] and its Textual TUI;
+[[python -X importtime]] put them at about 0.7~s and 0.9~s (November 2026).
+Scholar used to import both and call their hooks in [[main]], before the
+command line was parsed, so every command paid for them:
+[[scholar cache path]] took about 2.8~s and [[scholar --help]] about 3.4~s,
+although neither uses snowball or tuxedo
+(\url{https://github.com/dbosk/scholar/issues/130}).
+Agents and scripts call [[scholar]] many times in a row, so the fixed cost
+adds up to minutes.
 
-<<submodule registration>>=
-SUBMODULES = ["snowball", "tuxedo"]
+We therefore import a submodule only when its subcommand runs.
+To do that we need to know when Click needs which part of a command.
+A Click group is asked about its subcommands in three situations:
+\begin{description}
+\item[Help] [[scholar --help]] lists every subcommand with its short help.
+  The help formatter calls the group's [[list_commands]] and then
+  [[get_command]] for each name.
+\item[Dispatch] [[scholar snowball init]] needs the real command, with its
+  callback, options and subcommands.
+  The group's [[invoke]] gets it from [[resolve_command]].
+\item[Completion] Completing [[scholar sn]] lists names and short help, as
+  help does, through [[list_commands]] and [[get_command]].
+  Completing [[scholar snowball ]] must descend into the real command, and
+  Click's completion resolver descends with [[resolve_command]].
+\end{description}
+Help and name completion need only a name and a line of text, while
+dispatch and descent both pass through [[resolve_command]].
+So the group lists a placeholder for each submodule, a command that has the
+help text but no code, and its [[resolve_command]] replaces the placeholder
+with the real command, importing the submodule at that moment.
+The rest of this section builds the pieces: the help texts, how we find a
+submodule without importing it, how we load the real command, and the group
+that ties them together.
 
+\subsection{The listed help texts}
 
-def register_submodules() -> None:
+The placeholders need the help line that [[scholar --help]] shows, and the
+only way to get it from a package is to import it.
+So we keep a copy here, keyed by subcommand name; the key order is the
+order in which the subcommands are listed, after Scholar's own commands.
+A copy can drift from the original, so a test below compares each entry
+with the help of the real command.
+
+<<lazy subcommand group>>=
+LAZY_SUBCOMMANDS: dict[str, str] = {
+    "snowball": "Systematic literature review using snowballing.",
+    "tuxedo": "Organize literature review papers with LLMs.",
+}
+@
+
+\subsection{Finding a submodule without importing it}
+
+A submodule can be installed in two ways: nested in Scholar as
+[[scholar.<name>]] or as a sibling package [[<name>]].
+We look for both, nested first.
+[[importlib.util.find_spec]] asks the import system's finders where a
+module is, without running it.
+For [[scholar.<name>]] it imports the parent package [[scholar]], which is
+already loaded; the help test below checks that neither submodule is
+imported.
+Its docstring says it raises [[ValueError]] for a module in
+[[sys.modules]] without a spec, and a missing parent raises
+[[ModuleNotFoundError]]; both mean that this candidate is not the one we
+want.
+
+The old registration tried [[import scholar.<name>]] and then
+[[import <name>]] and ignored every [[ImportError]].
+That made a package that is installed but fails to import (a missing
+dependency, say) look exactly like an absent one: its command silently
+disappeared from [[scholar --help]].
+Deciding by the spec separates the two cases.
+A submodule without a spec is not listed at all; one with a spec is listed,
+and if its import fails, running it says why (see below).
+
+<<lazy subcommand group>>=
+def find_submodule(name: str) -> Optional[str]:
+    """Return the module that provides subcommand `name`, or None.
+
+    Tries `scholar.<name>` (nested package) before `<name>` (sibling
+    package). Nothing is imported apart from the parent package.
     """
-    Dynamically register subcommand modules if available.
-
-    This allows snowball and tuxedo to be added as submodules
-    without modifying this file. Each submodule should provide a
-    `register_commands(app)` function.
-
-    Tries both `scholar.<name>` and `<name>` import paths to support
-    different installation configurations.
-    """
-    for name in SUBMODULES:
-        module = None
-
-        # Try scholar.<name> first (for nested packages)
+    for module_name in (f"scholar.{name}", name):
         try:
-            module = __import__(f"scholar.{name}", fromlist=["register_commands"])
-        except ImportError:
-            pass
+            if importlib.util.find_spec(module_name) is not None:
+                return module_name
+        except (ImportError, ValueError):
+            continue
+    return None
+@
 
-        # Fall back to top-level <name> (for sibling packages)
-        if module is None:
+<<cli imports>>=
+import importlib
+import importlib.util
+@
+
+\subsection{Loading the real command}
+
+To get the real command we import the module and let its own
+[[register_commands]] add the command to a scratch Typer app.
+Typer turns that app into a Click group, and the command we want is the
+group's entry under [[name]].
+Going through the hook rather than importing, say,
+[[snowball.cli.app]] directly keeps us on the packages' public contract:
+snowball registers a Typer sub-app, tuxedo a single command that hands its
+arguments to its own Click group, and we need not know which.
+
+A module that imports but has no [[register_commands]] hook, or whose
+hook does not register [[name]], is as unusable as one that does not
+import, so we report it with the same exception type and let the caller
+handle all three alike.
+The missing hook is not hypothetical: [[find_spec]] also finds a plain
+directory of that name (a namespace package), such as an uninitialised
+submodule directory in the current directory.
+
+<<lazy subcommand group>>=
+def load_lazy_subcommand(name: str) -> TyperCommand | TyperGroup:
+    """Import the submodule behind subcommand `name` and return its command.
+
+    Raises ImportError when the submodule cannot be found or imported, or
+    when its `register_commands` does not register a command `name`.
+    """
+    module_name = find_submodule(name)
+    if module_name is None:
+        raise ImportError(f"no module scholar.{name} or {name}")
+    module = importlib.import_module(module_name)
+    register = getattr(module, "register_commands", None)
+    if register is None:
+        raise ImportError(f"{module_name} has no register_commands")
+    scratch = typer.Typer()
+    register(scratch)
+    command = typer.main.get_group(scratch).commands.get(name)
+    if command is None:
+        raise ImportError(f"{module_name} registers no command {name!r}")
+    return command
+@
+
+<<cli imports>>=
+from typer.core import TyperCommand, TyperGroup
+@
+
+\subsection{The group}
+
+The placeholder is its own class, so that [[resolve_command]] can tell it
+from Scholar's own commands by type.
+It has no callback: it is never run, because every path that would run it
+goes through [[resolve_command]] first.
+
+<<lazy subcommand group>>=
+class LazySubcommandStub(TyperCommand):
+    """Placeholder for a submodule subcommand that is not imported yet."""
+@
+
+The group adds a placeholder for each submodule that can be found, after
+Typer has added Scholar's own commands, so the submodules are listed last.
+This runs on every invocation, which is fine because [[find_submodule]]
+imports nothing; the help test below checks exactly that.
+
+In [[resolve_command]] we let Typer resolve the name first, which keeps its
+\enquote{No such command} error and its spelling suggestions.
+Only when the result is a placeholder do we load the real command and return
+it in the placeholder's stead.
+Both callers use the command they get back, Typer's [[invoke]] to run it and
+the completion resolver to descend into it, so the group need not remember
+it.
+If the import fails, [[ctx.fail]] ends the run with a usage error (exit
+code~2) whose one-line message names the subcommand and the reason, instead
+of a traceback.
+During completion, [[ctx.resilient_parsing]] is set, and a completion must
+never print errors into the user's shell.
+There we keep the placeholder: it has no options or subcommands, so
+completion offers nothing after the name.
+Resolving to no command instead would make Click complete from the parent
+group and offer Scholar's own command names in that position.
+
+<<lazy subcommand group>>=
+class LazySubcommandGroup(TyperGroup):
+    """A Typer group that imports submodule subcommands only when used."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        for name, help_text in LAZY_SUBCOMMANDS.items():
+            if name not in self.commands and find_submodule(name):
+                self.commands[name] = LazySubcommandStub(name, help=help_text)
+
+    def resolve_command(self, ctx, args):
+        """Resolve as Typer does, replacing a placeholder by its command."""
+        cmd_name, cmd, rest = super().resolve_command(ctx, args)
+        if isinstance(cmd, LazySubcommandStub):
             try:
-                module = __import__(name, fromlist=["register_commands"])
-            except ImportError:
-                pass
+                cmd = load_lazy_subcommand(cmd_name)
+            except ImportError as error:
+                if ctx.resilient_parsing:
+                    return cmd_name, cmd, rest
+                ctx.fail(f"{cmd_name} is unavailable: {error}")
+        return cmd_name, cmd, rest
+@
 
-        if module is not None and hasattr(module, "register_commands"):
-            module.register_commands(app)
+The application is created with this group class ([[cls=]] in
+\cref{sec:typer-application}), which is why [[<<lazy subcommand group>>]]
+is tangled before [[<<typer application>>]].
+
+\subsection{Testing the lazy subcommands}
+
+The property we want, \enquote{[[scholar --help]] imports neither
+submodule}, cannot be checked inside the test process: the other tests
+import both packages, and once a module is in [[sys.modules]] it stays
+there.
+So we run the CLI in a fresh interpreter, through [[main]] rather than
+[[app]], so that an eager import added back to [[main]] (as
+[[register_submodules]] used to be) also fails the test.
+The child prints to stderr which heavy modules it ended up importing.
+We list [[openai]] besides [[tuxedo]] because it is what made tuxedo slow,
+and [[scholar.crossref]] because [[<<currency reporting helpers>>]] used to
+import it at module level (\cref{sec:currency-reporting}).
+The child inherits the environment, so it uses the test's temporary cache
+and data directories rather than the developer's; it prints the cache
+directory it saw, and the tests check it.
+We assert on which modules were imported, not on time, so the test does
+not depend on the machine's speed.
+
+<<test functions>>=
+import os
+import subprocess
+import sys
+
+HEAVY_MODULES = ("tuxedo", "snowball", "openai", "scholar.crossref")
+CLI_CHILD_CODE = f"""
+import os, sys
+sys.argv = ["scholar", *sys.argv[1:]]
+import scholar.cli
+try:
+    scholar.cli.main()
+except SystemExit:
+    pass
+loaded = [name for name in {HEAVY_MODULES!r} if name in sys.modules]
+print("LOADED:" + ",".join(loaded), file=sys.stderr)
+print("CACHE:" + os.environ["SCHOLAR_CACHE_DIR"], file=sys.stderr)
+"""
+
+
+def run_cli_in_child(*args, env=None):
+    """Run `scholar <args>` through `main()` in a fresh interpreter.
+
+    Returns the completed process, the stdout of the CLI and the list of
+    heavy modules the run imported.
+    """
+    process = subprocess.run(
+        [sys.executable, "-c", CLI_CHILD_CODE, *args],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=120,
+    )
+    lines = process.stderr.splitlines()
+    loaded = next(line for line in lines if line.startswith("LOADED:"))
+    cache = next(line for line in lines if line.startswith("CACHE:"))
+    assert cache.removeprefix("CACHE:") == os.environ["SCHOLAR_CACHE_DIR"]
+    modules = [name for name in loaded.removeprefix("LOADED:").split(",")
+               if name]
+    return process, process.stdout, modules
+
+
+class TestLazySubcommands:
+    """Snowball and tuxedo are listed without being imported."""
+
+    <<lazy subcommand test methods>>
+@
+
+The help lists both subcommands and imports neither, nor
+[[scholar.crossref]]:
+
+<<lazy subcommand test methods>>=
+def test_help_lists_submodules_without_importing_them(self):
+    """`scholar --help` names snowball and tuxedo but imports neither."""
+    _, stdout, loaded = run_cli_in_child("--help")
+    assert "snowball" in stdout
+    assert "tuxedo" in stdout
+    assert loaded == []
+@
+
+Running a subcommand imports its package, and only that one: the help of
+[[scholar snowball]] shows snowball's own subcommands, which only the real
+command knows.
+
+<<lazy subcommand test methods>>=
+def test_subcommand_imports_its_submodule(self):
+    """`scholar snowball --help` loads snowball and shows its commands."""
+    _, stdout, loaded = run_cli_in_child("snowball", "--help")
+    assert "add-seed" in stdout
+    assert "snowball" in loaded
+    assert "tuxedo" not in loaded
+@
+
+Completion takes both routes.
+Completing the first word lists the placeholders, so it imports nothing;
+completing the word after [[snowball]] descends into the real command and
+lists its subcommands.
+Click reads the request from environment variables named after the program:
+[[_SCHOLAR_COMPLETE]], and [[COMP_WORDS]] and [[COMP_CWORD]] for bash.
+
+<<lazy subcommand test methods>>=
+def test_completion_of_first_word_imports_nothing(self):
+    """Completing `scholar ` lists the submodules from the placeholders."""
+    env = {**os.environ, "_SCHOLAR_COMPLETE": "complete_bash",
+           "COMP_WORDS": "scholar ", "COMP_CWORD": "1"}
+    _, stdout, loaded = run_cli_in_child(env=env)
+    assert {"snowball", "tuxedo", "search"} <= set(stdout.split())
+    assert loaded == []
+
+def test_completion_descends_into_submodule(self):
+    """Completing `scholar snowball ` lists snowball's subcommands."""
+    env = {**os.environ, "_SCHOLAR_COMPLETE": "complete_bash",
+           "COMP_WORDS": "scholar snowball ", "COMP_CWORD": "2"}
+    _, stdout, loaded = run_cli_in_child(env=env)
+    assert {"init", "add-seed", "review"} <= set(stdout.split())
+    assert "snowball" in loaded
+@
+
+[[LAZY_SUBCOMMANDS]] copies the help texts, so we compare each copy with
+the help of the real command; a package that rewords its help fails here
+instead of showing stale text in [[scholar --help]].
+
+<<lazy subcommand test methods>>=
+def test_listed_help_matches_the_real_command(self):
+    """Each copied help text equals the submodule's own help."""
+    for name, help_text in LAZY_SUBCOMMANDS.items():
+        assert load_lazy_subcommand(name).help == help_text
+@
+
+The two failure cases from \cref{sec:lazy-subcommands}: a submodule that
+cannot be found is not listed, and one that is found but fails to import
+ends with a one-line message and a usage error, not a traceback.
+We create the broken module ourselves, as a file on a temporary
+[[sys.path]] entry that raises [[ImportError]] when imported, as a package
+with a missing dependency does.
+
+<<lazy subcommand test methods>>=
+def test_missing_submodule_is_not_listed(self, monkeypatch):
+    """A subcommand whose module cannot be found is left out of help."""
+    monkeypatch.setitem(LAZY_SUBCOMMANDS, "nosuchsubmodule", "Never here.")
+    result = CliRunner().invoke(app, ["--help"])
+    assert result.exit_code == 0
+    assert "nosuchsubmodule" not in result.output
+    assert "snowball" in result.output
+
+def test_broken_submodule_fails_with_one_line(self, tmp_path, monkeypatch):
+    """A module that fails to import gives exit 2 and its reason."""
+    (tmp_path / "brokensubmodule.py").write_text(
+        'raise ImportError("needs the frobnicate package")\n'
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setitem(LAZY_SUBCOMMANDS, "brokensubmodule", "Broken.")
+    listed = CliRunner().invoke(app, ["--help"])
+    assert "brokensubmodule" in listed.output
+    result = CliRunner().invoke(app, ["brokensubmodule", "--help"])
+    assert result.exit_code == 2
+    assert isinstance(result.exception, SystemExit)
+    message = ("brokensubmodule is unavailable: "
+               "needs the frobnicate package")
+    assert message in result.output
+
+def test_submodule_without_hook_fails_with_one_line(
+        self, tmp_path, monkeypatch):
+    """A found module lacking register_commands is a usage error too."""
+    (tmp_path / "hooklesssubmodule").mkdir()  # a namespace package
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setitem(LAZY_SUBCOMMANDS, "hooklesssubmodule", "No hook.")
+    result = CliRunner().invoke(app, ["hooklesssubmodule", "--help"])
+    assert result.exit_code == 2
+    assert isinstance(result.exception, SystemExit)
+    assert "has no register_commands" in result.output
+@
+
+Completion must stay quiet about the broken module and offer nothing after
+its name, in particular not Scholar's own commands:
+
+<<lazy subcommand test methods>>=
+def test_broken_submodule_completes_to_nothing(self, tmp_path, monkeypatch):
+    """Completing after a broken subcommand offers nothing, silently."""
+    (tmp_path / "brokensubmodule.py").write_text(
+        'raise ImportError("needs the frobnicate package")\n'
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setitem(LAZY_SUBCOMMANDS, "brokensubmodule", "Broken.")
+    env = {"_SCHOLAR_COMPLETE": "complete_bash",
+           "COMP_WORDS": "scholar brokensubmodule ", "COMP_CWORD": "2"}
+    result = CliRunner().invoke(app, [], env=env, prog_name="scholar")
+    assert result.exit_code == 0
+    assert result.output.split() == []
 @
 
 
 \section{Entry Point}
 \label{sec:cli-main}
 
-The main entry point registers any available submodules and then runs the
-Typer application.
+The main entry point runs the Typer application.
+It registers nothing itself: the snowball and tuxedo subcommands are part of
+the application's group class and are imported only when they run
+(\cref{sec:lazy-subcommands}).
 
 Many commands read or write notes and per-query decisions, from the
 [[notes]] commands to the TUI.  When that file is unreadable, or a write
@@ -10221,7 +10592,6 @@ def main() -> None:
     from scholar.notes import NotesFileError
     from scholar.utils import backup_path
 
-    register_submodules()
     try:
         app()
     except NotesFileError as error:
@@ -10285,9 +10655,10 @@ class TestCLI:
 
 \subsection{Testing subcommand registration}
 
-Since submodules like snowball and tuxedo are dynamically registered via
-[[register_submodules]], we need to verify that the registration mechanism
-works correctly.
+Snowball and tuxedo reach the CLI through their [[register_commands]]
+hooks, called by [[LazySubcommandGroup]] when the subcommand runs
+(\cref{sec:lazy-subcommands}).
+No setup is needed: the application's group class provides them.
 These tests ensure that:
 \begin{enumerate}
 \item The [[register_commands]] function exists in each submodule.
@@ -10299,13 +10670,6 @@ These tests ensure that:
 
 class TestSubcommandRegistration:
     """Tests for subcommand registration from snowball and tuxedo."""
-
-    @pytest.fixture(autouse=True)
-    def register_submodules(self):
-        """Ensure submodules are registered before each test."""
-        from scholar.cli import register_submodules
-
-        register_submodules()
 
     def test_snowball_subcommand_registered(self):
         """Snowball subcommand is registered and shows help."""
