@@ -978,6 +978,41 @@ with `--include-llm` (exit 2 / `ValueError`).
 
 Environment variable: `SCHOLAR_CACHE_DIR` to override cache location.
 
+**Concurrent processes** (#175: two processes racing emptied the real
+cache). `load_cache` returns a `PersistentCache` (a `dict` subclass with
+a `changed` flag set by every mutating method). `save_cache` (and so the
+`atexit` hook `save_all_caches`):
+
+- skips a `PersistentCache` that was not changed (plain dicts are always
+  saved), so read-only processes never write. The flag does not see
+  changes *inside* a value: to add to a cached entry, reassign the key
+  (`cache[k] = {**cache[k], "field": x}`), as the synthesis does for
+  its report abstract;
+- under `utils.file_lock` on `.<name>.pkl.lock`, re-reads the file and
+  writes the union (in-memory wins on a shared key) with
+  `utils.atomic_write_bytes` (temp file, fsync, `os.replace`), so a
+  reader never sees a partial file and a save never drops another
+  process's entries. Cache saves wait up to `CACHE_LOCK_TIMEOUT` (60 s,
+  not the sessions' 10 s: a save re-reads and writes the whole file,
+  0.6 s for 6 MB). Past it the save runs unlocked: still atomic, never
+  truncated, but entries can be lost if another process replaces the
+  file in between;
+- never writes over a file it cannot read (`read_cache_file` catches
+  any unpickling error; `load_cache` warns with the path and returns an
+  empty cache): the file is kept and the entries go to a unique
+  `<name>.pkl.unmerged-<UTC time>-<random>` beside it (mkstemp), with a
+  warning. Nothing merges it back; `cache info` lists these files with
+  a hint and `cache clear` deletes them by the caches' rules
+  (`--provider`, LLM caches kept without `--include-llm`).
+
+The files stay plain pickled dicts, readable by older versions.
+`clear_cache` deletes each file under the same lock, but a process
+running at the time keeps its loaded entries in memory and writes them
+back at exit if it changes its cache (union cannot tell deleted from
+lost entries); clear again once the other processes have ended.
+Not covered: an older scholar without the lock writing in place, and
+processes on different machines.
+
 The keyed REST providers cache manually (search wrapper +
 `_search_uncached` returning `(papers, cacheable)`) instead of via
 `@cachedmethod`, so a rate-limited or errored empty result is never
