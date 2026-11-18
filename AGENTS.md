@@ -561,7 +561,8 @@ agent's own verdict) and `llm` (a classifier's verdict relayed) store
 unreviewed decisions (`ReviewSource.AGENT_UNREVIEWED`/`LLM_UNREVIEWED`,
 values `agent`/`llm`) that the TUI queues for confirmation, with
 `--confidence/-c 0..1` in `llm_confidence` like `llm classify`
-(validated; ignored with a note for human decisions); a human `decide`
+(validated; ignored with a note for human decisions; a machine decision
+without `-c` gets None, never an earlier run's number); a human `decide`
 (or TUI confirm) on such a row marks it `agent_reviewed`/`llm_reviewed`
 (`ReviewSource.reviewed`), with `is_example` set when the status
 changed. Ask a source `is_unreviewed` / `is_machine` instead of
@@ -569,11 +570,25 @@ listing members. A machine `decide` also calls
 `review.clear_machine_audit(decision)`, which sets every field named in
 `review.MACHINE_AUDIT_FIELDS` to None (empty here; classifier audit
 fields register there so a replaced decision does not keep the old
-run's model/prompt/reason). When `decide` changes a record's status, its old
-category tags (and all non-note tags of a formerly discarded record,
-its motivations) are dropped before the new `--tag`s are added
-(`review.tags_after_status_change`, #177); themes and note tags stay.
-Same status: tags append as before.
+run's model/prompt/reason). A machine `decide` never replaces a decided
+paper whose source is `human`, `llm_reviewed` or `agent_reviewed`:
+the batch is refused unsaved (exit 2, each conflict named) unless
+`--force`. When `decide` changes a record's status, only its old
+category tags (`AUDIT_CATEGORIES`) are dropped before the new `--tag`s
+are added (`review.tags_after_status_change`, #177); themes,
+motivations and notes stay (dropping motivations lost themes on
+keep→discard→keep). Same status: tags append as before.
+**Unknown stored sources** (e.g. `manual`, which no Scholar version
+wrote, or a hand-edited `Agent`) load as `ReviewSource` pseudo-members
+via `_missing_` (`is_unknown`; value kept verbatim on save), count as
+unreviewed (never cited, not in `example_papers`, queued in the TUI;
+a human review makes them `human`), are shown as "unknown source
+'<value>'", and are warned about once per file and process
+(`warn_about_unknown_sources`).
+**Old installs:** a Scholar older than this change reads `agent`,
+`agent_reviewed` (and any unknown source) as `human` and writes that
+back on its next save. Reinstall every scholar installation (pipx,
+other venvs) before anyone uses `--source agent`.
 Who decided is shown everywhere decisions are counted (#163): the
 LaTeX report (summary "Decided: <source>" rows, abstract sentence,
 "(agent, unreviewed)" marks in the paper lists and overview table),
