@@ -296,6 +296,28 @@ whenever `pdf_url` is among the requested fields, so `scholar enrich`,
 `set SCHOLAR_EMAIL` hint). `Paper.is_open_access` (checked status, else
 `bool(pdf_url)`) backs the client-side `--open-access` filter.
 
+`scholar enrich` flags (#137): `--pending-only` restricts everything
+(metadata, Unpaywall, preprint adoption, Crossref check, tally) to
+decisions whose stored status is pending; decided papers are saved
+unchanged. `--fields abstract,pdf_url,keywords` (the default) is checked
+against `enrich.ENRICHMENT_FIELD_NAMES` (unknown name: exit 2);
+leaving out `pdf_url` also skips Unpaywall and the preprint fallback
+(`--fields abstract` is the cheap run). The Crossref check always runs.
+
+**Batched OpenAlex DOI lookups.** `OpenAlexProvider.prefetch_dois(dois)`
+(`sec:openalex-doi-batch`) fills the `("doi", CACHE_VERSION, doi)` cache
+that `get_paper_by_doi` reads, 50 DOIs per request via
+`pyalex.Works().filter_or(doi=[...]).get(per_page=100)` (OR with `|`,
+documented max 100 values). It caches a DOI only when exactly one work
+matches (never misses: the singleton lookup caches a real 404), keys by
+each caller spelling grouped under `Paper._normalize_doi`, skips DOIs
+with `,|+` or whitespace, and stops quietly at the first failure.
+`enrich_papers` calls it before its loop when `openalex` is in the
+provider order, for the DOIs (or derived arXiv DOIs) of papers that
+`needs_enrichment`. S2 comes first in `ENRICHMENT_PROVIDERS` and is
+paced at 1 request / 3 s without a key, so
+`--enrich-providers openalex,s2,...` is the fast path.
+
 ### Currency / Retraction Checks
 
 `crossref.py` checks whether a paper has been retracted, corrected, or
@@ -404,6 +426,14 @@ context (#107). `review.save_session` now:
 - **writes atomically**: `utils.atomic_write_text` (temp file in the
   same directory, fsync, `os.replace`), keeping the previous file as
   `<name>.json.bak` (one generation).
+
+`scholar enrich` saves after every `ENRICH_SAVE_EVERY` (50) papers
+(`cli.nw`, `sec:enrich-chunks`): enrich → Crossref check → assign →
+`migrate_paper_id` for adoptions → `save_session`, per chunk. After such
+a run `.bak` holds only the state before the last chunk. Ctrl-C (and
+SIGTERM, turned into `KeyboardInterrupt` while the loop runs, so the
+atexit cache save still happens) prints `Interrupted: saved K of N
+papers; run again to continue` and exits 130.
 
 `load_session(..., strict=True)` raises `SessionFileError` for a file
 that exists but does not parse. `create_review_session` uses it, so

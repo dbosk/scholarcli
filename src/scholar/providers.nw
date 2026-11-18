@@ -3874,6 +3874,453 @@ def get_paper_by_doi(self, doi: str | None) -> Paper | None:
         return None
 @
 
+\subsubsection{Many DOIs in one request}
+\label{sec:openalex-doi-batch}
+
+[[get_paper_by_doi]] costs one request per paper, and enriching a
+session of a few thousand papers therefore costs a few thousand
+requests against the metered budget of \cref{sec:openalex-budget}
+(\url{https://github.com/dbosk/scholar/issues/137}).
+OpenAlex can answer many DOIs at once: its documentation
+(\url{https://help.openalex.org/how-to-use-the-api/get-lists-of-entities/filter-entity-lists},
+read 2026-11-18) says that the pipe [[|]] combines up to 100 values
+of one filter with OR, gives
+[[/works?filter=doi:https://doi.org/...|https://doi.org/...]]
+as its example of fetching two works by DOI in one request, and
+advises [[per_page=100]] to get all results.
+[[pyalex]] builds that filter with [[filter_or]] (its own lookup of a
+list of OpenAlex ids does the same), quoting each value but not the
+pipes between them.
+
+[[prefetch_dois]] uses this to \emph{fill the cache} that
+[[get_paper_by_doi]] reads, rather than to return papers.
+That keeps the enrichment loop (\cref{enrich-module}) unchanged:
+it still asks provider after provider for one DOI at a time, and the
+OpenAlex step simply finds its answer in the cache.
+A batch of 50 values stays well under the documented 100, and a page
+of 100 results leaves room for DOIs that match more than one work.
+
+What the batch may cache is narrower than what a single lookup
+caches, because the two answer different questions.
+[[get_paper_by_doi]] asks OpenAlex for \emph{the} work under a DOI,
+and OpenAlex picks one; the filter returns every work whose DOI
+matches.
+So we cache a DOI only when exactly one work came back for it: with
+two candidates we would be choosing for OpenAlex, possibly not the
+work its single lookup returns, and in a cache that never expires.
+For the same reason a DOI with no work in the result is not cached as
+a miss.  The singleton lookup still runs for it and caches a genuine
+404 itself (\cref{sec:openalex-refusal} and above), so the batch can
+only save requests, never change an answer.
+When the result reports more works than the page holds, some DOI's
+works may be missing from the page, and \enquote{exactly one} can no
+longer be told apart from \enquote{one of several}; that batch caches
+nothing.
+
+The cache key is the DOI spelled as the caller spelled it, as in
+[[get_paper_by_doi]].
+Several spellings of one DOI ([[10.1/ABC]] and [[10.1/abc]], or one
+with a resolver prefix) are grouped under [[Paper._normalize_doi]],
+the normalisation paper identity uses, so the DOI is requested once
+and its work is stored under every spelling.
+We leave out DOIs that cannot travel as a filter value: a comma
+separates filters, a pipe separates OR values, and a plus or
+whitespace may arrive as a space; such DOIs are rare, and the single
+lookup still handles them.
+A failure ends the prefetch: a refusal by the limiter, an HTTP error
+(logged through [[_note_http_error]], which turns a spent budget into
+a block) or anything else.
+Nothing more is cached and nothing is raised, since the singleton
+lookups that follow will meet the same condition and handle it as
+they always have.
+
+<<openalex get paper by doi>>=
+def prefetch_dois(self, dois: Iterable[str]) -> int:
+    """Look up many DOIs in a few requests and cache the answers.
+
+    Afterwards `get_paper_by_doi` answers each prefetched DOI from the
+    cache. DOIs already cached, and DOIs the OR filter cannot carry
+    (with a comma, pipe, plus or whitespace), are skipped. Only a DOI
+    that matches exactly one work is cached; misses and ambiguous
+    DOIs are left to `get_paper_by_doi`. Stops quietly at the first
+    failure.
+
+    Returns:
+        The number of cache entries written.
+    """
+    spellings = self._uncached_doi_spellings(dois)
+    keys = list(spellings)
+    cached = 0
+    for start in range(0, len(keys), OPENALEX_DOI_BATCH_SIZE):
+        batch = keys[start:start + OPENALEX_DOI_BATCH_SIZE]
+        works = self._fetch_works_by_doi(batch)
+        if works is None:
+            break
+        cached += self._cache_unique_works(batch, spellings, works)
+    logger.info(
+        "%s: prefetched %d of %d DOIs", self.name, cached,
+        sum(len(group) for group in spellings.values()),
+    )
+    return cached
+
+def _uncached_doi_spellings(
+    self, dois: Iterable[str]
+) -> dict[str, list[str]]:
+    """Group the uncached, filter-safe DOIs by normalised DOI."""
+    spellings: dict[str, list[str]] = {}
+    for doi in dois:
+        if not doi or OPENALEX_DOI_UNSAFE.search(doi):
+            continue
+        if ("doi", self.CACHE_VERSION, doi) in self._cache:
+            continue
+        group = spellings.setdefault(Paper._normalize_doi(doi), [])
+        if doi not in group:
+            group.append(doi)
+    return spellings
+
+def _fetch_works_by_doi(self, batch: list[str]) -> list[dict] | None:
+    """Return the works matching `batch`, or None after a failure."""
+    try:
+        self._limiter.acquire()
+        response = pyalex.Works().filter_or(
+            doi=[f"https://doi.org/{doi}" for doi in batch]
+        ).get(per_page=OPENALEX_DOI_PAGE_SIZE)
+    except RateLimited:
+        # The limiter already logged the reason once
+        return None
+    except requests.exceptions.HTTPError as e:
+        self._note_http_error(e)
+        return None
+    except Exception as e:
+        logger.warning("%s: DOI batch lookup failed: %s", self.name, e)
+        return None
+    works = list(response)
+    count = (getattr(response, "meta", None) or {}).get("count")
+    if isinstance(count, int) and count > len(works):
+        logger.debug(
+            "%s: DOI batch matched %d works, more than one page; "
+            "caching none of them", self.name, count,
+        )
+        return []
+    return works
+
+def _cache_unique_works(
+    self,
+    batch: list[str],
+    spellings: dict[str, list[str]],
+    works: list[dict],
+) -> int:
+    """Cache each DOI of `batch` that exactly one of `works` matches."""
+    by_doi: dict[str, list[dict]] = {}
+    for work in works:
+        key = Paper._normalize_doi(work.get("doi") or "")
+        by_doi.setdefault(key, []).append(work)
+    cached = 0
+    for key in batch:
+        matches = by_doi.get(key, [])
+        if len(matches) != 1:
+            continue
+        paper = self._convert_work(matches[0])
+        for doi in spellings[key]:
+            self._cache[("doi", self.CACHE_VERSION, doi)] = paper
+            cached += 1
+    return cached
+<<constants>>=
+OPENALEX_DOI_BATCH_SIZE = 50   # DOIs per request; OpenAlex allows 100
+OPENALEX_DOI_PAGE_SIZE = 100   # results per request, room for duplicates
+OPENALEX_DOI_UNSAFE = re.compile(r"[,|+\s]")
+<<openalex imports>>=
+import re
+from collections.abc import Iterable
+@
+
+To test the batch we replay a recorded OpenAlex answer through
+[[pyalex]]'s own request code, replacing only the
+[[requests.Session.get]] it calls, so the URL [[pyalex]] builds and
+its parsing of the reply are the real ones.
+The recording is one request made on 2026-11-18, without a key or
+contact email, to the URL that [[prefetch_dois]] builds (one line,
+broken here at the pipes):
+\begin{verbatim}
+https://api.openalex.org/works?filter=doi:https%3A%2F%2Fdoi.org%2F10.1371%2Fjournal.pone.0266781
+  |https%3A%2F%2Fdoi.org%2F10.1371%2Fjournal.pone.0267149
+  |https%3A%2F%2Fdoi.org%2F10.5555%2Fscholar-137-no-such-doi&per-page=100
+\end{verbatim}
+It asks for two real DOIs (the pair from the OpenAlex documentation)
+and one that does not exist.
+OpenAlex answered with [[count]] 2 and the two works.
+We kept only the fields [[_convert_work]] reads, cut each abstract
+index to its first eight words and each keyword list to three, and
+replaced the author names by placeholders.
+
+<<test functions>>=
+RECORDED_OPENALEX_DOI_BATCH = {
+  "meta": {"count": 2, "page": 1, "per_page": 100},
+  "results": [
+    {
+      "id": "https://openalex.org/W4224016882",
+      "doi": "https://doi.org/10.1371/journal.pone.0266781",
+      "title": "6 month serologic response to the Pfizer-BioNTech "
+               "COVID-19 vaccine among healthcare workers",
+      "publication_year": 2022,
+      "authorships": [{"author": {"display_name": "Author A"}},
+                      {"author": {"display_name": "Author B"}}],
+      "primary_location": {
+        "source": {"display_name": "PLoS ONE"},
+        "pdf_url": "https://journals.plos.org/plosone/article/file"
+                   "?id=10.1371/journal.pone.0266781&type=printable",
+        "landing_page_url":
+          "https://doi.org/10.1371/journal.pone.0266781",
+      },
+      "open_access": {
+        "oa_url": "https://journals.plos.org/plosone/article/file"
+                  "?id=10.1371/journal.pone.0266781&type=printable",
+      },
+      "abstract_inverted_index": {
+        "AIM:": [0], "Healthcare": [1], "workers": [2], "(HCWs)": [3],
+        "were": [4], "among": [5], "the": [6], "first": [7],
+      },
+      "keywords": [{"display_name": "BNT162b2"},
+                   {"display_name": "COVID-19 vaccines"},
+                   {"display_name": "SARS-CoV-2"}],
+    },
+    {
+      "id": "https://openalex.org/W4223895588",
+      "doi": "https://doi.org/10.1371/journal.pone.0267149",
+      "title": "Refractive and visual function changes in twilight "
+               "conditions",
+      "publication_year": 2022,
+      "authorships": [{"author": {"display_name": "Author A"}},
+                      {"author": {"display_name": "Author B"}}],
+      "primary_location": {
+        "source": {"display_name": "PLoS ONE"},
+        "pdf_url": "https://journals.plos.org/plosone/article/file"
+                   "?id=10.1371/journal.pone.0267149&type=printable",
+        "landing_page_url":
+          "https://doi.org/10.1371/journal.pone.0267149",
+      },
+      "open_access": {
+        "oa_url": "https://journals.plos.org/plosone/article/file"
+                  "?id=10.1371/journal.pone.0267149&type=printable",
+      },
+      "abstract_inverted_index": {
+        "PURPOSE:": [0], "We": [1], "investigated": [2], "the": [3],
+        "effect": [4], "of": [5], "luminance": [6], "on": [7],
+      },
+      "keywords": [{"display_name": "twilight vision"},
+                   {"display_name": "low luminance"},
+                   {"display_name": "refraction"}],
+    },
+  ],
+}
+RECORDED_DOI_A = "10.1371/journal.pone.0266781"
+RECORDED_DOI_B = "10.1371/journal.pone.0267149"
+RECORDED_DOI_MISSING = "10.5555/scholar-137-no-such-doi"
+
+
+def openalex_reply(status=200, payload=None, headers=None):
+  """Build the `requests.Response` OpenAlex would send."""
+  import json
+
+  response = requests.models.Response()
+  response.status_code = status
+  response._content = json.dumps(
+    payload if payload is not None else {}
+  ).encode()
+  response.headers.update(
+    {"Content-Type": "application/json", **(headers or {})}
+  )
+  response.url = "https://api.openalex.org/works"
+  return response
+
+
+@pytest.fixture
+def openalex_replay(monkeypatch):
+  """Answer pyalex's requests from `replies`, recording each URL.
+
+  The last reply is repeated once the others are used up.
+  """
+  urls, replies = [], []
+
+  def fake_get(session, url, **kwargs):
+    urls.append(url)
+    return replies.pop(0) if len(replies) > 1 else replies[0]
+
+  monkeypatch.setattr(requests.Session, "get", fake_get)
+  return urls, replies
+
+
+class TestOpenAlexPrefetchDois:
+  """Batched DOI lookups fill the cache `get_paper_by_doi` reads."""
+
+  <<openalex prefetch test methods>>
+@
+
+One request carries all three DOIs, as an OR filter on [[doi]];
+afterwards the two found DOIs are answered from the cache, while the
+missing one still gets its own lookup, whose 404 that lookup caches.
+
+<<openalex prefetch test methods>>=
+def test_one_request_then_cache_hits(self, openalex_replay):
+  urls, replies = openalex_replay
+  replies.append(openalex_reply(payload=RECORDED_OPENALEX_DOI_BATCH))
+  provider = OpenAlexProvider(api_key=None)
+  dois = [RECORDED_DOI_A, RECORDED_DOI_B, RECORDED_DOI_MISSING]
+
+  assert provider.prefetch_dois(dois) == 2
+  assert len(urls) == 1
+  assert "filter=doi:" in urls[0]
+  assert urls[0].count("|") == 2
+  assert "journal.pone.0266781" in urls[0]
+  assert "per-page=100" in urls[0]
+
+  paper = provider.get_paper_by_doi(RECORDED_DOI_A)
+  assert paper.title.startswith("6 month serologic response")
+  assert paper.abstract.startswith("AIM: Healthcare workers")
+  assert provider.get_paper_by_doi(RECORDED_DOI_B).year == 2022
+  assert len(urls) == 1
+
+  replies[:] = [openalex_reply(404, {"error": "not found"})]
+  assert provider.get_paper_by_doi(RECORDED_DOI_MISSING) is None
+  assert len(urls) == 2
+@
+
+A DOI may reach us in any case, and the cache is keyed by the
+spelling the caller uses.  Two spellings of one DOI are requested once
+and both are cached:
+
+<<openalex prefetch test methods>>=
+def test_spellings_requested_once_cached_each(self, openalex_replay):
+  urls, replies = openalex_replay
+  replies.append(openalex_reply(payload=RECORDED_OPENALEX_DOI_BATCH))
+  provider = OpenAlexProvider(api_key=None)
+  upper = RECORDED_DOI_A.upper()
+
+  assert provider.prefetch_dois([upper, RECORDED_DOI_A]) == 2
+  assert urls[0].count("|") == 0
+  assert provider.get_paper_by_doi(upper).doi == RECORDED_DOI_A
+  assert provider.get_paper_by_doi(RECORDED_DOI_A) is not None
+  assert len(urls) == 1
+@
+
+Two works under one DOI leave that DOI uncached, while the other DOI
+of the batch is cached as usual:
+
+<<openalex prefetch test methods>>=
+def test_duplicate_works_not_cached(self, openalex_replay):
+  import copy
+
+  urls, replies = openalex_replay
+  payload = copy.deepcopy(RECORDED_OPENALEX_DOI_BATCH)
+  twin = copy.deepcopy(payload["results"][0])
+  twin["id"] = "https://openalex.org/W1"
+  payload["results"].append(twin)
+  payload["meta"]["count"] = 3
+  replies.append(openalex_reply(payload=payload))
+  provider = OpenAlexProvider(api_key=None)
+
+  assert provider.prefetch_dois([RECORDED_DOI_A, RECORDED_DOI_B]) == 1
+  key = ("doi", provider.CACHE_VERSION, RECORDED_DOI_A)
+  assert key not in provider._cache
+  assert ("doi", provider.CACHE_VERSION, RECORDED_DOI_B) in provider._cache
+@
+
+When OpenAlex reports more matches than the page holds, a DOI that
+appears once on the page may have a twin on the next, so the batch
+caches nothing:
+
+<<openalex prefetch test methods>>=
+def test_truncated_page_caches_nothing(self, openalex_replay):
+  import copy
+
+  urls, replies = openalex_replay
+  payload = copy.deepcopy(RECORDED_OPENALEX_DOI_BATCH)
+  payload["meta"]["count"] = 150
+  replies.append(openalex_reply(payload=payload))
+  provider = OpenAlexProvider(api_key=None)
+
+  assert provider.prefetch_dois([RECORDED_DOI_A, RECORDED_DOI_B]) == 0
+  assert not any(key[0] == "doi" for key in provider._cache)
+@
+
+A failed request caches nothing and raises nothing; a spent budget
+(a 429) and a server error alike end the prefetch after one request,
+however many batches were left:
+
+<<openalex prefetch test methods>>=
+@pytest.mark.parametrize("status", [429, 500])
+def test_failure_caches_nothing(self, openalex_replay, status):
+  urls, replies = openalex_replay
+  replies.append(openalex_reply(status, {"error": "failed"}))
+  provider = OpenAlexProvider(api_key=None)
+  dois = [f"10.5555/fail-{i}" for i in range(120)]
+
+  assert provider.prefetch_dois(dois) == 0
+  assert len(urls) == 1
+  assert not any(key[0] == "doi" for key in provider._cache)
+@
+
+A DOI holding a comma, a pipe, a plus or whitespace would break the
+filter, so it never reaches a request:
+
+<<openalex prefetch test methods>>=
+def test_unsafe_dois_excluded(self, openalex_replay):
+  urls, replies = openalex_replay
+  replies.append(openalex_reply(payload={"meta": {}, "results": []}))
+  provider = OpenAlexProvider(api_key=None)
+  unsafe = ["10.1/a,b", "10.1/a|b", "10.1/a+b", "10.1/a b"]
+
+  assert provider.prefetch_dois(unsafe) == 0
+  assert urls == []
+@
+
+Batches hold at most 50 DOIs, and DOIs already in the cache are not
+asked for again:
+
+<<openalex prefetch test methods>>=
+def test_batches_of_fifty(self, openalex_replay):
+  urls, replies = openalex_replay
+  replies.append(openalex_reply(payload={"meta": {}, "results": []}))
+  provider = OpenAlexProvider(api_key=None)
+
+  provider.prefetch_dois([f"10.5555/many-{i}" for i in range(120)])
+  assert [url.count("|") + 1 for url in urls] == [50, 50, 20]
+
+def test_cached_dois_not_requested(self, openalex_replay):
+  urls, replies = openalex_replay
+  replies.append(openalex_reply(payload=RECORDED_OPENALEX_DOI_BATCH))
+  provider = OpenAlexProvider(api_key=None)
+  provider.prefetch_dois([RECORDED_DOI_A, RECORDED_DOI_B])
+
+  assert provider.prefetch_dois([RECORDED_DOI_A, RECORDED_DOI_B]) == 0
+  assert len(urls) == 1
+@
+
+Finally, a live check that the batch and the single lookup still
+agree: with [[--run-live]] it fetches the two recorded DOIs once as a
+batch and once each, three requests in all.
+
+<<openalex prefetch test methods>>=
+@pytest.mark.integration
+def test_batch_matches_single_lookup(self):
+  provider = OpenAlexProvider()
+  dois = [RECORDED_DOI_A, RECORDED_DOI_B]
+  for doi in dois:
+    provider._cache.pop(("doi", provider.CACHE_VERSION, doi), None)
+  if provider.prefetch_dois(dois) != 2:
+    pytest.skip("OpenAlex batch lookup unavailable")
+  batched = {
+    doi: provider._cache.pop(("doi", provider.CACHE_VERSION, doi))
+    for doi in dois
+  }
+  for doi in dois:
+    single = provider.get_paper_by_doi(doi)
+    assert single is not None
+    for field in ("title", "authors", "year", "doi", "abstract",
+                  "venue", "pdf_url", "tags"):
+      assert getattr(batched[doi], field) == getattr(single, field)
+@
+
 \subsubsection{Preprint locations of a work}
 \label{sec:preprint-lookups}
 
