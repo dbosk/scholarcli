@@ -3100,11 +3100,22 @@ deciding signal: a 429 body has a [[reason]], and
 [[daily_budget]] means \enquote{Today's budget (and any prepaid usage)
 is spent}, while the other reasons ([[requests_per_second]] and the
 query-shape limits) leave the budget alone.
-When the body names a reason, that decides.
-When it does not (the documentation also mentions rare 429s without
-one), the headers decide, and the budget counts as spent only when the
-daily allowance is zero \emph{and} neither prepaid nor one-time credit
-is reported.
+When the body names a reason, that decides, and it decides for the
+whole response: a reason other than [[daily_budget]] says the budget was
+not what ran out, so that response's [[X-RateLimit-Remaining]] does not
+reach the limiter either (\cref{sec:openalex-prepaid}).
+Otherwise a per-second 429 that reported a daily count of zero would
+start a short [[Retry-After]] cooldown and, once that had passed, leave
+the stored zero to block the quota group until midnight after all.
+Should the day really be spent, the next request costs nothing (see
+below) and its [[daily_budget]] answer blocks properly.
+When the body has no reason (the documentation also mentions rare 429s
+without one), the headers decide, and the budget counts as spent only
+when the daily allowance is zero \emph{and} neither prepaid nor one-time
+credit is reported.
+The headers are read with the limiter's own [[_get_header]], which also
+tries the lower-case name, so a plain dictionary from a test or another
+caller is read like the case-insensitive headers of a real response.
 Counting the undocumented one-time credits as credit errs towards not
 blocking, which is the cheaper mistake: the documentation says error
 responses cost nothing, so a wrong guess costs one refused request per
@@ -3114,12 +3125,15 @@ until midnight.
 <<openalex budget reporting>>=
 def _record_429(self, response) -> bool:
     """Persist a 429; return whether the whole budget was spent."""
-    self._record_response(response)
-    spent = self._budget_spent(response)
+    reason = _rejection_reason(response)
+    spent = self._budget_spent(response, reason)
+    self._record_response(
+        response, daily_count_applies=reason is None or spent
+    )
     if spent:
-        headers = response.headers or {}
+        reset = _openalex_header(response, "X-RateLimit-Reset")
         try:
-            until = time.time() + float(headers.get("X-RateLimit-Reset"))
+            until = time.time() + float(reset)
         except (TypeError, ValueError):
             until = None
         self._limiter.record_limit_hit(
@@ -3128,17 +3142,16 @@ def _record_429(self, response) -> bool:
     return spent
 
 @staticmethod
-def _budget_spent(response) -> bool:
+def _budget_spent(response, reason: str | None) -> bool:
     """Whether a 429 says the daily and any prepaid budget are spent."""
-    reason = _rejection_reason(response)
     if reason is not None:
         return reason == OPENALEX_BUDGET_SPENT_REASON
-    headers = response.headers or {}
+    remaining_usd = _openalex_header(response, "X-RateLimit-Remaining-USD")
     try:
-        daily_spent = float(headers.get("X-RateLimit-Remaining-USD")) <= 0
+        daily_spent = float(remaining_usd) <= 0
     except (TypeError, ValueError):
         return False
-    return daily_spent and not _credit_beyond_daily(headers)
+    return daily_spent and not _credit_beyond_daily(response)
 
 def _note_http_error(self, error: requests.HTTPError) -> None:
     """Log an HTTP failure, translating a spent budget into a reset time."""
@@ -3172,11 +3185,16 @@ def _rejection_reason(response) -> str | None:
     return reason if isinstance(reason, str) else None
 
 
-def _credit_beyond_daily(headers) -> bool:
-    """Whether the headers report prepaid or one-time credit left."""
+def _openalex_header(response, name: str):
+    """Return header `name` of `response`, in either spelling, or `None`."""
+    return ratelimit._get_header(response.headers or {}, name)
+
+
+def _credit_beyond_daily(response) -> bool:
+    """Whether the response reports prepaid or one-time credit left."""
     for name in (OPENALEX_PREPAID_HEADER, OPENALEX_ONETIME_HEADER):
         try:
-            if float(headers.get(name)) > 0:
+            if float(_openalex_header(response, name)) > 0:
                 return True
         except (TypeError, ValueError):
             continue
@@ -3200,12 +3218,17 @@ while prepaid credit paid for every request.
 The fix belongs here, not in the limiter: what a provider's
 [[X-RateLimit-Remaining]] counts is the provider's business, and for
 Scopus it is the whole weekly quota.
-So, while the headers report credit beyond the day, the OpenAlex
-provider hands the limiter the response without that one header; the
-reset and a 429's [[Retry-After]] still get through.
-Nothing is lost by dropping rather than correcting the number: the
-limiter uses it only to block at zero, and summing it with the one-time
-credits would assume a conversion the documentation does not give.
+So, while the headers report credit beyond the day, and for a 429 whose
+reason says the budget is untouched, the OpenAlex provider hands the
+limiter the response without that one header; the reset and a 429's
+[[Retry-After]] still get through.
+The number is dropped rather than corrected because summing it with the
+one-time credits would assume a conversion the documentation does not
+give.
+The price is in [[scholar providers limits]]: while prepaid or one-time
+credit is reported, its remaining column gets no fresh count.
+It shows the count synced before the credit appeared, if any, until the
+reset clears it, and nothing after that.
 
 A count of zero stored \emph{before} the credit was bought is not undone
 by this: [[check_provider]] reports the block without probing, so
@@ -3213,11 +3236,12 @@ nothing reaches the sync until the reset.
 [[scholar providers limits --reset openalex]] clears it at once.
 
 <<openalex budget reporting>>=
-def _record_response(self, response) -> None:
+def _record_response(
+    self, response, daily_count_applies: bool = True
+) -> None:
     """Hand a response to the limiter, minus a daily-only count."""
-    headers = response.headers or {}
-    if _credit_beyond_daily(headers):
-        headers = CaseInsensitiveDict(headers)
+    if not daily_count_applies or _credit_beyond_daily(response):
+        headers = CaseInsensitiveDict(response.headers or {})
         headers.pop("X-RateLimit-Remaining", None)
         response = SimpleNamespace(
             status_code=response.status_code, headers=headers
@@ -3504,6 +3528,49 @@ def test_429_blocks_only_when_the_budget_is_spent(
     else:
         assert availability.retry_at < time.time() + 60
         assert "rate limited (HTTP 429)" in caplog.text
+    after_cooldown = time.time() + 61
+    monkeypatch.setattr(ratelimit, "_now", lambda: after_cooldown)
+    assert provider._limiter.check_available().ok is not spent
+@
+
+The last two lines matter for the rate-limit cases: the [[Retry-After]]
+cooldown alone would hide a daily count of zero synced from the same
+429, which would surface only once the cooldown had passed.
+
+Callers that pass plain dictionaries (as the [[Mock]]s in
+[[TestOpenAlexApiKey]] do) must get the same answer as a real response,
+whatever the spelling of the header names:
+
+<<openalex prepaid credit test methods>>=
+@staticmethod
+def plain_response(status_code, headers):
+    response = Mock(status_code=status_code, ok=status_code < 400,
+                    headers=dict(headers))
+    response.json.return_value = {}
+    return response
+
+def test_plain_lower_case_prepaid_header_is_read(self, monkeypatch):
+    monkeypatch.delenv("OPENALEX_API_KEY", raising=False)
+    provider = OpenAlexProvider()
+    response = self.plain_response(200, {
+        **DAILY_ALLOWANCE_SPENT, "x-ratelimit-reset": "31231",
+        "x-ratelimit-prepaid-remaining-usd": "5",
+    })
+    with patch("requests.get", return_value=response):
+        assert provider.check()[0] == HEALTH_OK
+    assert provider._limiter.check_available().ok is True
+
+def test_plain_lower_case_spent_budget_is_read(self, monkeypatch):
+    monkeypatch.delenv("OPENALEX_API_KEY", raising=False)
+    provider = OpenAlexProvider()
+    response = self.plain_response(429, {
+        **DAILY_ALLOWANCE_SPENT, **NO_CREDIT_BEYOND_DAILY,
+        "x-ratelimit-reset": "31231",
+    })
+    assert provider._record_429(response) is True
+    availability = provider._limiter.check_available()
+    assert availability.quota is True
+    assert availability.retry_at > time.time() + 30000
 @
 
 \subsubsection{Applying filters}
