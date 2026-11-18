@@ -769,7 +769,15 @@ report body builders (`build_review_provenance_latex`,
   `supports-claim`/`qualifies-claim` (`audit_excluded`) is never in
   orders 0-2; it sorts as other (6) with reason "<category>, excluded"
   and the caption counts it apart (`extra_excluded`), so
-  `--bearing-only` never lists a rejected hit. The caption never
+  `--bearing-only` never lists a rejected hit. The other rows (6) are
+  counted by kind (#169): rows with a version note
+  (`AUDIT_VERSION_NOTES`) as "duplicates or other versions of cited
+  sources", discards under an exclusion criterion
+  (`audit_exclusion_criterion`: a discard with no category and no note
+  tag, its first tag that is not a `--theme`; e.g. `no-abstract`) per
+  criterion as "excluded by the criterion <tag>", the rest as "other
+  hits" (all localised). Criteria are the review's own labels, so
+  there is no fixed list. The caption never
   names the session (it is a `%` comment in the fragment) and ends with
   a full-name-first "Databases:" sentence built from the providers
   the session searched (search records that answered at least once,
