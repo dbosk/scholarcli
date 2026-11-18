@@ -2853,7 +2853,8 @@ key and [[mailto]] as real searches---a probe without the key would
 report \enquote{rate limited} while searches succeed.  With a key, a 401
 or 403 means the key was rejected, so [[authenticated]] follows the key.
 The probe's response headers go to the limiter, which keeps the
-persisted credit count current, and a healthy keyed probe is followed by
+persisted credit count current (except while prepaid credit is left,
+\cref{sec:openalex-prepaid}), and a healthy keyed probe is followed by
 one call to the rate-limit endpoint so the health table can show how
 much of the day's budget is left and when it resets.  Without a key the
 detail column says so, since the key is the one setting that changes
@@ -2889,7 +2890,7 @@ def _probe(self, params: dict) -> tuple[str, str]:
             HEALTH_QUOTA_EXHAUSTED,
             f"daily budget spent; resets {format_retry(retry_at)}",
         )
-    self._limiter.record_response(response)
+    self._record_response(response)
     return classify_check_response(
         response, authenticated=bool(self.api_key), expect_json=True
     )
@@ -2935,8 +2936,35 @@ def budget(self) -> dict | None:
     except (RateLimited, requests.RequestException, ValueError):
         return None
 
+@
+
+\paragraph{Prepaid and one-time credit.}
+The day's allowance is not the whole budget.
+OpenAlex sells prepaid usage on top of it, which \enquote{is only drawn
+down after your free daily budget runs out} and expires three months
+after the latest purchase
+(\url{https://help.openalex.org/access/pricing/}, read 2026-11-18).
+A key that has spent its day but still holds prepaid credit therefore
+keeps working, and a health table that said only \enquote{\$0.045 of
+\$1.00 daily budget left} made an orchestrator wait for the reset when
+it need not have (issue \#138).
+
+The report recorded on 2026-11-18 (in the tests below) carries the
+prepaid credit as [[prepaid_remaining_usd]] with an expiry
+[[prepaid_expires_at]], and also a count of
+[[onetime_credits_remaining]] with [[onetime_credits_expires_at]].
+The documentation does not mention one-time credits.
+In that report they had the same expiry as the prepaid credit and stood
+at 50000 while the daily allowance was reported both as \$1 and as 10000
+credits, so they may be the same \$5 counted in credits; since nothing
+says so, the message shows each as reported, in its own unit, rather
+than adding them up or hiding one.
+Each is shown only when it is positive, so a key without such credit
+gets exactly the message it got before.
+
+<<openalex budget reporting>>=
 def _budget_message(self) -> str:
-    """Describe the key and daily budget for the health table."""
+    """Describe the key and the budget left for the health table."""
     if not self.api_key:
         note = f"no API key ({OPENALEX_API_KEY_VAR}): keyless daily budget"
         if not pyalex.config.email:
@@ -2946,20 +2974,109 @@ def _budget_message(self) -> str:
     if not report:
         return "API key configured"
     message = "API key configured"
-    remaining = report.get("daily_remaining_usd")
-    total = report.get("daily_budget_usd")
-    if remaining is not None and total is not None:
-        message += f"; ${remaining:.3f} of ${total:.2f} daily budget left"
+    left = self._budget_left(report)
+    if left:
+        message += f"; {left}"
     resets_in = report.get("resets_in_seconds")
     if resets_in is not None:
         message += f"; resets {format_retry(time.time() + resets_in)}"
     return message
+
+@staticmethod
+def _budget_left(report: dict) -> str | None:
+    """Phrase the daily allowance and any credit beyond it."""
+    remaining = report.get("daily_remaining_usd")
+    total = report.get("daily_budget_usd")
+    daily = None
+    if remaining is not None and total is not None:
+        daily = f"${remaining:.3f} of ${total:.2f} daily"
+    extra = []
+    prepaid = _positive_number(report.get("prepaid_remaining_usd"))
+    if prepaid:
+        extra.append(
+            f"${prepaid:.2f} prepaid"
+            + _expiry_note(report.get("prepaid_expires_at"))
+        )
+    onetime = _positive_number(report.get("onetime_credits_remaining"))
+    if onetime:
+        extra.append(
+            f"{onetime:.0f} one-time credits"
+            + _expiry_note(report.get("onetime_credits_expires_at"))
+        )
+    if not extra:
+        return f"{daily} budget left" if daily else None
+    return " + ".join(([daily] if daily else []) + extra) + " left"
 @
 
+The expiry dates arrive in JavaScript's [[Date.toString]] form,
+\enquote{Tue Feb 16 2027 14:16:51 GMT+0000 (Coordinated Universal
+Time)}, unlike the ISO 8601 [[resets_at]] of the same report.
+The message shows the ISO date.
+The month is matched against English abbreviations rather than parsed
+with [[strptime]]'s [[%b]], which follows the user's locale, and an ISO
+timestamp is accepted too in case OpenAlex aligns the two fields.
+Anything else is shown as received: an odd date is better than a
+missing one, and a parse error must not cost the health check.
+
+<<openalex helpers>>=
+def _positive_number(value) -> float | None:
+    """Return `value` as a float if it is a positive number, else `None`."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value) if value > 0 else None
+
+
+def _expiry_note(text) -> str:
+    """Return ` (expires <date>)` for an OpenAlex expiry, or `""`."""
+    if not text:
+        return ""
+    return f" (expires {openalex_date(text)})"
+
+
+def openalex_date(text: str) -> str:
+    """Return an OpenAlex timestamp as an ISO date, or unchanged.
+
+    Accepts JavaScript's `Date.toString()` form ("Tue Feb 16 2027
+    14:16:51 GMT+0000 (...)") and ISO 8601; the date is the one written
+    in the timestamp, in its own offset.
+    """
+    match = JS_DATE_PATTERN.match(text) if isinstance(text, str) else None
+    if match and match["month"] in MONTH_ABBREVIATIONS:
+        try:
+            return datetime.date(
+                int(match["year"]),
+                MONTH_ABBREVIATIONS.index(match["month"]) + 1,
+                int(match["day"]),
+            ).isoformat()
+        except ValueError:
+            return text
+    try:
+        return datetime.datetime.fromisoformat(
+            text.replace("Z", "+00:00")
+        ).date().isoformat()
+    except (AttributeError, TypeError, ValueError):
+        return str(text)
+<<openalex constants>>=
+JS_DATE_PATTERN = re.compile(
+    r"[A-Z][a-z]{2} (?P<month>[A-Z][a-z]{2}) (?P<day>\d{1,2})"
+    r" (?P<year>\d{4})\b"
+)
+MONTH_ABBREVIATIONS = (
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+)
+<<openalex imports>>=
+import datetime
+import re
+
+from requests.structures import CaseInsensitiveDict
+@
+
+\paragraph{When a 429 means the budget is spent.}
 A 429 from OpenAlex means one of two things: too many requests per
 second, which the [[Retry-After]] header resolves in seconds, or a spent
-daily budget, which the [[X-RateLimit-Remaining-USD]] header reports as
-zero.  The second case used to surface as a bare \enquote{429} warning
+budget, which lasts until the reset at midnight UTC.
+The second case used to surface as a bare \enquote{429} warning
 and, worse, was retried on the next command.  Feeding the response to
 the limiter syncs the headers and starts the cooldown; a spent budget is
 then escalated to a quota block that lasts until the reset the
@@ -2968,16 +3085,39 @@ provider instead of burning a request to learn the same thing.  The
 warning names the reset time and, when no key is configured, the one
 change that would have avoided the block.
 
+Telling the two apart used to rest on [[X-RateLimit-Remaining-USD]]
+alone, and that header counts only the day's allowance: on 2026-11-18 a
+keyed [[GET /works?search=test&per-page=1]] answered with
+[[X-RateLimit-Remaining-USD: 0.0186]] next to
+[[X-RateLimit-Prepaid-Remaining-USD: 5]] and
+[[X-RateLimit-Onetime-Remaining: 50000]].
+A per-second 429 that happened to arrive after the day's allowance was
+used up would thus have blocked a key with prepaid credit until
+midnight.
+OpenAlex's error documentation
+(\url{https://help.openalex.org/api/errors/}, read 2026-11-18) gives the
+deciding signal: a 429 body has a [[reason]], and
+[[daily_budget]] means \enquote{Today's budget (and any prepaid usage)
+is spent}, while the other reasons ([[requests_per_second]] and the
+query-shape limits) leave the budget alone.
+When the body names a reason, that decides.
+When it does not (the documentation also mentions rare 429s without
+one), the headers decide, and the budget counts as spent only when the
+daily allowance is zero \emph{and} neither prepaid nor one-time credit
+is reported.
+Counting the undocumented one-time credits as credit errs towards not
+blocking, which is the cheaper mistake: the documentation says error
+responses cost nothing, so a wrong guess costs one refused request per
+[[Retry-After]], whereas the opposite mistake silences the provider
+until midnight.
+
 <<openalex budget reporting>>=
 def _record_429(self, response) -> bool:
-    """Persist a 429; return whether it was a spent daily budget."""
-    self._limiter.record_response(response)
-    headers = response.headers or {}
-    try:
-        spent = float(headers.get("X-RateLimit-Remaining-USD")) <= 0
-    except (TypeError, ValueError):
-        spent = False
+    """Persist a 429; return whether the whole budget was spent."""
+    self._record_response(response)
+    spent = self._budget_spent(response)
     if spent:
+        headers = response.headers or {}
         try:
             until = time.time() + float(headers.get("X-RateLimit-Reset"))
         except (TypeError, ValueError):
@@ -2986,6 +3126,19 @@ def _record_429(self, response) -> bool:
             until=until, reason="daily budget spent", exhausted_daily=True
         )
     return spent
+
+@staticmethod
+def _budget_spent(response) -> bool:
+    """Whether a 429 says the daily and any prepaid budget are spent."""
+    reason = _rejection_reason(response)
+    if reason is not None:
+        return reason == OPENALEX_BUDGET_SPENT_REASON
+    headers = response.headers or {}
+    try:
+        daily_spent = float(headers.get("X-RateLimit-Remaining-USD")) <= 0
+    except (TypeError, ValueError):
+        return False
+    return daily_spent and not _credit_beyond_daily(headers)
 
 def _note_http_error(self, error: requests.HTTPError) -> None:
     """Log an HTTP failure, translating a spent budget into a reset time."""
@@ -3008,6 +3161,70 @@ def _note_http_error(self, error: requests.HTTPError) -> None:
             "%s: rate limited (HTTP 429); retry %s",
             self.name, format_retry(retry_at),
         )
+<<openalex helpers>>=
+def _rejection_reason(response) -> str | None:
+    """Return the `reason` of an OpenAlex error body, if it has one."""
+    try:
+        body = response.json()
+    except ValueError:
+        return None
+    reason = body.get("reason") if isinstance(body, dict) else None
+    return reason if isinstance(reason, str) else None
+
+
+def _credit_beyond_daily(headers) -> bool:
+    """Whether the headers report prepaid or one-time credit left."""
+    for name in (OPENALEX_PREPAID_HEADER, OPENALEX_ONETIME_HEADER):
+        try:
+            if float(headers.get(name)) > 0:
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+<<openalex constants>>=
+OPENALEX_BUDGET_SPENT_REASON = "daily_budget"
+OPENALEX_PREPAID_HEADER = "X-RateLimit-Prepaid-Remaining-USD"
+OPENALEX_ONETIME_HEADER = "X-RateLimit-Onetime-Remaining"
+@
+
+\paragraph{Keeping the daily count out of the limiter.}
+\label{sec:openalex-prepaid}
+The same blind spot sat in the header sync.
+The limiter stores [[X-RateLimit-Remaining]] and treats a zero as a
+provider-reported quota block until [[X-RateLimit-Reset]]
+(\cref{sec:ratelimit-record-response}).
+For OpenAlex that header is the day's allowance in credits (186 in the
+response above, next to 50000 one-time credits), so a probe answered
+after the allowance ran out would have blocked the whole quota group
+while prepaid credit paid for every request.
+The fix belongs here, not in the limiter: what a provider's
+[[X-RateLimit-Remaining]] counts is the provider's business, and for
+Scopus it is the whole weekly quota.
+So, while the headers report credit beyond the day, the OpenAlex
+provider hands the limiter the response without that one header; the
+reset and a 429's [[Retry-After]] still get through.
+Nothing is lost by dropping rather than correcting the number: the
+limiter uses it only to block at zero, and summing it with the one-time
+credits would assume a conversion the documentation does not give.
+
+A count of zero stored \emph{before} the credit was bought is not undone
+by this: [[check_provider]] reports the block without probing, so
+nothing reaches the sync until the reset.
+[[scholar providers limits --reset openalex]] clears it at once.
+
+<<openalex budget reporting>>=
+def _record_response(self, response) -> None:
+    """Hand a response to the limiter, minus a daily-only count."""
+    headers = response.headers or {}
+    if _credit_beyond_daily(headers):
+        headers = CaseInsensitiveDict(headers)
+        headers.pop("X-RateLimit-Remaining", None)
+        response = SimpleNamespace(
+            status_code=response.status_code, headers=headers
+        )
+    self._limiter.record_response(response)
+<<openalex imports>>=
+from types import SimpleNamespace
 @
 
 Let's verify the key reaches [[pyalex]] and the probe, that the probe
@@ -3096,6 +3313,197 @@ class TestOpenAlexApiKey:
         assert availability.ok is False
         assert availability.quota is True
         assert availability.retry_at > time.time() + 3000
+@
+
+Prepaid credit (\cref{sec:openalex-prepaid}) is tested on what OpenAlex
+actually sent.
+[[OPENALEX_RECORDED_REPORT]] is the body of a keyed
+[[GET https://api.openalex.org/rate-limit]] on 2026-11-18, with the key
+removed and the [[rate_limit]] object trimmed to the fields the message
+reads; the account had spent most of its day and held \$5 of prepaid
+credit.
+[[OPENALEX_RECORDED_HEADERS]] are the [[X-RateLimit-*]] headers of a
+keyed [[GET https://api.openalex.org/works?search=test&per-page=1]] a
+few seconds later, lower-case as they arrived over HTTP/2.
+They go into real [[requests.Response]] objects rather than the
+[[Mock]]s above, so the header lookups meet the case-insensitive
+dictionary that [[requests]] really hands over.
+No 429 was recorded: spending the budget on purpose costs money, so the
+429s below are the recorded headers with the day's allowance set to zero
+and, where the reason matters, a body shaped like the examples in
+OpenAlex's error documentation.
+
+<<test functions>>=
+OPENALEX_RECORDED_REPORT = (
+    b'{"rate_limit": {"daily_budget_usd": 1, "daily_remaining_usd": 0.0196,'
+    b' "prepaid_remaining_usd": 5, "prepaid_expires_at": "Tue Feb 16 2027'
+    b' 14:16:51 GMT+0000 (Coordinated Universal Time)",'
+    b' "resets_in_seconds": 31242, "onetime_credits_remaining": 50000,'
+    b' "onetime_credits_expires_at": "Tue Feb 16 2027 14:16:51 GMT+0000'
+    b' (Coordinated Universal Time)"}}'
+)
+OPENALEX_RECORDED_HEADERS = {
+    "content-type": "application/json",
+    "x-ratelimit-cost-usd": "0.001",
+    "x-ratelimit-credits-used": "10",
+    "x-ratelimit-limit": "10000",
+    "x-ratelimit-limit-usd": "1",
+    "x-ratelimit-onetime-remaining": "50000",
+    "x-ratelimit-prepaid-remaining-usd": "5",
+    "x-ratelimit-remaining": "186",
+    "x-ratelimit-remaining-usd": "0.0186",
+    "x-ratelimit-reset": "31231",
+}
+DAILY_ALLOWANCE_SPENT = {
+    "x-ratelimit-remaining": "0", "x-ratelimit-remaining-usd": "0",
+}
+NO_CREDIT_BEYOND_DAILY = {
+    "x-ratelimit-prepaid-remaining-usd": "0",
+    "x-ratelimit-onetime-remaining": "0",
+}
+
+
+def openalex_response(status, headers, body=b"{}"):
+    """A real `requests.Response` carrying recorded OpenAlex headers."""
+    response = requests.Response()
+    response.status_code = status
+    response.headers = requests.structures.CaseInsensitiveDict(headers)
+    response._content = body
+    response.url = OPENALEX_API_URL
+    return response
+
+
+class TestOpenAlexPrepaidCredit:
+    """Prepaid credit in the health message, the 429s and the header sync."""
+
+    <<openalex prepaid credit test methods>>
+@
+
+The message must show the prepaid credit next to the day's allowance,
+and the one-time credits as reported; without them it stays as it was
+(the budget test in [[TestOpenAlexApiKey]] pins that wording).
+
+<<openalex prepaid credit test methods>>=
+@staticmethod
+def check_with_report(monkeypatch, report):
+    monkeypatch.setenv("OPENALEX_API_KEY", "k-123")
+    provider = OpenAlexProvider()
+    responses = [
+        openalex_response(200, OPENALEX_RECORDED_HEADERS),
+        openalex_response(
+            200, {"content-type": "application/json"}, report
+        ),
+    ]
+    with patch("requests.get", side_effect=responses):
+        return provider.check()
+
+def test_recorded_report_shows_prepaid_and_onetime_credit(
+        self, monkeypatch):
+    status, message = self.check_with_report(
+        monkeypatch, OPENALEX_RECORDED_REPORT
+    )
+    assert status == HEALTH_OK
+    assert message.startswith(
+        "API key configured; $0.020 of $1.00 daily"
+        " + $5.00 prepaid (expires 2027-02-16)"
+        " + 50000 one-time credits (expires 2027-02-16) left; resets "
+    )
+
+def test_unparseable_expiry_is_shown_as_received(self, monkeypatch):
+    report = OPENALEX_RECORDED_REPORT.replace(
+        b'"prepaid_expires_at": "Tue Feb 16 2027',
+        b'"prepaid_expires_at": "sometime in February", "x": "',
+    ).replace(
+        b'"onetime_credits_remaining": 50000',
+        b'"onetime_credits_remaining": 0',
+    )
+    _, message = self.check_with_report(monkeypatch, report)
+    assert (
+        "daily + $5.00 prepaid (expires sometime in February) left"
+        in message
+    )
+    assert "one-time" not in message
+@
+
+The expiry parser is checked on its own for the two forms it accepts and
+for a date that matches the pattern but does not exist:
+
+<<openalex prepaid credit test methods>>=
+@pytest.mark.parametrize("text, expected", [
+    ("Tue Feb 16 2027 14:16:51 GMT+0000 (Coordinated Universal Time)",
+     "2027-02-16"),
+    ("2026-11-19T00:00:00.000Z", "2026-11-19"),
+    ("Tue Feb 30 2027 14:16:51 GMT+0000",
+     "Tue Feb 30 2027 14:16:51 GMT+0000"),
+])
+def test_openalex_date(self, text, expected):
+    assert openalex_date(text) == expected
+@
+
+A probe answered after the day's allowance ran out must not block the
+quota group while prepaid credit is reported, and must block it, as
+before, when nothing is left beyond the day.
+
+<<openalex prepaid credit test methods>>=
+@pytest.mark.parametrize("beyond_daily, blocked", [
+    ({}, False), (NO_CREDIT_BEYOND_DAILY, True),
+], ids=["prepaid-left", "nothing-left"])
+def test_probe_sync_blocks_only_when_nothing_is_left(
+        self, monkeypatch, beyond_daily, blocked):
+    monkeypatch.delenv("OPENALEX_API_KEY", raising=False)
+    provider = OpenAlexProvider()
+    headers = {
+        **OPENALEX_RECORDED_HEADERS, **DAILY_ALLOWANCE_SPENT,
+        **beyond_daily,
+    }
+    with patch(
+        "requests.get", return_value=openalex_response(200, headers)
+    ):
+        provider.check()
+    availability = provider._limiter.check_available()
+    assert availability.ok is not blocked
+    assert availability.quota is blocked
+@
+
+A 429 with the day spent and prepaid credit left is a rate limit: a
+short cooldown and a \enquote{rate limited} warning, not a block until
+midnight.
+With nothing left beyond the day it is the quota block it always was.
+When the body names a reason, the reason decides, even against the
+headers.
+
+<<openalex prepaid credit test methods>>=
+@pytest.mark.parametrize("beyond_daily, body, spent", [
+    ({}, b"{}", False),
+    (NO_CREDIT_BEYOND_DAILY, b"{}", True),
+    ({}, b'{"reason": "daily_budget"}', True),
+    (NO_CREDIT_BEYOND_DAILY, b'{"reason": "requests_per_second"}', False),
+], ids=["prepaid-left", "nothing-left", "reason-daily-budget",
+        "reason-per-second"])
+def test_429_blocks_only_when_the_budget_is_spent(
+        self, monkeypatch, caplog, beyond_daily, body, spent):
+    monkeypatch.delenv("OPENALEX_API_KEY", raising=False)
+    provider = OpenAlexProvider()
+    headers = {
+        **OPENALEX_RECORDED_HEADERS, **DAILY_ALLOWANCE_SPENT,
+        **beyond_daily, "retry-after": "30",
+    }
+    response = openalex_response(429, headers, body)
+    error = requests.HTTPError(response=response)
+    with caplog.at_level(logging.WARNING):
+        with patch.object(
+            provider, "_search_uncached", side_effect=error
+        ):
+            assert provider.search("prepaid test") == []
+    availability = provider._limiter.check_available()
+    assert availability.ok is False
+    assert availability.quota is spent
+    if spent:
+        assert availability.retry_at > time.time() + 30000
+        assert "daily budget spent" in caplog.text
+    else:
+        assert availability.retry_at < time.time() + 60
+        assert "rate limited (HTTP 429)" in caplog.text
 @
 
 \subsubsection{Applying filters}
@@ -12034,6 +12442,7 @@ logger = logging.getLogger(__name__)
 # Provider constants
 DEFAULT_LIMIT = 100
 <<openalex constants>>
+<<openalex helpers>>
 <<dblp constants>>
 <<wos constants>>
 <<ieee constants>>
