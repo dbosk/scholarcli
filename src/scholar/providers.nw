@@ -1218,10 +1218,55 @@ def check_provider(
     try:
         status, message = provider.check()
     except requests.RequestException as e:
-        return ProviderHealth(
-            provider.name, True, HEALTH_NETWORK_ERROR, str(e)
-        )
-    return ProviderHealth(provider.name, True, status, message)
+        status, message = HEALTH_NETWORK_ERROR, str(e)
+    return ProviderHealth(
+        provider.name, True, status, network.redact_secrets(message)
+    )
+@
+
+A probe that fails before it gets an answer---a dead proxy, a refused
+connection---raises, and the exception's message names the URL it
+tried.
+IEEE Xplore takes its key in the URL, and so did the OpenAlex probe, so
+the health table used to print the key (issue~\#159).
+Every message the check reports therefore passes
+[[redact_secrets]] (\cref{sec:redact-secrets} in the network
+chapter), which hides the values of key-like URL parameters.
+It is applied to every message, not only to the exceptions, because a
+provider's own detail may quote a URL too.
+
+The tests send the probe through a proxy that is not there: a local
+port that was bound and released, so the connection is refused at once
+and the real [[requests]] and [[urllib3]] write the message.
+The key is made up, and the test asserts only that it is absent.
+
+<<test functions>>=
+class TestHealthMessagesHideKeys:
+  """A failed probe never shows the API key it sent."""
+
+  FAKE_KEY = "SECRETKEY123"
+
+  @staticmethod
+  def dead_proxy():
+    import socket
+
+    with socket.socket() as sock:
+      sock.bind(("127.0.0.1", 0))
+      port = sock.getsockname()[1]
+    return f"http://127.0.0.1:{port}"
+
+  @pytest.mark.parametrize("variable, make_provider", [
+    ("OPENALEX_API_KEY", OpenAlexProvider),
+    ("IEEE_API_KEY", IEEEXploreProvider),
+  ], ids=["openalex", "ieee"])
+  def test_dead_proxy_message_hides_the_key(
+      self, monkeypatch, variable, make_provider):
+    monkeypatch.setenv(variable, self.FAKE_KEY)
+    monkeypatch.setenv("SCHOLAR_PROXY", self.dead_proxy())
+    health = check_provider(make_provider())
+    assert health.status == HEALTH_NETWORK_ERROR
+    assert "proxy" in health.message.lower()
+    assert self.FAKE_KEY not in health.message
 @
 
 Let's verify the cross-provider logic: unconfigured providers are never
@@ -3606,8 +3651,9 @@ def _failure_reason(self, failure: Exception) -> str:
     if isinstance(failure, requests.HTTPError) and response is not None:
         self._note_http_error(failure)
         return self._refusal_reason(response)
-    logger.warning("%s: %s", self.name, failure)
-    return shorten_reason(str(failure) or type(failure).__name__)
+    text = network.redact_secrets(failure) or type(failure).__name__
+    logger.warning("%s: %s", self.name, text)
+    return shorten_reason(text)
 @
 
 The tests send [[pyalex]]'s requests to a local stand-in for
@@ -3820,8 +3866,11 @@ def _probe(self, params: dict) -> tuple[str, str]:
     except RateLimited as e:
         return HEALTH_RATE_LIMITED, str(e)
     params = dict(params)
-    params.update(self._auth_params())
-    response = network.get(OPENALEX_API_URL, params=params, timeout=30)
+    params.update(self._auth_params(key_in_url=False))
+    response = network.get(
+        OPENALEX_API_URL, params=params, headers=self._auth_headers(),
+        timeout=30,
+    )
     if response.status_code == 429:
         # [[_record_429]] records every 429 itself, and a subclass may
         # route a 429 that is not about the budget to a limiter of its
@@ -3859,15 +3908,32 @@ the endpoint is the only way to read them without spending a request.
 A failure to read it must not turn a healthy probe into an error, so
 the message falls back to a plain \enquote{API key configured}.
 
+OpenAlex's authentication page
+(\url{https://help.openalex.org/api/authentication/}, read 2026-11-18)
+offers two ways to send the key, an [[api_key]] query parameter or an
+[[Authorization: Bearer]] header, which \enquote{work identically}; its
+header example is a [[/works]] request, while for the rate-limit
+endpoint it shows only the parameter.
+The probe of [[/works]] therefore sends the key as a bearer token
+([[_auth_headers]]), as [[pyalex]] does for every search, so a failed
+probe's URL no longer holds the key (issue~\#159).
+The rate-limit request keeps the documented parameter, and its failures
+are swallowed here; what could still carry the key into a message is
+caught by [[redact_secrets]] (\cref{sec:redact-secrets}).
+
 <<openalex budget reporting>>=
-def _auth_params(self) -> dict[str, str]:
-    """Query parameters carrying the key and contact email."""
+def _auth_params(self, key_in_url: bool = True) -> dict[str, str]:
+    """Query parameters carrying the contact email and, by default, the key."""
     params: dict[str, str] = {}
-    if self.api_key:
+    if self.api_key and key_in_url:
         params["api_key"] = self.api_key
     if pyalex.config.email:
         params["mailto"] = pyalex.config.email
     return params
+
+def _auth_headers(self) -> dict[str, str]:
+    """The key as a bearer token, the way pyalex sends it."""
+    return {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
 
 def budget(self) -> dict | None:
     """Return OpenAlex's rate-limit report for the key, or `None`."""
@@ -4246,8 +4312,10 @@ class TestOpenAlexApiKey:
             status, message = provider.check()
         assert status == HEALTH_OK
         probe, report = mock_get.call_args_list
-        assert probe.kwargs["params"]["api_key"] == "k-123"
+        assert probe.kwargs["headers"]["Authorization"] == "Bearer k-123"
+        assert "api_key" not in probe.kwargs["params"]
         assert report.args[0] == OPENALEX_RATE_LIMIT_URL
+        assert report.kwargs["params"]["api_key"] == "k-123"
         assert "$0.990 of $1.00 daily budget left" in message
 
     def test_check_without_key_says_so(self, monkeypatch):
@@ -9898,6 +9966,13 @@ The two codes also demand different reactions, which
 mark the day exhausted; [[OVER_QPS]] means only \enquote{slow down}, so a
 short cooldown suffices and the day count is untouched.
 
+These details come from headers, never from the URL, and for a reason:
+IEEE takes its key as the [[apikey]] query parameter, so any message
+that quotes the request's URL quotes the key.
+The handlers below that log an exception's text (a connection failure,
+a [[raise_for_status]] error) pass it through [[redact_secrets]]
+(\cref{sec:redact-secrets}) first.
+
 <<ieee constants>>=
 IEEE_OVER_RATE_CODE = "ERR_403_DEVELOPER_OVER_RATE"
 IEEE_OVER_QPS_CODE = "ERR_403_DEVELOPER_OVER_QPS"
@@ -10111,7 +10186,7 @@ def _search_uncached(
         # Already logged with details in handle response errors
         return all_papers, False
     except Exception as e:
-        logger.warning("ieee: %s", e)
+        logger.warning("ieee: %s", network.redact_secrets(e))
         return all_papers, False
 
 def _record_mashery_rejection(self, response) -> None:
@@ -10207,10 +10282,14 @@ budget.
             # The limiter already logged the reason once
             return None
         except requests.exceptions.HTTPError as e:
-            logger.warning("ieee: DOI lookup error: %s", e)
+            logger.warning(
+                "ieee: DOI lookup error: %s", network.redact_secrets(e)
+            )
             return None
         except Exception as e:
-            logger.warning("ieee: DOI lookup failed: %s", e)
+            logger.warning(
+                "ieee: DOI lookup failed: %s", network.redact_secrets(e)
+            )
             return None
 
     <<convert ieee article>>
@@ -11842,7 +11921,9 @@ class TestPreprintSourceCheck:
         assert status == HEALTH_OK
         assert mock_get.call_count == 1
         params = mock_get.call_args.kwargs["params"]
-        assert params["api_key"] == "k-123"
+        headers = mock_get.call_args.kwargs["headers"]
+        assert headers["Authorization"] == "Bearer k-123"
+        assert "api_key" not in params
         assert params["filter"] == "locations.source.id:S123"
         assert "shares the openalex" in message
 @
@@ -12619,7 +12700,9 @@ def test_check_probes_a_semantic_search(self, monkeypatch):
   assert status == HEALTH_OK
   params = mock_get.call_args.kwargs["params"]
   assert params["search.semantic"] == "test"
-  assert params["api_key"] == "k-123"
+  assert "api_key" not in params
+  assert mock_get.call_args.kwargs["headers"]["Authorization"] \
+    == "Bearer k-123"
   assert "1 request/s" in message
 @
 

@@ -284,6 +284,14 @@ default (`max_retries=0` with 429/500/503 listed) retried nothing but
 turned those statuses into a `RetryError` without a response, so no
 search ever saw a real 429 or 503 body.
 
+Keys in messages (#159): `network.redact_secrets(text)` hides the
+values of `api_key`/`apikey`/`api-key`/`key` URL parameters (any
+case). `check_provider` applies it to every health message; the
+OpenAlex and IEEE (`apikey` in the URL) error logs use it. The OpenAlex
+`/works` probe sends the key as `Authorization: Bearer` (documented,
+as pyalex does); `/rate-limit` keeps the `api_key` parameter (the only
+form documented for it).
+
 ### Provider Health Checks
 
 Because search errors degrade silently, `scholar providers check` probes each
