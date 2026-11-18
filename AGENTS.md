@@ -697,6 +697,76 @@ content gaps via `merge_version_of` (never version-specific fields like
 `pdf_url`) and recording `Paper.preprint_versions`
 (`{"doi", "pdf_url"}`) for tier 0. Ambiguous groups are left untouched.
 
+**DOI-less copies and namesakes** (#170, `scholar.nw`
+`sec:same-work-guard`/`sec:doi-less-copies`, `review.nw`
+`sec:session-copies`): `plausibly_same_work` (moved from the sessions
+check; DOIs differ and are not version-linked, or years > 1 apart →
+not the same work) guards every title-based match. `deduplicate_papers`
+merges two hash-id copies only when it admits them (a DOI merges
+whatever the years), then `link_doi_less_copies` folds a DOI-less copy
+into the one published DOI copy whose `legacy_hash_paper_id` equals its
+id (`doi_copy_index`/`doi_copy_of`; preprints and ambiguous choices are
+left alone, and so is a copy without a year or a first author,
+`foldable_copy`). In sessions an append never folds (folding at
+append time raced other processes: double folds, notes moved by
+`get_note` on read, undo losing enrichment, stale saves resurrecting
+copies). `scholar sessions reconcile S [--dry-run]`
+(`reconcile_session`) takes the session file lock (reentrant, so the
+inner `save_session` takes it again), loads fresh, folds every
+`foldable_copies` pair with `reconcile_copies` (an `is_unscreened` copy
+-- pending, untagged, human, no confidence or `LLM_AUDIT_FIELDS` -- into
+the other, or two equal decisions: `decision_state` includes source and
+audit fields, so a fold never relabels a source; not if both ids have
+notes), saves, and only then moves notes: `move_stranded_notes` moves
+every tombstoned id's note whose new id has none and whose old id the
+session no longer holds (a copy kept apart keeps its note), so a re-run
+repairs a failed note write or a note a stale process saved under the
+old id.
+`--dry-run` runs `reconcile_copies` in memory without saving, so it
+lists exactly what a real run folds. Each fold leaves a tombstone in `ReviewSession.folded` (`{old_id: new_id}`,
+the DOI-less id always the old one; saved as `"folded"` only when
+non-empty, united with the file's on save). `merge_concurrent_changes`
+calls `apply_tombstones` after the three-way decision merge and the
+disk additions (a disk target the session loaded and renamed is not
+re-added). **Folding happens only in `sessions reconcile`; a save never
+folds a decision.** `apply_tombstones` only drops an in-memory copy
+under a tombstoned id that this process left untouched: unscreened,
+unchanged since loaded, without a note, and no longer in the file (its
+links, provider and `merge_version_of` metadata go to the target).
+Every other copy stays beside its target, never copying or dropping a
+decision, and is listed as foldable or conflicting for the next
+reconcile. Races tested with real subprocesses in both save orders.
+In the merge the tombstones run after the decision merge and before
+the record merge and `supersede_merged_records`, which repoints the
+links a dropped copy gave its target like all others; providers of
+folded copies are united with `united_providers` (comma-joined, as
+per-provider `found_by` records them). `repoint_folded_ids`
+repoints snowball `source_papers` and LLM sample `paper_id`s;
+`create_review_session` routes a result under a tombstoned id to its
+target, unless `plausibly_same_work` rules it out (a namesake goes to
+`same_id_copies`). The drop guard allows only for decided copies the file holds
+under a tombstoned id that the session no longer holds.
+Nothing unreconciled is silent: `foldable_copies` (counted with the
+reconcile hint), `conflicting_copies` (pairs with different statuses,
+plus `same_id_copies`), `alike_copies` (same status, different
+tags/source: not folded, merging tags is a judgement) and
+`possible_copies` (DOI-less decisions sharing an `audit_work_key` with a
+DOI decision but in none of those lists) are shown by `sessions show`
+(lines; foldable and possible copies counted, ids in JSON) and counted
+in the report, which
+also states "Unique works" from the audit rows. **Remaining gap**: the
+pairing uses the exact title + surname hash, the audit work key is
+looser (punctuation, case, year), so on the real sessions 2995 DOI-less
+records share a work key with a DOI record and only 403 pair; the rest
+are only counted as possible copies, deliberately not folded.
+**Known limitation**: a DOI-less id is a hash of title + surname, so two
+works years apart share it, and decisions, notes and the registry
+cannot separate them without changing the id scheme. A session keeps
+the stored paper unmerged and notes the newcomer in
+`ReviewDecision.same_id_copies` (`{"year", "venue", "provider"}`,
+saved only when non-empty, unioned by the concurrent merge), which
+`sessions show` lists as a conflicting copy naming both years.
+
 ### Headless Review Sessions
 
 `scholar search -n <name>` persists the search to the named review session
@@ -966,7 +1036,16 @@ report body builders (`build_review_provenance_latex`,
   `supports-claim`/`qualifies-claim` (`audit_excluded`) is never in
   orders 0-2; it sorts as other (6) with reason "<category>, excluded"
   and the caption counts it apart (`extra_excluded`), so
-  `--bearing-only` never lists a rejected hit. The caption never
+  `--bearing-only` never lists a rejected hit. The other rows (6) are
+  counted by kind (#169): rows with a version note
+  (`AUDIT_VERSION_NOTES`) as "duplicates or other versions of cited
+  sources", discards under an exclusion criterion
+  (`audit_exclusion_criterion`: a discard with no category and no note
+  tag, its last tag that is not a `--theme`, which the row shows too; e.g. `no-abstract`) per
+  criterion as "excluded by the criterion <tag>" (`no-abstract`:
+  "excluded for lack of an abstract", `AUDIT_STRINGS[lang]["criteria"]`),
+  the rest as "other hits" (all localised). Criteria are the review's own labels, so
+  there is no fixed list. The caption never
   names the session (it is a `%` comment in the fragment) and ends with
   a full-name-first "Databases:" sentence built from the providers
   the session searched (search records that answered at least once,

@@ -6877,6 +6877,9 @@ def sessions_show(
     from scholar.review import (
         decision_source_counts, decision_source_items, load_session,
     )
+    from scholar.review import conflicting_copies, copy_conflict_line
+    from scholar.review import alike_copies, possible_copies
+    from scholar.review import foldable_copies
 
     console = Console()
     session = load_session(name)
@@ -6932,6 +6935,26 @@ def sessions_show(
                     "provider": d.provider,
                 }
                 for d in session.decisions
+            ],
+            **{
+                key: [
+                    {
+                        "paper_ids": [d.paper.id for d in c.decisions],
+                        "statuses": [d.status.value for d in c.decisions],
+                        "other_works": c.copies,
+                        "description": copy_conflict_line(c),
+                    }
+                    for c in copies(session)
+                ]
+                for key, copies in (
+                    ("conflicting_copies", conflicting_copies),
+                    ("alike_copies", alike_copies),
+                )
+            },
+            "possible_copies": [d.paper.id for d in possible_copies(session)],
+            "foldable_copies": [
+                [bare.paper.id, with_doi.paper.id]
+                for bare, with_doi in foldable_copies(session)
             ],
         }
         print(json.dumps(output, indent=2))
@@ -7011,6 +7034,9 @@ def sessions_show(
                 )
                 for d in pending:
                     con.print(session_paper_line(d))
+                con.print()
+
+            <<show the conflicting copies>>
 
         # Use pager if TTY, otherwise print directly
         if sys.stdout.isatty():
@@ -7223,6 +7249,44 @@ The closing table of confirmed and changed machine decisions has the
 rows of the report's summary ([[machine_review_rows]],
 \cref{sec:report-provenance}), one group for the LLM and one for the
 agent, so what the terminal says and what the document says agree.
+
+[[sessions show]] ends with the copies of one work that the session
+could not reconcile (\cref{sec:session-copies} in the review module).
+Conflicting copies---a copy with a DOI and one without, decided
+differently, or a DOI-less id under which a search also returned a work
+of a distant year---and copies decided alike but not merged get a line
+each, naming both ids, decisions and tags, or both years, so the user
+can settle them with [[sessions decide --paper-id]].  The foldable
+copies are counted with the command that folds them
+(\cref{sec:sessions-reconcile}); the possible copies, which can run to
+thousands, are only counted.  The JSON form lists the ids of both.  A
+session without any prints nothing here.
+
+<<show the conflicting copies>>=
+foldable = foldable_copies(session)
+if foldable:
+    con.print(
+        f"[magenta bold]Foldable copies: {len(foldable)}[/magenta bold]"
+        f" — run [bold]scholar sessions reconcile "
+        f"{escape(session.name or session.query)}[/bold]"
+    )
+    con.print()
+for heading, copies in (
+    ("Conflicting copies", conflicting_copies(session)),
+    ("Copies decided alike, not merged", alike_copies(session)),
+):
+    if copies:
+        con.print(f"[magenta bold]{heading} ({len(copies)}):[/magenta bold]")
+        for conflict in copies:
+            con.print(f"  • {escape(copy_conflict_line(conflict))}")
+        con.print()
+possible = possible_copies(session)
+if possible:
+    con.print(
+        f"[magenta bold]Possible copies, not reconciled: {len(possible)}"
+        "[/magenta bold] [dim](ids in -f json)[/dim]"
+    )
+@
 
 A fragment cannot set up its own bibliography, so both commands that
 write one end with the same reminder of what the including document
@@ -8531,6 +8595,75 @@ class TestSessionsCommand:
         assert decisions[1]["doi"] is None
         assert decisions[1]["paper_id"].startswith("hash:")
 
+    def test_sessions_show_lists_conflicting_copies(
+        self, tmp_path, monkeypatch
+    ):
+        """Copies left unreconciled are listed, in text and JSON."""
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        from scholar.review import (
+            ReviewSession, ReviewDecision, DecisionStatus, save_session,
+        )
+
+        bare = Paper(title="A Work", authors=["Ada Lovelace"], year=2021)
+        session = ReviewSession(
+            query="cc", providers=["openalex"], timestamp=datetime.now(),
+            name="cc",
+        )
+        session.decisions.extend([
+            ReviewDecision(
+                paper=bare, provider="dblp",
+                status=DecisionStatus.DISCARDED, tags=["no-abstract"],
+            ),
+            ReviewDecision(
+                paper=Paper(title="A Work", authors=["Ada Lovelace"],
+                            year=2021, doi="10.1/cc"),
+                provider="openalex", status=DecisionStatus.KEPT,
+            ),
+        ])
+        save_session(session)
+
+        alike = Paper(title="B Work", authors=["Ada Lovelace"], year=2021)
+        possible = Paper(title="C Work.", authors=["Ada Lovelace"],
+                         year=2021)
+        session.decisions.extend([
+            ReviewDecision(
+                paper=alike, provider="dblp",
+                status=DecisionStatus.KEPT, tags=["ml"],
+            ),
+            ReviewDecision(
+                paper=Paper(title="B Work", authors=["Ada Lovelace"],
+                            year=2021, doi="10.1/bb"),
+                provider="openalex", status=DecisionStatus.KEPT,
+                tags=["nlp"],
+            ),
+            ReviewDecision(paper=possible, provider="dblp"),
+            ReviewDecision(
+                paper=Paper(title="C work", authors=["Ada Lovelace"],
+                            year=2021, doi="10.1/cw"),
+                provider="openalex",
+            ),
+        ])
+        save_session(session)
+
+        result = runner.invoke(app, ["sessions", "show", "cc"])
+        assert result.exit_code == 0
+        flat = " ".join(result.output.split())
+        assert "Conflicting copies (1):" in flat
+        assert f"A Work: {bare.id} discarded (dblp) [no-abstract], " \
+            "doi:10.1/cc kept (openalex)" in flat
+        assert "Copies decided alike, not merged (1):" in flat
+        assert f"B Work: {alike.id} kept (dblp) [ml]" in flat
+        assert "Possible copies, not reconciled: 1" in flat
+
+        as_json = runner.invoke(app, ["sessions", "show", "cc", "-f", "json"])
+        shown = json.loads(as_json.output)
+        [conflict] = shown["conflicting_copies"]
+        assert conflict["paper_ids"] == [bare.id, "doi:10.1/cc"]
+        assert conflict["statuses"] == ["discarded", "kept"]
+        [alike_pair] = shown["alike_copies"]
+        assert alike_pair["paper_ids"] == [alike.id, "doi:10.1/bb"]
+        assert shown["possible_copies"] == [possible.id]
+
     def test_sessions_show_displays_search_filters(
         self, tmp_path, monkeypatch
     ):
@@ -8568,6 +8701,108 @@ class TestSessionsCommand:
         assert data["search_records"][0]["limit"] == 50
 @
 
+
+\subsection{Reconciling copies of one work}
+\label{sec:sessions-reconcile}
+
+One provider records a paper with its DOI, another without, and a
+session holds the two copies as two decisions.  An append never folds
+them (\cref{sec:session-copies} in the review chapter explains why: a
+fold in memory raced every other process that saved the session before
+it did).  [[sessions reconcile]] does it on request: under the session
+file's lock it loads the file, folds every foldable pair, writes, and
+then moves the notes of the folded copies ([[reconcile_session]]).  It
+prints each fold as the old and the new id, so the user sees what
+became of the ids they may have noted; [[--dry-run]] prints the same
+list and writes nothing.
+
+<<sessions command>>=
+@sessions_app.command("reconcile")
+def sessions_reconcile(
+    name: Annotated[
+        str,
+        typer.Argument(
+            help="Session name to reconcile.",
+            autocompletion=complete_session_name,
+        ),
+    ],
+    dry_run: Annotated[
+        bool,
+        typer.Option(
+            "--dry-run",
+            help="List the copies that would be folded; write nothing.",
+        ),
+    ] = False,
+) -> None:
+    """
+    Fold the copies of one work, with and without a DOI, in a session.
+
+    A copy nobody has screened is folded into the decided one, and two
+    equal decisions become one; copies decided differently are left for
+    `sessions show` to list. Notes move to the folded entry's id.
+    """
+    from scholar.review import SessionFileError, reconcile_session
+
+    console = Console()
+    try:
+        folds = reconcile_session(name, dry_run=dry_run)
+    except FileNotFoundError:
+        console.print(f"[red]Session not found: {escape(name)}[/red]")
+        raise typer.Exit(1)
+    except SessionFileError as error:
+        exit_on_unreadable_session(error)
+    for old_id, new_id in folds:
+        console.print(f"  {escape(old_id)} -> {escape(new_id)}")
+    verb = "Would fold" if dry_run else "Folded"
+    console.print(f"{verb} {len(folds)} copies in {escape(name)}.")
+@
+
+The command is run on a saved session, once as a dry run and once for
+real; the second run finds nothing left to fold.
+
+<<test functions>>=
+class TestSessionsReconcile:
+  def test_dry_run_then_fold(self, tmp_path, monkeypatch):
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+    from scholar.review import (
+      ReviewSession, ReviewDecision, DecisionStatus, save_session,
+      load_session,
+    )
+    bare = Paper(title="A Work", authors=["Ada Lovelace"], year=2021)
+    session = ReviewSession(
+      query="rc", providers=["openalex"], timestamp=datetime.now(),
+      name="rc",
+    )
+    session.decisions.extend([
+      ReviewDecision(paper=bare, provider="dblp"),
+      ReviewDecision(
+        paper=Paper(title="A Work", authors=["Ada Lovelace"], year=2021,
+                    doi="10.1/rc"),
+        provider="openalex", status=DecisionStatus.KEPT,
+      ),
+    ])
+    save_session(session)
+
+    shown = runner.invoke(app, ["sessions", "show", "rc"])
+    assert "Foldable copies: 1" in shown.output
+    assert "scholar sessions reconcile rc" in shown.output
+
+    dry = runner.invoke(app, ["sessions", "reconcile", "rc", "--dry-run"])
+    assert dry.exit_code == 0, dry.output
+    assert f"{bare.id} -> doi:10.1/rc" in dry.output
+    assert "Would fold 1 copies in rc." in dry.output
+    assert len(load_session("rc").decisions) == 2
+
+    done = runner.invoke(app, ["sessions", "reconcile", "rc"])
+    assert done.exit_code == 0, done.output
+    assert "Folded 1 copies in rc." in done.output
+    assert len(load_session("rc").decisions) == 1
+    again = runner.invoke(app, ["sessions", "reconcile", "rc"])
+    assert "Folded 0 copies" in again.output
+
+    missing = runner.invoke(app, ["sessions", "reconcile", "nope"])
+    assert missing.exit_code == 1
+@
 
 \subsection{Checking sessions with a semantic search}
 \label{sec:sessions-check}

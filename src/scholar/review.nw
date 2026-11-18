@@ -641,6 +641,10 @@ class ReviewDecision:
             recorded; empty when not recorded (sessions saved before the
             link existed, snowballing). The filters key is `None` for an
             old link that could not be tied to one record.
+        same_id_copies: Other works a search returned under this
+            paper's DOI-less id, with years too far apart to be the same
+            work (`{"year", "venue", "provider"}` each); see
+            `is_same_id_namesake`.
     """
     paper: Paper
     provider: str
@@ -651,6 +655,7 @@ class ReviewDecision:
     llm_confidence: float | None = None
     <<LLM audit fields of a decision>>
     found_by: list[tuple[str, str, str | None]] = field(default_factory=list)
+    same_id_copies: list[dict] = field(default_factory=list)
 
     def __post_init__(self):
         """Coerce None list fields to empty lists."""
@@ -658,6 +663,19 @@ class ReviewDecision:
             self.tags = []
         if self.found_by is None:
             self.found_by = []
+        if self.same_id_copies is None:
+            self.same_id_copies = []
+
+    def add_same_id_copy(self, copy: dict) -> None:
+        """Note another work returned under this paper's id, once."""
+        if copy not in self.same_id_copies:
+            self.same_id_copies.append(copy)
+
+    def note_same_id_copy(self, paper: Paper, provider: str) -> None:
+        """Note `paper` as another work returned under this paper's id."""
+        self.add_same_id_copy(
+            {"year": paper.year, "venue": paper.venue, "provider": provider}
+        )
 
     def record_search(
         self, query: str, provider: str, key: str | None
@@ -1881,6 +1899,8 @@ class ReviewSession:
     search_records: list[SearchRecord] = field(default_factory=list)
     snowball_rounds: list[SnowballRound] = field(default_factory=list)
     llm_samples: list[LLMSample] = field(default_factory=list)
+    # Tombstones of folded copies: folded-away id -> id folded into
+    folded: dict[str, str] = field(default_factory=dict)
     # Internal cache for computed properties (not persisted)
     _cache: dict = field(default_factory=dict, repr=False, compare=False)
     # State as loaded or last saved, for merging on save (not persisted)
@@ -2715,6 +2735,7 @@ def create_review_session(
         session.research_context = previous_session.research_context
     if previous_session:
         session._baseline = previous_session._baseline
+        session.folded = dict(previous_session.folded)
 
     # Build search records (query, provider, filters, limit, outcome),
     # one per provider search, also inside a merged result
@@ -3927,7 +3948,21 @@ for result in results:
         )
         paper_id = get_paper_id(paper)
 
+        folded_to = resolve_folded_id(session.folded, paper_id)
+        if folded_to != paper_id and folded_to in decision_lookup:
+            target = decision_lookup[folded_to]
+            if not plausibly_same_work(paper, target.paper):
+                target.note_same_id_copy(paper, found_by_provider)
+                continue
+            target.paper = merge_version_of(target.paper, paper)
+            for link in links:
+                target.record_search(*link)
+            continue
+
         existing = decision_lookup.get(paper_id)
+        if existing is not None and is_same_id_namesake(paper, existing.paper):
+            existing.note_same_id_copy(paper, found_by_provider)
+            continue
         if existing is not None:
             try:
                 existing.paper = existing.paper.merge_with(paper)
@@ -3987,9 +4022,16 @@ for result in results:
             legacy_id = legacy_hash_paper_id(paper.title, paper.authors)
             if prev_dec is None:
                 prev_dec = prev_decision_lookup.get(legacy_id)
+                if prev_dec and not plausibly_same_work(paper, prev_dec.paper):
+                    prev_dec = None
             if prev_record is None and previous_decisions:
                 prev_record = previous_decisions.decisions.get(legacy_id)
 
+        if prev_dec and is_same_id_namesake(paper, prev_dec.paper):
+            prev_dec.note_same_id_copy(paper, found_by_provider)
+            session.decisions.append(prev_dec)
+            decision_lookup[paper_id] = prev_dec
+            continue
         if prev_dec:
             # Use previous decision but with fresh paper data
             decision = ReviewDecision(
@@ -4002,6 +4044,7 @@ for result in results:
                 llm_confidence=prev_dec.llm_confidence,
                 **llm_audit_of(prev_dec),
                 found_by=list(prev_dec.found_by),
+                same_id_copies=list(prev_dec.same_id_copies),
             )
         elif prev_record:
             # Fallback to notes module format
@@ -4204,6 +4247,1345 @@ class TestRecordsPerProvider:
         ]
         merged = records[2]
         assert {k: merged[k] for k in old} == old
+@
+
+\subsection{Copies of one work}
+\label{sec:session-copies}
+
+A session holds one decision per paper id, and two copies of one work
+can still end up as two decisions, or two works as one (issue~\#170).
+Search-time deduplication (\cref{sec:doi-less-copies} in the scholar
+module) handles the copies within one result list; a session collects
+many result lists, from many providers and many runs, so it has to ask
+the same two questions itself.
+
+\paragraph{Two works under one id.}
+A paper without a DOI is identified by a hash of its title and its first
+author's surname, and an editorial column or a talk given twice shares
+that hash with a work of the same name years earlier.  Search-time
+deduplication keeps two such records apart when their years are more
+than one apart ([[plausibly_same_work]]); a session cannot.  Its
+decisions, the notes, the per-query decision files and the paper
+registry are all keyed by the id, so two works with one id would share
+one decision whatever we did, and changing the id scheme to include the
+year would orphan every stored decision and note of a DOI-less paper
+(the rule \enquote{at most one year apart} is not even transitive, so no
+year-based id could express it).  This is a known limitation: a
+DOI-less identity cannot tell such namesakes apart.  What the session
+can do is not pretend.  When a search returns a DOI-less paper whose id
+a decision already holds but whose year is implausible for it, the
+decision keeps its paper as it was---merging the two would give one
+work the other's year, venue or abstract---and the newcomer is noted in
+[[same_id_copies]] with its year, venue and provider.  The search link
+is not recorded either: that search did not return this work.  The note
+is persisted, so [[sessions show]] and the report can name both years
+and let the user tell at a glance that two works probably share an id.
+The same guard keeps a DOI paper from taking over the decision of a
+DOI-less paper years away from it, which the backward-compatible lookup
+by the legacy hash id would otherwise do.
+
+<<review session functions>>=
+def is_same_id_namesake(paper: Paper, held: Paper) -> bool:
+    """Whether DOI-less `paper` shares `held`'s id but not its work.
+
+    Both have the hash id of the same title and first author, and
+    `plausibly_same_work` rules out that they are one work (their years
+    are more than one apart).
+    """
+    return (
+        not paper.doi
+        and get_paper_id(paper) == get_paper_id(held)
+        and not plausibly_same_work(paper, held)
+    )
+<<review imports>>=
+from scholar.scholar import doi_copy_index, doi_copy_of, foldable_copy
+from scholar.notes import NotesFileError, list_papers_with_notes
+@
+
+\paragraph{One work under two ids.}
+The opposite case is more common: one provider records a paper with
+its DOI and another without, and the two copies get two ids and two
+decisions.  In the integrity review that raised issue~\#170 this was
+3.5\,\% of the records, and the copies of 258 works had been given
+different decisions.  Each DOI-less decision is paired with its DOI
+copy by [[doi_copy_of]], the search-time rule, and what may be done
+with a pair depends on what the two decisions say:
+\begin{description}
+\item[Foldable] One is pending and carries no tags and no trace of a
+  machine: nobody has screened it, so it can be folded into the
+  decided one, which keeps its decision, tags and source.  A pending
+  decision with a machine source or LLM audit fields
+  ([[LLM_AUDIT_FIELDS]]) is a classifier's withheld answer, not an
+  unscreened record, and is kept.  Two equal decisions can be folded
+  too, and lose nothing by becoming one: [[decision_state]] compares the
+  source and the audit fields as well, so an unreviewed machine
+  decision is never \enquote{equal} to a human one, and no fold changes
+  a decision's source.  A DOI-less copy without a year or an author is
+  never folded ([[foldable_copy]], \cref{sec:doi-less-copies} in the
+  scholar module): on the title alone, a DOI-less
+  \enquote{Introduction} is anybody's introduction.
+\item[Both are decided] but differ in status, tags or source: which
+  decision stands, or how to merge two sets of tags, is a judgement the
+  session does not make.  Both stay, and are listed for the user
+  (below).
+\end{description}
+
+\paragraph{Folding is a command, not a side effect.}
+A first version folded the copies at the end of every append, in
+memory, and saved the result whenever the session was next saved---after
+a whole TUI session with [[--review]].  Every way of making that safe
+failed against another process in the meantime: two processes making
+the same fold undid each other, a note read in the TUI moved to the DOI
+id ([[get_note]] migrates a legacy hash id on read) before a fold that
+was later undone, an undo threw away enrichment done to the survivor
+after the fold, and a process that had loaded the session before a fold
+brought the folded copy back, because the merge with the file knows
+additions but not deletions.  An append therefore never folds; it only
+lists (below).  Folding is [[scholar sessions reconcile]], which
+[[reconcile_session]] implements: it takes the session's file lock,
+loads the file fresh, folds, writes, and only after the write moves the
+notes, to the ids the folded entries have at that moment.  The lock is
+held for the milliseconds this takes, so no other process can save in
+between, and nothing needs to be undone.  The lock is the one
+[[save_session]] takes; it is reentrant within a process, so the save
+inside the reconcile takes it again without waiting for itself.
+
+The folded entry takes the DOI copy's paper, filled from the DOI-less
+copy without overwriting anything ([[merge_version_of]]), so its id is
+the DOI.  The search links, the other-work notes and the provider names
+of both copies are united (the names joined by a comma, as a session
+records a paper several providers returned, \cref{sec:review-found-by}), so provenance points at every search that
+returned either copy.  A pair whose copies both carry a note is not
+folded, because [[migrate_paper_id]] keeps the target's note and drops
+the moved one when both ids have a note.  If the notes file cannot be
+read, nothing is folded.
+
+<<review session functions>>=
+def united_providers(*providers: str | None) -> str:
+    """Join the provider names of several decisions, each name once."""
+    names = [
+        name.strip()
+        for provider in providers
+        for name in re.split(r"[;,|]", provider or "")
+        if name.strip()
+    ]
+    return ", ".join(dict.fromkeys(names))
+
+
+def _fold_direction(
+    bare: ReviewDecision, with_doi: ReviewDecision
+) -> tuple[ReviewDecision, ReviewDecision] | None:
+    """Return (survivor, absorbed) for a copy pair, or None to keep both."""
+    if decision_state(bare) == decision_state(with_doi):
+        return with_doi, bare
+    if is_unscreened(bare):
+        return with_doi, bare
+    if is_unscreened(with_doi):
+        return bare, with_doi
+    return None
+
+
+def is_unscreened(decision: ReviewDecision) -> bool:
+    """Whether nobody, human or machine, has looked at `decision`."""
+    return (
+        decision.status == DecisionStatus.PENDING and not decision.tags
+        and decision.source == ReviewSource.HUMAN
+        and decision.llm_confidence is None
+        and not any(llm_audit_of(decision).values())
+    )
+
+
+def _doi_copy_pairs(
+    session: ReviewSession,
+) -> list[tuple[ReviewDecision, ReviewDecision]]:
+    """Pair each DOI-less decision with the decision of its DOI copy."""
+    papers = [d.paper for d in session.decisions]
+    index = doi_copy_index(papers)
+    pairs = []
+    for decision in session.decisions:
+        target = doi_copy_of(decision.paper, papers, index)
+        if target is not None:
+            pairs.append((decision, session.decisions[target]))
+    return pairs
+
+
+def foldable_copies(
+    session: ReviewSession,
+) -> list[tuple[ReviewDecision, ReviewDecision]]:
+    """The copy pairs `reconcile_copies` would fold (notes aside)."""
+    return [
+        (bare, with_doi) for bare, with_doi in _doi_copy_pairs(session)
+        if foldable_copy(bare.paper)
+        and _fold_direction(bare, with_doi) is not None
+    ]
+
+
+def reconcile_copies(session: ReviewSession) -> list[tuple[str, str]]:
+    """Fold the foldable copy pairs of `session`, in memory.
+
+    Each fold is recorded in `session.folded` (old id to new id). Notes
+    are not moved; `reconcile_session` does that after the write.
+    Returns the `(old id, new id)` of each fold.
+    """
+    pairs = foldable_copies(session)
+    if not pairs:
+        return []
+    try:
+        noted = {note.paper_id for note in list_papers_with_notes()}
+    except NotesFileError as error:
+        logger.warning("%s; copies of one work were not folded", error)
+        return []
+    folds: list[tuple[str, str]] = []
+    removed: set[int] = set()
+    for bare, with_doi in pairs:
+        if {id(bare), id(with_doi)} & removed:
+            continue
+        bare_id, doi_id = get_paper_id(bare.paper), get_paper_id(with_doi.paper)
+        if bare_id in noted and doi_id in noted:
+            continue
+        survivor, absorbed = _fold_direction(bare, with_doi)
+        <<fold [[absorbed]] into [[survivor]]>>
+        session.folded[bare_id] = doi_id
+        folds.append((bare_id, doi_id))
+        if bare_id in noted:
+            noted.add(doi_id)
+        removed.add(id(absorbed))
+    session.decisions = [d for d in session.decisions if id(d) not in removed]
+    repoint_folded_ids(session)
+    session._invalidate_cache()
+    return folds
+@
+
+The DOI-less id is what disappears in either direction: when the
+DOI-less copy survives, it takes the DOI copy's paper and so its id.  So
+the record of a fold, its \emph{tombstone}, always maps the DOI-less id
+to the DOI id.
+
+<<fold [[absorbed]] into [[survivor]]>>=
+survivor.paper = merge_version_of(with_doi.paper, bare.paper)
+for link in absorbed.found_by:
+    survivor.record_search(*link)
+for copy in absorbed.same_id_copies:
+    survivor.add_same_id_copy(copy)
+survivor.provider = united_providers(survivor.provider, absorbed.provider)
+@
+
+The command's side: lock, load fresh, fold, save, then move the notes.
+A dry run makes the same folds in memory and writes nothing, so it
+lists exactly what a real run would fold, the pairs skipped for their
+notes included.  A save that fails raises before any note has moved,
+so the notes still match the file, which still holds both copies.
+
+The notes are moved from the tombstones, not only from this run's
+folds ([[move_stranded_notes]]): every folded-away id that still has a
+note, whose new id has none, gets it moved.  So a reconcile can be run
+again to repair what its notes step left undone: a note write that
+failed after the session was saved, or a note that a process which had
+loaded the session before the reconcile saved under the old id
+afterwards.  When both ids have a note the old one stays, as
+[[migrate_paper_id]] would otherwise drop it, and it is still found:
+[[has_note]] looks a DOI paper's note up under its legacy hash id too.
+A note whose old id the session still holds stays where it is: that
+copy was kept apart (below), and its note belongs to it.
+
+<<review session functions>>=
+def reconcile_session(
+    name: str, *, dry_run: bool = False
+) -> list[tuple[str, str]]:
+    """Fold the foldable copies of the saved session `name`.
+
+    Runs under the session file's lock: loads the file, folds, saves,
+    and then moves the notes of the folded copies to their new ids.
+    With `dry_run`, lists the folds without writing anything. Returns
+    the `(old id, new id)` of each fold (to be) made.
+    """
+    session = load_session(name, strict=True)
+    if session is None:
+        raise FileNotFoundError(f"Session not found: {name}")
+    if dry_run:
+        return reconcile_copies(session)
+    with file_lock(session_file_path(session)):
+        session = load_session(name, strict=True)
+        folds = reconcile_copies(session)
+        if folds:
+            save_session(session)
+    move_stranded_notes(session)
+    return folds
+
+
+def move_stranded_notes(session: ReviewSession) -> list[tuple[str, str]]:
+    """Move notes left under folded-away ids to their new id.
+
+    Only when the new id has no note and the session no longer holds a
+    decision under the old id. Returns the moves made.
+    """
+    if not session.folded:
+        return []
+    noted = {note.paper_id for note in list_papers_with_notes()}
+    held = {get_paper_id(d.paper) for d in session.decisions}
+    moves = []
+    for old_id in session.folded:
+        new_id = resolve_folded_id(session.folded, old_id)
+        if old_id in noted and new_id not in noted and old_id not in held:
+            migrate_paper_id(old_id, new_id)
+            noted.discard(old_id)
+            noted.add(new_id)
+            moves.append((old_id, new_id))
+    return moves
+@
+
+\paragraph{Tombstones.}
+A process that loaded the session before the reconcile still holds the
+folded copy, and its next save would write it back: the merge adds a
+paper only the file has, and keeps a paper only this process has.  So
+the session file records every fold in [[folded]], a map from the
+folded-away id to the id it was folded into, and the merge with the
+file (\cref{sec:session-integrity}) applies it.  The map is united with
+the file's on every save, like the search records, so a stale process
+cannot drop it either.  [[apply_tombstones]] then looks at each
+decision this process holds under a folded-away id.  The principle is
+strict: \emph{folding happens only in [[sessions reconcile]]; a save
+never folds a decision.}  Every attempt to let a save settle a stale
+copy against its target by comparing decisions lost a decision to some
+order of saves: with the tombstones applied before the merge, a stale
+copy's keep overwrote a discard another process had saved on the
+target; applied after it, the keep was copied onto the still
+unscreened target, and a discard saved after that won.  So a save only
+drops what this process did not touch:
+\begin{description}
+\item[Untouched] The copy is unscreened, its state is what this
+  process loaded (or, for a copy this process created, it is
+  unscreened all the same), it has no note, and the file no longer
+  holds it: the reconcile removed it there.  Nobody has screened it, so
+  it holds no decision to lose.  It is dropped, and its search links,
+  other-work notes, provider and metadata go to the target, the
+  metadata filling gaps only ([[merge_version_of]]) as in a fold, so an
+  abstract a stale process added to its copy is not lost.
+\item[Touched] This process decided it, tagged it, had an LLM classify
+  it, or gave it a note; or the copy was decided already when this
+  process loaded it; or the file still holds it, because it was kept
+  apart before.  The copy stays apart, beside its target, whatever the
+  target says.  A decided copy is never dropped by a save, even an
+  unchanged one equal to its target: that would be a fold.  [[sessions show]] lists the pair as
+  foldable or conflicting, and the next [[sessions reconcile]] settles
+  it from a fresh load under the lock.
+\end{description}
+It runs after the three-way merge of the decisions and the disk
+additions, so the target is the decision under the new id in the
+merged session; a target only the file holds is in it only if the merge
+added it, which it does not when this process loaded that id and then
+gave it another (a preprint adoption renames a paper), so no rename is
+undone by a duplicate.  Without a target, the copy stays and is listed
+again.
+An append ([[create_review_session]]) routes a search result that
+arrives under a folded-away id to its target directly, recording the
+search there, so a re-run of an old search does not bring the copy back
+even in memory.  The folded-away id is a DOI-less hash, so it is shared
+by namesakes (\cref{sec:session-copies}); a result whose year is
+implausible for the target is a namesake of the folded copy, not the
+copy, and is noted in the target's [[same_id_copies]] instead, as a
+namesake of a held paper is.  Paper ids stored elsewhere in the session---the source
+papers of a snowballing round, the drawn papers of an LLM review
+sample---are repointed to the new id ([[repoint_folded_ids]]), so that
+they still name a decision of the session.  A chain of folds (an id
+folded into one that was later folded again) is followed to its end,
+with a guard against a cycle that a hand-edited file could contain.
+
+<<review session functions>>=
+def resolve_folded_id(folded: dict[str, str], paper_id: str) -> str:
+    """Follow the tombstones in `folded` from `paper_id` to its end."""
+    seen = {paper_id}
+    while paper_id in folded and folded[paper_id] not in seen:
+        paper_id = folded[paper_id]
+        seen.add(paper_id)
+    return paper_id
+
+
+def repoint_folded_ids(session: ReviewSession) -> None:
+    """Repoint stored paper ids of folded-away copies to their target."""
+    if not session.folded:
+        return
+    for snowball_round in session.snowball_rounds:
+        snowball_round.source_papers = [
+            resolve_folded_id(session.folded, paper_id)
+            for paper_id in snowball_round.source_papers
+        ]
+    for sample in session.llm_samples:
+        for paper in sample.papers:
+            if paper.get("paper_id"):
+                paper["paper_id"] = resolve_folded_id(
+                    session.folded, paper["paper_id"]
+                )
+
+
+def apply_tombstones(
+    session: ReviewSession,
+    base_states: dict[str, tuple],
+    disk_decisions: dict[str, ReviewDecision],
+) -> None:
+    """Drop the untouched copies `session` holds under folded-away ids.
+
+    A copy is untouched when it is unscreened, unchanged since it was
+    loaded, has no note and is no longer in the file; its links and
+    metadata go to the target. Every other copy stays. Never changes or
+    drops a decision.
+    """
+    if not session.folded:
+        return
+    by_id = {get_paper_id(d.paper): d for d in session.decisions}
+    folded_held = [
+        paper_id for paper_id in by_id
+        if resolve_folded_id(session.folded, paper_id) != paper_id
+    ]
+    if not folded_held:
+        return
+    try:
+        noted = {note.paper_id for note in list_papers_with_notes()}
+    except NotesFileError:
+        return
+    dropped: set[int] = set()
+    for paper_id in folded_held:
+        decision = by_id[paper_id]
+        target = by_id.get(resolve_folded_id(session.folded, paper_id))
+        untouched = (
+            is_unscreened(decision)
+            and base_states.get(paper_id, decision_state(decision))
+            == decision_state(decision)
+            and paper_id not in noted
+            and paper_id not in disk_decisions
+        )
+        if target is None or not untouched:
+            continue
+        <<unite the links of [[decision]] into [[target]]>>
+        dropped.add(id(decision))
+    if dropped:
+        session.decisions = [
+            d for d in session.decisions if id(d) not in dropped
+        ]
+        session._invalidate_cache()
+@
+
+<<unite the links of [[decision]] into [[target]]>>=
+target.paper = merge_version_of(target.paper, decision.paper)
+for link in decision.found_by:
+    target.record_search(*link)
+for copy in decision.same_id_copies:
+    target.add_same_id_copy(copy)
+target.provider = united_providers(target.provider, decision.provider)
+@
+
+\paragraph{What is left for the user.}
+What is not folded is listed, never silently kept.  Four kinds remain,
+all found by reading the session only, so [[sessions show]] and the
+report can list them for any session, old ones included, without
+changing it:
+\begin{description}
+\item[Foldable copies] ([[foldable_copies]]): pairs that
+  [[sessions reconcile]] would fold.  They are counted with a hint to
+  run it.
+\item[Conflicting copies] ([[conflicting_copies]]): a pair decided with
+  different statuses, and a decision under whose DOI-less id a search
+  also returned a work of a distant year.
+\item[Copies decided alike, not merged] ([[alike_copies]]): a pair with
+  the same status but different tags or sources.  Folding them would
+  mean choosing tags or a source for the user.
+\item[Possible copies, not reconciled] ([[possible_copies]]): DOI-less
+  decisions that the audit table would merge with a DOI decision
+  ([[audit_work_key]]) but that are in none of the lists above.  The
+  pairing uses the exact title-and-surname hash, while the audit
+  table's key ignores punctuation, case and year, so it joins more: on
+  copies of the real sessions behind issue~\#170, the review of this
+  change found 2\,995 DOI-less records that share a work key with a DOI
+  record, of which only 403 were pairs.  The rest, and the pairs that
+  cannot be folded (no year or author, a pending copy with tags or a
+  machine's trace), are counted here, so that nothing goes
+  unreconciled without being said.  Folding is not widened to that key:
+  it ignores the year, and a fold is not taken back.
+\end{description}
+[[copy_conflict_line]] says in one line what the user needs to decide:
+the two copies' ids, decisions (with the source when it is not a
+human), providers and tags, or the two years (and venues, when they
+differ) of works that share an id.
+
+<<review session functions>>=
+@dataclass
+class CopyConflict:
+    """Copies of one work decided differently, or two works under one id.
+
+    `decisions` holds the session's copies (two for a DOI and a DOI-less
+    copy, one for an id shared by several works); `copies` the other
+    works a search returned under that id.
+    """
+
+    decisions: list[ReviewDecision]
+    copies: list[dict] = field(default_factory=list)
+
+
+def _decided_pairs(
+    session: ReviewSession,
+) -> list[tuple[ReviewDecision, ReviewDecision]]:
+    """The copy pairs that could be folded, both decided, not equal."""
+    return [
+        (bare, with_doi) for bare, with_doi in _doi_copy_pairs(session)
+        if foldable_copy(bare.paper)
+        and bare.is_decided and with_doi.is_decided
+        and decision_state(bare) != decision_state(with_doi)
+    ]
+
+
+def conflicting_copies(session: ReviewSession) -> list[CopyConflict]:
+    """List the copy conflicts in `session` that a user must resolve."""
+    conflicts = [
+        CopyConflict([bare, with_doi])
+        for bare, with_doi in _decided_pairs(session)
+        if bare.status != with_doi.status
+    ]
+    conflicts += [
+        CopyConflict([d], list(d.same_id_copies))
+        for d in session.decisions if d.same_id_copies
+    ]
+    return conflicts
+
+
+def alike_copies(session: ReviewSession) -> list[CopyConflict]:
+    """List the copy pairs decided with one status but not merged."""
+    return [
+        CopyConflict([bare, with_doi])
+        for bare, with_doi in _decided_pairs(session)
+        if bare.status == with_doi.status
+    ]
+
+
+def possible_copies(session: ReviewSession) -> list[ReviewDecision]:
+    """List DOI-less decisions sharing a work key with a DOI decision.
+
+    Those in a foldable, conflicting or alike pair are left out: they
+    are listed there.
+    """
+    listed = {id(bare) for bare, _ in _decided_pairs(session)}
+    listed |= {id(bare) for bare, _ in foldable_copies(session)}
+    doi_keys = {
+        audit_work_key(d.paper) for d in session.decisions if d.paper.doi
+    }
+    return [
+        d for d in session.decisions
+        if not d.paper.doi and id(d) not in listed
+        and audit_work_key(d.paper)[0]
+        and audit_work_key(d.paper) in doi_keys
+    ]
+
+
+def copy_conflict_line(conflict: CopyConflict) -> str:
+    """Describe one copy conflict in a line of plain text."""
+    first = conflict.decisions[0]
+    title = first.paper.title or "(untitled)"
+    if not conflict.copies:
+        def copy(d: ReviewDecision) -> str:
+            tags = f" [{', '.join(d.tags)}]" if d.tags else ""
+            by = ("" if d.source == ReviewSource.HUMAN
+                  else f" by {d.source.value}")
+            return (f"{get_paper_id(d.paper)} {d.status.value}{by} "
+                    f"({d.provider}){tags}")
+        return f"{title}: " + ", ".join(copy(d) for d in conflict.decisions)
+
+    def when(year, venue, shown_venue):
+        text = str(year) if year else "no year"
+        return f"{text}, {venue}" if venue and shown_venue else text
+
+    held = first.paper
+    others = "; ".join(
+        when(c.get("year"), c.get("venue"), c.get("venue") != held.venue)
+        + f" ({c.get('provider')})"
+        for c in conflict.copies
+    )
+    venue_differs = any(c.get("venue") != held.venue for c in conflict.copies)
+    return (
+        f"{title} ({get_paper_id(held)}): {first.status.value} as "
+        f"{when(held.year, held.venue, venue_differs)}; also returned as "
+        f"{others}; probably different works sharing one id"
+    )
+@
+
+The tests go through the real [[create_review_session]],
+[[reconcile_session]], save and load, with the notes and session files
+in the test's own data directory.  First the namesakes: an editorial of
+2018, kept, and one of 2023 under the same id; then the copies: a DBLP
+record without a DOI and the OpenAlex record with it.  Most races are
+played out in one process with two session objects, one loaded before
+the other's save, which is what a second process amounts to for the
+merge; the race that the re-review found with real processes (a stale
+process against a fresh decision on the DOI copy) is run in real
+subprocesses, so that it tests the files and the lock, not the paper
+registry that one process shares between its session objects.
+
+<<test functions>>=
+class TestSessionCopies:
+  @staticmethod
+  def _result(provider, papers, query="q"):
+    from scholar.scholar import SearchResult
+    return SearchResult(
+      query=query, provider=provider, timestamp="t", papers=papers,
+    )
+
+  def _append(self, provider, papers, query="q"):
+    session = create_review_session(
+      [self._result(provider, papers, query)], query,
+      session_name="copies",
+    )
+    save_session(session)
+    return load_session("copies")
+
+  @staticmethod
+  def _saved_papers():
+    """The papers as saved: this process's registry hands a load the
+    `Paper` objects it already holds, with their old metadata."""
+    import json
+    from scholar.review import _get_sessions_dir
+    data = json.loads((_get_sessions_dir() / "copies.json").read_text())
+    return [d["paper"] for d in data["decisions"]]
+
+  @staticmethod
+  def _noted_ids():
+    from scholar.notes import list_papers_with_notes
+    return {note.paper_id for note in list_papers_with_notes()}
+
+  def _two_copies(self, bare_decision, doi_decision, doi="10.1145/race",
+                  bare_year=2021):
+    """Save a session holding a DOI-less and a DOI copy of one work."""
+    bare = Paper(title="A Work", authors=["Ada Lovelace"], year=bare_year)
+    with_doi = Paper(title="A Work", authors=["Ada Lovelace"], year=2021,
+                     doi=doi)
+    session = ReviewSession(query="q", providers=["p"],
+                            timestamp=datetime.now(), name="copies")
+    session.decisions = [
+      ReviewDecision(paper=bare, provider="dblp", status=bare_decision[0],
+                     tags=list(bare_decision[1])),
+      ReviewDecision(paper=with_doi, provider="openalex",
+                     status=doi_decision[0], tags=list(doi_decision[1])),
+    ]
+    save_session(session)
+    return bare, with_doi
+
+  @staticmethod
+  def _decide_copy(with_doi, status, tags):
+    """Another process decides one copy and saves."""
+    other = load_session("copies")
+    for decision in other.decisions:
+      if bool(decision.paper.doi) == with_doi:
+        decision.status, decision.tags = status, list(tags)
+    save_session(other)
+
+  @staticmethod
+  def _states():
+    return {
+      d.paper.id: (d.status, d.tags) for d in load_session("copies").decisions
+    }
+
+  def _decide(self, session, status, tags=()):
+    for decision in session.decisions:
+      decision.status, decision.tags = status, list(tags)
+    save_session(session)
+
+  def test_a_namesake_years_apart_is_noted_not_merged(self):
+    old = Paper(title="Editorial", authors=["J. Smith"], year=2018,
+                venue="CACM")
+    session = self._append("dblp", [old])
+    self._decide(session, DecisionStatus.KEPT, ["ml"])
+    new = Paper(title="Editorial", authors=["J. Smith"], year=2023,
+                venue="IEEE Software", abstract="Other text.")
+    session = self._append("openalex", [new], query="q2")
+    [decision] = session.decisions
+    [saved] = self._saved_papers()
+    assert (saved["year"], saved["venue"]) == (2018, "CACM")
+    assert saved.get("abstract") is None
+    assert decision.status == DecisionStatus.KEPT
+    assert decision.same_id_copies == [
+      {"year": 2023, "venue": "IEEE Software", "provider": "openalex"},
+    ]
+    assert all(link[0] != "q2" for link in decision.found_by)
+    [conflict] = conflicting_copies(session)
+    assert copy_conflict_line(conflict) == (
+      f"Editorial ({decision.paper.id}): kept as 2018, CACM; also "
+      "returned as 2023, IEEE Software (openalex); probably different "
+      "works sharing one id"
+    )
+
+  def test_the_note_survives_later_appends_and_concurrent_saves(self):
+    old = Paper(title="Editorial", authors=["J. Smith"], year=2018)
+    new = Paper(title="Editorial", authors=["J. Smith"], year=2023)
+    self._append("dblp", [old])
+    stale = load_session("copies")
+    self._append("openalex", [new], query="q2")
+    session = create_review_session(
+      [self._result("dblp", [old])], "q", session_name="copies",
+    )
+    assert session.decisions[0].same_id_copies == [
+      {"year": 2023, "venue": None, "provider": "openalex"},
+    ]
+    save_session(session)
+    stale.decisions[0].status = DecisionStatus.KEPT
+    save_session(stale)
+    session = load_session("copies")
+    assert session.decisions[0].status == DecisionStatus.KEPT
+    assert len(session.decisions[0].same_id_copies) == 1
+
+  def test_a_namesake_in_one_run_is_noted(self):
+    a = Paper(title="Editorial", authors=["J. Smith"], year=2018)
+    b = Paper(title="Editorial", authors=["J. Smith"], year=2023)
+    session = create_review_session(
+      [self._result("dblp", [a]), self._result("hal", [b])], "q",
+    )
+    [decision] = session.decisions
+    assert decision.paper.year == 2018
+    assert decision.same_id_copies == [
+      {"year": 2023, "venue": None, "provider": "hal"},
+    ]
+    assert copy_conflict_line(conflicting_copies(session)[0]).endswith(
+      "pending as 2018; also returned as 2023 (hal); probably different "
+      "works sharing one id"
+    )
+
+  def test_a_doi_paper_does_not_take_a_distant_doi_less_decision(self):
+    old = Paper(title="A Work", authors=["Ada Lovelace"], year=2010)
+    session = self._append("dblp", [old])
+    self._decide(session, DecisionStatus.DISCARDED, ["off-topic-false-hit"])
+    new = Paper(title="A Work", authors=["Ada Lovelace"], year=2020,
+                doi="10.1145/far")
+    session = self._append("openalex", [new])
+    statuses = {d.paper.id: d.status for d in session.decisions}
+    assert statuses["doi:10.1145/far"] == DecisionStatus.PENDING
+
+  def test_an_append_never_folds(self):
+    pending, kept = (DecisionStatus.PENDING, []), (DecisionStatus.KEPT, ["ml"])
+    bare, with_doi = self._two_copies(pending, kept)
+    session = self._append("dblp", [bare], query="q2")
+    assert len(session.decisions) == 2
+    assert len(foldable_copies(session)) == 1
+    assert possible_copies(session) == []
+    assert r"\item[Foldable copies] 1, see \texttt{scholar sessions " \
+      "reconcile}" in report_work_items(session)
+
+  def test_reconcile_folds_and_then_moves_the_note(self):
+    from scholar.notes import save_note, get_note
+    pending, kept = (DecisionStatus.PENDING, []), (DecisionStatus.KEPT, ["ml"])
+    bare, with_doi = self._two_copies(pending, kept, doi="10.1145/fold")
+    save_note(bare, "read the DBLP copy")
+    assert reconcile_session("copies") == [(bare.id, "doi:10.1145/fold")]
+    session = load_session("copies")
+    [decision] = session.decisions
+    assert decision.paper.doi == "10.1145/fold"
+    assert (decision.status, decision.tags) == (DecisionStatus.KEPT, ["ml"])
+    assert decision.provider == "openalex, dblp"
+    assert session.folded == {bare.id: "doi:10.1145/fold"}
+    assert self._noted_ids() == {"doi:10.1145/fold"}
+    assert get_note(decision.paper).note == "read the DBLP copy"
+    assert reconcile_session("copies") == []
+
+  def test_a_failed_write_moves_no_note(self, monkeypatch):
+    import scholar.review
+    from scholar.notes import save_note
+    pending, kept = (DecisionStatus.PENDING, []), (DecisionStatus.KEPT, ["ml"])
+    bare, with_doi = self._two_copies(pending, kept)
+    save_note(bare, "read the DBLP copy")
+
+    def fail(*args, **kwargs):
+      raise OSError("disk full")
+
+    with monkeypatch.context() as patched:
+      patched.setattr(scholar.review, "atomic_write_text", fail)
+      with pytest.raises(OSError):
+        reconcile_session("copies")
+    assert self._noted_ids() == {bare.id}
+    assert len(self._saved_papers()) == 2
+
+  def test_a_dry_run_writes_nothing(self):
+    from scholar.notes import save_note
+    from scholar.review import _get_sessions_dir
+    pending, kept = (DecisionStatus.PENDING, []), (DecisionStatus.KEPT, ["ml"])
+    bare, with_doi = self._two_copies(pending, kept)
+    save_note(bare, "read the DBLP copy")
+    path = _get_sessions_dir() / "copies.json"
+    before = path.read_bytes()
+    assert reconcile_session("copies", dry_run=True) \
+      == [(bare.id, "doi:10.1145/race")]
+    assert path.read_bytes() == before
+    assert self._noted_ids() == {bare.id}
+
+  def test_a_decided_doi_less_copy_takes_the_doi(self):
+    discarded = (DecisionStatus.DISCARDED, ["no-abstract"])
+    bare, with_doi = self._two_copies(discarded, (DecisionStatus.PENDING, []))
+    reconcile_session("copies")
+    assert self._states() == {"doi:10.1145/race": discarded}
+
+  def test_reconciling_equal_decisions_raises_no_alarm(self, caplog):
+    import logging
+    kept = (DecisionStatus.KEPT, ["ml"])
+    self._two_copies(kept, kept)
+    with caplog.at_level(logging.WARNING):
+      assert len(reconcile_session("copies")) == 1
+    assert self._states() == {"doi:10.1145/race": kept}
+    assert "reduces the decided papers" not in caplog.text
+
+  def test_the_drop_guard_allows_only_tombstoned_copies(self, caplog):
+    import logging
+    kept = (DecisionStatus.KEPT, ["ml"])
+    self._two_copies(kept, kept)
+    session = load_session("copies")
+    session.folded["hash:not-in-the-file"] = "doi:10.1145/race"
+    session.decisions = session.decisions[1:]
+    with caplog.at_level(logging.WARNING):
+      save_session(session)
+    assert "reduces the decided papers from 2 to 1" in caplog.text
+
+  def test_copies_that_both_have_notes_are_not_folded(self):
+    from scholar.notes import save_note
+    pending, kept = (DecisionStatus.PENDING, []), (DecisionStatus.KEPT, ["ml"])
+    bare, with_doi = self._two_copies(pending, kept)
+    save_note(with_doi, "DOI note")
+    save_note(bare, "DBLP note")
+    assert reconcile_session("copies") == []
+    assert len(self._saved_papers()) == 2
+
+  def test_a_stale_save_does_not_bring_a_reconciled_copy_back(self):
+    pending, kept = (DecisionStatus.PENDING, []), (DecisionStatus.KEPT, ["ml"])
+    bare, with_doi = self._two_copies(pending, kept)
+    stale = load_session("copies")
+    reconcile_session("copies")
+    stale.research_context = "edited meanwhile"
+    save_session(stale)
+    assert self._states() == {"doi:10.1145/race": kept}
+    assert load_session("copies").folded == {bare.id: "doi:10.1145/race"}
+
+  def test_a_stale_decided_copy_stays_until_reconciled(self):
+    """The decided DOI-less copy took the DOI; the stale process left its
+    copy unchanged, but a save never drops a decided copy."""
+    discarded = (DecisionStatus.DISCARDED, ["no-abstract"])
+    bare, with_doi = self._two_copies(discarded, (DecisionStatus.PENDING, []))
+    stale = load_session("copies")
+    reconcile_session("copies")
+    stale.research_context = "edited meanwhile"
+    save_session(stale)
+    assert self._states() == {
+      bare.id: discarded, "doi:10.1145/race": discarded,
+    }
+    assert len(foldable_copies(load_session("copies"))) == 1
+    assert len(reconcile_session("copies")) == 1
+    assert self._states() == {"doi:10.1145/race": discarded}
+
+  def test_the_drop_guard_ignores_tombstones_of_kept_copies(self, caplog):
+    import logging
+    bare, with_doi = self._two_copies(
+      (DecisionStatus.KEPT, ["ml"]), (DecisionStatus.KEPT, ["nlp"]),
+    )
+    session = load_session("copies")
+    session.decisions.append(ReviewDecision(
+      paper=Paper(title="Other", authors=["B"], doi="10.1/other"),
+      provider="p", status=DecisionStatus.KEPT,
+    ))
+    save_session(session)
+    session = load_session("copies")
+    session.folded[bare.id] = "doi:10.1145/race"
+    session.decisions = [d for d in session.decisions
+                         if d.paper.title != "Other"]
+    with caplog.at_level(logging.WARNING):
+      save_session(session)
+    assert "reduces the decided papers from 3 to 2" in caplog.text
+
+  def test_a_fresh_decision_on_the_doi_copy_survives_a_stale_process(self):
+    """The re-review's sequence, in real processes: P loads, both copies
+    unscreened; the reconcile folds them; Q discards the DOI copy and
+    saves; P keeps the DOI-less copy and saves."""
+    import subprocess
+    import sys
+    import textwrap
+    pending = (DecisionStatus.PENDING, [])
+    bare, with_doi = self._two_copies(pending, pending)
+    stale = subprocess.Popen(
+      [sys.executable, "-c", textwrap.dedent("""
+        import sys
+        from scholar.review import DecisionStatus, load_session, save_session
+        session = load_session("copies")
+        print("loaded", flush=True)
+        sys.stdin.readline()
+        for decision in session.decisions:
+          if not decision.paper.doi:
+            decision.status, decision.tags = DecisionStatus.KEPT, ["p"]
+        save_session(session)
+      """)],
+      stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+    )
+    try:
+      assert stale.stdout.readline().strip() == "loaded"
+
+      def run(code):
+        subprocess.run([sys.executable, "-c", textwrap.dedent(code)],
+                       check=True, timeout=120)
+
+      run("""
+        from scholar.review import reconcile_session
+        assert len(reconcile_session("copies")) == 1
+      """)
+      run("""
+        from scholar.review import DecisionStatus, load_session, save_session
+        session = load_session("copies")
+        [decision] = session.decisions
+        decision.status, decision.tags = DecisionStatus.DISCARDED, ["q"]
+        save_session(session)
+      """)
+      stale.communicate("go\n", timeout=120)
+    finally:
+      if stale.poll() is None:
+        stale.kill()
+    assert stale.returncode == 0
+    assert self._states() == {
+      "doi:10.1145/race": (DecisionStatus.DISCARDED, ["q"]),
+      bare.id: (DecisionStatus.KEPT, ["p"]),
+    }
+
+  @staticmethod
+  def _waiting_process(body):
+    """A real process that loads the session, waits for a line on its
+    standard input, then runs `body` on the session and saves it."""
+    import subprocess
+    import sys
+    import textwrap
+    code = textwrap.dedent("""
+      import sys
+      from scholar.review import DecisionStatus, load_session, save_session
+      session = load_session("copies")
+      print("loaded", flush=True)
+      sys.stdin.readline()
+    """) + textwrap.dedent(body) + "\nsave_session(session)\n"
+    process = subprocess.Popen(
+      [sys.executable, "-c", code],
+      stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+    )
+    assert process.stdout.readline().strip() == "loaded"
+    return process
+
+  @staticmethod
+  def _release(process):
+    try:
+      process.communicate("go\n", timeout=120)
+    finally:
+      if process.poll() is None:
+        process.kill()
+    assert process.returncode == 0
+
+  @pytest.mark.parametrize("order", ["P then Q", "Q then P"])
+  def test_a_stale_keep_and_a_fresh_discard_both_survive(self, order):
+    """P and Q load; the reconcile folds the unscreened copies; P keeps
+    the DOI-less copy, Q discards the DOI copy, in either order."""
+    import subprocess
+    import sys
+    pending = (DecisionStatus.PENDING, [])
+    bare, with_doi = self._two_copies(pending, pending)
+    keep = self._waiting_process("""
+      for decision in session.decisions:
+        if not decision.paper.doi:
+          decision.status, decision.tags = DecisionStatus.KEPT, ["p"]
+    """)
+    discard = self._waiting_process("""
+      for decision in session.decisions:
+        if decision.paper.doi:
+          decision.status, decision.tags = DecisionStatus.DISCARDED, ["q"]
+    """)
+    subprocess.run([sys.executable, "-c",
+                    "from scholar.review import reconcile_session; "
+                    "assert len(reconcile_session('copies')) == 1"],
+                   check=True, timeout=120)
+    first, second = (keep, discard) if order == "P then Q" \
+      else (discard, keep)
+    self._release(first)
+    self._release(second)
+    expected = {
+      bare.id: (DecisionStatus.KEPT, ["p"]),
+      "doi:10.1145/race": (DecisionStatus.DISCARDED, ["q"]),
+    }
+    assert self._states() == expected
+    assert len(conflicting_copies(load_session("copies"))) == 1
+    assert reconcile_session("copies") == []
+    assert self._states() == expected
+
+  def test_a_noted_stale_copy_stays_until_reconciled(self):
+    from scholar.notes import save_note
+    pending, kept = (DecisionStatus.PENDING, []), (DecisionStatus.KEPT, ["ml"])
+    bare, with_doi = self._two_copies(pending, kept)
+    stale = load_session("copies")
+    reconcile_session("copies")
+    save_note(bare, "written by the stale process")
+    save_session(stale)
+    session = load_session("copies")
+    assert len(session.decisions) == 2
+    assert len(foldable_copies(session)) == 1
+    assert len(reconcile_session("copies")) == 1
+    assert self._noted_ids() == {"doi:10.1145/race"}
+
+  def test_a_copy_reset_by_the_stale_process_stays(self):
+    discarded = (DecisionStatus.DISCARDED, ["no-abstract"])
+    bare, with_doi = self._two_copies(discarded, (DecisionStatus.PENDING, []))
+    stale = load_session("copies")
+    reconcile_session("copies")
+    for decision in stale.decisions:
+      if not decision.paper.doi:
+        decision.status, decision.tags = DecisionStatus.PENDING, []
+    save_session(stale)
+    assert self._states() == {
+      bare.id: (DecisionStatus.PENDING, []), "doi:10.1145/race": discarded,
+    }
+
+  def test_a_copy_the_file_still_holds_is_never_dropped(self):
+    from scholar.notes import save_note, delete_note
+    pending, kept = (DecisionStatus.PENDING, []), (DecisionStatus.KEPT, ["ml"])
+    bare, with_doi = self._two_copies(pending, kept)
+    stale = load_session("copies")
+    reconcile_session("copies")
+    save_note(bare, "keeps the copy apart")
+    save_session(stale)
+    delete_note(bare)
+    later = load_session("copies")
+    later.research_context = "edited"
+    save_session(later)
+    assert set(self._states()) == {bare.id, "doi:10.1145/race"}
+
+  def test_a_dropped_copy_s_links_follow_a_superseded_record(self):
+    """A stale process holds the copies with links to an old merged
+    record; meanwhile per-provider records superseded it and the copies
+    were reconciled. The stale save drops the untouched copy, and its
+    link ends on the per-provider records, not on the merged one."""
+    merged = SearchRecord("q | q", "openalex, dblp", None, 100, hits=2)
+    link = merged.key
+    pending, kept = (DecisionStatus.PENDING, []), (DecisionStatus.KEPT, ["ml"])
+    bare, with_doi = self._two_copies(pending, kept)
+    session = load_session("copies")
+    session.search_records = [merged]
+    for decision in session.decisions:
+      decision.found_by = [link]
+    save_session(session)
+    stale = load_session("copies")
+    rerun = load_session("copies")
+    rerun.search_records += [
+      SearchRecord("q", provider, None, 100, hits=2)
+      for provider in ("openalex", "dblp")
+    ]
+    save_session(rerun)
+    reconcile_session("copies")
+    stale.research_context = "edited meanwhile"
+    save_session(stale)
+    final = load_session("copies")
+    [decision] = final.decisions
+    assert decision.paper.doi == "10.1145/race"
+    assert set(decision.found_by) == {
+      ("q", "openalex", ""), ("q", "dblp", ""),
+    }
+    assert [r.provider for r in final.search_records] == ["openalex", "dblp"]
+
+  def test_a_note_stays_on_a_copy_kept_apart(self):
+    from scholar.notes import save_note
+    pending, kept = (DecisionStatus.PENDING, []), (DecisionStatus.KEPT, ["ml"])
+    bare, with_doi = self._two_copies(pending, kept)
+    stale = load_session("copies")
+    reconcile_session("copies")
+    for decision in stale.decisions:
+      if not decision.paper.doi:
+        decision.status, decision.tags = DecisionStatus.DISCARDED, ["x"]
+    save_session(stale)
+    save_note(bare, "why the DBLP copy was discarded")
+    assert reconcile_session("copies") == []
+    assert self._noted_ids() == {bare.id}
+
+  def test_a_stale_copy_gives_its_metadata_to_the_target(self):
+    pending, kept = (DecisionStatus.PENDING, []), (DecisionStatus.KEPT, ["ml"])
+    bare, with_doi = self._two_copies(pending, kept)
+    stale = load_session("copies")
+    reconcile_session("copies")
+    for decision in stale.decisions:
+      if not decision.paper.doi:
+        decision.paper = Paper(title="A Work", authors=["Ada Lovelace"],
+                               year=2021, abstract="Enriched.")
+    save_session(stale)
+    [saved] = self._saved_papers()
+    assert (saved["doi"], saved["abstract"]) == ("10.1145/race", "Enriched.")
+
+  def test_a_renamed_target_gets_no_duplicate(self):
+    pending, kept = (DecisionStatus.PENDING, []), (DecisionStatus.KEPT, ["ml"])
+    bare, with_doi = self._two_copies(pending, kept)
+    stale = load_session("copies")
+    reconcile_session("copies")
+    preprint = Paper(
+      title="A Work", authors=["Ada Lovelace"], year=2021,
+      doi="10.48550/arXiv.2101.00001", venue="arXiv",
+      published_versions=[{"doi": "10.1145/race", "relation": "preprint-of"}],
+    )
+    for decision in stale.decisions:
+      if decision.paper.doi:
+        decision.paper = preprint
+    save_session(stale)
+    assert set(self._states()) == {bare.id, preprint.id}
+
+  def test_a_namesake_is_not_routed_into_the_target(self):
+    pending, kept = (DecisionStatus.PENDING, []), (DecisionStatus.KEPT, ["ml"])
+    bare, with_doi = self._two_copies(pending, kept)
+    reconcile_session("copies")
+    namesake = Paper(title="A Work", authors=["Ada Lovelace"], year=2008,
+                     abstract="Another work.")
+    session = create_review_session(
+      [self._result("dblp", [namesake], query="q2")], "q2",
+      session_name="copies",
+    )
+    [decision] = session.decisions
+    assert decision.paper.abstract is None
+    assert decision.same_id_copies == [
+      {"year": 2008, "venue": None, "provider": "dblp"},
+    ]
+    assert all(link[0] != "q2" for link in decision.found_by)
+
+  def test_a_rerun_moves_a_note_whose_move_failed(self, monkeypatch):
+    import scholar.review
+    from scholar.notes import save_note
+    pending, kept = (DecisionStatus.PENDING, []), (DecisionStatus.KEPT, ["ml"])
+    bare, with_doi = self._two_copies(pending, kept)
+    save_note(bare, "read the DBLP copy")
+
+    def fail(*args, **kwargs):
+      raise OSError("notes file locked")
+
+    with monkeypatch.context() as patched:
+      patched.setattr(scholar.review, "migrate_paper_id", fail)
+      with pytest.raises(OSError):
+        reconcile_session("copies")
+    assert len(self._saved_papers()) == 1
+    assert self._noted_ids() == {bare.id}
+    assert reconcile_session("copies") == []
+    assert self._noted_ids() == {"doi:10.1145/race"}
+
+  def test_a_rerun_moves_a_note_saved_late_under_the_old_id(self):
+    from scholar.notes import save_note
+    pending, kept = (DecisionStatus.PENDING, []), (DecisionStatus.KEPT, ["ml"])
+    bare, with_doi = self._two_copies(pending, kept)
+    reconcile_session("copies")
+    save_note(bare, "written by a process that loaded before")
+    assert self._noted_ids() == {bare.id}
+    assert reconcile_session("copies") == []
+    assert self._noted_ids() == {"doi:10.1145/race"}
+
+  def test_the_dry_run_lists_what_a_real_run_folds(self):
+    from scholar.notes import save_note
+    papers = [
+      Paper(title=title, authors=["Ada Lovelace"], year=2021, doi=doi)
+      for title in ("Noted", "Plain") for doi in (None, f"10.1/{title}")
+    ]
+    session = ReviewSession(query="q", providers=["p"],
+                            timestamp=datetime.now(), name="copies")
+    session.decisions = [
+      ReviewDecision(paper=paper, provider="p",
+                     status=(DecisionStatus.KEPT if paper.doi
+                             else DecisionStatus.PENDING))
+      for paper in papers
+    ]
+    save_session(session)
+    save_note(papers[1], "DOI note")
+    save_note(papers[0], "DBLP note")
+    dry = reconcile_session("copies", dry_run=True)
+    assert dry == [(papers[2].id, "doi:10.1/plain")]
+    assert reconcile_session("copies") == dry
+
+  def test_llm_samples_are_repointed(self):
+    from scholar.review import LLMSample
+    pending, kept = (DecisionStatus.PENDING, []), (DecisionStatus.KEPT, ["ml"])
+    bare, with_doi = self._two_copies(pending, kept)
+    session = load_session("copies")
+    session.llm_samples.append(LLMSample(
+      sample_id="s1", seed=1, drawn_at="2026-11-18T00:00:00+00:00",
+      criteria={}, sessions=["copies"], population=1,
+      population_digest="d", size=1,
+      papers=[{"paper_id": bare.id, "status": "pending", "source": "llm",
+               "confidence": None}],
+    ))
+    save_session(session)
+    reconcile_session("copies")
+    [sample] = load_session("copies").llm_samples
+    assert sample.papers[0]["paper_id"] == "doi:10.1145/race"
+
+  def test_a_stale_decision_on_the_folded_copy_is_kept_apart(self):
+    """B loaded before the reconcile and discards the DOI-less copy."""
+    pending, kept = (DecisionStatus.PENDING, []), (DecisionStatus.KEPT, ["ml"])
+    bare, with_doi = self._two_copies(pending, kept)
+    stale = load_session("copies")
+    reconcile_session("copies")
+    for decision in stale.decisions:
+      if not decision.paper.doi:
+        decision.status, decision.tags = DecisionStatus.DISCARDED, ["x"]
+    save_session(stale)
+    assert self._states() == {
+      bare.id: (DecisionStatus.DISCARDED, ["x"]),
+      "doi:10.1145/race": kept,
+    }
+    [conflict] = conflicting_copies(load_session("copies"))
+
+  def test_a_stale_decision_on_the_taken_doi_copy_is_kept_apart(self):
+    """The decided DOI-less copy took the DOI; B keeps the DOI copy."""
+    discarded = (DecisionStatus.DISCARDED, ["no-abstract"])
+    bare, with_doi = self._two_copies(discarded, (DecisionStatus.PENDING, []))
+    stale = load_session("copies")
+    reconcile_session("copies")
+    for decision in stale.decisions:
+      if decision.paper.doi:
+        decision.status, decision.tags = DecisionStatus.KEPT, ["ml"]
+    save_session(stale)
+    assert self._states() == {
+      bare.id: discarded,
+      "doi:10.1145/race": (DecisionStatus.KEPT, ["ml"]),
+    }
+
+  def test_a_decision_saved_before_the_reconcile_is_seen_by_it(self):
+    pending, kept = (DecisionStatus.PENDING, []), (DecisionStatus.KEPT, ["ml"])
+    bare, with_doi = self._two_copies(pending, kept)
+    self._decide_copy(False, DecisionStatus.DISCARDED, ["x"])
+    assert reconcile_session("copies") == []
+    assert len(conflicting_copies(load_session("copies"))) == 1
+
+  def test_a_search_returning_a_folded_copy_feeds_its_target(self):
+    pending, kept = (DecisionStatus.PENDING, []), (DecisionStatus.KEPT, ["ml"])
+    bare, with_doi = self._two_copies(pending, kept)
+    reconcile_session("copies")
+    session = create_review_session(
+      [self._result("dblp", [bare], query="q2")], "q2",
+      session_name="copies",
+    )
+    [decision] = session.decisions
+    assert decision.paper.id == "doi:10.1145/race"
+    assert ("q2", "dblp", "") in decision.found_by
+
+  def test_tombstones_round_trip_merge_and_repoint(self):
+    from scholar.review import SnowballRound
+    pending, kept = (DecisionStatus.PENDING, []), (DecisionStatus.KEPT, ["ml"])
+    bare, with_doi = self._two_copies(pending, kept)
+    session = load_session("copies")
+    session.snowball_rounds.append(SnowballRound(
+      timestamp=datetime(2026, 1, 1), source_papers=[bare.id],
+      direction="references", papers_added=0,
+    ))
+    save_session(session)
+    other = load_session("copies")
+    reconcile_session("copies")
+    other.folded["hash:elsewhere"] = "doi:10.1/elsewhere"
+    save_session(other)
+    final = load_session("copies")
+    assert final.folded == {
+      bare.id: "doi:10.1145/race", "hash:elsewhere": "doi:10.1/elsewhere",
+    }
+    assert final.snowball_rounds[0].source_papers == ["doi:10.1145/race"]
+    assert resolve_folded_id({"a": "b", "b": "a"}, "a") == "b"
+
+  def test_a_copy_without_year_or_author_is_listed_not_folded(self):
+    yearless = Paper(title="Introduction", authors=["Ada Lovelace"])
+    dated = Paper(title="Introduction", authors=["Ada Lovelace"], year=2021,
+                  doi="10.1/intro")
+    authorless = Paper(title="Introduction", authors=[], year=2021)
+    anonymous = Paper(title="Introduction", authors=[], year=2021,
+                      doi="10.1/anon")
+    session = create_review_session([
+      self._result("dblp", [yearless, authorless]),
+      self._result("openalex", [dated, anonymous]),
+    ], "q")
+    assert len(session.decisions) == 4
+    assert foldable_copies(session) == []
+    assert reconcile_copies(session) == []
+    assert {d.paper.id for d in possible_copies(session)} \
+      == {yearless.id, authorless.id}
+    assert report_work_items(session)[-1] \
+      == r"\item[Possible copies, not reconciled] 2"
+    for decision in session.decisions:
+      decision.status = (DecisionStatus.KEPT if decision.paper.doi
+                         else DecisionStatus.DISCARDED)
+    assert conflicting_copies(session) == []
+    assert len(possible_copies(session)) == 2
+
+  def test_differently_decided_copies_are_kept_and_listed(self):
+    bare, with_doi = self._two_copies(
+      (DecisionStatus.DISCARDED, ["no-abstract"]),
+      (DecisionStatus.KEPT, ["ml"]),
+    )
+    assert reconcile_session("copies") == []
+    session = load_session("copies")
+    [conflict] = conflicting_copies(session)
+    assert copy_conflict_line(conflict) == (
+      f"A Work: {bare.id} discarded (dblp) [no-abstract], "
+      "doi:10.1145/race kept (openalex) [ml]"
+    )
+    assert alike_copies(session) == []
+
+  def test_copies_decided_alike_are_listed_not_folded(self):
+    bare, with_doi = self._two_copies(
+      (DecisionStatus.KEPT, ["ml"]), (DecisionStatus.KEPT, ["nlp"]),
+    )
+    assert reconcile_session("copies") == []
+    session = load_session("copies")
+    assert conflicting_copies(session) == []
+    [alike] = alike_copies(session)
+    assert copy_conflict_line(alike) == (
+      f"A Work: {bare.id} kept (dblp) [ml], doi:10.1145/race kept "
+      "(openalex) [nlp]"
+    )
+    assert possible_copies(session) == []
+    assert r"\item[Copies decided alike, not merged] 1" \
+      in report_work_items(session)
+
+  def test_machine_decisions_are_neither_absorbed_nor_relabelled(self):
+    withheld = (DecisionStatus.PENDING, [])
+    bare, with_doi = self._two_copies(withheld, (DecisionStatus.KEPT, ["ml"]))
+    session = load_session("copies")
+    bare_decision = next(d for d in session.decisions if not d.paper.doi)
+    bare_decision.source = ReviewSource.AGENT_UNREVIEWED
+    assert reconcile_copies(session) == []
+    bare_decision.source = ReviewSource.HUMAN
+    bare_decision.llm_reason = "no usable answer"
+    assert reconcile_copies(session) == []
+    bare_decision.source = ReviewSource.LLM_UNREVIEWED
+    for decision in session.decisions:
+      decision.status, decision.tags = DecisionStatus.KEPT, ["ml"]
+    assert reconcile_copies(session) == []
+    [alike] = alike_copies(session)
+    assert copy_conflict_line(alike) == (
+      f"A Work: {bare.id} kept by llm (dblp) [ml], doi:10.1145/race kept "
+      "(openalex) [ml]"
+    )
+    assert [d.source for d in session.decisions] \
+      == [ReviewSource.LLM_UNREVIEWED, ReviewSource.HUMAN]
+
+  def test_a_work_key_match_without_a_pair_is_a_possible_copy(self):
+    bare = Paper(title="A Work.", authors=["Ada Lovelace"], year=2021)
+    with_doi = Paper(title="A work", authors=["Ada Lovelace"], year=2021,
+                     doi="10.1145/key")
+    session = create_review_session(
+      [self._result("dblp", [bare]), self._result("openalex", [with_doi])],
+      "q",
+    )
+    assert len(session.decisions) == 2
+    assert [d.paper.id for d in possible_copies(session)] == [bare.id]
+
+  def test_old_sessions_load_without_copy_notes(self):
+    import json
+    from scholar.review import _get_sessions_dir
+    a = Paper(title="Editorial", authors=["J. Smith"], year=2018)
+    b = Paper(title="Editorial", authors=["J. Smith"], year=2023)
+    save_session(create_review_session(
+      [self._result("dblp", [a]), self._result("hal", [b])], "q",
+      session_name="copies",
+    ))
+    path = _get_sessions_dir() / "copies.json"
+    data = json.loads(path.read_text())
+    assert data["decisions"][0]["same_id_copies"] == [
+      {"year": 2023, "venue": None, "provider": "hal"},
+    ]
+    del data["decisions"][0]["same_id_copies"]
+    path.write_text(json.dumps(data))
+    session = load_session("copies")
+    assert session.decisions[0].same_id_copies == []
+    assert conflicting_copies(session) == []
+    assert session.folded == {}
+    assert "folded" not in data
 @
 
 Extracting tags from a [[ReviewDecisionRecord]] is useful for backward compatibility
@@ -4530,6 +5912,7 @@ def read_session_file(session_path: Path) -> ReviewSession:
                     papers_added=round_data["papers_added"],
                 ))
         <<load the LLM review samples>>
+        session.folded = dict(data.get("folded") or {})
 
         for dec_data in data["decisions"]:
             paper_data = dec_data["paper"]
@@ -4564,6 +5947,7 @@ def read_session_file(session_path: Path) -> ReviewSession:
                     llm_confidence=llm_confidence,
                     **{name: dec_data.get(name) for name in LLM_AUDIT_FIELDS},
                     found_by=found_by,
+                    same_id_copies=list(dec_data.get("same_id_copies") or []),
                 )
             )
         
@@ -4648,6 +6032,7 @@ data = {
         for r in session.snowball_rounds
     ],
     <<serialise the LLM review samples>>
+    **({"folded": session.folded} if session.folded else {}),
     "decisions": [
         {
             "paper_id": get_paper_id(d.paper),
@@ -4661,6 +6046,10 @@ data = {
             "found_by": [
                 _found_by_link_data(link) for link in d.found_by
             ],
+            **(
+                {"same_id_copies": d.same_id_copies}
+                if d.same_id_copies else {}
+            ),
             "paper": d.paper.to_dict(include_refs_cites=True),
         }
         for d in session.decisions
@@ -4876,7 +6265,20 @@ since both records have the same key.  So do a paper's
 links to the searches that returned it ([[found_by]],
 \cref{sec:review-found-by}): each is a fact about a search that ran, not
 a judgement, so the links the file holds for a paper are added to the
-links this process holds, whatever the decision rules decide.
+links this process holds, whatever the decision rules decide.  The
+same goes for the other works a search returned under a paper's id
+([[same_id_copies]], \cref{sec:session-copies}).  After the
+decisions are merged, the tombstones of folded copies are united with
+the file's and applied ([[apply_tombstones]], \cref{sec:session-copies}),
+so that a copy that [[sessions reconcile]] folded after this process
+loaded the session is settled against the merged decision it was
+folded into instead of being written back; the paper ids that
+snowballing rounds and LLM review samples store are repointed at the
+end.  The tombstones touch decisions only, the superseding of merged
+records (\cref{sec:superseded-merged}) records and links only, and the
+superseding runs after the tombstones over every decision held then,
+so the links a dropped copy gave its target are repointed with all the
+others, and no superseded record decides whether a copy is kept.
 
 The baseline keeps one comparable state per paper id.  We compare the
 whole decision state rather than the status alone, because a change of
@@ -4960,6 +6362,8 @@ def merge_concurrent_changes(
         if theirs is not None:
             for link in theirs.found_by:
                 decision.record_search(*replaced.get(link, link))
+            for copy in theirs.same_id_copies:
+                decision.add_same_id_copy(copy)
         if theirs is None or paper_id not in base_states:
             continue
         mine, base_state = decision_state(decision), base_states[paper_id]
@@ -4979,6 +6383,8 @@ def merge_concurrent_changes(
     for paper_id, theirs in disk_decisions.items():
         if paper_id not in own_ids and paper_id not in base_states:
             session.decisions.append(theirs)
+    session.folded = {**on_disk.folded, **session.folded}
+    apply_tombstones(session, base_states, disk_decisions)
 
     <<merge research context from disk>>
 
@@ -4997,6 +6403,7 @@ def merge_concurrent_changes(
             session.snowball_rounds.append(snowball_round)
     <<merge the LLM review samples from disk>>
     supersede_merged_records(session)
+    repoint_folded_ids(session)
 
     session._invalidate_cache()
 @
@@ -5277,7 +6684,12 @@ number of decided (non-pending) papers on disk with the number it is about
 to write.  A drop is legitimate only when this process itself reset
 decisions to pending (the TUI can undo a decision), and those resets are
 exactly the decisions whose baseline was decided and whose state is now
-pending.  Any drop beyond them is logged as a warning that names the
+pending.  The other legitimate drop is a fold of two copies of one
+work that were decided alike into one decision
+by [[sessions reconcile]] (\cref{sec:session-copies}): a decided
+copy the file holds under a tombstoned id and the session no longer
+holds.  Only those are allowed for; a tombstone of an id the file does
+not hold explains no drop.  Any drop beyond them is logged as a warning that names the
 session, the two counts and the [[.bak]] that still holds the previous
 version.  We warn rather than refuse: refusing would also throw away this
 process's own work, and the [[.bak]] makes the loss recoverable.
@@ -5304,7 +6716,13 @@ def warn_if_decisions_dropped(
         and base_states.get(get_paper_id(d.paper), (DecisionStatus.PENDING,))[0]
         != DecisionStatus.PENDING
     )
-    if after + reset_here < before:
+    session_ids = {get_paper_id(d.paper) for d in session.decisions}
+    folded_here = sum(
+        1 for d in on_disk.decisions
+        if d.is_decided and get_paper_id(d.paper) in session.folded
+        and get_paper_id(d.paper) not in session_ids
+    )
+    if after + reset_here + folded_here < before:
         logger.warning(
             "Session %s: this save reduces the decided papers from %d to %d "
             "although no decision command reset them; the previous version "
@@ -8352,6 +9770,7 @@ lines.extend(
         r"\begin{description}",
         f"\\item[Date] {session.timestamp.strftime('%Y-%m-%d %H:%M')}",
         f"\\item[Total Papers] {len(session.decisions)}",
+        *report_work_items(session),
         r"\end{description}",
         r"",
         f"{heading_command}{{Summary}}",
@@ -8361,6 +9780,72 @@ lines.extend(
         r"",
     ]
 )
+@
+
+A session's decisions are records, not works: the copies of one work
+that the session could not fold (\cref{sec:session-copies}) are
+separate decisions, so the total above can count one work twice.  The
+audit table counts works ([[audit_work_key]], \cref{sec:audit-table}),
+and a report that gives a different total for the same session invites
+the question which one is right.  So the summary also states the number
+of unique works, taken from the audit table's own rows, and, when there
+are any, the copies left for the user: foldable (with the command
+that folds them), conflicting, decided alike but not merged, and
+possible copies not reconciled
+(\cref{sec:session-copies}); [[sessions show]] lists them.
+
+<<review report generation>>=
+def report_work_items(session: ReviewSession) -> list[str]:
+    """Report summary items for the works behind the session's records."""
+    works = len(collect_audit_rows(
+        session, theme_names={}, strings=AUDIT_STRINGS["en"]
+    ))
+    items = [f"\\item[Unique works] {works}"]
+    for label, count, hint in (
+        ("Foldable copies", len(foldable_copies(session)),
+         ", see \\texttt{scholar sessions reconcile}"),
+        ("Conflicting copies", len(conflicting_copies(session)), ""),
+        ("Copies decided alike, not merged", len(alike_copies(session)), ""),
+        ("Possible copies, not reconciled", len(possible_copies(session)),
+         ""),
+    ):
+        if count:
+            items.append(f"\\item[{label}] {count}{hint}")
+    return items
+@
+
+<<test functions>>=
+class TestReportWorkItems:
+  def test_works_and_conflicts_are_counted(self):
+    bare = Paper(title="A Work", authors=["Ada Lovelace"], year=2021)
+    with_doi = Paper(title="A Work", authors=["Ada Lovelace"], year=2021,
+                     doi="10.1145/rep")
+    other = Paper(title="Other", authors=["B"], year=2020)
+    session = ReviewSession(query="q", providers=["p"],
+                            timestamp=datetime.now())
+    session.decisions = [
+      ReviewDecision(paper=bare, provider="dblp",
+                     status=DecisionStatus.DISCARDED, tags=["no-abstract"]),
+      ReviewDecision(paper=with_doi, provider="openalex",
+                     status=DecisionStatus.KEPT, tags=["ml"]),
+      ReviewDecision(paper=other, provider="openalex"),
+    ]
+    assert report_work_items(session) == [
+      r"\item[Unique works] 2", r"\item[Conflicting copies] 1",
+    ]
+    session.decisions = session.decisions[1:]
+    assert report_work_items(session) == [r"\item[Unique works] 2"]
+
+  def test_the_report_states_them(self, tmp_path):
+    session = ReviewSession(query="q", providers=["p"],
+                            timestamp=datetime.now())
+    session.decisions = [ReviewDecision(
+      paper=Paper(title="P", authors=["A"], year=2024), provider="p",
+      status=DecisionStatus.KEPT,
+    )]
+    path = tmp_path / "report.tex"
+    generate_latex_report(session, path)
+    assert r"\item[Unique works] 1" in path.read_text()
 @
 
 Snowballing rounds only appear when they happened. The papers they added
@@ -8865,6 +10350,11 @@ AUDIT_STRINGS: dict[str, dict] = {
         "extra_other": (
             ", {other} duplicates or other versions of cited sources"
         ),
+        "extra_criterion": ", {count} excluded by the criterion {criterion}",
+        "criteria": {
+            "no-abstract": ", {count} excluded for lack of an abstract",
+        },
+        "extra_rest": ", {rest} other hits",
         "extra_excluded": (
             ", {excluded} excluded although classified as bearing on the "
             "claim"
@@ -8948,6 +10438,13 @@ AUDIT_STRINGS: dict[str, dict] = {
         "extra_other": (
             ", {other} dubbletter eller andra versioner av citerade källor"
         ),
+        "extra_criterion": (
+            ", {count} uteslutna enligt kriteriet {criterion}"
+        ),
+        "criteria": {
+            "no-abstract": ", {count} uteslutna i brist på sammanfattning",
+        },
+        "extra_rest": ", {rest} övriga träffar",
         "extra_excluded": (
             ", {excluded} uteslutna trots att de klassats som relevanta "
             "för påståendet"
@@ -9063,6 +10560,8 @@ class AuditRow:
     reason: str
     order: int
     excluded: bool = False   # discarded despite a bearing category
+    criterion: str | None = None   # the exclusion criterion of a discard
+    version: bool = False    # noted as another record of a cited source
 @
 
 Three facts about how decisions are recorded shape the cited rule.
@@ -9161,6 +10660,10 @@ def audit_reason(
     elif machine_label:
         confidence = f" ({strings['no_confidence']})"
 
+    criterion = audit_exclusion_criterion(
+        decision, theme_names=theme_names, notes=notes
+    )
+
     if decision.status == DecisionStatus.PENDING:
         return strings["pending"], AUDIT_ORDER_PENDING
     if kept and human_decision and theme_tags:
@@ -9177,6 +10680,8 @@ def audit_reason(
     elif category is not None:
         label = strings[category] + confidence
         order = AUDIT_CATEGORIES[category]
+    elif criterion is not None:
+        return escape_latex(criterion) + confidence, AUDIT_ORDER_OTHER
     elif note_texts:
         return "; ".join(note_texts), AUDIT_ORDER_OTHER
     elif not tags:
@@ -9332,6 +10837,158 @@ class TestAuditReason:
         assert self._reason(DecisionStatus.DISCARDED, ["needs_fulltext"]) \
             == (r"needs\_fulltext", AUDIT_ORDER_OTHER)
         assert AUDIT_ORDER_PENDING < AUDIT_ORDER_OTHER
+@
+
+\paragraph{Exclusion criteria and other versions.}
+A row that sorts among the \enquote{other} rows is there for one of
+several reasons, and the caption must not give them all one name
+(issue~\#169). The note tags fall in two groups: most say that the
+record is \emph{another record of a cited source}---a duplicate, a
+reprint, a report or thesis version, an erratum---and the caption's
+\enquote{duplicates or other versions of cited sources} is true of
+exactly those; the remaining two, [[recorded-not-cited]] and
+[[no-abstract-title-only]], say nothing about another version.
+[[AUDIT_VERSION_NOTES]] names the first group.
+
+A discard that carries neither a category nor a note tag is a third
+kind. A systematic review states its exclusion criteria as labelled
+tags and discards each record with the label of the criterion it
+failed---[[no-abstract]] for a record with no abstract to screen,
+[[new-scheme]] or whatever the review's method defines---so the tag
+\emph{is} the reason for the exclusion. Scholar cannot know a review's
+criteria in advance: they are the author's own words, written into the
+research context and passed to [[llm classify -t]] and
+[[sessions decide --discard -t]]. What identifies a criterion is
+therefore its place in the decision, not a fixed list: a discarded
+decision without a category and without a note tag, and its tag that
+is not one of the themes the caller named.  When there are several,
+the \emph{last} is the criterion, for the reason the last category tag
+is the decision ([[audit_category]]): [[sessions decide -t]] appends,
+so a record first discarded as [[usable-security]] and then, on a second
+look, as [[no-abstract]] carries both, and the second word is the
+reviewer's latest.  The row's reason column shows that tag alone, also
+when [[--theme]] is given (which otherwise lists every tag that is not
+a theme as a note), so the row and the caption's count name the same
+criterion. Counting such
+records as duplicates told the reader of an appendix that, say, a
+hundred records without abstracts were versions of cited papers, which
+is a false statement about the review: one review held 1\,483 records
+discarded as [[no-abstract]], and its caption called nearly all of them
+duplicates, of which about 26 were. The caption counts each criterion
+on its own, under its own label, which is also the reason the row
+shows, so the reader can match the count to the rows. One criterion has
+a sentence of its own: [[no-abstract]], the criterion the
+backing-claims method puts on every review's list, reads \enquote{excluded
+for lack of an abstract} (localised in [[criteria]]); any other
+criterion is named by its label, since Scholar has no words for the
+author's own criteria.
+
+A discard that carries a note as well (a duplicate record that also has
+no abstract) is a note row: its reason column shows the note, so that is
+what the caption counts it under. Whatever is left among the
+\enquote{other} rows---a [[recorded-not-cited]] note, a machine keep
+under a theme, which is not a citation---is counted plainly as
+\enquote{other hits}, so that the caption's counts still add up to the
+number of unique hits.
+
+<<review report generation>>=
+AUDIT_VERSION_NOTES: frozenset[str] = frozenset({
+    "duplicate-record-of-cited-source",
+    "duplicate-reprint-of-cited-source",
+    "extended-tech-report",
+    "earlier-version-of-cited-source",
+    "superseded-by-journal-version",
+    "thesis-of-cited-source",
+    "erratum-to-cited-source",
+})
+
+
+def audit_exclusion_criterion(
+    decision: ReviewDecision,
+    *,
+    theme_names: dict[str, str],
+    notes: dict[str, str],
+) -> str | None:
+    """Return the exclusion-criterion tag a discard was made under.
+
+    That is the last tag of a discarded decision that has neither an
+    audit category nor a note tag, unless it is one of `theme_names`
+    (tags accumulate, so the last is the reviewer's latest).
+    """
+    tags = decision.tags
+    if decision.status != DecisionStatus.DISCARDED:
+        return None
+    if audit_category(tags) is not None or any(t in notes for t in tags):
+        return None
+    return next((t for t in reversed(tags) if t not in theme_names), None)
+
+
+def audit_version_note(decision: ReviewDecision) -> bool:
+    """Tell whether `decision` is noted as another version of a source."""
+    return any(t in AUDIT_VERSION_NOTES for t in decision.tags)
+@
+
+Each kind of decision is checked, and the version notes must stay a part
+of the notes every language translates:
+
+<<test functions>>=
+class TestAuditExclusionCriterion:
+  def _decision(self, status, tags):
+    return ReviewDecision(
+      paper=Paper(title="P", authors=["A"], year=2024),
+      provider="p", status=status, tags=tags,
+    )
+
+  def _criterion(self, status, tags, theme_names=None):
+    return audit_exclusion_criterion(
+      self._decision(status, tags), theme_names=theme_names or {},
+      notes=AUDIT_STRINGS["en"]["notes"],
+    )
+
+  def test_a_discard_tagged_with_a_criterion_names_it(self):
+    assert self._criterion(DecisionStatus.DISCARDED, ["no-abstract"]) \
+      == "no-abstract"
+    assert self._criterion(
+      DecisionStatus.DISCARDED, ["usable-security", "no-abstract"]
+    ) == "no-abstract"
+
+  def test_the_row_shows_the_counted_criterion(self):
+    decision = self._decision(
+      DecisionStatus.DISCARDED, ["usable-security", "no-abstract"]
+    )
+    for themes in ({}, {"ml": "ML"}):
+      assert audit_reason(
+        decision, theme_names=themes, strings=AUDIT_STRINGS["en"]
+      ) == ("no-abstract", AUDIT_ORDER_OTHER)
+
+  def test_categories_notes_and_keeps_are_not_criteria(self):
+    discarded = DecisionStatus.DISCARDED
+    assert self._criterion(discarded, ["off-topic-false-hit"]) is None
+    assert self._criterion(
+      discarded, ["no-abstract", "duplicate-record-of-cited-source"]
+    ) is None
+    assert self._criterion(discarded, []) is None
+    assert self._criterion(DecisionStatus.KEPT, ["no-abstract"]) is None
+    assert self._criterion(DecisionStatus.PENDING, ["no-abstract"]) is None
+
+  def test_a_named_theme_is_not_a_criterion(self):
+    assert self._criterion(
+      DecisionStatus.DISCARDED, ["ml"], theme_names={"ml": "ML"}
+    ) is None
+    assert self._criterion(
+      DecisionStatus.DISCARDED, ["no-abstract", "ml"],
+      theme_names={"ml": "ML"},
+    ) == "no-abstract"
+
+  def test_version_notes_are_translated_notes(self):
+    for strings in AUDIT_STRINGS.values():
+      assert AUDIT_VERSION_NOTES < set(strings["notes"])
+    assert audit_version_note(self._decision(
+      DecisionStatus.DISCARDED, ["thesis-of-cited-source"]
+    ))
+    assert not audit_version_note(self._decision(
+      DecisionStatus.DISCARDED, ["recorded-not-cited"]
+    ))
 @
 
 An agent's decisions follow the same rule as an LLM's: unreviewed, a
@@ -9497,6 +11154,10 @@ def collect_audit_rows(
             decision, theme_names=theme_names, strings=strings
         )
         excluded = audit_excluded(decision)
+        criterion = audit_exclusion_criterion(
+            decision, theme_names=theme_names, notes=strings["notes"]
+        )
+        version = audit_version_note(decision)
         row = rows.get(key)
         if row is None:
             rows[key] = AuditRow(
@@ -9507,6 +11168,8 @@ def collect_audit_rows(
                 reason=reason,
                 order=order,
                 excluded=excluded,
+                criterion=criterion,
+                version=version,
             )
             continue
         for provider in providers:
@@ -9516,7 +11179,8 @@ def collect_audit_rows(
             row.year = year
         if order < row.order:
             row.status, row.reason, row.order = decision.status, reason, order
-            row.excluded = excluded
+            row.excluded, row.criterion = excluded, criterion
+            row.version = version
     return sorted(rows.values(), key=lambda r: (r.order, r.title.lower()))
 @
 
@@ -10302,12 +11966,18 @@ claim---cited, supporting, qualifying---and moves the adjacent,
 off-topic and unclassified records into the caption as counts, so the
 appendix still accounts for every record without printing it.
 
-The \enquote{other} rows are counted in two parts. Most of them are
-bookkeeping (duplicates, other versions of cited sources), and the
-caption says so; the rows excluded despite a bearing category are not,
-and calling them duplicates would misreport the review, so they get a
-count and a phrase of their own.
+The \enquote{other} rows are counted by kind, each with a phrase of its
+own, because each says something different about the review. The rows
+noted as duplicates or other versions of cited sources are bookkeeping,
+and the caption says so. The rows excluded under an exclusion criterion
+are counted per criterion, most frequent first, under the criterion's
+label. The rows excluded despite a bearing category are neither, and
+calling them duplicates would misreport the review. What remains is
+counted as other hits. The four counts are taken from the merged rows,
+so a work is counted once, under the decision its row shows.
 
+<<review imports>>=
+from collections import Counter
 <<review report generation>>=
 def build_audit_table_latex(
     session: ReviewSession,
@@ -10331,6 +12001,12 @@ def build_audit_table_latex(
         order: sum(1 for r in rows if r.order == order) for order in range(7)
     }
     excluded = sum(1 for r in rows if r.excluded)
+    other_rows = [
+        r for r in rows if r.order == AUDIT_ORDER_OTHER and not r.excluded
+    ]
+    criteria = Counter(r.criterion for r in other_rows if r.criterion)
+    versions = sum(1 for r in other_rows if r.version and not r.criterion)
+    rest = len(other_rows) - sum(criteria.values()) - versions
     databases = " ".join(filter(None, [
         audit_databases_sentence(rows, strings, session.search_records),
         audit_semantic_sentence(rows, strings, session.search_records),
@@ -10352,10 +12028,15 @@ def build_audit_table_latex(
         extra += strings["extra_pending"].format(
             pending=counts[AUDIT_ORDER_PENDING]
         )
-    if counts[AUDIT_ORDER_OTHER] - excluded:
-        extra += strings["extra_other"].format(
-            other=counts[AUDIT_ORDER_OTHER] - excluded
-        )
+    if versions:
+        extra += strings["extra_other"].format(other=versions)
+    for criterion, count in sorted(
+        criteria.items(), key=lambda item: (-item[1], item[0])
+    ):
+        phrase = strings["criteria"].get(criterion, strings["extra_criterion"])
+        extra += phrase.format(count=count, criterion=escape_latex(criterion))
+    if rest:
+        extra += strings["extra_rest"].format(rest=rest)
     if excluded:
         extra += strings["extra_excluded"].format(excluded=excluded)
     caption = template.format(
@@ -10540,6 +12221,71 @@ class TestAuditTable:
         assert r"\begin{longtable}" in content
 @
 
+The \enquote{other} rows are counted by kind (issue~\#169): a discard
+under an exclusion criterion such as [[no-abstract]] under its
+criterion, a duplicate under the duplicate wording, anything else as
+\enquote{other hits}; together with the categories they must add up to
+the unique hits. The session mixes all of them:
+
+<<test functions>>=
+class TestAuditCaptionOtherRows:
+  def _session(self):
+    session = _audit_session()
+
+    def discard(title, tags, source=ReviewSource.HUMAN):
+      return ReviewDecision(
+        paper=Paper(title=title, authors=["E"], year=2020),
+        provider="openalex", status=DecisionStatus.DISCARDED,
+        tags=tags, source=source,
+      )
+
+    session.decisions += [
+      discard("No abstract 1", ["no-abstract"]),
+      discard("No abstract 2", ["no-abstract"],
+              source=ReviewSource.LLM_UNREVIEWED),
+      discard("New scheme", ["new-scheme"]),
+      discard("Thesis", ["thesis-of-cited-source"]),
+      discard("Recorded", ["recorded-not-cited"]),
+    ]
+    return session
+
+  def test_criteria_are_not_called_duplicates(self):
+    text = "\n".join(build_audit_table_latex(self._session(), label="x"))
+    assert "(8 unique hits: 1 cited, 1 supporting the claim, " \
+      "0 qualifying or contradicting it, 0 adjacent, 0 false hits, " \
+      "1 unclassified, 1 duplicates or other versions of cited sources, " \
+      "2 excluded for lack of an abstract, " \
+      "1 excluded by the criterion new-scheme, 1 other hits)" in text
+    assert r"No abstract 1 & 2020 & OA & no-abstract \\" in text
+
+  def test_swedish_caption(self):
+    text = "\n".join(build_audit_table_latex(
+      self._session(), label="x", lang="sv"
+    ))
+    assert ", 1 dubbletter eller andra versioner av citerade källor, " \
+      "2 uteslutna i brist på sammanfattning, " \
+      "1 uteslutna enligt kriteriet new-scheme, 1 övriga träffar)" in text
+
+  def test_bearing_only_counts_the_criteria(self):
+    text = "\n".join(build_audit_table_latex(
+      self._session(), label="x", bearing_only=True
+    ))
+    assert "No abstract" not in text
+    assert "2 excluded for lack of an abstract, " in text
+    assert "1 other hits are not listed" in text
+
+  def test_a_criterion_is_escaped(self):
+    session = _audit_session()
+    session.decisions.append(ReviewDecision(
+      paper=Paper(title="Old", authors=["F"], year=1990),
+      provider="openalex", status=DecisionStatus.DISCARDED,
+      tags=["before_2000"],
+    ))
+    text = "\n".join(build_audit_table_latex(session, label="x"))
+    assert r"1 excluded by the criterion before\_2000)" in text
+    assert "duplicates" not in text
+@
+
 \subsection{Checking a semantic search against sessions}
 \label{sec:semantic-check}
 
@@ -10606,15 +12352,6 @@ def _title_index_key(paper: Paper) -> str | None:
     return f"title:{title}" if title else None
 
 
-def _link_dois(paper: Paper) -> list[str]:
-    """The DOIs of the paper's recorded preprint or published versions."""
-    links = (paper.preprint_versions or []) + (paper.published_versions or [])
-    return [
-        f"doi:{Paper._normalize_doi(link['doi'])}"
-        for link in links if isinstance(link, dict) and link.get("doi")
-    ]
-
-
 def session_match_index(
     sessions: list[ReviewSession],
 ) -> dict[str, list[tuple[str, ReviewDecision, str]]]:
@@ -10642,7 +12379,7 @@ def session_match_index(
             by_title = CHECK_BY_TITLE_ONLY if authorless else CHECK_BY_TITLE
             by_id = CHECK_BY_DOI if paper.doi else by_title
             add(_identity_key(paper), (name, decision, by_id))
-            for key in _link_dois(paper):
+            for key in version_link_dois(paper):
                 add(key, (name, decision, CHECK_BY_DOI))
             add(_work_index_key(paper), (name, decision, by_title))
             if authorless:
@@ -10657,36 +12394,16 @@ Title and first author's surname is a weak key.  Short generic titles
 surnames collide, and a search by meaning returns exactly such
 near-namesakes.  Calling one of them \enquote{in the session} would hide
 the gap the check is looking for.  So a title match is dropped when the
-two records say outright that they are different works:
-\begin{description}
-\item[Different DOIs] Both have a DOI, the DOIs differ, and no version
-  link of either paper names the other's DOI.  Two DOIs are two
-  registered works; a preprint and its published version are joined by
-  the link, and then they match by DOI anyway.
-\item[Years apart] Both have a year and the years are more than one
-  apart.  One year of slack covers an online-first article and its
-  issue, or a preprint posted in December.
-\end{description}
+two records say outright that they are different works: two DOIs that
+differ and are not linked as versions, or years more than one apart.
+That rule, [[plausibly_same_work]], lives with deduplication in the
+scholar module (\cref{sec:same-work-guard}), which asks the same
+question when it decides whether two records are one; the version-link
+DOIs that the index above adds come from [[version_link_dois]] there.
 A DOI match needs no guard: the DOI is the identity.
 
-<<review report generation>>=
-CHECK_YEAR_SLACK = 1
-
-
-def _plausibly_same_work(found: Paper, held: Paper) -> bool:
-    """Whether a title match between `found` and `held` may stand."""
-    if found.doi and held.doi:
-        found_doi = f"doi:{Paper._normalize_doi(found.doi)}"
-        held_doi = f"doi:{Paper._normalize_doi(held.doi)}"
-        if (found_doi != held_doi and found_doi not in _link_dois(held)
-                and held_doi not in _link_dois(found)):
-            return False
-    try:
-        if abs(int(found.year) - int(held.year)) > CHECK_YEAR_SLACK:
-            return False
-    except (TypeError, ValueError):
-        pass
-    return True
+<<review imports>>=
+from scholar.scholar import plausibly_same_work, version_link_dois
 @
 
 \paragraph{Buckets.}
@@ -10830,11 +12547,11 @@ def match_work(
     """Look `paper` up in a `session_match_index`."""
     keys = [_identity_key(paper), _work_index_key(paper),
             _title_index_key(paper)]
-    keys += _link_dois(paper)
+    keys += version_link_dois(paper)
     entries = [
         entry for key in keys if key for entry in index.get(key, [])
         if entry[2] == CHECK_BY_DOI
-        or _plausibly_same_work(paper, entry[1].paper)
+        or plausibly_same_work(paper, entry[1].paper)
     ]
     return _session_matches(entries)
 @
