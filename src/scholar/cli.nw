@@ -70,6 +70,7 @@ across bibliographic databases.
 <<typer application>>
 <<completion functions>>
 <<session error helpers>>
+<<session check helpers>>
 <<search command>>
 <<rq command>>
 <<currency reporting helpers>>
@@ -791,6 +792,8 @@ if provider is None:
 else:
     provider_names = expand_provider_names(provider)
 
+<<refuse what a semantic search cannot do>>
+
 effective_limit = UNLIMITED_PROVIDER_LIMIT if limit == 0 else limit
 limit_label = "unlimited" if limit == 0 else str(limit)
 
@@ -808,6 +811,7 @@ if any([year, open_access, venue, min_citations is not None, pub_type]):
         min_citations=min_citations,
         pub_types=pub_type,
     )
+<<refuse filters for a semantic search>>
 
 s = Search(query)
 results = s.execute(
@@ -1083,6 +1087,192 @@ class TestSearchFailureRecorded:
 
         shown = runner.invoke(app, ["sessions", "show", "dead"])
         assert "failed (non-JSON response" in shown.stdout
+@
+
+\subsection{Semantic search: alone, unfiltered, at most fifty}
+\label{sec:search-semantic-checks}
+
+[[-p openalex-semantic]] runs OpenAlex's search by meaning
+(\cref{sec:openalex-semantic} in the providers chapter).  Its answer
+is a ranked list of at most fifty works, not a count of matches, and
+three things a keyword search allows would make that answer misleading
+in the record, so the command refuses them before any request is made:
+\begin{description}
+\item[Other providers in the same search] Their results would be merged
+  with the ranked list into one record whose count is neither a count
+  nor a ranking.  A semantic check is its own search, recorded as such.
+\item[Filters] The provider takes none (the providers chapter explains
+  why); refusing here says so at once instead of recording a failed
+  search.  This refusal looks at the [[SearchFilters]] the command
+  builds, not at the filter options one by one, so a filter added
+  later is refused without anyone remembering this place; it therefore
+  sits right after the filters are built, in a chunk of its own.
+\item[A question over 2\,000 characters] OpenAlex matches only the first
+  2\,000 characters, so the recorded question would not be the one
+  matched.
+\end{description}
+Each is a usage error, exit code 2 with one line saying what to change,
+as for any other malformed command line.
+
+The limit is different: a limit above fifty is not wrong, only more
+than exists, and [[-l 0]] (\enquote{all}) means all fifty.  So the
+limit is lowered to the provider's maximum rather than refused.  It is
+lowered here, before the search, because the session records the limit
+that was asked for, and [[prov found-via]] reproduces the search from
+that record: the record should say [[--limit 50]], what was actually
+asked for, not the [[1000]] of the default.
+
+<<refuse what a semantic search cannot do>>=
+ranked_names = [n for n in provider_names if is_ranked_provider(n)]
+if ranked_names:
+    from scholar.providers import OPENALEX_SEMANTIC_MAX_CHARS, get_provider
+
+    ranked_name = ranked_names[0]
+    if len(provider_names) > 1:
+        refusal = (
+            f"{ranked_name} must be the only provider of a search: it "
+            f"returns a ranked list, not a count of matches."
+        )
+    elif len(query) > OPENALEX_SEMANTIC_MAX_CHARS:
+        refusal = (
+            f"{ranked_name} matches at most {OPENALEX_SEMANTIC_MAX_CHARS} "
+            f"characters; this question has {len(query)}."
+        )
+    else:
+        refusal = None
+    if refusal:
+        Console(stderr=True).print(f"[red]{escape(refusal)}[/red]")
+        raise typer.Exit(2)
+    ranked_max = getattr(get_provider(ranked_name), "MAX_LIMIT", None)
+    if ranked_max and (limit == 0 or limit > ranked_max):
+        limit = ranked_max
+<<refuse filters for a semantic search>>=
+if ranked_names and filters is not None and not filters.is_empty():
+    Console(stderr=True).print(
+        f"[red]{escape(ranked_names[0])} takes no filters.[/red]"
+    )
+    raise typer.Exit(2)
+@
+
+Let's verify the refusals and the limit.  A [[Mock]] stands in for the
+provider (the request itself is tested against a recorded response in
+the providers chapter); what matters here is what the command lets
+through and what the session records.  The recorded search must show
+as a ranked list in [[sessions show]], never with a plain hit count,
+and [[prov found-via]] must reproduce it with [[-p openalex-semantic]].
+
+<<test functions>>=
+class TestSemanticSearchCommand:
+  """search -p openalex-semantic: alone, unfiltered, capped at fifty."""
+
+  <<semantic search command test methods>>
+<<semantic search command test methods>>=
+def _providers(self, monkeypatch, papers):
+  from scholar import providers
+
+  semantic = Mock()
+  semantic.name = "openalex-semantic"
+  semantic.MAX_LIMIT = 50
+  semantic.last_error = None
+  semantic.last_retries = 0
+  semantic.search.return_value = papers
+  keyword = Mock()
+  keyword.name = "openalex"
+  keyword.MAX_LIMIT = None
+  keyword.search.return_value = []
+  monkeypatch.setattr(providers, "PROVIDERS", {
+    "openalex-semantic": semantic, "openalex": keyword,
+  })
+  return semantic
+
+@pytest.mark.parametrize("extra, message", [
+  (["-p", "openalex"], "must be the only provider"),
+  (["--year", "2020"], "takes no filters"),
+  (["--open-access"], "takes no filters"),
+  (["--venue", "CHI"], "takes no filters"),
+  (["--min-citations", "3"], "takes no filters"),
+  (["--type", "article"], "takes no filters"),
+])
+def test_refusals_exit_2(self, monkeypatch, extra, message):
+  semantic = self._providers(monkeypatch, [])
+  result = runner.invoke(
+    app, ["search", "q", "-p", "openalex-semantic"] + extra
+  )
+  assert result.exit_code == 2
+  assert message in result.output
+  semantic.search.assert_not_called()
+
+def test_long_question_exits_2(self, monkeypatch):
+  semantic = self._providers(monkeypatch, [])
+  result = runner.invoke(
+    app, ["search", "x" * 2001, "-p", "openalex-semantic"]
+  )
+  assert result.exit_code == 2
+  assert "at most 2000 characters" in result.output
+  semantic.search.assert_not_called()
+
+def test_unlimited_records_fifty_and_shows_ranked(
+  self, tmp_path, monkeypatch
+):
+  from scholar.review import load_session
+
+  monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+  semantic = self._providers(monkeypatch, [
+    Paper(title="By meaning", authors=["A"], doi="10.1/meaning"),
+  ])
+  result = runner.invoke(app, [
+    "search", "q", "-p", "openalex-semantic",
+    "-l", "0", "-n", "check", "-f", "json",
+  ])
+  assert result.exit_code == 0, result.output
+  assert semantic.search.call_args.kwargs["limit"] == 50
+  record = load_session("check").search_records[0]
+  assert (record.provider, record.limit) == ("openalex-semantic", 50)
+
+  shown = runner.invoke(app, ["sessions", "show", "check"])
+  line = next(
+    l for l in shown.output.splitlines() if "openalex-semantic:" in l
+  )
+  assert "top 1, ranked (not a count)" in line
+  assert "hits:" not in line
+
+  as_json = runner.invoke(app, ["sessions", "show", "check", "-f", "json"])
+  assert json.loads(as_json.output)["search_records"][0]["ranked"] is True
+
+  traced = runner.invoke(app, ["prov", "found-via", "doi:10.1/meaning"])
+  assert traced.exit_code == 0, traced.output
+  assert "scholar search q -p openalex-semantic --limit 50" \
+    in traced.output
+
+def test_keyword_record_is_not_marked_ranked(self, tmp_path, monkeypatch):
+  from scholar.review import ReviewSession, SearchRecord, save_session
+
+  monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+  save_session(ReviewSession(
+    query="q", providers=["openalex"], timestamp=datetime.now(),
+    name="kw", search_records=[SearchRecord("q", "openalex", hits=3)],
+  ))
+  as_json = runner.invoke(app, ["sessions", "show", "kw", "-f", "json"])
+  assert "ranked" not in json.loads(as_json.output)["search_records"][0]
+
+def test_rq_refuses_the_semantic_search(self, monkeypatch):
+  semantic = self._providers(monkeypatch, [])
+  result = runner.invoke(
+    app, ["rq", "a question", "-p", "openalex-semantic"]
+  )
+  assert result.exit_code == 2
+  assert "rq cannot run openalex-semantic" in result.output
+  semantic.search.assert_not_called()
+
+def test_csv_header_says_ranked(self, monkeypatch):
+  self._providers(monkeypatch, [
+    Paper(title="By meaning", authors=["A"], doi="10.1/meaning"),
+  ])
+  result = runner.invoke(
+    app, ["search", "q", "-p", "openalex-semantic", "-f", "csv"]
+  )
+  assert result.exit_code == 0
+  assert "# Results: top 1, ranked (not a count)" in result.output
 @
 
 \subsection{Testing the search command}
@@ -1478,6 +1668,7 @@ model_selection = LLMModelSelection(
 )
 
 <<generate provider queries>>
+<<refuse a semantic search in rq>>
 <<resolve research question>>
 
 <<select rq providers>>
@@ -1489,6 +1680,31 @@ model_selection = LLMModelSelection(
 <<create rq session>>
 <<label rq session>>
 <<save rq session and print summary>>
+@
+
+[[rq]] does not run the semantic search ([[openalex-semantic]],
+\cref{sec:openalex-semantic}).  Everything [[rq]] does around a
+provider assumes a keyword search: the model writes one keyword query
+per provider, with boolean operators where the provider's rule allows
+them, and none of the rules describes a question in plain words; the
+providers' results go into one session next to each other; the limit
+recorded is the keyword default; and the filters are applied to every
+provider, which the semantic search refuses.  Run through [[rq]], it
+would record a keyword-style query as a semantic search, mixed with
+counts from the other providers.  So [[rq]] refuses it before the
+research question is even asked for, and names the two commands that
+run it properly: [[search -p openalex-semantic]] for a recorded check,
+[[sessions check]] for one held against the sessions.
+
+<<refuse a semantic search in rq>>=
+if provider and any(
+    is_ranked_provider(name) for name in expand_provider_names(provider)
+):
+    Console(stderr=True).print(
+        "[red]rq cannot run openalex-semantic; use 'scholar search "
+        "-p openalex-semantic' or 'scholar sessions check'.[/red]"
+    )
+    raise typer.Exit(2)
 @
 
 <<select rq providers>>=
@@ -3525,6 +3741,11 @@ widens its column instead of splitting or ellipsizing the name.
 The table also drops its edge padding ([[pad_edge=False]]): with four
 columns now rigid, those two blank columns of margin are what let
 \enquote{No key needed} render on one line at 80 columns.
+The seventeen characters of [[openalex-semantic]]
+(\cref{sec:openalex-semantic}) took three more, so the table also
+collapses the padding between columns ([[collapse_padding=True]]): one
+blank between two columns instead of two, which gives back a character
+per column gap.
 
 <<display provider information>>=
 from scholar.providers import get_all_providers, PROVIDER_GROUPS
@@ -3537,6 +3758,7 @@ table = Table(
     title="Available Search Providers",
     box=box.HORIZONTALS,
     pad_edge=False,
+    collapse_padding=True,
 )
 table.add_column("Provider", style="cyan", no_wrap=True)
 table.add_column("Configured", style="magenta")
@@ -3551,6 +3773,8 @@ console.print()
 console.print("[dim]Configured providers (no key needed, or key already set) are searched by default.[/dim]")
 console.print("[dim]* opt-in: answers through OpenAlex, so a plain search already finds these papers[/dim]")
 console.print("[dim]  via openalex; name the provider (e.g. -p ssrn) to scope a search to that server.[/dim]")
+console.print("[dim]  openalex-semantic is a search by meaning: a ranked top 50, not a count. Run it[/dim]")
+console.print("[dim]  alone (-p openalex-semantic) or through 'scholar sessions check'.[/dim]")
 for group_name, members in PROVIDER_GROUPS.items():
     console.print(
         f"[dim]Group: -p {group_name} = {', '.join(members)}[/dim]"
@@ -3626,6 +3850,11 @@ provider_info = {
         "how_to_get": "Any email (optional, faster responses)",
     },
     "iacr": {
+        "required": False,
+        "env_var": "SCHOLAR_EMAIL",
+        "how_to_get": "Any email (optional, faster responses)",
+    },
+    "openalex-semantic": {
         "required": False,
         "env_var": "SCHOLAR_EMAIL",
         "how_to_get": "Any email (optional, faster responses)",
@@ -4012,6 +4241,8 @@ table.add_row("scopus", "[green]✓[/]", "[green]✓[/]", "[green]✓[/]", "[gre
               "Must be UPPERCASE, supports W/n PRE/n proximity")
 table.add_row("arxiv", "[green]✓[/]", "[green]✓[/]", "[green]✓[/]", "[green]✓[/]",
               "Use ANDNOT instead of NOT")
+table.add_row("openalex-semantic", "[red]✗[/]", "[red]✗[/]", "[red]✗[/]",
+              "[red]✗[/]", "A question in plain words, max 2000 characters")
 
 console.print(table)
 console.print()
@@ -4038,6 +4269,8 @@ table2.add_row("scopus", "[green]✓[/] * ?", '[green]✓[/] "..."', "[green]✓
                "TITLE-ABS-KEY(), AUTH(), SRCTITLE()")
 table2.add_row("arxiv", "[red]✗[/]", '[green]✓[/] "..."', "[green]✓[/] ti: au: cat:",
                "ti:title, au:author, cat:category")
+table2.add_row("openalex-semantic", "[red]✗[/]", "[red]✗[/]", "[red]✗[/]",
+               "Ranked by meaning, top 50; no filters")
 
 console.print(table2)
 console.print()
@@ -4052,6 +4285,8 @@ examples = [
     ("ieee", '"machine learning" AND privacy NOT survey'),
     ("scopus", 'TITLE-ABS-KEY("machine learning" AND privacy)'),
     ("arxiv", 'ti:"machine learning" AND cat:cs.AI'),
+    ("openalex-semantic",
+     "How can machine learning be trained without sharing data?"),
 ]
 for provider, example in examples:
     console.print(f"  [cyan]{provider:12}[/]  {example}")
@@ -4071,6 +4306,7 @@ docs = [
     ("ieee", "https://ieeexplore.ieee.org/Xplorehelp/searching-ieee-xplore/command-search"),
     ("scopus", "https://dev.elsevier.com/sc_search_tips.html"),
     ("arxiv", "https://info.arxiv.org/help/api/user-manual.html#query_details"),
+    ("openalex-semantic", "https://help.openalex.org/api/semantic-search/"),
 ]
 for provider, url in docs:
     console.print(f"  [cyan]{provider:12}[/]  {url}")
@@ -5507,6 +5743,8 @@ query-provider pairs when multiple queries were used
 \item[sessions export] Generate reports (CSV, \LaTeX{}) from a saved session
 \item[sessions resume] Continue reviewing a saved session in the TUI
 \item[sessions decide] Record keep/discard decisions non-interactively
+\item[sessions check] Hold a semantic search against sessions to find
+  works the keyword searches missed
 \end{description}
 
 This enables scripted workflows and integration with other tools.
@@ -5659,15 +5897,26 @@ the hit count, or a highlighted \enquote{failed} with the reason.  This
 listing is where someone auditing a review reads the query--provider
 grid, so it is where a dead provider has to stand out.  Records from
 before outcomes were stored show nothing, since nothing is known.
+A semantic search's record shows its ranked list as one
+(\enquote{top 50, ranked (not a count)}, \cref{sec:ranked-list}) and
+without the \enquote{hits:} prefix, which would read as a count.  The
+JSON form marks such a record with [["ranked": true]] (and leaves the
+key out otherwise), so a script reading [[hits]] can tell the two
+apart as well.
 
 <<sessions command>>=
 def _record_outcome_markup(record) -> str:
     """Rich markup for a search record's outcome, or "" if unknown."""
-    label = hits_label(record.hits, record.error, record.retries)
+    ranked = is_ranked_provider(record.provider)
+    label = hits_label(
+        record.hits, record.error, record.retries, ranked=ranked
+    )
     if not label:
         return ""
     if record.error:
         return f" [yellow]— {escape(label)}[/yellow]"
+    if ranked:
+        return f"[dim] — {escape(label)}[/dim]"
     return f"[dim] — hits: {escape(label)}[/dim]"
 
 
@@ -5736,6 +5985,10 @@ def sessions_show(
                     "hits": r.hits,
                     "error": r.error,
                     "retries": r.retries,
+                    **(
+                        {"ranked": True}
+                        if is_ranked_provider(r.provider) else {}
+                    ),
                 }
                 for r in session.search_records
             ],
@@ -6947,6 +7200,598 @@ class TestSessionsCommand:
         assert data["search_records"][0]["limit"] == 50
 @
 
+
+\subsection{Checking sessions with a semantic search}
+\label{sec:sessions-check}
+
+A keyword search's record shows what was found and cannot show what was
+missed (issue~\#136).  [[sessions check]] puts a search by meaning next
+to it: for each question it runs the [[openalex-semantic]] provider
+(\cref{sec:openalex-semantic} in the providers chapter) and looks every
+returned work up in the given sessions
+([[check_against_sessions]], \cref{sec:semantic-check} in the review
+chapter).  It prints, per work, its place in the ranking, its bucket
+(bearing, adjacent, other topic, excluded, unclassified, or not in any
+session) and how each session classified it; then how many of the
+works are in no session; then where each [[--known]] study ended up.
+
+\begin{verbatim}
+scholar sessions check review-a review-b \
+    --semantic "How do users regain access to a lost account?" \
+    --known 10.1145/3576915.3623180 -f json -o check/
+\end{verbatim}
+
+The command is strictly read-only on the sessions: the check is
+evidence about the review and must not change the record it is evidence
+about, so it loads each session and never saves one.  A session that
+does not exist or does not parse stops the command with exit code 1
+and its name, before any request, since a check against fewer sessions
+than asked for would report false gaps.
+
+It reuses the provider's [[search()]], so the cache, the pacing at one
+request a second and the shared OpenAlex budget all apply, and a
+question asked again costs nothing.  A question whose search failed is
+reported as failed, with the reason, and the exit code is then 1: a
+failed check found no gap, and a script must not read it as a clean
+one.  The limit is at most fifty, the most the search returns, and
+fifty by default.
+
+[[-o]] keeps the evidence with the audit record, one pair of files per
+question, numbered in the order the questions were given:
+[[<n>.json]], the question with the works as returned and converted by
+the provider, each with its rank and OpenAlex's [[relevance_score]],
+and [[<n>.txt]], the list as printed in the table format.
+The JSON output ([[-f json]]) carries, per question, the question, the
+provider, the limit, the date of the check, where the answer came from
+and every row, so it can be kept as it is.  The CSV has one line per
+returned work and one per known study (its [[kind]] column tells
+which), so a spreadsheet can sort them.
+
+Evidence has to be dated correctly.  The provider's cache never
+expires, so a question asked again may be answered from a fetch made
+months before the check.  Each question therefore records two dates:
+[[check_date]], when this command ran, and the answer's source, read
+from the provider (\cref{sec:openalex-semantic} keeps the fetch time
+with the cached answer): \enquote{fetched} with its time,
+\enquote{cached, fetched} with the original time, or \enquote{cached
+(date unknown)} when the cache holds no time.  The check date is never
+passed off as the fetch time.  A provider that does not say (a
+third-party provider, or a stand-in in a test) is reported as
+\enquote{fetched (date unknown)}.
+
+Each question also gets a tally of its buckets
+([[check_tally]], \cref{sec:semantic-check}), \enquote{8 works: 1
+bearing, 7 not in any session}, the one line to read first, as the
+earlier script printed it.
+
+<<sessions command>>=
+@sessions_app.command("check")
+def sessions_check(
+    names: Annotated[
+        list[str],
+        typer.Argument(
+            help="Sessions to look the returned works up in.",
+            autocompletion=complete_session_name,
+        ),
+    ],
+    <<sessions check options>>
+) -> None:
+    """
+    Check sessions against a semantic search (OpenAlex search.semantic).
+
+    For each --semantic question, runs a search by meaning and prints,
+    per returned work, its place, how the sessions classified it, and
+    which works are in no session. A check on a keyword search, not a
+    search of its own: it returns a ranked list of at most 50 works.
+    The sessions are only read. Exit code 1 if a session is missing or
+    a question's search failed.
+    """
+    <<validate the check arguments>>
+    <<load the sessions to check, read-only>>
+    <<run each semantic check>>
+    <<print the check results>>
+    <<write the check evidence files>>
+    if any(result["error"] for result in results):
+        raise typer.Exit(1)
+@
+
+The options follow the issue's sketch.  [[--semantic]] is repeatable,
+one question per concept, and so is [[--known]].
+
+<<sessions check options>>=
+semantic: Annotated[
+    Optional[list[str]],
+    typer.Option(
+        "--semantic", "-s",
+        help="A question in plain words, at most 2000 characters. "
+             "Repeatable: one check per question.",
+    ),
+] = None,
+known: Annotated[
+    Optional[list[str]],
+    typer.Option(
+        "--known", "-k",
+        help="A known study to locate, by DOI (exact) or by a part of "
+             "its title (case-insensitive). Repeatable.",
+    ),
+] = None,
+limit: Annotated[
+    int,
+    typer.Option(
+        "--limit", "-l", min=1, max=CHECK_MAX_LIMIT,
+        help=f"Works per question (at most {CHECK_MAX_LIMIT}).",
+    ),
+] = CHECK_MAX_LIMIT,
+output_format: Annotated[
+    str,
+    typer.Option(
+        "--format", "-f",
+        help="Output format: table, csv or json.",
+        autocompletion=complete_check_format,
+    ),
+] = "table",
+output_dir: Annotated[
+    Optional[Path],
+    typer.Option(
+        "--output-dir", "-o",
+        help="Directory for <n>.json (the works) and <n>.txt (the list) "
+             "per question.",
+    ),
+] = None,
+<<completion functions>>=
+CHECK_FORMATS = ["table", "csv", "json"]
+CHECK_MAX_LIMIT = 50   # the most a semantic search returns
+
+
+def complete_check_format(incomplete: str) -> list[str]:
+    """Complete the output format of `sessions check`."""
+    return [f for f in CHECK_FORMATS if f.startswith(incomplete)]
+@
+
+The arguments are checked before anything is loaded or sent; each
+mistake is a usage error (exit 2), like a malformed option.
+
+<<validate the check arguments>>=
+from scholar.providers import OPENALEX_SEMANTIC_MAX_CHARS
+
+err = Console(stderr=True)
+usage_error = None
+if not semantic:
+    usage_error = "Give at least one question with --semantic."
+elif known and any(not item.strip() for item in known):
+    usage_error = (
+        "A --known value is empty; give a DOI or a part of a title."
+    )
+elif output_format not in CHECK_FORMATS:
+    usage_error = (
+        f"Unknown format {output_format!r}; use "
+        f"{', '.join(CHECK_FORMATS)}."
+    )
+else:
+    too_long = [q for q in semantic if len(q) > OPENALEX_SEMANTIC_MAX_CHARS]
+    if too_long:
+        usage_error = (
+            f"A question has {len(too_long[0])} characters; the semantic "
+            f"search matches at most {OPENALEX_SEMANTIC_MAX_CHARS}."
+        )
+if usage_error:
+    err.print(f"[red]{escape(usage_error)}[/red]")
+    raise typer.Exit(2)
+@
+
+Loading is strict, so an unreadable file is an error and not a missing
+session, and nothing is saved afterwards.
+
+<<load the sessions to check, read-only>>=
+from scholar.review import load_session, SessionFileError
+
+sessions = []
+for session_name in names:
+    try:
+        loaded = load_session(session_name, strict=True)
+    except SessionFileError as error:
+        err.print(f"[red]{escape(str(error))}[/red]")
+        raise typer.Exit(1)
+    if loaded is None:
+        err.print(f"[red]Session not found: {escape(session_name)}[/red]")
+        raise typer.Exit(1)
+    sessions.append(loaded)
+@
+
+Each question is one search.  A provider blocked by its quota is
+skipped by [[Search.execute]] with a warning; here, where each question
+is reported on its own, the block is the question's failure, with the
+limiter's reason.  The works are cleaned as [[Search.execute]] cleans
+them, so titles compare as they do in the sessions.
+
+<<run each semantic check>>=
+from scholar.providers import get_provider
+from scholar.ratelimit import limiter_for
+from scholar.review import (
+    CHECK_NOT_IN_SESSIONS, check_against_sessions, check_tally,
+)
+from scholar.scholar import provider_outcome
+from scholar.utils import clean_paper_text
+
+provider = get_provider("openalex-semantic")
+results = []
+works_by_question = []
+for number, question in enumerate(semantic, start=1):
+    availability = limiter_for(provider).check_available()
+    if availability.ok:
+        papers = provider.search(question, limit=limit)
+        error, retries = provider_outcome(provider)
+    else:
+        papers, error, retries = [], availability.reason, 0
+    for paper in papers:
+        clean_paper_text(paper)
+    rows, known_rows = check_against_sessions(papers, sessions, known or [])
+    scores = check_scores(papers)
+    works_by_question.append((papers, scores))
+    results.append({
+        "number": number,
+        "question": question,
+        "provider": provider.name,
+        "limit": limit,
+        "check_date": datetime.now().isoformat(timespec="seconds"),
+        "source": check_source(provider, papers, error),
+        "sessions": [s.name or s.query for s in sessions],
+        "error": error,
+        "retries": retries,
+        "returned": len(rows),
+        "tally": check_tally(rows),
+        "not_in_any_session": sum(
+            1 for row in rows if row.bucket == CHECK_NOT_IN_SESSIONS
+        ),
+        "rows": [
+            {**dataclasses.asdict(row), "relevance_score": score}
+            for row, score in zip(rows, scores)
+        ],
+        "known": [dataclasses.asdict(row) for row in known_rows],
+    })
+@
+
+The scores and the source are read with [[getattr]], since the
+provider's answer is only promised to be a list: the semantic provider
+returns a [[RankedPapers]] that carries them, any other answer reads
+as \enquote{unknown}.  [[last_from_cache]] counts only when it is
+literally [[True]], so a stand-in whose every attribute is a [[Mock]]
+is not mistaken for a cache hit.
+
+<<session check helpers>>=
+def check_scores(papers: list) -> list:
+    """The relevance score of each paper, or None where unknown."""
+    scores = list(getattr(papers, "scores", None) or [])
+    return [
+        scores[i] if i < len(scores) else None for i in range(len(papers))
+    ]
+
+
+def check_source(provider, papers: list, error: str | None) -> dict:
+    """Where a question's answer came from: cache or fetch, and when."""
+    from_cache = getattr(provider, "last_from_cache", False) is True
+    fetched_at = getattr(papers, "fetched_at", None)
+    if not isinstance(fetched_at, str):
+        fetched_at = None
+    if error:
+        label = "not fetched"
+    elif from_cache:
+        label = (
+            f"cached, fetched {fetched_at}" if fetched_at
+            else "cached (date unknown)"
+        )
+    else:
+        label = (
+            f"fetched {fetched_at}" if fetched_at
+            else "fetched (date unknown)"
+        )
+    return {"from_cache": from_cache, "fetched_at": fetched_at,
+            "label": label}
+@
+
+The three formats print the same results.  The table format is plain
+text rather than a Rich table: it is also what [[<n>.txt]] keeps, and a
+file should read the same as the screen did.
+
+<<print the check results>>=
+if output_format == "json":
+    print(json.dumps(results, indent=2))
+elif output_format == "csv":
+    write_check_csv(results, sys.stdout)
+else:
+    for result in results:
+        print("\n".join(check_text_lines(result)))
+        print()
+@
+
+<<write the check evidence files>>=
+if output_dir is not None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for result, (papers, scores) in zip(results, works_by_question):
+        number = result["number"]
+        evidence = {
+            key: result[key]
+            for key in ("question", "provider", "limit", "check_date",
+                        "source", "error")
+        }
+        evidence["works"] = [
+            {"rank": rank, "relevance_score": score, **paper.to_dict()}
+            for rank, (paper, score) in enumerate(
+                zip(papers, scores), start=1
+            )
+        ]
+        (output_dir / f"{number}.json").write_text(
+            json.dumps(evidence, indent=2) + "\n", encoding="utf-8"
+        )
+        (output_dir / f"{number}.txt").write_text(
+            "\n".join(check_text_lines(result)) + "\n", encoding="utf-8"
+        )
+@
+
+The text lists every returned work with its place, bucket, year, DOI
+and title, and under it one line per session that holds it.  A ranked
+list is labelled as one ([[hits_label]], \cref{sec:search-result-error}),
+and a failed question says why.
+
+<<session check helpers>>=
+def _check_match_text(match: dict) -> str:
+    """One session's verdict on a work: name, status, category, how."""
+    category = f", {match['category']}" if match["category"] else ""
+    return (
+        f"{match['session']}: {match['status']}{category} "
+        f"({match['matched_by']})"
+    )
+
+
+def check_text_lines(result: dict) -> list[str]:
+    """The plain-text listing of one question's check."""
+    lines = [f"== Question {result['number']}: {result['question']}"]
+    label = hits_label(
+        result["returned"], result["error"], result["retries"],
+        ranked=True,
+    )
+    lines.append(
+        f"   {result['provider']}: {label}; checked "
+        f"{result['check_date']}; {result['source']['label']}"
+    )
+    if result["error"] and not result["returned"]:
+        return lines
+    lines.append(
+        f"   {result['returned']} works: "
+        + ", ".join(f"{n} {bucket}" for bucket, n in result["tally"].items())
+    )
+    for row in result["rows"]:
+        lines.append(
+            f"{row['rank']:4d}  {row['bucket']:<18}  "
+            f"{row['year'] or '':<4}  {row['doi'] or '-':<30}  "
+            f"{row['title']}"
+        )
+        for match in row["matches"]:
+            lines.append(f"{'':8}{_check_match_text(match)}")
+    lines.append(
+        f"   {result['not_in_any_session']} of {result['returned']} "
+        f"in no session"
+    )
+    for known in result["known"]:
+        place = (
+            f"place {known['rank']}" if known["rank"] else "not returned"
+        )
+        sessions = "; ".join(
+            _check_match_text(m) for m in known["matches"]
+        )
+        lines.append(
+            f"   known {known['known']!r}: {place}, {known['bucket']}"
+            + (f" ({sessions})" if sessions else "")
+        )
+    return lines
+@
+
+<<cli imports>>=
+import csv
+from datetime import datetime
+<<session check helpers>>=
+CHECK_CSV_COLUMNS = [
+    "question_number", "question", "kind", "known", "rank", "title",
+    "year", "doi", "paper_id", "bucket", "sessions", "error",
+]
+
+
+def write_check_csv(results: list[dict], stream) -> None:
+    """Write the check results as CSV: one line per work or known study."""
+    writer = csv.DictWriter(stream, fieldnames=CHECK_CSV_COLUMNS)
+    writer.writeheader()
+    for result in results:
+        base = {
+            "question_number": result["number"],
+            "question": result["question"],
+        }
+        if result["error"]:
+            writer.writerow({**base, "kind": "failed",
+                             "error": result["error"]})
+        for kind, rows in (("returned", result["rows"]),
+                           ("known", result["known"])):
+            for row in rows:
+                writer.writerow({
+                    **base,
+                    "kind": kind,
+                    "known": row.get("known", ""),
+                    "rank": row["rank"] or "",
+                    "title": row["title"] or "",
+                    "year": row.get("year") or "",
+                    "doi": row["doi"] or "",
+                    "paper_id": row.get("paper_id", ""),
+                    "bucket": row["bucket"],
+                    "sessions": "; ".join(
+                        _check_match_text(m) for m in row["matches"]
+                    ),
+                })
+@
+
+Let's verify the command end to end with a stand-in provider: the
+formats, the evidence files, the read-only promise (the session file is
+byte-identical afterwards), a failed question, and a missing session.
+The provider is a [[Mock]] registered under the real name, since what
+is tested here is the command around the search; the search itself is
+tested against a recorded response in the providers chapter.
+
+<<test functions>>=
+class TestSessionsCheck:
+  """sessions check: a semantic search held against sessions."""
+
+  <<sessions check test methods>>
+<<sessions check test methods>>=
+def _setup(self, tmp_path, monkeypatch, papers, error=None):
+  from scholar import providers
+  from scholar.review import (
+    ReviewSession, ReviewDecision, DecisionStatus, save_session,
+  )
+
+  monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+  session = ReviewSession(
+    query="q", providers=["openalex"], timestamp=datetime.now(),
+    name="kw",
+  )
+  session.decisions.append(ReviewDecision(
+    paper=Paper(title="Kept one", authors=["Ann"], doi="10.1/kept"),
+    provider="openalex", status=DecisionStatus.KEPT,
+    tags=["supports-claim"],
+  ))
+  path = save_session(session)
+  semantic = Mock()
+  semantic.name = "openalex-semantic"
+  semantic.MAX_LIMIT = 50
+  semantic.last_error = error
+  semantic.last_retries = 0
+  semantic.search.return_value = papers
+  monkeypatch.setattr(
+    providers, "PROVIDERS", {"openalex-semantic": semantic}
+  )
+  return path, semantic
+
+def _papers(self):
+  return [
+    Paper(title="Kept one", authors=["Ann"], doi="10.1/KEPT"),
+    Paper(title="Missed one", authors=["Bo"], doi="10.1/missed"),
+  ]
+
+def test_table_lists_places_buckets_and_gaps(self, tmp_path, monkeypatch):
+  path, semantic = self._setup(tmp_path, monkeypatch, self._papers())
+  before = path.read_bytes()
+  result = runner.invoke(app, [
+    "sessions", "check", "kw", "--semantic", "a question",
+    "--known", "10.1/missed", "--known", "absent title",
+  ])
+  assert result.exit_code == 0, result.output
+  assert semantic.search.call_args.kwargs["limit"] == 50
+  out = result.output
+  assert "== Question 1: a question" in out
+  assert "top 2, ranked (not a count)" in out
+  assert "   1  bearing" in out
+  assert "kw: kept, supports-claim (doi)" in out
+  assert "   2  not in any session" in out
+  assert "1 of 2 in no session" in out
+  assert "2 works: 1 bearing, 1 not in any session" in out
+  assert "fetched (date unknown)" in out
+  assert "known '10.1/missed': place 2, not in any session" in out
+  assert "known 'absent title': not returned, not in any session" in out
+  assert path.read_bytes() == before
+
+def test_json_and_csv(self, tmp_path, monkeypatch):
+  import csv as _csv
+  import io
+
+  self._setup(tmp_path, monkeypatch, self._papers())
+  as_json = runner.invoke(app, [
+    "sessions", "check", "kw", "-s", "q1", "-s", "q2", "-f", "json",
+    "-l", "10",
+  ])
+  assert as_json.exit_code == 0, as_json.output
+  data = json.loads(as_json.stdout)
+  assert [d["question"] for d in data] == ["q1", "q2"]
+  first = data[0]
+  assert first["provider"] == "openalex-semantic"
+  assert first["limit"] == 10
+  assert first["check_date"]
+  assert first["tally"] == {"bearing": 1, "not in any session": 1}
+  assert first["not_in_any_session"] == 1
+  assert first["rows"][0]["matches"][0]["session"] == "kw"
+
+  as_csv = runner.invoke(app, [
+    "sessions", "check", "kw", "-s", "q1", "-k", "missed", "-f", "csv",
+  ])
+  assert as_csv.exit_code == 0
+  rows = list(_csv.DictReader(io.StringIO(as_csv.stdout)))
+  assert [(r["kind"], r["rank"], r["bucket"]) for r in rows] == [
+    ("returned", "1", "bearing"),
+    ("returned", "2", "not in any session"),
+    ("known", "2", "not in any session"),
+  ]
+
+def test_output_dir_keeps_the_evidence(self, tmp_path, monkeypatch):
+  from scholar.providers import RankedPapers
+
+  _, semantic = self._setup(tmp_path, monkeypatch, RankedPapers(
+    self._papers(), scores=[0.93, 0.85], fetched_at="2026-01-02T03:04:05",
+  ))
+  semantic.last_from_cache = True
+  out = tmp_path / "evidence"
+  result = runner.invoke(app, [
+    "sessions", "check", "kw", "-s", "q1", "-s", "q2", "-o", str(out),
+  ])
+  assert result.exit_code == 0
+  assert sorted(p.name for p in out.iterdir()) \
+    == ["1.json", "1.txt", "2.json", "2.txt"]
+  saved = json.loads((out / "1.json").read_text())
+  assert saved["question"] == "q1"
+  assert saved["check_date"] != "2026-01-02T03:04:05"
+  assert saved["source"] == {
+    "from_cache": True, "fetched_at": "2026-01-02T03:04:05",
+    "label": "cached, fetched 2026-01-02T03:04:05",
+  }
+  assert [(w["rank"], w["relevance_score"], w["doi"])
+          for w in saved["works"]] \
+    == [(1, 0.93, "10.1/KEPT"), (2, 0.85, "10.1/missed")]
+  text = (out / "2.txt").read_text()
+  assert text.startswith("== Question 2: q2")
+  assert "cached, fetched 2026-01-02T03:04:05" in text
+
+def test_cached_answer_without_a_date(self, tmp_path, monkeypatch):
+  _, semantic = self._setup(tmp_path, monkeypatch, self._papers())
+  semantic.last_from_cache = True
+  result = runner.invoke(app, ["sessions", "check", "kw", "-s", "q1"])
+  assert result.exit_code == 0
+  assert "cached (date unknown)" in result.output
+
+def test_failed_question_exits_1(self, tmp_path, monkeypatch):
+  self._setup(tmp_path, monkeypatch, [], error="HTTP 503")
+  result = runner.invoke(app, ["sessions", "check", "kw", "-s", "q1"])
+  assert result.exit_code == 1
+  assert "failed (HTTP 503)" in result.output
+
+def test_missing_session_exits_1(self, tmp_path, monkeypatch):
+  _, semantic = self._setup(tmp_path, monkeypatch, self._papers())
+  result = runner.invoke(
+    app, ["sessions", "check", "kw", "nonesuch", "-s", "q1"]
+  )
+  assert result.exit_code == 1
+  assert "Session not found: nonesuch" in result.output
+  semantic.search.assert_not_called()
+
+@pytest.mark.parametrize("args, message", [
+  ([], "at least one question"),
+  (["-s", "x" * 2001], "at most 2000"),
+  (["-s", "q", "-f", "xml"], "Unknown format"),
+  (["-s", "q", "-l", "51"], "51 is not in the range"),
+  (["-s", "q", "-k", ""], "--known value is empty"),
+  (["-s", "q", "-k", "  "], "--known value is empty"),
+])
+def test_usage_errors_exit_2(self, tmp_path, monkeypatch, args, message):
+  _, semantic = self._setup(tmp_path, monkeypatch, self._papers())
+  result = runner.invoke(app, ["sessions", "check", "kw"] + args)
+  assert result.exit_code == 2
+  assert message in " ".join(result.output.split())
+  semantic.search.assert_not_called()
+@
 
 \section{Citation Provenance}
 \label{sec:prov-commands}
@@ -8943,7 +9788,7 @@ gets its own line with the reason, worded by [[hits_label]] as in every
 other view, and so does one that answered only in part.
 
 <<cli imports>>=
-from scholar.scholar import hits_label
+from scholar.scholar import hits_label, is_ranked_provider
 
 <<formatter classes>>=
 class TableFormatter:
@@ -8982,13 +9827,18 @@ class TableFormatter:
 
             self.console.print(table)
 
+            ranked = is_ranked_provider(result.provider)
+            label = hits_label(
+                len(result.papers), result.error, ranked=ranked
+            )
             if result.error:
-                label = hits_label(len(result.papers), result.error)
                 self.console.print(
                     f"[yellow]Results: {escape(label)}[/yellow]"
                 )
             elif not result.papers:
                 self.console.print("[dim]No results found.[/dim]")
+            elif ranked:
+                self.console.print(f"[dim]Results: {escape(label)}[/dim]")
 @
 
 Let's verify the table formatter produces correct output:
@@ -9048,7 +9898,11 @@ class CSVFormatter:
             print(f"# Query: {result.query}")
             print(f"# Provider: {result.provider}")
             print(f"# Timestamp: {result.timestamp}")
-            print(f"# Results: {hits_label(len(result.papers), result.error)}")
+            label = hits_label(
+                len(result.papers), result.error,
+                ranked=is_ranked_provider(result.provider),
+            )
+            print(f"# Results: {label}")
             if result.retries:
                 print(f"# Retries: {result.retries}")
             print()
