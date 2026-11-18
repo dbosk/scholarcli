@@ -274,15 +274,22 @@ provider should do the same.
 OpenAlex (#150, #151): a limiter refusal sets `last_error` to its
 reason; a refusal or failed request after some pages keeps those pages
 (`PagesCutShort` from the paging loop → `N, incomplete (reason)`,
-uncached). A refused request records `HTTP <code>: <message>` from the
-JSON body (`message`, else `error`; `openalex_error_message`, shortened
-to `OPENALEX_REASON_MAX_CHARS` = 120), plus `; no API key: set
-OPENALEX_API_KEY` when keyless and the refusal is a 503 or a
-budget-spent 429; `providers check` gives the same detail. The
-constructor sets `pyalex.config.retry_http_codes = []`: pyalex's
-default (`max_retries=0` with 429/500/503 listed) retried nothing but
-turned those statuses into a `RetryError` without a response, so no
-search ever saw a real 429 or 503 body.
+uncached). A refused request that reaches scholar as an `HTTPError`
+records `HTTP <code>: <message>` from the JSON body (`message`, else
+`error`; `openalex_error_message`, shortened to
+`OPENALEX_REASON_MAX_CHARS` = 120), or `HTTP <code>` without one, plus
+`; no API key: set OPENALEX_API_KEY` when keyless and the refusal is a
+503 with OpenAlex's message in the body or a budget-spent 429;
+`providers check` gives the same detail. Two refusals pyalex raises
+itself as a `QueryError` before any `HTTPError`: a 400 whose `error`
+mentions "query parameters" (the exception holds the body's
+`message`) and a 401 whose `error` mentions "API key" (`error` plus
+pyalex's "Did you configure a valid API key?"). Those record the
+exception text, shortened, without the `HTTP <code>:` prefix. The
+constructor sets `pyalex.config.retry_http_codes =
+[]`: pyalex's default (`max_retries=0` with 429/500/503 listed) retried
+nothing but turned those statuses into a `RetryError` without a
+response, so no search ever saw a real 429 or 503 body.
 
 Keys in messages (#159): `network.redact_secrets(text)` hides the
 values of `api_key`/`apikey`/`api-key`/`key` URL parameters (any
