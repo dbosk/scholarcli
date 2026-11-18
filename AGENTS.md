@@ -888,7 +888,15 @@ requests/day and each `scholar` run is a fresh process.
 - State: one JSON file per quota group in
   `$SCHOLAR_DATA_DIR/rate_limits/` (data dir, NOT the cache dir —
   `scholar cache clear` must not erase quota memory). Written
-  atomically on every change; fail-open on corruption. Daily quotas
+  atomically on every change; fail-open on corruption. Every
+  read-modify-write (`acquire`, `record_limit_hit`, the header sync)
+  runs in `RateLimiter._exclusive`: the limiter's `threading.RLock`
+  plus `utils.file_lock` on the state file (`.<group>.json.lock`), so
+  threads and processes take turns and no count is lost (#148). The
+  locks are never held across a sleep: `acquire` loops (lock, load,
+  refuse/pace check, stamp+save or unlock-sleep-reload) and waits again
+  if someone else stamped while it slept. Stamps are wall-clock
+  (`_now`), shared across processes. Daily quotas
   bucket on the UTC calendar day and self-correct via the provider's
   own rejection if the guess is wrong.
 - `Search.execute` pre-checks `check_available()` and **skips** a

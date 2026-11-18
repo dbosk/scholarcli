@@ -567,15 +567,12 @@ A crash mid-run is also precisely when rate-limit events are most likely
 to have just happened, so waiting for [[atexit]] would lose exactly the
 records that matter most.
 
-We accept one known race: two concurrent [[scholar]] processes doing
-read-modify-write on the same file can lose an increment (last writer
-wins).
-File locking would close it, but [[fcntl]] is POSIX-only and Scholar
-ships to Windows via [[platformdirs]].
-The undercount is bounded by the number of concurrent processes, and two
-authoritative backstops correct it: the provider's own quota rejection
-(\cref{sec:ratelimit-record-limit-hit}) and header sync
-(\cref{sec:ratelimit-record-response}).
+Saving alone does not make the record safe to share.
+Every change is a read--modify--write (load, change, save), and two
+writers that interleave lose one change: the last save wins.
+That is why [[save_state]] is never called on its own: the limiter
+methods that change the record hold a lock around the whole
+read--modify--write (\cref{sec:ratelimit-taking-turns}).
 
 <<state functions>>=
 def save_state(name: str, state: dict) -> None:
@@ -652,10 +649,9 @@ class TestStateStore:
         assert files == ["ieee.json"]
 
     def test_last_writer_wins(self, clock):
-        """Concurrent read-modify-write loses increments; last save wins.
+        """Unlocked read-modify-writes lose increments; last save wins.
 
-        This pins the documented trade-off: no file locking, bounded
-        undercount, corrected by the provider's own rejections.
+        This is why the limiter never saves outside its lock.
         """
         first = load_state("ieee")
         second = load_state("ieee")
@@ -717,9 +713,12 @@ The object itself is almost stateless: all quota facts live in the state
 file and are re-read on every operation, so concurrent processes see each
 other's updates as promptly as the file system allows.
 What does live in memory is [[_last_request]] (sub-second pacing needs
-better resolution than a file round-trip guarantees) and [[_warned]], a
+better resolution than a file round-trip guarantees), [[_warned]], a
 per-process flag that keeps a blocked 300-paper enrichment run from
-printing 300 identical warnings.
+printing 300 identical warnings, and [[_lock]], which makes the threads
+of one process take turns (\cref{sec:ratelimit-taking-turns}).
+None of these is persisted: the state file holds only the record of
+\cref{sec:ratelimit-state}.
 
 <<rate limiter class>>=
 class RateLimiter:
@@ -735,6 +734,7 @@ class RateLimiter:
         self.limits = limits or Limits()
         self._last_request: float | None = None
         self._warned = False
+        self._lock = threading.RLock()
 
     <<rate limiter methods>>
 @
@@ -800,6 +800,13 @@ Counting increments the day tally and persists immediately---not at
 exit---so a crash or Ctrl-C cannot lose requests that were actually
 made.
 
+All three happen under the limiter's lock, and the sleep happens
+outside it, which is why [[acquire]] is a loop: it takes the lock,
+reads the record, and either stamps the request and returns or lets go
+of the lock, sleeps, and reads the record again.
+\Cref{sec:ratelimit-taking-turns} explains why the lock is not held
+across the sleep and why the record must be read again after it.
+
 <<rate limiter methods>>=
 def acquire(self, cost: int = 1) -> None:
     """Gate one imminent HTTP request.
@@ -809,37 +816,86 @@ def acquire(self, cost: int = 1) -> None:
     request against the daily budget and persists the count
     immediately.
     """
-    state = load_state(self.name)
-    availability = _availability(state, self.limits)
-    if not availability.ok:
-        if not self._warned:
-            logger.warning(
-                f"{self.name}: {availability.reason};"
-                f" retry {format_retry(availability.retry_at)}."
-            )
-            self._warned = True
-        raise RateLimited(
-            self.name, availability.reason, availability.retry_at
-        )
-    <<pace the request rate>>
-    now = _now()
-    state["day_count"] += cost
-    state["daily_limit"] = self.limits.daily
-    state["last_request"] = now
-    self._last_request = now
-    save_state(self.name, state)
+    waited_for = None
+    while True:
+        with self._exclusive():
+            state = load_state(self.name)
+            <<refuse while unavailable>>
+            last, wait = self._pacing_wait(state)
+            if wait <= 0 or last == waited_for:
+                <<count and stamp the request>>
+                return
+        _sleep(wait)
+        waited_for = last
 @
 
-<<pace the request rate>>=
-if self.limits.per_second:
-    interval = 1.0 / self.limits.per_second
+<<refuse while unavailable>>=
+availability = _availability(state, self.limits)
+if not availability.ok:
+    if not self._warned:
+        logger.warning(
+            f"{self.name}: {availability.reason};"
+            f" retry {format_retry(availability.retry_at)}."
+        )
+        self._warned = True
+    raise RateLimited(
+        self.name, availability.reason, availability.retry_at
+    )
+@
+
+The wait is measured from the latest request anyone made: the
+in-process stamp or the persisted one, whichever is later.
+[[_pacing_wait]] returns that stamp along with the wait, because the
+loop needs it to decide when it has waited long enough.
+
+<<rate limiter methods>>=
+def _pacing_wait(self, state: dict) -> tuple[float, float]:
+    """Return the latest request stamp and how long to wait after it."""
     last = max(
         self._last_request or 0.0,
         state.get("last_request") or 0.0,
     )
-    wait = last + interval - _now()
-    if wait > 0:
-        _sleep(wait)
+    if not self.limits.per_second:
+        return last, 0.0
+    return last, last + 1.0 / self.limits.per_second - _now()
+@
+
+The loop ends when there is nothing left to wait, or when the latest
+stamp is still the one we slept for.
+The second condition is not redundant.
+The sleep was computed to end one interval after that stamp, so if
+nobody has stamped since, we have waited long enough, whatever the
+clock now says.
+Testing for \enquote{nothing left to wait} alone would never end when
+time does not pass: the test suite replaces [[_sleep]] by a no-op and
+some tests freeze [[_now]].
+A \emph{new} stamp means that another thread or process went first
+while we slept, and we must wait a full interval after it.
+
+The request is stamped twice.
+The persisted stamp has to be written before the record is saved, so
+it is taken just before [[save_state]]; the in-process stamp is taken
+after the save, as close as we can get to the moment the caller sends
+the request.
+The gap between the persisted stamp and the send is the time a save
+takes, about a millisecond (measured in
+\cref{sec:ratelimit-taking-turns}), which the declared rate must
+leave room for
+(Semantic Scholar's does, \cref{sec:semantic-scholar}).
+Both stamps are wall-clock time from [[_now]].
+The persisted one has to be: another process compares it with its own
+clock, and only the wall clock is shared between processes.
+The in-process one could use [[time.monotonic]], which no clock
+adjustment moves, but it is compared with the persisted stamp, and
+mixing two clocks in one comparison would need a second time seam that
+every test faking the time would then have to replace as well.
+
+<<count and stamp the request>>=
+state["day_count"] += cost
+state["daily_limit"] = self.limits.daily
+state["last_request"] = _now()
+save_state(self.name, state)
+self._last_request = _now()
 @
 
 <<test functions>>=
@@ -905,6 +961,164 @@ class TestAcquire:
         assert load_state("ieee")["day_count"] == 1
 @
 
+\subsection{Taking turns}
+\label{sec:ratelimit-taking-turns}
+
+Pacing against a stamp works only if each request sees the stamp of
+the one before it.
+Without coordination it does not: two threads, or two [[scholar]]
+processes, can each read the same last stamp, each wait out the same
+interval, and send together.
+Each then saves its own count over the other's, so the day tally loses
+requests too.
+The TUI is such a case: its enrichment thread looks up DOIs while the
+main thread fetches PDFs and references from the same API.
+
+So every method that reads and changes the record does so in
+[[_exclusive]], which holds two locks: the limiter's own
+[[threading.RLock]] for the threads of this process, and
+[[utils.file_lock]] (\cref{sec:file-lock}) on the group's state file
+for other processes.
+[[file_lock]] would exclude threads by itself, but it gives up after
+[[LOCK_TIMEOUT]] seconds or where no lock file can be created, and the
+thread lock still holds then; it also guards the in-memory
+[[_last_request]] and [[_warned]].
+The lock is reentrant, as [[file_lock]] is, so that a method holding
+it may call another that takes it.
+The lock file is [[.<group>.json.lock]] next to the state file, which
+the [[*.json]] listings of [[all_status]] and [[reset_state]] do not
+match.
+This applies to every quota group, not only Semantic Scholar's: any
+provider used from two threads or two processes gets the same
+guarantee.
+
+The locks are held for a load, a check and a save, never for a sleep.
+Holding them across the sleep would serialise the requests just as
+well, but a process waiting for the file lock gives up after
+[[LOCK_TIMEOUT]] seconds and goes ahead without it, and the third of
+three anonymous Semantic Scholar requests queued together already
+waits nine seconds.
+It would also block [[record_response]] and [[record_limit_hit]] in
+other threads for as long as the sleep lasts.
+Instead, [[acquire]] lets go while it sleeps and reads the record again
+when it wakes (above): if someone stamped in the meantime, it waits
+again.
+The price is small.
+Timing 3000 unpaced [[acquire]] calls with a temporary data directory
+on [[tmpfs]] (November 2026), each took 1.1 to 1.4~ms with the locks
+and 0.4 to 0.7~ms without them: under a millisecond more per request,
+against a pacing interval of a second or more.
+
+<<rate limiter methods>>=
+@contextmanager
+def _exclusive(self) -> Iterator[None]:
+    """Hold this limiter's thread lock and its state file's lock."""
+    with self._lock, file_lock(_state_file(self.name)):
+        yield
+@
+
+<<imports>>=
+import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
+
+from scholar.utils import file_lock
+@
+
+Let's verify both halves.
+The first test plays the other process inside our sleep: it stamps the
+record while we wait, and our [[acquire]] must notice, wait a second
+interval, and keep the other process's count.
+The second runs two threads on one limiter with real time, at twenty
+requests per second to keep it short.
+It records each stamp as it is saved and checks that no two are closer
+than the interval.
+The small tolerance is there because the sleep is measured on the
+monotonic clock and the stamps on the wall clock, which the operating
+system may adjust slightly while the test runs; the failure it guards
+against, two threads stamping together, gives gaps near zero.
+The third repeats the second with [[file_lock]] giving up, as it does
+after [[LOCK_TIMEOUT]] or without a writable lock file: then the thread
+lock alone must keep the threads apart.
+
+<<test functions>>=
+class TestAcquireTakesTurns:
+    """Concurrent acquires lose no count and keep their stamps apart."""
+
+    def test_rereads_the_state_after_waking(self, clock, monkeypatch):
+        """A stamp another process made during our wait is waited for."""
+        limiter = RateLimiter("ieee", Limits(per_second=10.0))
+        limiter.acquire()
+
+        def sleep_while_another_process_stamps(seconds):
+            clock["sleeps"].append(seconds)
+            clock["now"] += seconds
+            if len(clock["sleeps"]) == 1:
+                other = load_state("ieee")
+                other["day_count"] += 1
+                other["last_request"] = clock["now"]
+                save_state("ieee", other)
+
+        monkeypatch.setattr(
+            rl, "_sleep", sleep_while_another_process_stamps
+        )
+        limiter.acquire()
+        assert clock["sleeps"] == [
+            pytest.approx(0.1), pytest.approx(0.1)
+        ]
+        assert load_state("ieee")["day_count"] == 3
+
+    def test_threads_take_turns(self, monkeypatch):
+        """Two threads on one limiter: every count kept, stamps apart."""
+        self.assert_two_threads_take_turns(monkeypatch)
+
+    def test_threads_take_turns_without_the_file_lock(self, monkeypatch):
+        """The thread lock holds when `file_lock` gives up."""
+        from contextlib import contextmanager
+
+        @contextmanager
+        def gives_up(path, timeout=None):
+            yield False
+
+        monkeypatch.setattr(rl, "file_lock", gives_up)
+        self.assert_two_threads_take_turns(monkeypatch)
+
+    @staticmethod
+    def assert_two_threads_take_turns(monkeypatch):
+        import threading
+        import time
+
+        monkeypatch.setattr(rl, "_sleep", time.sleep)
+        stamps = []
+        real_save = rl.save_state
+
+        def recording_save(name, state):
+            stamps.append(state["last_request"])
+            real_save(name, state)
+
+        monkeypatch.setattr(rl, "save_state", recording_save)
+        limiter = RateLimiter("s2", Limits(per_second=20.0))
+
+        def three_requests():
+            for _ in range(3):
+                limiter.acquire()
+
+        threads = [threading.Thread(target=three_requests)
+                   for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(10)
+
+        assert load_state("s2")["day_count"] == 6
+        stamps.sort()
+        gaps = [b - a for a, b in zip(stamps, stamps[1:])]
+        assert min(gaps) >= 1 / 20.0 - CLOCK_TOLERANCE
+
+
+CLOCK_TOLERANCE = 0.001  # seconds; see the prose
+@
+
 \subsection{Recording responses}
 \label{sec:ratelimit-record-response}
 
@@ -953,19 +1167,20 @@ def record_response(self, response) -> None:
 remaining = _get_header(headers, "X-RateLimit-Remaining")
 reset = _get_header(headers, "X-RateLimit-Reset")
 if remaining is not None or reset is not None:
-    state = load_state(self.name)
-    try:
-        state["remaining"] = int(remaining)
-    except (TypeError, ValueError):
-        pass
-    try:
-        value = float(reset)
-        if value < EPOCH_THRESHOLD:
-            value = _now() + value
-        state["reset_at"] = value
-    except (TypeError, ValueError):
-        pass
-    save_state(self.name, state)
+    with self._exclusive():
+        state = load_state(self.name)
+        try:
+            state["remaining"] = int(remaining)
+        except (TypeError, ValueError):
+            pass
+        try:
+            value = float(reset)
+            if value < EPOCH_THRESHOLD:
+                value = _now() + value
+            state["reset_at"] = value
+        except (TypeError, ValueError):
+            pass
+        save_state(self.name, state)
 @
 
 Real [[requests.Response]] headers are case-insensitive dictionaries, but
@@ -1071,24 +1286,25 @@ def record_limit_hit(self, *, retry_after: float | None = None,
     is spent: the day count is forced to the declared limit and the
     cooldown extends to the next daily reset.
     """
-    state = load_state(self.name)
-    if exhausted_daily:
-        if self.limits.daily:
-            state["day_count"] = max(
-                state["day_count"], self.limits.daily
+    with self._exclusive():
+        state = load_state(self.name)
+        if exhausted_daily:
+            if self.limits.daily:
+                state["day_count"] = max(
+                    state["day_count"], self.limits.daily
+                )
+                state["daily_limit"] = self.limits.daily
+            if until is None and retry_after is None:
+                until = next_daily_reset()
+        if until is None:
+            delay = (
+                retry_after if retry_after is not None else DEFAULT_COOLDOWN
             )
-            state["daily_limit"] = self.limits.daily
-        if until is None and retry_after is None:
-            until = next_daily_reset()
-    if until is None:
-        delay = (
-            retry_after if retry_after is not None else DEFAULT_COOLDOWN
-        )
-        until = _now() + delay
-    state["cooldown_until"] = until
-    state["cooldown_reason"] = reason or "rate limited"
-    state["cooldown_quota"] = exhausted_daily
-    save_state(self.name, state)
+            until = _now() + delay
+        state["cooldown_until"] = until
+        state["cooldown_reason"] = reason or "rate limited"
+        state["cooldown_quota"] = exhausted_daily
+        save_state(self.name, state)
 <<constants>>=
 # Cooldown applied on a 429 without a usable Retry-After, in seconds.
 DEFAULT_COOLDOWN = 60.0
