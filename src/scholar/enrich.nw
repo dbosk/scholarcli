@@ -348,6 +348,18 @@ def enrich_paper(
 
 @
 
+Any [[Paper]] attribute could be passed in [[fields]], but only some
+are filled by the merge above ([[Paper.merge_with]]): the default
+fields and the author [[keywords]], which callers request explicitly.
+[[ENRICHMENT_FIELD_NAMES]] lists them, so that a command taking field
+names from the user ([[scholar enrich --fields]]) can reject a name
+that would silently never be filled.
+
+<<enrichment functions>>=
+# Field names enrich_paper can fill; callers validate user input here.
+ENRICHMENT_FIELD_NAMES = [*ENRICHABLE_FIELDS, "keywords"]
+@
+
 \subsection{Global enrichment cache}
 \label{sec:enrichment-cache}
 
@@ -1212,6 +1224,106 @@ class TestNeedsEnrichment:
 For enriching multiple papers (e.g., after a search), we provide a batch
 function with optional progress reporting.
 
+Before its loop, the batch function lets OpenAlex answer the whole
+batch's DOIs in a few requests ([[prefetch_dois]],
+\cref{sec:openalex-doi-batch}), fifty DOIs to a request instead of one.
+The loop itself is unchanged: when [[enrich_paper]] reaches OpenAlex
+for a paper, the answer is already in the cache.
+We prefetch only when OpenAlex is among the providers the loop will
+try (and has the method), and only the DOIs of papers that
+[[needs_enrichment]] for the requested fields, since the loop asks
+no provider about the others.
+A paper without a DOI is included under the arXiv DOI derived from its
+URL, because [[enrich_paper]] derives that DOI before its lookups too.
+
+The prefetch is not free when a provider earlier in the order fills
+a paper first: the batch has then asked OpenAlex about a DOI the loop
+never needed it for.
+That costs one fiftieth of a request per such paper.
+It also says what the fast path is.
+Semantic Scholar comes first in [[ENRICHMENT_PROVIDERS]], and without
+a key its declared rate is one request every three seconds
+([[SemanticScholarProvider.LIMITS]]), so a paper that Semantic Scholar
+answers still costs three seconds whatever OpenAlex holds.
+The batch saves time only for papers that reach OpenAlex, and saves
+the most when OpenAlex is asked first:
+[[--enrich-providers openalex,s2,...]].
+
+<<enrichment functions>>=
+def _prefetch_openalex_lookups(
+    papers: list[Paper],
+    fields: list[str],
+    providers: list[str] | None,
+) -> None:
+    """Batch the OpenAlex DOI lookups that enriching `papers` will make."""
+    if "openalex" not in (providers or ENRICHMENT_PROVIDERS):
+        return
+    provider = get_provider("openalex")
+    prefetch = getattr(provider, "prefetch_dois", None)
+    if prefetch is None:
+        return
+    dois = [
+        paper.doi or derive_arxiv_doi(paper)
+        for paper in papers
+        if needs_enrichment(paper, fields)
+    ]
+    prefetch([doi for doi in dois if doi])
+@
+
+Let's verify both conditions with a stand-in for OpenAlex that records
+what it is asked to prefetch.
+The stand-in sits where the real provider's network request would be;
+the provider's own batching is tested with a recorded answer in
+\cref{sec:openalex-doi-batch}.
+
+<<test functions>>=
+class _PrefetchRecorder:
+    """Stands in for OpenAlex: records prefetches, finds nothing."""
+
+    def __init__(self):
+        self.prefetched = []
+
+    def prefetch_dois(self, dois):
+        self.prefetched.append(list(dois))
+        return 0
+
+    def get_paper_by_doi(self, doi):
+        return None
+
+
+class TestEnrichPapersPrefetch:
+    """enrich_papers batches the OpenAlex lookups it is about to make."""
+
+    PAPERS = [
+        Paper(title="Needs", authors=["a"], doi="10.1/need"),
+        Paper(title="Done", authors=["a"], doi="10.1/done", abstract="x"),
+        Paper(title="Preprint", authors=["a"],
+              url="https://arxiv.org/abs/2401.00001"),
+        Paper(title="Unknown", authors=["a"]),
+    ]
+
+    def _run(self, providers):
+        openalex = _PrefetchRecorder()
+        with patch(
+            "scholar.enrich.get_provider",
+            lambda name: openalex if name == "openalex" else None,
+        ):
+            enrich_papers(self.PAPERS, fields=["abstract"],
+                          providers=providers)
+        return openalex.prefetched
+
+    def test_prefetches_dois_that_need_enrichment(self):
+        assert self._run(["s2", "openalex"]) == [
+            ["10.1/need", "10.48550/arXiv.2401.00001"]
+        ]
+
+    def test_default_order_includes_openalex(self):
+        assert len(self._run(None)) == 1
+
+    def test_no_prefetch_without_openalex(self):
+        assert self._run(["s2", "arxiv"]) == []
+@
+
 <<enrichment functions>>=
 def enrich_papers(
     papers: list[Paper],
@@ -1239,6 +1351,7 @@ def enrich_papers(
         fields = ["abstract", "pdf_url"]
 
     logger.info(f"Starting batch enrichment of {len(papers)} papers")
+    _prefetch_openalex_lookups(papers, fields, providers)
 
     enriched = []
     total = len(papers)
