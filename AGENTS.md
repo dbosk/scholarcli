@@ -80,7 +80,13 @@ Providers self-register via `register_provider()` at module load time.
   `OpenAlexSemanticProvider` sets `HONOURS_SEARCH_IN = False`. The report's provider table has a
   Filters column (`filter_flags`, `scholar.py`, shared with
   `_search_flags`) and appears also when two records share
-  (query, provider).
+  (query, provider), when the records have several queries, or when
+  any record knows its outcome or dates (then with a Date column).
+  The report's search parameters describe all records (#163, search
+  part): `search_parameter_items` (Query/Queries, Providers from
+  `searched_providers` incl. merged ones, Searched period from
+  `search_period`), and the abstract's "The search covered ..." uses
+  `searched_providers`, not `session.providers` (last append only).
 - One record per provider search (#164). `SearchResult.parts` /
   `found_in` (not compared): `merge` keeps the single-provider results
   it was made of and, per merged paper, the indices of the parts that
