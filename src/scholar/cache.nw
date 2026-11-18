@@ -81,6 +81,7 @@ import pickle
 import subprocess
 import sys
 import threading
+import time
 import pytest
 from pathlib import Path
 from unittest.mock import patch
@@ -254,6 +255,34 @@ us one, which the first rule then protects instead of overwriting.
 And the lock coordinates processes on one machine only, as for sessions
 (\cref{sec:file-lock}).
 
+Nor is the lock unconditional.
+[[file_lock]] gives up after a timeout and lets the body run unlocked,
+so that one stuck process cannot hang every other
+(\cref{sec:file-lock}).
+An unlocked save is still atomic, so it never leaves a truncated file,
+but it can lose entries: if another process replaces the file between
+our re-read and our replace, our replace drops what that process added.
+The default timeout of ten seconds was chosen for sessions, whose saves
+hold the lock for milliseconds.
+A cache save holds it for a re-read and a write of the whole file, which
+grows with the cache: we measured 0.6\,s for a changed 6\,MB cache
+(November 2026, one laptop).
+With many processes exiting at once on one large cache, the last in the
+queue would wait for all the others, and ten seconds runs out after a
+handful.
+Cache saves therefore wait up to [[CACHE_LOCK_TIMEOUT]], a minute.
+Waiting costs little: only an exiting process waits, and it waits long
+only behind a queue or a holder that is stuck (suspended mid-save, say);
+not waiting costs entries that were paid for.
+Past the minute the save goes ahead unlocked with [[file_lock]]'s
+warning, and the loss described above becomes possible.
+[[cache clear]] keeps the default: it is interactive, and an unlocked
+delete loses no entry; at worst a save under way undoes it.
+
+<<constants>>=
+CACHE_LOCK_TIMEOUT = 60  # seconds; a cache save re-reads and writes it all
+@
+
 The rest of the section builds the pieces in the order a cache meets
 them: the dictionary that knows whether it changed, the loading, and the
 saving.
@@ -274,6 +303,13 @@ Every mutating method has to set the flag, not only [[__setitem__]]:
 the C implementations of [[dict.update]], [[setdefault]], [[pop]] and
 [[clear]] do not go through [[__setitem__]], so overriding that alone
 would let an [[update]] slip by unsaved.
+What the flag cannot see is a change \emph{inside} a value: after
+[[cache[key]["field"] = x]] the cache holds the same object under the
+same key, and nothing tells it the object changed.
+Code that adds to a cached value must therefore assign the key anew,
+[[cache[key] = {**cache[key], "field": x}]], as the synthesis does for
+its report abstract (\cref{llm-review-module}).
+The provider caches only ever assign whole values.
 The file always receives a plain [[dict]] ([[save_cache]] copies the
 entries), so cache files stay readable by older versions of
 [[scholar]], which matters while one is still installed.
@@ -423,7 +459,7 @@ def save_cache(provider_name: str, cache: dict[Any, Any]) -> None:
         return
     cache_file = get_cache_dir() / f"{provider_name}.pkl"
     try:
-        with file_lock(cache_file):
+        with file_lock(cache_file, timeout=CACHE_LOCK_TIMEOUT):
             on_disk, error = read_cache_file(cache_file)
             if error is not None:
                 <<keep the unreadable file, save [[cache]] beside it>>
@@ -450,24 +486,38 @@ logger.debug(
 )
 @
 
-The file beside the unreadable one is named after the process, so two
-processes that meet the same unreadable file do not overwrite each
-other, and it does not end in [[.pkl]], so [[load_cache]],
-[[cache info]] and [[cache clear]] leave it alone.
-Nothing merges it back automatically: the file it belongs to could not
+Each file beside an unreadable one gets a name of its own, made by
+[[tempfile.mkstemp]], which creates the file exclusively and so never
+picks a name that exists.
+The name carries the UTC time it was written, so a listing sorts the
+files by age.
+A name made of the process id alone, as the first version did, was not
+enough: process ids are reused, and a later process that met the same
+unreadable file would have replaced an earlier one's entries.
+The name does not end in [[.pkl]], so [[load_cache]] never takes it for
+a cache; [[cache info]] lists these files and [[cache clear]] deletes
+them (\cref{sec:cache-unmerged-files}).
+Nothing merges one back automatically: the file it belongs to could not
 be read, so there is nothing safe to merge it into.
 The cache stays marked as changed, so a later save in the same process
 tries the merge again.
 An empty cache is not worth such a file (a process that ran
 [[cache clear]] meets this only if the file reappeared unreadable).
 
+<<imports>>=
+import tempfile
+from datetime import datetime, timezone
 <<constants>>=
 UNMERGED_SUFFIX = ".unmerged-"
 <<keep the unreadable file, save [[cache]] beside it>>=
 if cache:
-    unmerged = cache_file.with_name(
-        f"{cache_file.name}{UNMERGED_SUFFIX}{os.getpid()}"
+    written = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    fd, name = tempfile.mkstemp(
+        dir=cache_file.parent,
+        prefix=f"{cache_file.name}{UNMERGED_SUFFIX}{written}-",
     )
+    os.close(fd)
+    unmerged = Path(name)
     atomic_write_bytes(unmerged, pickle.dumps(dict(cache)))
     logger.warning(
         "Cannot read cache %s (%s), so it is left as it is; "
@@ -691,6 +741,36 @@ def test_a_reader_never_sees_a_partial_cache_file(monkeypatch):
     assert load_cache("openalex") == {"old": "entry", "new": "written"}
 @
 
+A save must also outwait a lock held longer than the session timeout.
+The test shortens that timeout to a fifth of a second and has a second
+thread hold the lock for half a second, as a slow save of another
+process would, writing that process's entries before it lets go.
+A save that gave up after the session timeout would go ahead unlocked,
+and one of the two writes would drop the other's entries.
+
+<<test functions>>=
+def test_a_cache_save_outwaits_the_session_lock_timeout(monkeypatch):
+    """A slow save ahead of us costs time, not entries."""
+    monkeypatch.setattr("scholar.utils.LOCK_TIMEOUT", 0.2)
+    cache_file = get_cache_dir() / "scopus.pkl"
+    holding = threading.Event()
+
+    def slow_save_of_another_process():
+        with file_lock(cache_file):
+            holding.set()
+            time.sleep(0.5)
+            cache_file.write_bytes(pickle.dumps({"theirs": 1}))
+
+    other = threading.Thread(target=slow_save_of_another_process)
+    other.start()
+    assert holding.wait(timeout=10)
+    cache = load_cache("scopus")
+    cache["ours"] = 2
+    save_cache("scopus", cache)
+    other.join(timeout=10)
+    assert load_cache("scopus") == {"theirs": 1, "ours": 2}
+@
+
 The bug itself needs real processes: each loads at start-up and saves in
 its exit hook, and no test inside the pytest process can observe that.
 The script below is such a process.
@@ -848,10 +928,7 @@ def clear_cache(
     count = 0
     logger.info("Clearing all cache files")
     for cache_file in cache_dir.glob("*.pkl"):
-        if providers is not None:
-            if cache_file.stem not in providers:
-                continue
-        elif is_llm_cache(cache_file.stem) and not include_llm:
+        if not selected_for_clearing(cache_file.stem, include_llm, providers):
             continue
         with file_lock(cache_file):
             try:
@@ -864,8 +941,18 @@ def clear_cache(
             registered = CACHE_REGISTRY.get(cache_file.stem)
             if registered is not None:
                 registered.clear()
+    count += clear_unmerged_files(include_llm, providers)
     logger.info(f"Cleared {count} cache file(s)")
     return count
+
+
+def selected_for_clearing(
+    name: str, include_llm: bool, providers: list[str] | None
+) -> bool:
+    """Return whether `clear_cache` deletes the files of cache `name`."""
+    if providers is not None:
+        return name in providers
+    return include_llm or not is_llm_cache(name)
 @
 
 Sometimes one cache is stale and the others are not.
@@ -884,6 +971,100 @@ nothing.
 Checking that a name is one a user could mean is the caller's job,
 because the registry of providers lives above this module.
 
+\subsection{Files saved beside unreadable caches}
+\label{sec:cache-unmerged-files}
+
+The files that [[save_cache]] writes beside an unreadable cache file
+(\cref{sec:cache-concurrency}) belong to that cache: they hold entries
+of the same kind, fetched at the same cost.
+Left out of [[cache info]] they would go unnoticed, since the warning
+that announced them scrolls away; left out of [[cache clear]] they
+would survive a clear the user meant to be complete.
+So both commands treat them as files of the cache they are named after,
+by the same rules: [[--provider]] selects them by that name, and those
+of an LLM cache are kept unless [[include_llm]] is given.
+They count among the deleted files that [[clear_cache]] returns.
+Hidden names are skipped, because they are the temporary files of a
+write in progress (\cref{sec:atomic-write}).
+
+<<cache management functions>>=
+def unmerged_cache_files() -> list[Path]:
+    """Return the files saved beside unreadable caches, by name."""
+    return sorted(
+        path
+        for path in get_cache_dir().glob(f"*.pkl{UNMERGED_SUFFIX}*")
+        if not path.name.startswith(".")
+    )
+
+
+def unmerged_cache_name(path: Path) -> str:
+    """Return the cache that the unmerged file `path` belongs to."""
+    return path.name.split(f".pkl{UNMERGED_SUFFIX}", 1)[0]
+
+
+def clear_unmerged_files(
+    include_llm: bool = False, providers: list[str] | None = None
+) -> int:
+    """Delete the unmerged files `clear_cache` selects; return how many."""
+    count = 0
+    for path in unmerged_cache_files():
+        name = unmerged_cache_name(path)
+        if not selected_for_clearing(name, include_llm, providers):
+            continue
+        try:
+            path.unlink()
+            count += 1
+        except OSError as e:
+            logger.warning(f"Failed to delete {path.name}: {e}")
+    return count
+@
+
+Let's check both commands against files of three caches: a search
+cache, a second one that a [[--provider]] clear does not name, and an
+LLM cache.
+
+<<test functions>>=
+class TestUnmergedCacheFiles:
+    """Files beside unreadable caches are listed and cleared (#175)."""
+
+    def make_unmerged(self, name):
+        cache_file = get_cache_dir() / f"{name}.pkl"
+        cache_file.write_bytes(TRUNCATED_PICKLE)
+        cache = load_cache(name)
+        cache["ours"] = 1
+        save_cache(name, cache)
+
+    def caches_with_unmerged_files(self):
+        return sorted(
+            path.name.split(".pkl.unmerged-")[0]
+            for path in get_cache_dir().glob("*.pkl.unmerged-*")
+        )
+
+    def test_a_reused_process_id_keeps_both_files(self):
+        """Two saves of one process write two files, not one."""
+        self.make_unmerged("s2")
+        self.make_unmerged("s2")
+        assert self.caches_with_unmerged_files() == ["s2", "s2"]
+
+    def test_stats_list_them(self):
+        self.make_unmerged("s2")
+        stats = get_cache_stats()
+        (path,) = stats["unmerged_files"]
+        assert Path(path).name.startswith("s2.pkl.unmerged-")
+
+    def test_clear_deletes_them_by_the_cache_rules(self):
+        for name in ("s2", "openalex", "llm_synthesis_theme"):
+            self.make_unmerged(name)
+        clear_cache(providers=["s2"])
+        assert self.caches_with_unmerged_files() == [
+            "llm_synthesis_theme", "openalex"
+        ]
+        clear_cache()
+        assert self.caches_with_unmerged_files() == ["llm_synthesis_theme"]
+        clear_cache(include_llm=True)
+        assert self.caches_with_unmerged_files() == []
+@
+
 \subsection{Cache statistics}
 
 The statistics report the LLM caches apart from the search caches.
@@ -892,6 +1073,10 @@ whether to clear needs to see which entries a plain clear would remove
 and which it would keep.
 The totals still cover every file, because they answer a different
 question: how much the cache directory holds.
+The files saved beside unreadable caches are listed by path instead
+(\cref{sec:cache-unmerged-files}): their entries are not in use, so
+counting them would overstate what the cache serves, and the user who
+has to look at them needs to know where they are.
 
 <<cache management functions>>=
 def get_cache_stats() -> dict[str, Any]:
@@ -906,6 +1091,8 @@ def get_cache_stats() -> dict[str, Any]:
       (kept by `clear_cache` unless `include_llm` is true)
     - total_entries: Total number of cached entries in all files
     - total_size_bytes: Total size of all cache files
+    - unmerged_files: Paths of the files saved beside unreadable caches
+      (not counted in the totals)
     """
     cache_dir = get_cache_dir()
     providers: dict[str, int] = {}
@@ -927,6 +1114,7 @@ def get_cache_stats() -> dict[str, Any]:
         "llm_caches": llm_caches,
         "total_entries": sum(providers.values()) + sum(llm_caches.values()),
         "total_size_bytes": total_size,
+        "unmerged_files": [str(path) for path in unmerged_cache_files()],
     }
 @
 
@@ -1120,18 +1308,14 @@ class TestAutoPersistence:
     def test_register_and_save_all(self, tmp_path, monkeypatch):
         """Registered caches are saved on save_all_caches."""
         monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path))
-        # Clear any existing registrations
-        CACHE_REGISTRY.clear()
-        # Register a cache
+        # A registry of the test's own: clearing the real one would
+        # drop the registrations that the imported modules made.
+        monkeypatch.setattr("scholar.cache.CACHE_REGISTRY", {})
         cache = {("query", 100): [Paper(title="Test", authors=["A"])]}
         register_cache("test_provider", cache)
-        # Save all caches
         save_all_caches()
-        # Verify it was saved
         loaded = load_cache("test_provider")
         assert loaded == cache
-        # Clean up
-        CACHE_REGISTRY.clear()
 @
 
 
