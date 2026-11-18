@@ -133,6 +133,8 @@ The test file collects all distributed test chunks:
 """Tests for the providers module."""
 import json
 import logging
+import pickle
+import time
 
 import pytest
 import requests
@@ -10748,6 +10750,7 @@ class OpenAlexSemanticProvider(OpenAlexProvider):
     default_enabled = False
     MAX_LIMIT = OPENALEX_SEMANTIC_MAX_RESULTS
     RANKED_LIST = True
+    CACHE_VERSION = 3   # entries are RankedPapers, with scores and date
 
     def __init__(
         self, email: str | None = None, api_key: str | None = None
@@ -10755,8 +10758,12 @@ class OpenAlexSemanticProvider(OpenAlexProvider):
         """Initialize as the OpenAlex provider, plus the 1/s pacing."""
         super().__init__(email=email, api_key=api_key)
         <<create the semantic search limiter>>
+        self.last_from_cache = False
+        self._fetched_now = False
 
     <<semantic search request>>
+    <<semantic search answer source>>
+    <<semantic search 429 handling>>
     <<semantic search check method>>
 @
 
@@ -10788,6 +10795,24 @@ characters of [[openalex-semantic]] cut the status column down until
 The group's [[acquire()]] comes first: when the day's budget is spent
 it refuses before the semantic limiter has counted, or waited for, a
 request that will not be made.
+
+A refusal by either limiter must read as a failure, not as zero works.
+The inherited [[search()]] catches [[RateLimited]] and returns an
+empty, uncached list without setting [[last_error]] (the limiter has
+already logged the reason); for the [[openalex]] provider the
+pre-check in [[Search.execute]] makes that rare.  The semantic limiter
+is not the one [[Search.execute]] pre-checks, though, and after a 429
+(\cref{sec:openalex-semantic-429}) it is the one that refuses.  So the
+semantic request sets [[last_error]] to the limiter's reason before the
+refusal travels on, and the session records the search as failed.
+
+<<pass both limiters>>=
+try:
+    self._limiter.acquire()
+    self._semantic_limiter.acquire()
+except RateLimited as refusal:
+    self.last_error = refusal.reason
+    raise
 
 <<create the semantic search limiter>>=
 self._semantic_limiter = get_limiter(
@@ -10840,7 +10865,7 @@ def _search_uncached(
     filters: SearchFilters | None,
 ) -> list[Paper]:
     """Send one semantic search; refuse filters and over-long input."""
-    if filters and filters.cache_key():
+    if filters and not filters.is_empty():
         raise ValueError("semantic search takes no filters")
     if len(query) > OPENALEX_SEMANTIC_MAX_CHARS:
         raise ValueError(
@@ -10851,23 +10876,139 @@ def _search_uncached(
         min(limit, self.MAX_LIMIT) if limit and limit > 0
         else self.MAX_LIMIT
     )
-    self._limiter.acquire()
-    self._semantic_limiter.acquire()
+    <<pass both limiters>>
     works = pyalex.Works().similar(query).get(per_page=per_page)
-    return [self._convert_work(work) for work in works]
+    self._fetched_now = True
+    return RankedPapers(
+        [self._convert_work(work) for work in works],
+        scores=[work.get("relevance_score") for work in works],
+        fetched_at=datetime.datetime.now(datetime.timezone.utc).isoformat(
+            timespec="seconds"
+        ),
+    )
+@
+
+\subsection{Where the answer came from}
+
+A check is kept as evidence (\cref{sec:sessions-check}), and evidence
+must say what it rests on.  Two facts about the answer are lost when
+works become [[Paper]]s: OpenAlex's [[relevance_score]] for each work,
+which shows how close the ranking found it, and when the answer was
+fetched.  The cache never expires, so a check run today may show a
+list fetched months ago, and stamping it with today's date would
+misdate it.
+
+So the request returns a [[RankedPapers]]: a list of the papers, in
+rank order, that also carries the scores and the time of the fetch.
+Being a list, it passes through every caller unchanged, and being what
+[[_search_uncached]] returns, it is what the inherited [[search()]]
+caches, so a cache hit brings back the original fetch time with it.
+[[CACHE_VERSION]] is raised for this provider so that no entry from
+before (a plain list) is served without them.
+[[search()]] also notes whether this call fetched or was served from
+the cache ([[last_from_cache]]): the request sets a flag that a cache
+hit never reaches.
+
+<<semantic search answer source>>=
+def search(
+    self,
+    query: str,
+    limit: int = 100,
+    filters: SearchFilters | None = None,
+) -> list[Paper]:
+    """Search as OpenAlex does; note whether the cache answered."""
+    self._fetched_now = False
+    papers = super().search(query, limit, filters)
+    self.last_from_cache = self.last_error is None and not self._fetched_now
+    return papers
+<<openalex semantic helpers>>=
+class RankedPapers(list):
+    """Papers in rank order, with their relevance scores and fetch time.
+
+    `scores[i]` is OpenAlex's `relevance_score` of the paper at index
+    `i`; `fetched_at` is the ISO time (UTC) the list was fetched.
+    """
+
+    def __init__(self, papers=(), scores=(), fetched_at=None):
+        super().__init__(papers)
+        self.scores = list(scores)
+        self.fetched_at = fetched_at
+@
+
+\subsection{A 429 on a semantic search}
+\label{sec:openalex-semantic-429}
+
+The semantic search has its own rate, one request a second, so a
+semantic request can be refused for its pace while the group's ten a
+second are nowhere near spent.  The inherited handling
+(\cref{sec:openalex-budget}) would put such a 429's cooldown on the
+shared [[openalex]] limiter and pause the keyword searches and the
+preprint servers for a limit they did not exceed.  So this provider
+decides the 429 with the same rule ([[_budget_spent]]: the body's
+[[reason]], else the headers) and routes it: a spent budget is the
+group's and goes to the inherited [[_record_429]], which blocks the
+group until the reset; any other 429 starts the cooldown on the
+[[oa-semantic]] limiter only.  That response reaches the semantic
+limiter without its [[X-RateLimit-Remaining]], for the reason
+\cref{sec:openalex-prepaid} gives: the count is the group's daily
+allowance, not a semantic quota.
+The warning names the semantic limiter's retry time, which is the one
+that applies.
+
+<<semantic search 429 handling>>=
+def _record_429(self, response) -> bool:
+    """Route a 429: a spent budget to the group, else to `oa-semantic`."""
+    if self._budget_spent(response, _rejection_reason(response)):
+        return super()._record_429(response)
+    headers = CaseInsensitiveDict(response.headers or {})
+    headers.pop("X-RateLimit-Remaining", None)
+    self._semantic_limiter.record_response(
+        SimpleNamespace(status_code=response.status_code, headers=headers)
+    )
+    return False
+
+def _note_http_error(self, error: requests.HTTPError) -> None:
+    """Log a failure; a pace 429 names the semantic limiter's retry."""
+    response = getattr(error, "response", None)
+    if response is None or response.status_code != 429:
+        return super()._note_http_error(error)
+    if self._record_429(response):
+        retry_at = self._limiter.check_available().retry_at
+        logger.warning(
+            "%s: daily budget spent; resets %s",
+            self.name, format_retry(retry_at),
+        )
+    else:
+        retry_at = self._semantic_limiter.check_available().retry_at
+        logger.warning(
+            "%s: rate limited (HTTP 429); retry %s",
+            self.name, format_retry(retry_at),
+        )
 @
 
 \subsection{Health check}
 
 The probe sends a one-result semantic search through the shared
 [[_probe]] (\cref{sec:openalex}), so it carries the key and email and
-records the rate-limit headers like the [[openalex]] probe.  It passes
-the semantic limiter first, since it is a semantic request.  Like the
-preprint servers' probes it does not report the budget again.
+records the rate-limit headers like the [[openalex]] probe; a 429 goes
+through the routing above.  It passes both limiters in the order the
+search does, group first: [[_probe]] acquires the group limiter itself,
+so the probe first asks the group whether a request may be made at all
+(a pure query, [[check_available]]), and only then counts against the
+semantic limiter.  A spent budget is thus reported without a semantic
+request counted for nothing.  Like the preprint servers' probes it does
+not report the budget again.
 
 <<semantic search check method>>=
 def check(self) -> tuple[str, str]:
     """Probe the works endpoint with a one-result semantic search."""
+    availability = self._limiter.check_available()
+    if not availability.ok:
+        status = (
+            HEALTH_QUOTA_EXHAUSTED if availability.quota
+            else HEALTH_RATE_LIMITED
+        )
+        return status, availability.reason
     try:
         self._semantic_limiter.acquire()
     except RateLimited as e:
@@ -10931,18 +11072,21 @@ OPENALEX_SEMANTIC_RECORDING = {
 }
 
 
-def _replay_semantic(sent, payload=None, now=None):
+def _replay_semantic(sent, payload=None, now=None, status=200,
+                     headers=None):
   """Patch the HTTP adapter to answer every request with the recording.
 
   Each request's URL, and with `now` the time it went out, is appended
-  to `sent`.
+  to `sent`.  `status`, `headers` and `payload` replace the recorded
+  answer, for injected failures.
   """
   body = json.dumps(payload or OPENALEX_SEMANTIC_RECORDING).encode()
 
   def send(adapter, request, **kwargs):
     sent.append((request.url, now() if now else None))
     response = requests.Response()
-    response.status_code = 200
+    response.status_code = status
+    response.headers.update(headers or {})
     response.headers["Content-Type"] = "application/json"
     response._content = body
     response.url = request.url
@@ -11117,6 +11261,75 @@ def test_check_probes_a_semantic_search(self, monkeypatch):
   assert params["search.semantic"] == "test"
   assert params["api_key"] == "k-123"
   assert "1 request/s" in message
+@
+
+The answer carries its source: the scores in rank order and the time
+of the fetch, and a second, identical search is served from the cache
+with the original time, without a request.
+
+<<semantic provider test methods>>=
+def test_answer_carries_scores_and_its_source(self):
+  provider = OpenAlexSemanticProvider()
+  sent = []
+  with _replay_semantic(sent):
+    first = provider.search("a question kept as evidence", limit=5)
+    fresh = provider.last_from_cache
+    again = provider.search("a question kept as evidence", limit=5)
+  assert len(sent) == 1
+  assert fresh is False and provider.last_from_cache is True
+  assert first.scores == [0.9335, 0.9042, 0.9005, 0.863, 0.8497]
+  assert first.fetched_at and again.fetched_at == first.fetched_at
+  assert again.scores == first.scores
+  restored = pickle.loads(pickle.dumps(first))
+  assert (restored.scores, restored.fetched_at) \
+    == (first.scores, first.fetched_at)
+@
+
+A 429 that is only about pace cools down the semantic limiter alone,
+and the next semantic search fails with the limiter's reason instead
+of reading as zero works; a 429 that says the budget is spent blocks
+the whole group.  The 429 bodies are written by hand (an injected
+failure); their [[reason]] values are the ones \cref{sec:openalex-budget}
+cites from OpenAlex's error documentation.  The health probe asks the
+group first, so a spent budget costs no semantic request.
+
+<<semantic provider test methods>>=
+def test_pace_429_cools_down_only_the_semantic_limiter(self):
+  provider = OpenAlexSemanticProvider()
+  sent = []
+  with _replay_semantic(sent, status=429,
+                        payload={"reason": "requests_per_second"},
+                        headers={"Retry-After": "30",
+                                 "X-RateLimit-Remaining": "0"}):
+    assert provider.search("paced out", limit=5) == []
+    assert provider.last_error == "HTTP 429"
+    assert provider.search("paced out again", limit=5) == []
+  assert len(sent) == 1
+  assert provider.last_error
+  assert not provider._semantic_limiter.check_available().ok
+  assert provider._limiter.check_available().ok
+
+def test_budget_429_blocks_the_group(self):
+  provider = OpenAlexSemanticProvider()
+  sent = []
+  with _replay_semantic(sent, status=429,
+                        payload={"reason": "daily_budget"},
+                        headers={"X-RateLimit-Reset": "3600"}):
+    assert provider.search("budget gone", limit=5) == []
+  availability = provider._limiter.check_available()
+  assert not availability.ok and availability.quota
+
+def test_check_asks_the_group_first(self):
+  provider = OpenAlexSemanticProvider()
+  provider._limiter.record_limit_hit(
+    until=time.time() + 3600, reason="daily budget spent",
+    exhausted_daily=True,
+  )
+  with patch("requests.get") as mock_get:
+    status, _ = provider.check()
+  assert status == HEALTH_QUOTA_EXHAUSTED
+  mock_get.assert_not_called()
+  assert provider._semantic_limiter.status().day_count == 0
 @
 
 The recording goes stale if OpenAlex changes the shape of its answer.
@@ -13603,5 +13816,6 @@ DEFAULT_LIMIT = 100
 <<arxiv constants>>
 <<preprint source constants>>
 <<openalex semantic constants>>
+<<openalex semantic helpers>>
 <<hal constants>>
 @
