@@ -58,8 +58,29 @@ Providers self-register via `register_provider()` at module load time.
   result as 0: format counts with `hits_label(hits, error, retries)`
   ("12", "failed (reason)", "25, incomplete (reason)").
 - Session `SearchRecord`s store the same outcome (`hits`, `error`,
-  `retries`; old records load as `hits=None`). A failed re-run of the
-  same (query, provider) does not overwrite an earlier answered record.
+  `retries`; old records load as `hits=None`). A record's identity is
+  `SearchRecord.key` = `(query, provider, filters_key(filters))` (#140):
+  the same query with other filters (`--year`, `--in`, ...) is a record
+  of its own, the limit is not part of the key. `filters_key`
+  (`scholar.py`) is `SearchFilters(**stored).cache_key()` plus any
+  unknown keys as sorted JSON; `""` for no filters. A failed re-run of
+  the same key does not overwrite an earlier answered record. The audit
+  caption counts each record as one query (two filter sets = two
+  queries, on purpose). Legacy records (`SearchRecord.is_legacy`:
+  `filters` and `limit` both `None`; written before #61, which stored
+  both together, while every search since records a limit) have
+  unknown filters: a re-run of their (query, provider) replaces them
+  whatever its filters, their links move to the new key
+  (`replaced_links` in `create_review_session`), and
+  `merge_concurrent_changes` guards both directions: it does not re-add
+  a legacy record from disk that this session replaced, and it drops
+  this session's own legacy record when the file replaced it (the key is
+  in `SessionBaseline.record_keys`, gone from the file, and the file has
+  a record of that (query, provider)); links move to the successor.
+  `OpenAlexSemanticProvider` sets `HONOURS_SEARCH_IN = False`. The report's provider table has a
+  Filters column (`filter_flags`, `scholar.py`, shared with
+  `_search_flags`) and appears also when two records share
+  (query, provider).
 
 ### Search Flow
 
@@ -101,6 +122,42 @@ environment is the normal key source. Tests wanting no key must
 construction). Exception: `WebOfScienceProvider` uses a sentinel, so an
 explicit `None` disables that tier (the legacy `WOS_API_KEY` still
 fills it).
+
+### Title-and-Abstract Search (`--in`)
+
+`scholar search/rq --in title-abstract` sets `SearchFilters.search_in`
+(#135; values in `SEARCH_IN_CHOICES`, a Typer `Enum` in the CLI so a bad
+value is a usage error). It is a filter: in `as_dict`/`cache_key` only
+when set (old cache keys unchanged), in the session record's key, and
+rendered back by `filter_flags` as `--in title-abstract`. A search
+records the filters its provider *applied*
+(`scholar.applied_filters(provider, query, filters)`, used by
+`Search.execute` and rq): a provider's own `applied_filters(query,
+filters)` method if it has one (Scopus), else `search_in` is kept only
+when `HONOURS_SEARCH_IN is True` (OpenAlex and subclasses, WoS).
+Provider cache keys still use the requested filters (an ignoring
+provider caches an `--in` search separately; harmless).
+`SearchResult.merge` keeps `search_in` when the inputs differ only in
+it, since a merged record stands for the whole command. Per provider
+(docs cited in `providers.nw`, section "Searching title and abstract
+only"; `scholar syntax` has a "Default Search Fields" table):
+- OpenAlex + source-pinned servers: scoped parameter
+  `search.title_and_abstract=` instead of `search=` (which also matches
+  full text). The filter form `title_and_abstract.search` is deprecated
+  in OpenAlex's docs. `_base_query(query, filters)` is the seam;
+  subclasses must pass `filters` on. Boolean queries work (checked live
+  2026-11-18 via `meta.x_query.oql`). OpenAlex lacks abstracts for many
+  works (its docs: >60% of 2022 works have one, ~45% pre-2000), so this
+  is not the same search as in WoS/Scopus.
+- Scopus: query wrapped as `TITLE-ABS-KEY(...)` unless it already has a
+  field code (`SCOPUS_FIELD_CODE`, case-insensitive over the explicit
+  `SCOPUS_FIELD_CODES` list from Elsevier's search tips, plus
+  `PUBYEAR`/`REFPUBYEAR` with an operator); then it warns and does not
+  record `search_in`. WoS: nothing to do
+  (`TS=` = title, abstract, author keywords, Keywords Plus).
+- S2, DBLP, IEEE, arXiv, HAL: `warn_search_in_ignored()` logs
+  "`<name>: --in title-abstract not supported, ignoring`" and searches
+  as usual.
 
 ### Preprint-Server Providers and Groups
 
@@ -560,17 +617,26 @@ reconstructing a `Paper` from the `.bib` fields and reusing `Paper.id`
 ### Search Provenance (`prov found-via`)
 
 Each `ReviewDecision` records the searches that returned its paper in
-`found_by`: `(query, provider)` keys of the session's `SearchRecord`s
-(merged `q | q` / `openalex, dblp` keys included), set in
+`found_by`: `(query, provider, filters key)` keys of the session's
+`SearchRecord`s (merged `q | q` / `openalex, dblp` keys included), set in
 `create_review_session` on every branch that resolves a result to a
-decision, persisted as `found_by` in the session JSON, and unioned from
-disk by `merge_concurrent_changes` (#128). `prov found-via` prints one
-command per link via `ReviewSession.search_record(query, provider)` and
+decision, persisted as `found_by` in the session JSON
+(`{"query", "provider", "filters"}`), and unioned from
+disk by `merge_concurrent_changes` (#128). Old two-part links (no
+`"filters"`) are resolved at load when exactly one record has that
+query and provider; otherwise they stay `(q, p, None)` and are saved
+back without `"filters"`. A resolved link supersedes the unresolved
+links of its (q, p) (`without_superseded_links`, on record and on
+load). `ReviewSession.search_record(q, p, key)`
+matches the full key; with `key=None` it answers only a unique
+(q, p). `prov found-via` prints one
+command per resolved link via `search_record` and
 `cli._search_command` (shared with `bibtex+prov`'s `_found_via`; undoes
 the merge joins). JSON `link` is `recorded`, `inferred` (no links, but
 the provider ran exactly one search in the session) or `missing` (no
 command; printed under `Not reproducible:` with `candidate_queries`,
-never with the `FOUND-VIA:` token). Old sessions get links when their
+never with the `FOUND-VIA:` token; an ambiguous old link is `missing`
+with the records of its query and provider as candidates). Old sessions get links when their
 searches are re-run with `-n` (cache hits cost nothing). Never fall back
 to `search_record_for(provider)`: with several queries on a provider it
 returns the latest search, which is how #128 named wrong queries.

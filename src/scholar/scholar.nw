@@ -74,12 +74,14 @@ Scholar package for structured literature searches.
 """
 
 from .scholar import Search, SearchResult, Paper, SearchFilters
-from .scholar import search, filter_papers, deduplicate_papers
+from .scholar import search, filter_papers, filters_key, deduplicate_papers
 from .scholar import deduplicate_versions, merge_version_of
 from .scholar import get_registry, isolated_registry
 from .scholar import hits_label, provider_outcome, result_outcome
+from .scholar import applied_filters, without_search_in, filter_flags
 from .scholar import RANKED_PROVIDERS, is_ranked_provider
 from .scholar import normalize_venue
+from .scholar import SEARCH_IN_TITLE_ABSTRACT, SEARCH_IN_CHOICES
 from .utils import safe_get_nested, ensure_list
 
 __all__ = [
@@ -87,14 +89,20 @@ __all__ = [
     "RANKED_PROVIDERS",
     "is_ranked_provider",
     "provider_outcome",
+    "applied_filters",
+    "filter_flags",
+    "without_search_in",
     "result_outcome",
     "normalize_venue",
+    "SEARCH_IN_TITLE_ABSTRACT",
+    "SEARCH_IN_CHOICES",
     "Search",
     "SearchResult",
     "Paper",
     "SearchFilters",
     "search",
     "filter_papers",
+    "filters_key",
     "deduplicate_papers",
     "deduplicate_versions",
     "merge_version_of",
@@ -1847,6 +1855,8 @@ class SearchFilters:
         min_citations: Minimum citation count
         pub_types: List of publication types to include
             (article, conference, review, book, preprint, dataset)
+        search_in: Where the query must match: "title-abstract" for
+            title and abstract only; None for each provider's default
     """
 
     year: str | None = None
@@ -1854,6 +1864,7 @@ class SearchFilters:
     venue: str | None = None
     min_citations: int | None = None
     pub_types: list[str] | None = None
+    search_in: str | None = None
 
     <<search filters methods>>
 @
@@ -1934,6 +1945,8 @@ def as_dict(self) -> dict:
         result["min_citations"] = self.min_citations
     if self.pub_types:
         result["pub_types"] = self.pub_types
+    if self.search_in:
+        result["search_in"] = self.search_in
     return result
 
 def cache_key(self) -> str:
@@ -1954,6 +1967,8 @@ def cache_key(self) -> str:
         parts.append(f"c:{self.min_citations}")
     if self.pub_types:
         parts.append(f"t:{','.join(sorted(self.pub_types))}")
+    if self.search_in:
+        parts.append(f"in:{self.search_in}")
     return "|".join(parts)
 
 def is_empty(self) -> bool:
@@ -1964,6 +1979,7 @@ def is_empty(self) -> bool:
         self.venue,
         self.min_citations is not None,
         self.pub_types,
+        self.search_in,
     ])
 
 def matches(self, paper: Paper) -> bool:
@@ -2233,6 +2249,263 @@ class TestFilterPapers:
             ]
             result = filter_papers(papers, SearchFilters(year="2020-"))
             assert [p.title for p in result] == ["A", "B", "C"]
+@
+
+\subsubsection{Where the query is matched}
+\label{sec:search-in}
+
+The other filters narrow the result by a property of the paper.
+[[search_in]] instead says which part of the paper the query words must
+appear in.  Providers do not agree on that by default: OpenAlex matches
+a work's full text where it has one, while Web of Science's topic search
+covers title, abstract and keywords, so the same Boolean query returned
+ten to a hundred times as many OpenAlex records in one literature review
+(\url{https://github.com/dbosk/scholar/issues/135}).  The one value,
+[[SEARCH_IN_TITLE_ABSTRACT]] ([[title-abstract]]), asks for title and
+abstract matching; [[None]] leaves each provider at its default.  How
+each provider honours or declines it is described with the provider.
+
+It is a filter field, not a separate search parameter, because it has to
+travel everywhere the filters travel: into the provider cache keys (a
+title-and-abstract search must not be answered from the cache of a
+full-text one), into the session's search record and its key
+(\cref{sec:filters-key}), and back into the [[--in]] flag of a
+reproduced command.  [[as_dict]] and [[cache_key]] mention it only when
+it is set, so every existing cache key and stored dictionary stays as it
+was.  [[matches]] ignores it: whether the words occur in an abstract
+cannot be checked against the metadata a [[Paper]] holds.
+
+<<constants>>=
+SEARCH_IN_TITLE_ABSTRACT = "title-abstract"
+SEARCH_IN_CHOICES = (SEARCH_IN_TITLE_ABSTRACT,)
+@
+
+Let's verify that the field is serialised only when set, so that
+existing cache keys are unchanged (the exact strings below are the keys
+the providers have been using), and that it makes a filter set non-empty
+and its key different:
+
+<<test functions>>=
+class TestSearchIn:
+    """search_in is a filter that leaves existing keys unchanged."""
+
+    def test_unset_leaves_dict_and_key_unchanged(self):
+        f = SearchFilters(year="2020-2024", open_access=True)
+        assert f.as_dict() == {"year": "2020-2024", "open_access": True}
+        assert f.cache_key() == "y:2020-2024|oa:1"
+        assert SearchFilters().cache_key() == ""
+
+    def test_set_is_serialised(self):
+        f = SearchFilters(year="2020", search_in=SEARCH_IN_TITLE_ABSTRACT)
+        assert f.as_dict() == {"year": "2020", "search_in": "title-abstract"}
+        assert f.cache_key() != SearchFilters(year="2020").cache_key()
+        assert SearchFilters(search_in="title-abstract").cache_key() != ""
+
+    def test_set_is_not_empty(self):
+        assert not SearchFilters(search_in="title-abstract").is_empty()
+
+    def test_round_trips_through_filters_key(self):
+        f = SearchFilters(search_in="title-abstract")
+        assert filters_key(f.as_dict()) == f.cache_key()
+        assert filters_key(f.as_dict()) != filters_key({})
+@
+
+\paragraph{Recording what a provider applied.}
+Most providers cannot restrict a search to title and abstract; they warn
+and search their default fields.  If their search record still said
+[[search_in]], the session, [[sessions show]] and [[prov found-via]]
+would describe a title-and-abstract search that never happened, and the
+record would not even match an earlier full-text record of the same
+query, which is the search that really ran.  So a search records the
+filters the provider \emph{applied}, not the ones it was asked for.
+
+[[applied_filters]] asks the provider.  A provider may implement
+[[applied_filters(query, filters)]] itself, when whether it honours a
+filter depends on the query (Scopus cannot when the query names its own
+fields).  Otherwise the class attribute [[HONOURS_SEARCH_IN]] decides,
+and without it [[search_in]] is dropped: a provider honours the option
+only by saying so, so a new or third-party provider cannot misreport.
+Like [[provider_outcome]], it reads the provider defensively, so a
+[[Mock]] provider, whose every attribute is another [[Mock]], counts as
+not honouring the option.  The other filters are recorded as given,
+since every provider either applies them or warns as before.
+
+<<functions>>=
+def without_search_in(filters: SearchFilters | None) -> SearchFilters | None:
+    """Return `filters` without `search_in`; `None` if nothing remains."""
+    if not filters or not filters.search_in:
+        return filters
+    rest = replace(filters, search_in=None)
+    return None if rest.is_empty() else rest
+
+
+def applied_filters(
+    provider, query: str, filters: SearchFilters | None
+) -> SearchFilters | None:
+    """Return the part of `filters` that `provider` applies to `query`.
+
+    Uses the provider's own `applied_filters(query, filters)` when it
+    has one; otherwise keeps `search_in` only if the provider's
+    `HONOURS_SEARCH_IN` is `True`.
+    """
+    method = getattr(provider, "applied_filters", None)
+    if callable(method):
+        applied = method(query, filters)
+        if applied is None or isinstance(applied, SearchFilters):
+            return applied
+    if getattr(provider, "HONOURS_SEARCH_IN", False) is True:
+        return filters
+    return without_search_in(filters)
+@
+
+Let's verify the three ways a provider can answer:
+
+<<test functions>>=
+class TestAppliedFilters:
+    """A search records the filters its provider applied."""
+
+    ASKED = SearchFilters(year="2020", search_in="title-abstract")
+
+    def test_a_provider_that_does_not_say_drops_search_in(self):
+        class Plain:
+            name = "plain"
+        assert applied_filters(Plain(), "q", self.ASKED) == SearchFilters(
+            year="2020"
+        )
+        assert applied_filters(
+            Plain(), "q", SearchFilters(search_in="title-abstract")
+        ) is None
+        assert applied_filters(Mock(), "q", self.ASKED).search_in is None
+
+    def test_a_provider_that_honours_keeps_it(self):
+        class Honours:
+            HONOURS_SEARCH_IN = True
+        assert applied_filters(Honours(), "q", self.ASKED) == self.ASKED
+
+    def test_a_provider_can_decide_per_query(self):
+        class PerQuery:
+            def applied_filters(self, query, filters):
+                return filters if query == "plain" else None
+        assert applied_filters(PerQuery(), "plain", self.ASKED) == self.ASKED
+        assert applied_filters(PerQuery(), "coded", self.ASKED) is None
+
+    def test_no_filters_stay_none(self):
+        assert applied_filters(Mock(), "q", None) is None
+@
+
+\subsubsection{Filters as command-line flags}
+\label{sec:filter-flags}
+
+A stored filters dictionary is shown to people as the [[scholar search]]
+flags that produce it: in a reproduced command ([[prov found-via]],
+[[bibtex+prov]], [[sessions show]]) and in a report's table of searches,
+where two searches of one query differ only in their flags.  The
+command line and the review report live in different modules, and the
+report must not import the command line, so the translation lives here,
+beside the filters it translates; the [[cli]] module adds the
+[[--limit]] flag, which is not a filter.  A free-text value (the
+venue) is quoted with [[shlex.quote]] so that a pasted command runs it
+as one argument and nothing in it is executed by the shell.
+
+<<functions>>=
+def filter_flags(filters: dict | None) -> list[str]:
+    """Return the `scholar search` flags that reproduce stored `filters`."""
+    flags = []
+    filters = filters or {}
+    if filters.get("year"):
+        flags.append(f"--year {filters['year']}")
+    if filters.get("open_access"):
+        flags.append("--open-access")
+    if filters.get("venue"):
+        flags.append(f"--venue {shlex.quote(filters['venue'])}")
+    if filters.get("min_citations") is not None:
+        flags.append(f"--min-citations {filters['min_citations']}")
+    for pub_type in filters.get("pub_types") or []:
+        flags.append(f"--type {pub_type}")
+    if filters.get("search_in"):
+        flags.append(f"--in {filters['search_in']}")
+    return flags
+@
+
+\subsubsection{Filters as part of a search's identity}
+\label{sec:filters-key}
+
+A review session stores each search with the filters it ran with, as the
+dictionary [[as_dict]] produced (the search records of the [[review]]
+module).  Two searches with
+the same words on the same provider but other filters---[[--year
+2010-2019]] and [[--year 2020-2024]]---are two different searches: they
+return different papers and have their own hit counts.  The session
+therefore has to tell them apart, which needs a canonical form of the
+stored dictionary that two equal filter sets always share
+(\url{https://github.com/dbosk/scholar/issues/140}).
+
+[[cache_key]] is that form already.  It lists the active filters in a
+fixed order, sorts the publication types and is empty when no filter is
+active, which is exactly what an identity needs.  And it can be computed
+from the stored dictionary with nothing lost: [[as_dict]] writes one
+entry per active field, under the field's own name, so
+[[SearchFilters(**stored)]] rebuilds the object the dictionary came
+from.  Reusing it means one canonical form for both purposes rather than
+two that could drift apart.  A record with no filters ([[None]], or an
+empty dictionary) gets the empty key, the same as an unfiltered search.
+
+A dictionary written by a newer scholar may hold a field this one does
+not know.  Dropping it would make two different searches look like one,
+so an unknown entry is appended to the key in a canonical JSON form
+instead of being ignored.
+
+<<functions>>=
+def filters_key(filters: dict | None) -> str:
+    """Return the canonical string of a stored filters dict.
+
+    Two dicts that describe the same filters give the same key; `None`
+    and `{}` give `""`. The key is `SearchFilters.cache_key()` of the
+    filters the dict describes, so it matches the provider cache keys.
+    """
+    if not filters:
+        return ""
+    known = {f.name for f in fields(SearchFilters)}
+    key = SearchFilters(
+        **{k: v for k, v in filters.items() if k in known}
+    ).cache_key()
+    unknown = {k: v for k, v in filters.items() if k not in known}
+    if unknown:
+        extra = json.dumps(unknown, sort_keys=True, default=str)
+        key = f"{key}|{extra}" if key else extra
+    return key
+@
+
+Let's verify that the key is the cache key of the same filters, that it
+does not depend on how the dictionary was ordered, and that the two
+year ranges of the example above stay apart:
+
+<<test functions>>=
+class TestFiltersKey:
+    """filters_key gives a stored filters dict a canonical identity."""
+
+    def test_no_filters_is_empty(self):
+        assert filters_key(None) == ""
+        assert filters_key({}) == ""
+
+    def test_equals_the_cache_key_of_the_same_filters(self):
+        f = SearchFilters(year="2020-2024", open_access=True,
+                          pub_types=["conference", "article"])
+        assert filters_key(f.as_dict()) == f.cache_key()
+
+    def test_order_does_not_matter(self):
+        a = {"year": "2020", "pub_types": ["article", "conference"]}
+        b = {"pub_types": ["conference", "article"], "year": "2020"}
+        assert filters_key(a) == filters_key(b)
+
+    def test_different_filters_differ(self):
+        assert filters_key({"year": "2010-2019"}) != filters_key(
+            {"year": "2020-2024"}
+        )
+
+    def test_unknown_fields_are_kept_apart(self):
+        assert filters_key({"future": "a"}) != filters_key({"future": "b"})
+        assert filters_key({"future": "a"}) != ""
 @
 
 
@@ -2779,6 +3052,12 @@ A single search applies the \emph{same} query, filters, and limit to every
 provider, so the merged result can keep them: we carry [[filters]] and
 [[limit]] forward when both inputs agree, and fall back to [[None]] only when
 they differ --- in which case no single set of values describes the merge.
+One difference is expected within a single search: each result records
+the filters its provider \emph{applied}, so with [[--in title-abstract]]
+the OpenAlex result has [[search_in]] and the DBLP result does not.  The
+merged result keeps the one with [[search_in]], since the merged record
+stands for the whole command, and that command was run with [[--in]]
+([[_merged_filters]]).
 This mirrors the query field, which records each input's query; keeping the
 filters and limit lets provenance tooling rebuild the original command rather
 than just its query.
@@ -2790,6 +3069,20 @@ its provider, unless the input is itself a merge (its provider string
 lists several, joined by a comma) and so already carries the prefixes.
 Retries add up, since each was a request someone waited for.
 
+<<functions>>=
+def _merged_filters(a: dict | None, b: dict | None) -> dict | None:
+    """The filters of a merged result: equal ones, else `None`.
+
+    Filters that differ only in `search_in` (one provider applied it,
+    the other did not) merge to the ones with `search_in`.
+    """
+    if a == b:
+        return a
+    rest_a = {k: v for k, v in (a or {}).items() if k != "search_in"}
+    rest_b = {k: v for k, v in (b or {}).items() if k != "search_in"}
+    if rest_a != rest_b:
+        return None
+    return a if (a or {}).get("search_in") else b
 <<search result methods>>=
 def _labelled_error(self) -> str | None:
     """This result's error, prefixed with its provider if not merged."""
@@ -2816,7 +3109,7 @@ def merge(self, other: "SearchResult") -> "SearchResult":
         provider=f"{self.provider}, {other.provider}",
         timestamp=self.timestamp,
         papers=deduped,
-        filters=self.filters if self.filters == other.filters else None,
+        filters=_merged_filters(self.filters, other.filters),
         limit=self.limit if self.limit == other.limit else None,
         error="; ".join(
             e for e in (self._labelled_error(), other._labelled_error()) if e
@@ -2992,6 +3285,17 @@ reconstructable:
             merged = r1.merge(r2)
             assert merged.filters == {"year": "2020-2024"}
             assert merged.limit == 50
+
+    def test_merge_keeps_search_in_of_one_provider(self):
+        """One provider applied --in and the other not: keep --in."""
+        with isolated_registry():
+            asked = {"year": "2020", "search_in": "title-abstract"}
+            a = SearchResult(query="q", provider="openalex", timestamp="t",
+                             papers=[], filters=asked, limit=50)
+            b = SearchResult(query="q", provider="dblp", timestamp="t",
+                             papers=[], filters={"year": "2020"}, limit=50)
+            assert a.merge(b).filters == asked
+            assert b.merge(a).filters == asked
 
     def test_merge_drops_conflicting_filters_and_limit(self):
         """Differing filters or limit cannot describe one command, so drop."""
@@ -3234,12 +3538,13 @@ def execute(
             ranked=is_ranked_provider(provider.name),
         )
         logger.info(f"{provider.name}: {label}")
+        applied = applied_filters(provider, self.query, filters)
         result = SearchResult(
             query=self.query,
             provider=provider.name,
             timestamp=timestamp,
             papers=papers,
-            filters=filters.as_dict() if filters else None,
+            filters=applied.as_dict() if applied else None,
             limit=limit,
             error=error,
             retries=retries,
@@ -3443,11 +3748,13 @@ We collect the imports used throughout the module:
 
 <<imports>>=
 from contextlib import contextmanager
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields, replace
 from datetime import datetime
 from functools import cached_property
 import hashlib
+import json
 import logging
+import shlex
 import re
 
 from scholar.utils import is_preprint_paper, legacy_hash_paper_id
