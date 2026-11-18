@@ -2527,6 +2527,7 @@ class SearchResult:
     limit: int | None = None
     error: str | None = None
     retries: int = 0
+    <<search result parts>>
 
     <<search result methods>>
 @
@@ -3104,6 +3105,7 @@ def merge(self, other: "SearchResult") -> "SearchResult":
         f"Merged results: {len(deduped)} unique papers "
         f"({duplicates} duplicates removed)"
     )
+    parts = self.search_parts() + other.search_parts()
     return SearchResult(
         query=f"{self.query} | {other.query}",
         provider=f"{self.provider}, {other.provider}",
@@ -3115,6 +3117,8 @@ def merge(self, other: "SearchResult") -> "SearchResult":
             e for e in (self._labelled_error(), other._labelled_error()) if e
         ) or None,
         retries=self.retries + other.retries,
+        parts=parts,
+        found_in=parts_returning(deduped, parts),
     )
 @
 
@@ -3364,6 +3368,134 @@ provider failed---also when the merge is itself merged again, as
             deduped = result.deduplicate()
             assert deduped.error == "HTTP 503"
             assert deduped.retries == 1
+@
+
+\subsubsection{Each provider keeps its own search}
+\label{sec:search-result-parts}
+
+The merged result is what the user wants to read: one list, each paper
+once.  It is not what a review session should record.  A session used
+to store the merged result of [[search -n]] as \emph{one} search record,
+provider [[openalex, dblp]], query [[q | q]], one deduplicated count and
+the errors of all providers together.  The query--provider grid that a
+systematic review reports could not be read from it, and the audit
+caption marked every provider of such a record \enquote{incomplete}
+when one of them failed---OpenAlex included, although it had answered
+(\url{https://github.com/dbosk/scholar/issues/164}).  Deduplication is
+about papers; the record of who answered what is about searches, and
+the merge must not fold the second into the first.
+
+So a merged result keeps the single-provider results it was made of, in
+[[parts]], and for each of its papers the indices of the parts that
+returned it, in [[found_in]].  The session code records one search per
+part, with that part's own count and error, and links each paper to the
+parts that returned it (\cref{sec:review-found-by} in the review
+module).  A result that is not a merge has no parts: it is its own one
+part ([[search_parts]]).  Both fields stay out of the dataclass
+comparison and representation, since they describe how the result came
+about, not what it holds.
+
+<<search result parts>>=
+parts: list["SearchResult"] = field(
+    default_factory=list, repr=False, compare=False
+)
+found_in: list[tuple[int, ...]] = field(
+    default_factory=list, repr=False, compare=False
+)
+<<search result methods>>=
+def search_parts(self) -> list["SearchResult"]:
+    """The single-provider results this result was made of."""
+    return list(self.parts) if self.parts else [self]
+@
+
+The link from a merged paper back to its parts has to be computed while
+merging, because that is the last moment at which it is exact.  Two
+facts identify a part that returned a merged paper.  Deduplication
+merges papers by [[Paper.id]], so the merged paper has the id of the
+copies it absorbed, and a part whose papers include that id returned
+it.  The version pass (\cref{sec:version-merge}) also folds a preprint
+into its published version, under another DOI and possibly with no DOI
+at all; but [[merge_version_of]] and [[merge_with]] both union
+[[sources]], the providers that returned each copy, so a part whose
+provider is among the merged paper's sources returned one of its
+versions.  Sources alone would not do: they are only as good as the
+provider that sets them (a [[Mock]] provider sets none), and enrichment
+later adds the providers it asked for.  That is also why the links are
+not recomputed after enrichment: [[enrich_papers]] keeps the papers'
+order and number, so the indices still fit the enriched list.
+
+<<functions>>=
+def parts_returning(
+    papers: list[Paper], parts: list["SearchResult"]
+) -> list[tuple[int, ...]]:
+    """For each paper, the indices of the parts that returned it.
+
+    A part returned a paper when one of the part's papers has the
+    paper's id, or when the part's provider is among the paper's
+    `sources` (which also covers versions folded into it).
+    """
+    by_id: dict[str, set[int]] = {}
+    for index, part in enumerate(parts):
+        for paper in part.papers:
+            by_id.setdefault(paper.id, set()).add(index)
+    found_in = []
+    for paper in papers:
+        indices = set(by_id.get(paper.id, ()))
+        indices.update(
+            index for index, part in enumerate(parts)
+            if part.provider in (paper.sources or [])
+        )
+        found_in.append(tuple(sorted(indices)))
+    return found_in
+@
+
+Let's verify with three providers merged by [[reduce]], as the search
+command does: each part keeps its own papers and error, and every paper
+points to exactly the providers that returned it---also the published
+paper that absorbed a preprint from arXiv under another DOI.
+
+<<test functions>>=
+    def test_merge_keeps_each_providers_part(self):
+        """A merged result keeps its parts and which returned what."""
+        with isolated_registry():
+            both = Paper(title="Both", authors=["X"], doi="10.1/both")
+            only_oa = Paper(title="OA", authors=["Y"], doi="10.1/oa")
+            published = Paper(
+                title="A Work", authors=["Ada Lovelace"],
+                doi="10.1145/1", venue="TOPLAS", sources=["openalex"],
+            )
+            preprint = Paper(
+                title="A Work", authors=["Ada Lovelace"],
+                doi="10.48550/arXiv.2401.1", venue="arXiv",
+                sources=["arxiv"],
+            )
+            oa = SearchResult(query="q", provider="openalex", timestamp="t",
+                              papers=[both, only_oa, published])
+            dblp = SearchResult(query="q", provider="dblp", timestamp="t",
+                                papers=[both], error="HTTP 503")
+            arxiv = SearchResult(query="q", provider="arxiv", timestamp="t",
+                                 papers=[preprint])
+            merged = oa.merge(dblp).merge(arxiv)
+            assert [p.provider for p in merged.parts] == [
+                "openalex", "dblp", "arxiv",
+            ]
+            assert [p.error for p in merged.parts] == [None, "HTTP 503", None]
+            found = {
+                paper.doi: [merged.parts[i].provider for i in indices]
+                for paper, indices in zip(merged.papers, merged.found_in)
+            }
+            assert found == {
+                "10.1/both": ["openalex", "dblp"],
+                "10.1/oa": ["openalex"],
+                "10.1145/1": ["openalex", "arxiv"],
+            }
+
+    def test_unmerged_result_is_its_own_part(self):
+        """A single provider's result is its own one part."""
+        result = SearchResult(query="q", provider="dblp", timestamp="t",
+                              papers=[])
+        assert result.search_parts() == [result]
+        assert result.parts == []
 @
 
 

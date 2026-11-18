@@ -81,6 +81,20 @@ Providers self-register via `register_provider()` at module load time.
   Filters column (`filter_flags`, `scholar.py`, shared with
   `_search_flags`) and appears also when two records share
   (query, provider).
+- One record per provider search (#164). `SearchResult.parts` /
+  `found_in` (not compared): `merge` keeps the single-provider results
+  it was made of and, per merged paper, the indices of the parts that
+  returned it (`parts_returning`: same `Paper.id`, or the part's
+  provider in `sources`; computed before enrichment, which keeps the
+  order). `create_review_session` records one `SearchRecord` per part
+  (`search_parts_of`, Mock-safe) and links each paper to its parts only
+  (`paper_search_links`); the decision's `provider` names those
+  providers. Pre-#164 merged records (provider `openalex, dblp`, query
+  `q | q`) load unchanged: `SearchRecord.is_merged`,
+  `search_outcome_label` ("merged record (providers …): outcome cannot
+  be split"); the audit caption counts them as a query of each provider
+  but marks a failure only when every provider in them failed
+  (`merged_record_failed_everywhere`, "…, in a merged record").
 
 ### Search Flow
 

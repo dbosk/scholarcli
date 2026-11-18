@@ -110,6 +110,7 @@ from cachetools import cachedmethod
 from scholar.scholar import Paper, SearchFilters, merge_version_of
 from scholar.scholar import filters_key, filter_flags
 from scholar.scholar import hits_label, result_outcome
+from scholar.scholar import parts_returning
 from scholar.scholar import RANKED_PROVIDERS, is_ranked_provider
 from scholar.notes import (
     get_paper_id, get_query_hash, get_data_dir,
@@ -506,6 +507,8 @@ class SearchRecord:
         recorded since stores its limit.
         """
         return self.filters is None and self.limit is None
+
+    <<search record properties>>
 @
 
 One kind of record cannot take part in that key.  Sessions written
@@ -530,6 +533,89 @@ of its query on its provider replaces it, whatever the new run's
 filters (\cref{sec:legacy-records}).  Keeping it beside the new record
 would make [[found-via]] print, for it, a command without filters that
 may never have been run.
+
+\label{sec:merged-records}
+A second kind of old record cannot be split either.  Until
+\url{https://github.com/dbosk/scholar/issues/164} a multi-provider
+[[search -n]] stored its merged result as one record: provider
+[[openalex, dblp]], query [[q | q]], the deduplicated count of all
+providers together and their errors joined, each prefixed with its
+provider.  Searches now record one record per provider
+(\cref{sec:review-found-by}), but sessions hold hundreds of the old
+ones, and their papers link to them.  They load unchanged, since
+rewriting them would invent per-provider counts that were never
+stored.  What changes is how they are read: [[is_merged]] recognises
+them by the comma that no provider name contains, and
+[[search_outcome_label]] says what such a record is---\enquote{merged
+record (providers openalex, dblp): outcome cannot be split}, with the
+total and the provider-labelled errors after it---instead of a count
+that a reader would take for each provider's.
+
+<<search record properties>>=
+@property
+def merged_providers(self) -> list[str]:
+    """The providers of a merged record, or `[provider]` for one search."""
+    return [p.strip() for p in self.provider.split(",") if p.strip()]
+
+@property
+def is_merged(self) -> bool:
+    """Whether the record is a merged one from before #164."""
+    return len(self.merged_providers) > 1
+@
+
+The label is the one place that decides how a record's outcome reads,
+for [[sessions show]] and the report alike; for a record of one search
+it is [[hits_label]] (\cref{sec:search-result-error} in the
+[[scholar]] module).
+
+<<review data structures>>=
+def search_outcome_label(record: SearchRecord) -> str:
+    """Describe a search record's outcome; "" when nothing is known.
+
+    A merged record (see `SearchRecord.is_merged`) is labelled as such,
+    since its count and errors cannot be attributed to its providers.
+    """
+    if record.is_merged:
+        details = []
+        if record.hits is not None:
+            details.append(f"{record.hits} papers in total")
+        if record.error:
+            details.append(f"errors: {record.error}")
+        label = (
+            f"merged record (providers {', '.join(record.merged_providers)})"
+            ": outcome cannot be split"
+        )
+        return label + (f" ({'; '.join(details)})" if details else "")
+    return hits_label(
+        record.hits, record.error, record.retries,
+        ranked=is_ranked_provider(record.provider),
+    )
+@
+
+<<test functions>>=
+class TestMergedRecords:
+    """Merged records from before #164 are labelled, never split."""
+
+    def test_merged_record_is_recognised(self):
+        record = SearchRecord("q | q", "openalex, dblp", None, 100,
+                              hits=25, error="dblp: non-JSON response")
+        assert record.is_merged
+        assert record.merged_providers == ["openalex", "dblp"]
+        assert not SearchRecord("q", "dblp", None, 100).is_merged
+
+    def test_label_does_not_split_the_outcome(self):
+        record = SearchRecord("q | q", "openalex, dblp", None, 100,
+                              hits=25, error="dblp: non-JSON response")
+        assert search_outcome_label(record) == (
+            "merged record (providers openalex, dblp): outcome cannot be "
+            "split (25 papers in total; errors: dblp: non-JSON response)"
+        )
+
+    def test_single_search_label_is_hits_label(self):
+        record = SearchRecord("q", "dblp", None, 100, hits=0,
+                              error="HTTP 503")
+        assert search_outcome_label(record) == "failed (HTTP 503)"
+@
 
 
 \subsection{Review Session}
@@ -1401,7 +1487,9 @@ def create_review_session(
                         len(previous_decisions.decisions))
     
     # Create review session
-    providers = list(dict.fromkeys(r.provider for r in results))
+    providers = list(dict.fromkeys(
+        part.provider for r in results for part in search_parts_of(r)
+    ))
     logger.debug("Session includes providers: %s", providers)
     session = ReviewSession(
         query=query,
@@ -1416,13 +1504,15 @@ def create_review_session(
     if previous_session:
         session._baseline = previous_session._baseline
 
-    # Build search records (query, provider, filters, limit, outcome)
+    # Build search records (query, provider, filters, limit, outcome),
+    # one per provider search, also inside a merged result
     for result in results:
-        error, retries = result_outcome(result)
-        session.add_query_provider_pair(
-            result.query, result.provider, result.filters, result.limit,
-            hits=len(result.papers), error=error, retries=retries,
-        )
+        for part in search_parts_of(result):
+            error, retries = result_outcome(part)
+            session.add_query_provider_pair(
+                part.query, part.provider, part.filters, part.limit,
+                hits=len(part.papers), error=error, retries=retries,
+            )
 
     # Merge with previous session's searches (if any), preserving their filters
     replaced_links: dict[tuple, tuple] = {}
@@ -2069,13 +2159,55 @@ this run, a renamed or adopted entry, a previous decision, or a new one),
 the decision records the search that returned it ([[record_search]]).  The
 link has to be made here: this loop is the only place that still knows
 which [[SearchResult]], and so which search record, a paper came from.
-The result's query, provider and [[filters_key]] of its filters are
-exactly the key [[add_query_provider_pair]] recorded above, merged
-results included ([[q | q]], [[openalex, dblp]]), so the link always
-names a stored record.
+A link is a part's query, provider and [[filters_key]] of its filters,
+exactly the key [[add_query_provider_pair]] recorded above, so the link
+always names a stored record.
 A decision rebuilt from the previous session copies that session's links,
-and the new one is added to them: a paper returned by three queries keeps
-all three.
+and the new ones are added to them: a paper returned by three queries
+keeps all three.
+
+A merged result (the default [[search -n]] over several providers) is
+recorded part by part (\cref{sec:search-result-parts} in the [[scholar]]
+module): one record per provider, with that provider's own count and
+error, never one record [[openalex, dblp]] whose failure would be
+charged to every provider in it
+(\url{https://github.com/dbosk/scholar/issues/164}).  Its papers are
+still the deduplicated ones, so deduplication stays a matter of papers,
+and each paper is linked to the parts that returned it
+([[paper_search_links]]).  The decision's [[provider]] names the same
+providers, so a paper only OpenAlex returned no longer reads as found
+by DBLP as well.  Results built without parts (by [[rq]], by
+[[--no-dedup]], in tests, by code outside scholar) are their own one
+part; a [[Mock]] standing in for a result has no list of parts and is
+treated so too.  Should a merged result's [[found_in]] not fit its
+papers---code that filtered the papers after merging---the links are
+computed again from the papers themselves.
+
+<<review session functions>>=
+def search_parts_of(result) -> list:
+    """The single-provider searches of a `SearchResult`-like object."""
+    parts = getattr(result, "parts", None)
+    if isinstance(parts, list) and parts:
+        return list(parts)
+    return [result]
+
+
+def paper_search_links(result) -> list[list[tuple[str, str, str]]]:
+    """For each paper of `result`, the keys of the searches that returned it.
+
+    A key is `(query, provider, filters key)` of one part of the result
+    (see `search_parts_of`); a result that is not a merge links every
+    paper to itself.
+    """
+    parts = search_parts_of(result)
+    keys = [(p.query, p.provider, filters_key(p.filters)) for p in parts]
+    if len(parts) == 1:
+        return [[keys[0]] for _ in result.papers]
+    found_in = getattr(result, "found_in", None)
+    if not isinstance(found_in, list) or len(found_in) != len(result.papers):
+        found_in = parts_returning(result.papers, parts)
+    return [[keys[i] for i in indices] for indices in found_in]
+@
 
 <<convert search results to decisions>>=
 decision_lookup: dict[str, ReviewDecision] = {
@@ -2095,8 +2227,10 @@ for d in session.decisions:
             provenance_lookup[key] = d
 
 for result in results:
-    link = (result.query, result.provider, filters_key(result.filters))
-    for paper in result.papers:
+    for paper, links in zip(result.papers, paper_search_links(result)):
+        found_by_provider = ", ".join(
+            dict.fromkeys(provider for _, provider, _ in links)
+        ) or result.provider
         paper = without_homonym_numbers(
             _normalize_paper_identifiers(paper)
         )
@@ -2108,7 +2242,8 @@ for result in results:
                 existing.paper = existing.paper.merge_with(paper)
             except ValueError:
                 pass
-            existing.record_search(*link)
+            for link in links:
+                existing.record_search(*link)
             continue
 
         renamed = renamed_lookup.pop(paper_id, None)
@@ -2120,13 +2255,15 @@ for result in results:
             ).merge_with(paper)
             decision_lookup.pop(old_id, None)
             decision_lookup[paper_id] = renamed
-            renamed.record_search(*link)
+            for link in links:
+                renamed.record_search(*link)
             continue
 
         adopted = provenance_lookup.get(paper_id)
         if adopted is not None:
             adopted.paper = merge_version_of(adopted.paper, paper)
-            adopted.record_search(*link)
+            for link in links:
+                adopted.record_search(*link)
             continue
 
         replaced = None
@@ -2143,7 +2280,8 @@ for result in results:
             replaced.paper = merge_version_of(paper, replaced.paper)
             decision_lookup[paper_id] = replaced
             provenance_lookup[old_id] = replaced
-            replaced.record_search(*link)
+            for link in links:
+                replaced.record_search(*link)
             continue
 
         # Check for previous decision (prefer session data over notes)
@@ -2165,7 +2303,7 @@ for result in results:
             # Use previous decision but with fresh paper data
             decision = ReviewDecision(
                 paper=paper,  # Fresh paper data from search
-                provider=result.provider,
+                provider=found_by_provider,
                 status=prev_dec.status,
                 tags=prev_dec.tags,
                 source=prev_dec.source,
@@ -2192,7 +2330,7 @@ for result in results:
 
             decision = ReviewDecision(
                 paper=paper,
-                provider=result.provider,
+                provider=found_by_provider,
                 status=status,
                 tags=tags,
                 source=source,
@@ -2203,11 +2341,13 @@ for result in results:
             # New paper, no previous decision
             decision = ReviewDecision(
                 paper=paper,
-                provider=result.provider,
+                provider=found_by_provider,
                 status=DecisionStatus.PENDING,
             )
 
-        decision.record_search(*link)
+
+        for link in links:
+            decision.record_search(*link)
         session.decisions.append(decision)
         decision_lookup[paper_id] = decision
 @
@@ -2288,6 +2428,84 @@ class TestFoundByLinks:
         assert set(links["10.1/fb-first"]) == {
             ("q1", "openalex", ""), ("q2", "openalex", ""),
         }
+@
+
+The case of \url{https://github.com/dbosk/scholar/issues/164}: the
+default search merges OpenAlex, which answered, with DBLP, which
+failed.  The session must hold two records with their own outcomes, the
+paper only OpenAlex returned must link to OpenAlex alone, and a merged
+record already in the session from before must load and stay as it was.
+The merge is the real [[SearchResult.merge]] that the search command
+runs.
+
+<<test functions>>=
+class TestRecordsPerProvider:
+    """A merged result is recorded as one search per provider (#164)."""
+
+    @staticmethod
+    def _merged():
+        from scholar.scholar import SearchResult
+        both = Paper(title="Both", authors=["A"], doi="10.1/pp-both")
+        only = Paper(title="Only OA", authors=["B"], doi="10.1/pp-oa")
+        openalex = SearchResult(
+            query="q", provider="openalex", timestamp="t",
+            papers=[both, only], limit=100,
+        )
+        dblp = SearchResult(
+            query="q", provider="dblp", timestamp="t", papers=[both],
+            limit=100, error="non-JSON response",
+        )
+        return openalex.merge(dblp)
+
+    def test_one_record_per_provider(self):
+        session = create_review_session(
+            [self._merged()], "q", session_name="per-provider",
+        )
+        outcomes = {
+            r.provider: (r.query, r.hits, r.error)
+            for r in session.search_records
+        }
+        assert outcomes == {
+            "openalex": ("q", 2, None),
+            "dblp": ("q", 1, "non-JSON response"),
+        }
+        assert session.providers == ["openalex", "dblp"]
+
+    def test_papers_link_to_the_providers_that_returned_them(self):
+        session = create_review_session(
+            [self._merged()], "q", session_name="per-provider",
+        )
+        found = {
+            d.paper.doi: (d.provider, d.found_by) for d in session.decisions
+        }
+        assert found["10.1/pp-oa"] == ("openalex", [("q", "openalex", "")])
+        assert found["10.1/pp-both"] == (
+            "openalex, dblp", [("q", "openalex", ""), ("q", "dblp", "")],
+        )
+
+    def test_old_merged_record_loads_unchanged(self):
+        import json
+        from scholar.review import _get_sessions_dir
+        old = {"query": "q | q", "provider": "openalex, dblp",
+               "filters": None, "limit": 100, "hits": 25,
+               "error": "dblp: non-JSON response", "retries": 0}
+        path = _get_sessions_dir() / "merged-old.json"
+        path.write_text(json.dumps({
+            "query": "q", "name": "merged-old",
+            "providers": ["openalex, dblp"],
+            "timestamp": datetime.now().isoformat(),
+            "search_records": [old], "decisions": [],
+        }))
+        session = create_review_session(
+            [self._merged()], "q", session_name="merged-old",
+        )
+        save_session(session)
+        records = json.loads(path.read_text())["search_records"]
+        assert [r["provider"] for r in records] == [
+            "openalex", "dblp", "openalex, dblp",
+        ]
+        merged = records[2]
+        assert {k: merged[k] for k in old} == old
 @
 
 Extracting tags from a [[ReviewDecisionRecord]] is useful for backward compatibility
@@ -5081,10 +5299,7 @@ def search_outcomes(
     return [
         (
             r.query, r.provider, " ".join(filter_flags(r.filters)),
-            hits_label(
-                r.hits, r.error, r.retries,
-                ranked=is_ranked_provider(r.provider),
-            ),
+            search_outcome_label(r),
         )
         for r in session.search_records
     ]
@@ -6386,6 +6601,9 @@ AUDIT_STRINGS: dict[str, dict] = {
         "openalex_note": "not open access",
         "search_failed": "failed for {n} of {total} {queries}",
         "search_incomplete": "incomplete for {n} of {total} {queries}",
+        "search_failed_merged": (
+            "failed for {n} of {total} {queries}, in a merged record"
+        ),
         "query": "query",
         "queries": "queries",
         "title": "Title",
@@ -6457,6 +6675,9 @@ AUDIT_STRINGS: dict[str, dict] = {
         "openalex_note": "inte open access",
         "search_failed": "misslyckades för {n} av {total} {queries}",
         "search_incomplete": "ofullständig för {n} av {total} {queries}",
+        "search_failed_merged": (
+            "misslyckades för {n} av {total} {queries}, i en sammanslagen post"
+        ),
         "query": "sökfråga",
         "queries": "sökfrågor",
         "title": "Titel",
@@ -7129,8 +7350,8 @@ def audit_databases_sentence(
         for provider in row.providers:
             if provider not in used and provider not in RANKED_SHORT_NAMES:
                 used.append(provider)
-    for short, (failed, _, total) in shortfalls.items():
-        if failed < total and short not in used:
+    for short, (failed, _, total, merged_failed) in shortfalls.items():
+        if failed + merged_failed < total and short not in used:
             used.append(short)
     names: list[str] = []
     for key, short in PROVIDER_SHORT_NAMES.items():
@@ -7185,19 +7406,46 @@ queries} is exactly true when one year range failed and the other
 answered.  Counting the words once would hide either the failure or
 the answer, so the wording stays as it is.
 
+A merged record from before searches were recorded per provider
+(\cref{sec:merged-records}) counts as one query for each of its
+providers, but its outcome cannot be split, so it marks none of them
+failed or incomplete.  That used to be the bug of
+\url{https://github.com/dbosk/scholar/issues/164}: one DBLP failure in
+a merged record made OpenAlex, IEEE and arXiv read \enquote{incomplete}
+as well, although they had answered.  The exception is a record in
+which every provider failed: no papers, and an error naming each of
+its providers (the merge prefixes each error with its provider).  Then
+the failure is each provider's, and it is counted apart, so the note
+can say that it comes from a merged record.
+
 <<review report generation>>=
+def merged_record_failed_everywhere(record: SearchRecord) -> bool:
+    """Whether every provider of a merged record failed outright."""
+    if not record.is_merged or not record.error or record.hits:
+        return False
+    named = {
+        segment.split(":", 1)[0].strip()
+        for segment in record.error.split("; ") if ":" in segment
+    }
+    return set(record.merged_providers) <= named
+
+
 def audit_search_shortfalls(
     records: list[SearchRecord],
-) -> dict[str, tuple[int, int, int]]:
-    """Count failed, incomplete and all searches per provider code."""
+) -> dict[str, tuple[int, int, int, int]]:
+    """Count searches per provider code that failed, ended incomplete,
+    all of them, and those that failed inside a merged record."""
     counts: dict[str, list[int]] = {}
     for record in records:
         if is_ranked_provider(record.provider):
             continue
         for short in provider_short_names(record.provider):
-            tally = counts.setdefault(short, [0, 0, 0])
+            tally = counts.setdefault(short, [0, 0, 0, 0])
             tally[2] += 1
-            if record.error and record.hits:
+            if record.is_merged:
+                if merged_record_failed_everywhere(record):
+                    tally[3] += 1
+            elif record.error and record.hits:
                 tally[1] += 1
             elif record.error:
                 tally[0] += 1
@@ -7205,17 +7453,18 @@ def audit_search_shortfalls(
 
 
 def audit_search_notes(
-    shortfall: tuple[int, int, int] | None, strings: dict
+    shortfall: tuple[int, int, int, int] | None, strings: dict
 ) -> list[str]:
     """Localised notes on a database's failed and incomplete searches."""
     if not shortfall:
         return []
-    failed, incomplete, total = shortfall
+    failed, incomplete, total, merged_failed = shortfall
     queries = strings["query"] if total == 1 else strings["queries"]
     notes = []
     for count, template in (
         (failed, strings["search_failed"]),
         (incomplete, strings["search_incomplete"]),
+        (merged_failed, strings["search_failed_merged"]),
     ):
         if count:
             notes.append(
@@ -7323,6 +7572,41 @@ class TestAuditDatabasesFailures:
                 build_audit_table_latex(session, label="x", lang=lang)
             )
             assert expected in text
+@
+
+A merged record charges no provider with another's failure, and one
+in which every provider failed is reported as such, in both languages:
+
+<<test functions>>=
+class TestAuditMergedRecords:
+    """Merged records from before #164 in the databases sentence."""
+
+    ROWS = [AuditRow("t", "2020", ["OA", "DBLP"], DecisionStatus.KEPT,
+                     "r", 0)]
+
+    def test_one_failure_marks_no_provider(self):
+        records = [SearchRecord("q | q", "openalex, dblp", None, 100,
+                                hits=25, error="dblp: non-JSON response")]
+        assert audit_databases_sentence(
+            self.ROWS, AUDIT_STRINGS["en"], records
+        ) == "Databases: OpenAlex (OA; not open access), DBLP."
+
+    def test_all_failed_says_merged(self):
+        records = [
+            SearchRecord("q | q", "openalex, dblp", None, 100, hits=0,
+                         error="openalex: HTTP 503; dblp: HTTP 503"),
+            SearchRecord("r", "dblp", None, 100, hits=4),
+        ]
+        rows = [AuditRow("t", "2020", ["DBLP"], DecisionStatus.KEPT,
+                         "r", 0)]
+        assert audit_databases_sentence(
+            rows, AUDIT_STRINGS["en"], records
+        ) == (
+            "Databases: DBLP (failed for 1 of 2 queries, in a merged record)."
+        )
+        assert "i en sammanslagen post" in audit_databases_sentence(
+            rows, AUDIT_STRINGS["sv"], records
+        )
 @
 
 A query run with two filter sets counts as two queries, as argued above:
