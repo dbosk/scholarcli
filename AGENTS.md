@@ -207,6 +207,13 @@ part. COMPLETE results are served to everyone (unless
 `SCOPUS_VIEW=standard`); default-view results only when COMPLETE is not
 available, which a new process learns from one `count=1` probe
 (`_complete_confirmed()`); a failed probe still serves the cache.
+When it is served because the probe was inconclusive (HTTP 429/5xx/403,
+a bad key, `RateLimited`, a network error; a *refusal* is the normal
+off-campus case and silent, and so is `SCOPUS_VIEW=standard`), the
+provider logs one WARNING per process naming the reason and the remedy
+`scholar cache clear --provider scopus` (#139). The route (proxy or
+direct) is deliberately not part of the key: what changes the data is
+the view the route entitles, and that is already keyed.
 
 `ScopusProvider.get_paper_by_doi()` (a one-result `DOI("...")` search)
 makes Scopus the *last* entry of `ENRICHMENT_PROVIDERS`. It returns
@@ -689,8 +696,13 @@ shared registry let one test's titles leak into the next), and
 `fresh_rate_limiters` returns the limiter registry to its import-time
 state after every test (test-created limiters dropped, the others'
 limits, last request and warning flag reset). It restores rather than
-empties: `providers limits` lists Crossref/Unpaywall only because their
-import registered limiters. No test needs to pop `ratelimit._LIMITERS`.
+empties: `providers limits` lists Crossref/Unpaywall only because
+importing `scholar.crossref`/`scholar.unpaywall` registers their
+limiters. `scholar.cli` imports Unpaywall lazily, so the fixture imports
+`scholar.providers`, `crossref` and `unpaywall` itself (inside the
+fixture, never at conftest level, #132) before taking its snapshot;
+otherwise the first test to trigger the import lost the registration at
+teardown (#131). No test needs to pop `ratelimit._LIMITERS`.
 
 Per-test fixtures cannot protect state touched at import or at exit:
 provider caches load when their module is imported (during collection)
@@ -744,6 +756,12 @@ their own line. `clear_cache()` also empties the in-memory copy of each
 deleted cache in `CACHE_REGISTRY`, else the exit hook would write it
 back (the CLI loads `crossref.pkl` at import).
 
+`scholar cache clear --provider NAME` (repeatable) deletes only
+`NAME.pkl` (`clear_cache(providers=[...])`), also emptying its in-memory
+cache. Valid names are the registered providers plus `crossref` and
+`unpaywall`; an unknown one exits 2 listing them. It cannot be combined
+with `--include-llm` (exit 2 / `ValueError`).
+
 Environment variable: `SCHOLAR_CACHE_DIR` to override cache location.
 
 The keyed REST providers cache manually (search wrapper +
@@ -792,9 +810,26 @@ requests/day and each `scholar` run is a fresh process.
   comes from OpenAlex: the health probe's
   `X-RateLimit-Remaining`/`X-RateLimit-Reset` headers are synced via
   `record_response`, a keyed probe also reads `/rate-limit` for the
-  detail column, and a search 429 with `X-RateLimit-Remaining-USD: 0`
-  becomes a quota block until `X-RateLimit-Reset` (`_note_http_error`),
-  logged with the reset time and a key hint.
+  detail column, and a search 429 that spends the budget becomes a
+  quota block until `X-RateLimit-Reset` (`_note_http_error`), logged
+  with the reset time and a key hint.
+- OpenAlex prepaid credit (#138) is drawn after the daily allowance,
+  and `X-RateLimit-Remaining(-USD)` count the allowance only (recorded
+  2026-11-18); prepaid/one-time credit come as
+  `X-RateLimit-Prepaid-Remaining-USD`/`X-RateLimit-Onetime-Remaining`.
+  So: the detail column adds `+ $5.00 prepaid (expires …) + N one-time
+  credits` when positive; a 429 is "spent" iff its body `reason` is
+  `daily_budget` (documented: daily and prepaid spent), else iff
+  `-Remaining-USD` ≤ 0 with no prepaid/one-time credit (headers read
+  via `ratelimit._get_header`, either case);
+  `OpenAlexProvider._record_response` drops `X-RateLimit-Remaining`
+  before the limiter sync while such credit is reported, and for a 429
+  whose `reason` is not `daily_budget`, so neither a spent day nor a
+  per-second 429 blocks the quota group. Consequence: while prepaid
+  credit is reported, `providers limits` gets no fresh remaining
+  count (an earlier one until the reset, then none). A zero stored
+  before the purchase stays until the reset
+  (`providers limits --reset openalex`).
 - Pacing is the limiter's job: S2 (`LIMITS` anonymous 1/3 per second,
   `KEYED_LIMITS` 1.0; `_acquire()` re-declares per request because a
   rejected key changes the rate), OpenAlex and arXiv (a
