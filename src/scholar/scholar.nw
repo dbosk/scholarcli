@@ -3576,6 +3576,7 @@ Names that resolve to no provider are skipped as before; expansion has
 already warned about them.
 
 \subsubsection{Skipping unavailable providers}
+\label{sec:skipped-providers}
 
 Before entering a provider, [[execute()]] consults the persistent
 rate-limit state (\cref{ch:ratelimit}): a provider whose daily quota is
@@ -3590,10 +3591,28 @@ The warning goes through [[logger.warning]] (visible at default
 verbosity) rather than a console print, because [[execute()]] is
 library code shared by the CLI, the TUI, and [[rq]], and stdout must
 stay pure for [[-f json]]/[[-f bibtex]].
-A skipped provider produces \emph{no} [[SearchResult]] at all: a
-zero-paper result would read as \enquote{the provider found nothing} in
-a review session's audit trail, which is precisely the wrong record for
-a provider that was never asked.
+A skipped provider still produces a [[SearchResult]]: no papers, and
+the error [[skipped: daily quota spent; resets 01:00 (in 3h02m)]].  It
+used to produce none, on the argument that a zero-paper result would
+read as \enquote{the provider found nothing}.  That argument predates
+[[error]] (\cref{sec:search-result-error}), which lets a result say
+\enquote{failed} instead of 0; and producing nothing was worse than
+either.  A counter-search that never ran was then \emph{absent} from
+the review session---exit 0, an empty CSV, no search record, an
+unchanged audit caption---rather than visible as a search that failed
+(\url{https://github.com/dbosk/scholar/issues/165}).  As a failed
+result it reaches every view a failure reaches ([[hits_label]] says
+\enquote{failed (skipped: \dots)}), and the session rules for failures
+apply unchanged: it is recorded, and it never overwrites an earlier
+answered record of the same search
+(\cref{sec:search-record-key} in the review module).  Its filters are
+those the provider would have applied ([[applied_filters]]), so that
+it has the same key as that earlier record.
+
+One function, [[search_provider]], runs one provider's search for
+[[execute()]] and for [[rq]] alike, so the skip, the outcome and every
+field added to a result later are the same on both paths; [[rq]] used
+to build its results by hand and so never skipped at all.
 
 A provider that \emph{was} asked but did not answer is the opposite
 case: the attempt belongs in the record, as an attempt that failed.
@@ -3615,7 +3634,8 @@ def execute(
 
     Providers whose persisted rate-limit state says they cannot be
     queried right now (spent daily quota, active cooldown) are
-    skipped with a warning and produce no `SearchResult`.
+    skipped with a warning; their `SearchResult` has no papers and
+    the error "skipped: <reason>; resets <time>".
 
     Args:
         providers: List of provider names or group aliases (e.g.
@@ -3632,8 +3652,6 @@ def execute(
         get_default_providers,
         expand_provider_names,
     )
-    from scholar.ratelimit import format_retry, limiter_for
-    from scholar.utils import clean_paper_text
 
     timestamp = datetime.now().isoformat()
 
@@ -3652,39 +3670,66 @@ def execute(
 
     # Query each provider
     for provider in provider_list:
-        availability = limiter_for(provider).check_available()
-        if not availability.ok:
-            logger.warning(
-                f"{provider.name}: {availability.reason};"
-                f" resets {format_retry(availability.retry_at)}."
-                f" Skipping."
-            )
-            continue
-        logger.debug(f"Querying {provider.name} with limit={limit}")
-        papers = provider.search(self.query, limit=limit, filters=filters)
-        error, retries = provider_outcome(provider)
-        for paper in papers:
-            clean_paper_text(paper)
-        label = hits_label(
-            len(papers), error, retries,
-            ranked=is_ranked_provider(provider.name),
-        )
-        logger.info(f"{provider.name}: {label}")
-        applied = applied_filters(provider, self.query, filters)
-        result = SearchResult(
-            query=self.query,
-            provider=provider.name,
-            timestamp=timestamp,
-            papers=papers,
-            filters=applied.as_dict() if applied else None,
-            limit=limit,
-            error=error,
-            retries=retries,
-        )
-        self.results.append(result)
+        self.results.append(search_provider(
+            provider, self.query, limit, filters, timestamp=timestamp,
+        ))
 
     logger.info(f"Search complete: {len(self.results)} result set(s)")
     return self.results
+@
+
+[[search_provider]] is the body of that loop, shared with [[rq]].
+Everything a result records about its search is read here, right after
+[[search()]] returns, for the reason given above.
+
+<<functions>>=
+def search_provider(
+    provider,
+    query: str,
+    limit: int,
+    filters: "SearchFilters | None" = None,
+    *,
+    timestamp: str | None = None,
+) -> SearchResult:
+    """Run one provider's search and return its result, failures included.
+
+    A provider whose limiter says it cannot be queried now is not asked:
+    its result has no papers and the error
+    "skipped: <reason>; resets <time>".
+    """
+    from scholar.ratelimit import format_retry, limiter_for
+    from scholar.utils import clean_paper_text
+
+    timestamp = timestamp or datetime.now().isoformat()
+    applied = applied_filters(provider, query, filters)
+    result = SearchResult(
+        query=query,
+        provider=provider.name,
+        timestamp=timestamp,
+        papers=[],
+        filters=applied.as_dict() if applied else None,
+        limit=limit,
+    )
+    availability = limiter_for(provider).check_available()
+    if not availability.ok:
+        resets = format_retry(availability.retry_at)
+        logger.warning(
+            f"{provider.name}: {availability.reason};"
+            f" resets {resets}. Skipping."
+        )
+        result.error = f"skipped: {availability.reason}; resets {resets}"
+        return result
+    logger.debug(f"Querying {provider.name} with limit={limit}")
+    result.papers = provider.search(query, limit=limit, filters=filters)
+    result.error, result.retries = provider_outcome(provider)
+    for paper in result.papers:
+        clean_paper_text(paper)
+    label = hits_label(
+        len(result.papers), result.error, result.retries,
+        ranked=is_ranked_provider(provider.name),
+    )
+    logger.info(f"{provider.name}: {label}")
+    return result
 @
 
 \subsubsection{Testing the search interface}
@@ -3799,8 +3844,10 @@ while one that answered (here a [[Mock]] whose attributes are
 @
 
 A provider whose persisted quota is spent must be skipped visibly but
-harmlessly: one warning, no request, no [[SearchResult]]---and the other
-providers must be entirely unaffected:
+harmlessly: one warning, no request, a [[SearchResult]] that says it
+was skipped and why (\url{https://github.com/dbosk/scholar/issues/165};
+before, this test asserted that there was no result at all)---and the
+other providers must be entirely unaffected:
 
 <<test functions>>=
     def test_execute_skips_quota_blocked_provider(
@@ -3834,7 +3881,13 @@ providers must be entirely unaffected:
                 )
 
         blocked.search.assert_not_called()
-        assert [r.provider for r in results] == ["healthy"]
+        assert [r.provider for r in results] == ["blocked", "healthy"]
+        skipped = results[0]
+        assert skipped.papers == []
+        assert skipped.error.startswith(
+            "skipped: daily quota spent; resets "
+        )
+        assert results[1].error is None
         warnings = [
             r for r in caplog.records
             if r.levelname == "WARNING" and "blocked" in r.getMessage()

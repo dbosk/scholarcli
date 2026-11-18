@@ -1332,6 +1332,65 @@ class TestSearchRecordsPerProvider:
         assert "incomplete" not in shown.stdout
 @
 
+A provider skipped for its spent quota is a search that failed, not one
+that never happened (\url{https://github.com/dbosk/scholar/issues/165}):
+the session records it with the reason and the reset time, the search
+output says so, and a later skip does not erase an earlier answer.  The
+quota state is the real persisted limiter state, set as a spent quota
+would set it.
+
+<<test functions>>=
+class TestSkippedProviderRecorded:
+    """A quota-blocked provider is recorded as skipped (#165)."""
+
+    def _provider(self, monkeypatch):
+        from scholar import providers
+
+        mock = Mock()
+        mock.name = "blockable"
+        mock.MAX_LIMIT = None
+        mock.search.return_value = [
+            Paper(title="Answer", authors=["A"], doi="10.1/skip-answer"),
+        ]
+        monkeypatch.setattr(providers, "PROVIDERS", {"blockable": mock})
+        return mock
+
+    @staticmethod
+    def _block():
+        from scholar import ratelimit
+        ratelimit.get_limiter("blockable").record_limit_hit(
+            reason="daily quota spent", exhausted_daily=True
+        )
+
+    def test_skip_is_recorded_and_shown(self, tmp_path, monkeypatch):
+        from scholar.review import load_session
+
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        mock = self._provider(monkeypatch)
+        self._block()
+        result = runner.invoke(
+            app, ["search", "q", "-n", "skipped", "-f", "csv"]
+        )
+        mock.search.assert_not_called()
+        assert "# Results: failed (skipped: daily quota spent; resets " \
+            in result.stdout
+        record = load_session("skipped").search_records[0]
+        assert record.provider == "blockable"
+        assert record.hits == 0
+        assert record.error.startswith("skipped: daily quota spent")
+
+    def test_skip_keeps_an_earlier_answer(self, tmp_path, monkeypatch):
+        from scholar.review import load_session
+
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        self._provider(monkeypatch)
+        runner.invoke(app, ["search", "q", "-n", "kept", "-f", "csv"])
+        self._block()
+        runner.invoke(app, ["search", "q", "-n", "kept", "-f", "csv"])
+        records = load_session("kept").search_records
+        assert [(r.hits, r.error) for r in records] == [(1, None)]
+@
+
 \subsection{Semantic search: alone, unfiltered, at most fifty}
 \label{sec:search-semantic-checks}
 
@@ -1892,7 +1951,7 @@ from scholar.providers import (
     get_provider,
     expand_provider_names,
 )
-from scholar.scholar import SearchResult, provider_outcome, applied_filters
+from scholar.scholar import SearchResult, search_provider
 from scholar.review import create_review_session, save_session
 from scholar.llm_review import (
     classify_papers_with_llm,
@@ -1988,6 +2047,13 @@ provider_queries = generate_provider_queries(
 )
 @
 
+[[rq]] runs each provider's own query through [[search_provider]], the
+function behind [[Search.execute]] (\cref{sec:skipped-providers} in
+the [[scholar]] module), so a provider whose quota is spent is recorded
+as skipped, with its reason, exactly as in [[search]]
+(\url{https://github.com/dbosk/scholar/issues/165}); before, [[rq]]
+called the provider directly and never looked at the limiter first.
+
 <<execute rq provider searches>>=
 results: list[SearchResult] = []
 timestamp = datetime.now().isoformat()
@@ -1997,21 +2063,9 @@ for pname in provider_names:
         continue
 
     q = provider_queries.get(pname, rq_text)
-    papers = p.search(q, limit=effective_limit, filters=filters)
-    error, retries = provider_outcome(p)
-    applied = applied_filters(p, q, filters)
-    results.append(
-        SearchResult(
-            query=q,
-            provider=pname,
-            timestamp=timestamp,
-            papers=papers,
-            filters=applied.as_dict() if applied else None,
-            limit=effective_limit,
-            error=error,
-            retries=retries,
-        )
-    )
+    results.append(search_provider(
+        p, q, effective_limit, filters, timestamp=timestamp,
+    ))
 
 if not results:
     console.print("[yellow]No results returned[/yellow]")
@@ -2325,6 +2379,79 @@ class TestRQCommand:
             for r in data["search_records"]
         )
         assert data["decisions"][0]["source"] == "llm"
+@
+
+[[rq]] goes through the same [[search_provider]], so a provider whose
+quota is spent is recorded as skipped there too, beside the provider
+that answered.  The model is the same kind of stand-in as above: it
+writes the queries and classifies the one paper.
+
+<<test functions>>=
+class TestRQRecordsSkippedProvider:
+    """rq records a quota-blocked provider as skipped (#165)."""
+
+    def test_skipped_provider_has_a_record(self, tmp_path, monkeypatch):
+        import json
+        import sys
+        import types
+
+        from scholar import providers, ratelimit
+        from scholar.review import load_session
+
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        good, blocked = Mock(), Mock()
+        good.name, blocked.name = "good", "blocked"
+        good.search.return_value = [
+            Paper(title="Found", authors=["A"], year=2024,
+                  doi="10.1/rq-skip", abstract="Abstract."),
+        ]
+        monkeypatch.setattr(
+            providers, "PROVIDERS", {"good": good, "blocked": blocked}
+        )
+        ratelimit.get_limiter("blocked").record_limit_hit(
+            reason="daily quota spent", exhausted_daily=True
+        )
+
+        class Reply:
+            def __init__(self, data):
+                self._text = json.dumps(data)
+
+            def text(self):
+                return self._text
+
+        class Model:
+            model_id = "dummy"
+
+            def prompt(self, prompt):
+                if "Papers to Classify" in prompt:
+                    return Reply({"classifications": [{
+                        "paper_index": 0, "decision": "kept",
+                        "tags": ["theme"], "confidence": 0.9,
+                        "reasoning": "Relevant.",
+                    }]})
+                return Reply({"queries": [
+                    {"provider": "good", "query": "good query"},
+                    {"provider": "blocked", "query": "blocked query"},
+                ]})
+
+        llm_mod = types.ModuleType("llm")
+        llm_mod.get_model = lambda model_id=None: Model()
+        monkeypatch.setitem(sys.modules, "llm", llm_mod)
+
+        result = runner.invoke(app, [
+            "rq", "A question?", "-p", "good", "-p", "blocked",
+            "--count", "1", "--no-enrich", "-n", "rq-skip",
+        ])
+        assert result.exit_code == 0, result.output
+        blocked.search.assert_not_called()
+        records = {
+            r.provider: r for r in load_session("rq-skip").search_records
+        }
+        assert records["good"].hits == 1
+        assert records["blocked"].query == "blocked query"
+        assert records["blocked"].error.startswith(
+            "skipped: daily quota spent; resets "
+        )
 @
 
 \section{Reporting currency issues}

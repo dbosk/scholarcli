@@ -1028,9 +1028,13 @@ requests/day and each `scholar` run is a fresh process.
   (`_now`), shared across processes. Daily quotas
   bucket on the UTC calendar day and self-correct via the provider's
   own rejection if the guess is wrong.
-- `Search.execute` pre-checks `check_available()` and **skips** a
-  blocked provider with one `logger.warning` (no `SearchResult` is
-  recorded for it). `providers check` reports `quota exhausted`
+- `search_provider()` (`scholar.py`, behind `Search.execute` and
+  `rq`) pre-checks `check_available()` and **skips** a blocked
+  provider with one `logger.warning`; its `SearchResult` has no papers
+  and `error="skipped: <reason>; resets <time>"`, so it is recorded
+  as a failed search and never overwrites an answered record (#165).
+  The search still exits 0 (as when every provider fails).
+  `providers check` reports `quota exhausted`
   (yellow, exit 0) from persisted state without burning a probe.
 - CLI: `scholar providers limits` shows usage/remaining/reset per
   quota group; `--reset <name|all>` clears state (use after a key
