@@ -46,8 +46,9 @@ We use Typer for the CLI framework because it provides:
 
 The CLI is organized as subcommands to prepare for future extensions.
 Currently, the core commands are [[search]] and [[rq]].
-Later we will add [[snowball]] and [[tuxedo]] as git submodules that register
-their own commands.
+The [[snowball]] and [[tuxedo]] commands come from git submodules that
+register their own commands; Scholar imports them only when they run
+(\cref{sec:lazy-subcommands}).
 
 
 \section{Module structure}
@@ -65,6 +66,7 @@ across bibliographic databases.
 <<cli imports>>
 <<constants>>
 <<output formatters>>
+<<lazy subcommand group>>
 <<typer application>>
 <<completion functions>>
 <<session error helpers>>
@@ -85,7 +87,6 @@ across bibliographic databases.
 <<tutorial command>>
 <<llm command helpers>>
 <<llm command>>
-<<submodule registration>>
 <<main entry point>>
 @
 
@@ -134,10 +135,14 @@ from scholar.cli import (
 
 
 \section{The Typer Application}
+\label{sec:typer-application}
 
 We create a Typer application that serves as the root for all subcommands.
 The [[no_args_is_help=True]] setting ensures users see help when they run
 [[scholar]] without arguments.
+Its group class, [[LazySubcommandGroup]], adds the snowball and tuxedo
+subcommands without importing them until they run
+(\cref{sec:lazy-subcommands}).
 
 To ensure proper subcommand behavior (where users must type [[scholar search]]
 rather than just [[scholar]]), we add a callback to the main app.
@@ -149,6 +154,7 @@ app = typer.Typer(
     name="scholar",
     help="Structured literature search tool for systematic reviews.",
     no_args_is_help=True,
+    cls=LazySubcommandGroup,
 )
 
 
@@ -2034,9 +2040,13 @@ DOI-less).  Returning a sentinel rather than printing lets each caller decide
 what to do with the silent majority: [[enrich]] drops them, while [[verify]]
 still lists them as \enquote{ok} or \enquote{unknown}.
 
-<<currency reporting helpers>>=
-from scholar.crossref import currency_status
+The helper imports [[currency_status]] when it is called, like the two
+commands do, not when the CLI module is loaded: importing
+[[scholar.crossref]] loads its cache from disk, and every [[scholar]]
+command would pay for that although only these two use it
+(\cref{sec:lazy-subcommands}).
 
+<<currency reporting helpers>>=
 CURRENCY_PROBLEM_STYLES = {
     "retracted": "bold red",
     "corrected": "yellow",
@@ -2050,6 +2060,8 @@ def format_currency_warning(paper) -> Optional[Text]:
     Returns None for papers that are ok, unchecked, or lack a DOI, so callers
     can skip the silent majority.
     """
+    from scholar.crossref import currency_status
+
     status = currency_status(paper)
     style = CURRENCY_PROBLEM_STYLES.get(status)
     if style is None:
@@ -2106,6 +2118,24 @@ learns which of its papers are open access: the enrichment step consults
 Unpaywall (\cref{unpaywall-module}) for every paper with a DOI, and the
 command reports the tally.
 
+A session can be large---thousands of papers---while the papers that
+need attention now are few: those still pending after a new search,
+which are about to be classified and need their abstracts first
+(\url{https://github.com/dbosk/scholar/issues/137}).
+Three options and one property of the command serve that case:
+\begin{description}
+\item[ [[--pending-only]] ] restricts the whole run to the papers still
+  pending a decision.
+\item[ [[--fields]] ] names what to fill, so a run that only wants
+  abstracts can skip the open-access and preprint steps.
+\item[ [[--enrich-providers]] ] reorders the providers; with OpenAlex
+  first the run profits most from its batched DOI lookups
+  (\cref{sec:openalex-doi-batch}).
+\item[Saving as it goes] the session is saved after every chunk of
+  papers, so a run cut short keeps what it has fetched
+  (\cref{sec:enrich-chunks}).
+\end{description}
+
 <<enrich command>>=
 @app.command()
 def enrich(
@@ -2122,7 +2152,8 @@ def enrich(
             "--enrich-providers",
             help=(
                 "Comma-separated provider names to use for enrichment. "
-                "Overrides the default order."
+                "Overrides the default order. Putting openalex first "
+                "makes the most of its batched DOI lookups."
             ),
         ),
     ] = None,
@@ -2138,6 +2169,29 @@ def enrich(
             ),
         ),
     ] = False,
+    pending_only: Annotated[
+        bool,
+        typer.Option(
+            "--pending-only",
+            help=(
+                "Enrich and check only the papers still pending a "
+                "decision; decided papers are left as they are."
+            ),
+        ),
+    ] = False,
+    fields: Annotated[
+        Optional[str],
+        typer.Option(
+            "--fields",
+            help=(
+                "Comma-separated fields to fill (default: "
+                "abstract,pdf_url,keywords). pdf_url also turns on the "
+                "Unpaywall open-access lookup and the preprint fallback. "
+                "Valid: title, authors, abstract, year, venue, pdf_url, "
+                "keywords."
+            ),
+        ),
+    ] = None,
 ) -> None:
     """
     Fetch missing abstracts/metadata for papers in a review session.
@@ -2148,41 +2202,102 @@ def enrich(
     via Unpaywall (requires SCHOLAR_EMAIL) and checks Crossref for
     retractions. When no PDF can be found, a preprint version may be
     adopted in place of the published entry (see --preprint-search).
+    The session is saved after every 50 papers, so an interrupted run
+    keeps its progress.
 
     Example:
-        scholar enrich "machine learning"
+        scholar enrich "machine learning" --pending-only --fields abstract
     """
     <<enrich session papers>>
 @
 
+\subsection{Choosing the fields}
+
+The fields are those [[enrich_paper]] can fill
+([[ENRICHMENT_FIELD_NAMES]], \cref{enrich-module}); the default is the
+set the command always used.
+A misspelt name would otherwise be passed on and never filled, and the
+run would look like one that found nothing, so we reject it as a usage
+error (exit status 2, like a bad [[--proxy]]) naming the valid choices.
+The help text lists them too; it cannot read them from the enrichment
+module, which the command imports only when it runs.
+[[pdf_url]] is more than a field: [[enrich_paper]] runs the Unpaywall
+lookup and the preprint fallback only when it is requested, so
+[[--fields abstract]] is the cheap run that skips both.
+The Crossref currency check is not a field and runs either way.
+
+<<constants>>=
+ENRICH_DEFAULT_FIELDS = ["abstract", "pdf_url", "keywords"]
+<<enrich command>>=
+def parse_enrich_fields(value: str | None) -> list[str]:
+    """Return the field names in a `--fields` value, validated.
+
+    Raises `typer.BadParameter` (exit status 2) for an unknown name.
+    """
+    from scholar.enrich import ENRICHMENT_FIELD_NAMES
+
+    if value is None:
+        return list(ENRICH_DEFAULT_FIELDS)
+    names = [name.strip() for name in value.split(",") if name.strip()]
+    unknown = [name for name in names if name not in ENRICHMENT_FIELD_NAMES]
+    if unknown or not names:
+        raise typer.BadParameter(
+            f"unknown field(s): {', '.join(unknown) or '(none given)'}; "
+            f"choose from {', '.join(ENRICHMENT_FIELD_NAMES)}",
+            param_hint="'--fields'",
+        )
+    return names
+@
+
 \subsection{Enriching session papers}
 
-We load the session, enrich the papers, and save the updated session.
-Enrichment runs over \emph{all} the session's papers, not only those missing
-an abstract: a paper can be metadata-complete yet never have had its
-open-access status looked up, and the per-paper cost for a complete paper is
-one cached (or skipped) Unpaywall call.  The \enquote{N papers to enrich}
-message therefore describes the metadata gaps, while the open-access and
-currency passes below always cover the whole session.
+We load the session, choose the decisions to work on, enrich them chunk
+by chunk, and report.
+Without [[--pending-only]] enrichment runs over \emph{all} the session's
+papers, not only those missing an abstract: a paper can be
+metadata-complete yet never have had its open-access status looked up,
+and the per-paper cost for a complete paper is one cached (or skipped)
+Unpaywall call.  The \enquote{N papers to enrich} message therefore
+describes the metadata gaps, while the open-access and currency passes
+cover every selected paper.
 
 <<enrich session papers>>=
-from scholar.review import load_session, save_session
-from scholar.enrich import enrich_papers, needs_enrichment
-from scholar import unpaywall
-from rich.progress import Progress
+from scholar.review import load_session
 
 console = Console()
+enrich_fields = parse_enrich_fields(fields)
 
-# Load the session
 session_data = load_session(session)
 if session_data is None:
     console.print(f"Session not found: {escape(session)}")
     raise typer.Exit(1)
 
-# Extract papers from decisions
-papers = [decision.paper for decision in session_data.decisions]
-enrich_fields = ["abstract", "pdf_url", "keywords"]
-papers_to_enrich = [p for p in papers if needs_enrichment(p, enrich_fields)]
+<<select the decisions to enrich>>
+<<enrich and save chunk by chunk>>
+<<report open-access findings during enrich>>
+<<warn on currency issues during enrich>>
+<<report how many papers gained metadata>>
+@
+
+[[--pending-only]] selects by each decision's status as stored, not
+through [[ReviewSession.pending_papers]], which keeps a cached list.
+The restriction covers everything the command does to a paper:
+metadata, Unpaywall, preprint adoption and the Crossref check.
+A decided paper is not touched, and the saves write it back unchanged.
+
+<<select the decisions to enrich>>=
+from scholar.enrich import needs_enrichment
+from scholar.review import DecisionStatus
+
+selected = [
+    decision
+    for decision in session_data.decisions
+    if not pending_only or decision.status == DecisionStatus.PENDING
+]
+scope = "pending papers" if pending_only else "papers"
+papers_to_enrich = [
+    d.paper for d in selected if needs_enrichment(d.paper, enrich_fields)
+]
 
 providers_for_enrich = (
     [p.strip() for p in enrich_providers.split(",") if p.strip()]
@@ -2190,45 +2305,138 @@ providers_for_enrich = (
     else None
 )
 
+of_what = f"{len(selected)} " + ("pending papers" if pending_only else "total")
 if papers_to_enrich:
-    console.print(f"[cyan]Found {len(papers_to_enrich)} papers to enrich (of {len(papers)} total).[/cyan]")
-else:
-    console.print("[yellow]No papers need metadata enrichment (all have abstracts).[/yellow]")
-
-# Enrich with progress bar (all papers, so open-access status is filled too)
-with Progress() as progress:
-    task = progress.add_task("[cyan]Enriching...", total=len(papers))
-
-    def update_progress(current: int, total: int) -> None:
-        progress.update(task, completed=current)
-
-    enriched_papers = enrich_papers(
-        papers,
-        fields=enrich_fields,
-        providers=providers_for_enrich,
-        progress_callback=update_progress,
-        preprint_search=preprint_search,
+    console.print(
+        f"[cyan]Found {len(papers_to_enrich)} papers to enrich "
+        f"(of {of_what}).[/cyan]"
     )
+else:
+    console.print(
+        f"[yellow]No {scope} need metadata enrichment "
+        f"(all have {', '.join(enrich_fields)}).[/yellow]"
+    )
+@
 
-# Update decisions with enriched papers (preserve order)
-for decision, enriched in zip(session_data.decisions, enriched_papers):
-    decision.paper = enriched
+\subsection{Saving chunk by chunk}
+\label{sec:enrich-chunks}
 
-<<record preprint adoptions during enrich>>
+A run over a large session takes long enough to be cut short---by a
+time limit, a closed terminal or [[Ctrl-C]]---and the command used to
+save only at the very end, so an interrupted run kept nothing but the
+provider caches.
+We therefore work in chunks of [[ENRICH_SAVE_EVERY]] papers.
+Each chunk goes through the whole pipeline---enrichment (with one
+OpenAlex prefetch, \cref{sec:openalex-doi-batch}), the Crossref check,
+the preprint-adoption bookkeeping---and then the session is saved.
+Saving often is safe because [[save_session]] merges what other
+processes saved meanwhile and then takes the saved state as its new
+baseline (\cref{sec:session-integrity}): each save compares against the
+previous one, not against the state loaded hours ago.
+The price is the backup: [[.bak]] keeps one generation, so after a
+chunked run it holds the state before the last chunk, not the state
+before the run.
 
-<<report open-access findings during enrich>>
+Fifty papers is one OpenAlex batch, and at the slowest pace of a run
+(Semantic Scholar without a key, one request in three seconds) a few
+minutes of work, which bounds what an interruption can lose.
 
-<<warn on currency issues during enrich>>
+<<constants>>=
+ENRICH_SAVE_EVERY = 50  # papers per chunk; the session is saved after each
+@
 
-save_session(session_data)
+An interruption ends the loop with [[KeyboardInterrupt]].
+We catch it, say how many papers were saved, and exit with 130, the
+status bash gives a command ended by SIGINT (128 plus the signal
+number, according to its manual page).
+A time limit sends SIGTERM instead (the default of [[timeout]], per its
+manual page), and Python does not handle SIGTERM: the process ends on
+the spot, and its exit handlers do not run---we checked, with a
+script that registers one and sends itself the signal.
+An exit handler is what writes the provider caches to disk
+([[save_all_caches]], \cref{cache-module}), so a run
+ended that way would lose even the lookups it paid for.
+While the loop runs we therefore turn SIGTERM into the same
+[[KeyboardInterrupt]]; the same script with such a handler exits
+through [[sys.exit(130)]] and runs its exit handler.
+The work of the chunk in progress is lost either way, apart from what
+the providers cached.
+The papers already processed are in [[originals]] and [[processed]],
+which the reports below use.
 
-# Count how many gained an abstract or a PDF link
-enriched_count = sum(
-    1 for orig, new in zip(papers, enriched_papers)
-    if (new.abstract and orig.abstract != new.abstract)
-    or (new.pdf_url and orig.pdf_url != new.pdf_url)
+<<enrich and save chunk by chunk>>=
+from rich.progress import Progress
+from scholar.notes import get_paper_id, migrate_paper_id
+
+originals: list = []
+processed: list = []
+try:
+    with sigterm_as_keyboard_interrupt(), Progress() as progress:
+        task = progress.add_task("[cyan]Enriching...", total=len(selected))
+        for start in range(0, len(selected), ENRICH_SAVE_EVERY):
+            chunk = selected[start:start + ENRICH_SAVE_EVERY]
+            <<enrich, check and save one chunk>>
+except KeyboardInterrupt:
+    console.print(
+        f"[yellow]Interrupted: saved {len(processed)} of {len(selected)} "
+        f"{scope}; run again to continue.[/yellow]"
+    )
+    raise typer.Exit(130)
+@
+
+Within a chunk the order matters: the Crossref check reads the DOI the
+enrichment settled on (an adopted preprint's, if any), and the ids are
+migrated before the save so that the notes and decisions stored under
+the old id are moved by the time the session names the new one.
+
+<<enrich, check and save one chunk>>=
+from scholar.enrich import enrich_papers
+from scholar.crossref import annotate_papers
+from scholar.review import save_session
+
+before = [decision.paper for decision in chunk]
+after = enrich_papers(
+    before,
+    fields=enrich_fields,
+    providers=providers_for_enrich,
+    progress_callback=lambda current, _total: progress.update(
+        task, completed=start + current
+    ),
+    preprint_search=preprint_search,
 )
-console.print(f"[green]Enriched {enriched_count} papers.[/green]")
+after = annotate_papers(after)
+for decision, paper in zip(chunk, after):
+    decision.paper = paper
+<<record preprint adoptions during enrich>>
+save_session(session_data)
+originals.extend(before)
+processed.extend(after)
+@
+
+[[signal.signal]] may only be called from the main thread, and the
+command can be called from elsewhere (a worker thread of a test runner
+or an application); there we leave SIGTERM alone rather than fail.
+
+<<enrich command>>=
+@contextlib.contextmanager
+def sigterm_as_keyboard_interrupt():
+    """Raise `KeyboardInterrupt` on SIGTERM while the block runs."""
+
+    def interrupt(signum, frame):
+        raise KeyboardInterrupt
+
+    try:
+        previous = signal.signal(signal.SIGTERM, interrupt)
+    except ValueError:  # not the main thread
+        yield
+        return
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+<<cli imports>>=
+import contextlib
+import signal
 @
 
 When the preprint fallback (\cref{preprint-module}) adopted a preprint,
@@ -2242,9 +2450,7 @@ what was swapped, naming both DOIs so the substitution is transparent
 in the terminal transcript, not only in the session file.
 
 <<record preprint adoptions during enrich>>=
-from scholar.notes import get_paper_id, migrate_paper_id
-
-for orig, new in zip(papers, enriched_papers):
+for orig, new in zip(before, after):
     if get_paper_id(orig) == get_paper_id(new):
         continue
     migrate_paper_id(get_paper_id(orig), get_paper_id(new))
@@ -2261,16 +2467,26 @@ of this session can I read?---so we count open papers and, among them, those
 with a direct PDF link, over the papers Unpaywall managed to check.  When no
 contact email is configured the lookups were silently skipped, and the only
 useful thing to say is which variable enables them; we say it once here rather
-than once per paper.
+than once per paper.  When [[pdf_url]] was not among the fields, no lookup was
+made at all, and a tally would only repeat the findings of earlier runs.
+The tally counts the papers this run processed: with [[--pending-only]] the
+pending ones, and after an interruption none, since the command has exited.
 
 <<report open-access findings during enrich>>=
-if unpaywall.is_configured():
-    checked = [p for p in enriched_papers if p.oa_status is not None]
+from scholar import unpaywall
+
+if "pdf_url" not in enrich_fields:
+    console.print(
+        "[dim]Open-access lookup skipped: pdf_url is not among "
+        "--fields.[/dim]"
+    )
+elif unpaywall.is_configured():
+    checked = [p for p in processed if p.oa_status is not None]
     open_papers = [p for p in checked if p.is_open_access]
     with_pdf = [p for p in open_papers if p.pdf_url]
     console.print(
         f"[cyan]Open access: {len(open_papers)} of {len(checked)} checked "
-        f"papers ({len(with_pdf)} with PDF link).[/cyan]"
+        f"{scope} ({len(with_pdf)} with PDF link).[/cyan]"
     )
 else:
     console.print(
@@ -2280,29 +2496,21 @@ else:
 @
 
 Enrichment is also the natural moment to check currency: we already hold the
-session's papers and are about to write them back, so a retraction check costs
-one extra pass and saves its results in the same [[save_session]].  We check
-\emph{every} paper, not just those that needed metadata enrichment---a paper can
-be complete yet retracted---so this runs over all decisions rather than the
-[[papers_to_enrich]] subset.
+papers and are about to write them back, so a retraction check costs one
+extra pass and saves its results in the same [[save_session]].  We check
+\emph{every} selected paper, not just those that needed metadata
+enrichment---a paper can be complete yet retracted---so the check runs on
+each chunk as a whole rather than on the [[papers_to_enrich]] subset.
 
-We only surface problems here (a warning per retracted, corrected, or
-superseded paper); the clean and unchecked majority stay silent.  Users who want
-the full per-paper picture run [[scholar verify]] instead.
+We only surface problems, once at the end and over every paper the run
+processed (a warning per retracted, corrected, or superseded paper); the clean
+and unchecked majority stay silent.  Users who want the full per-paper picture
+run [[scholar verify]] instead.
 
 <<warn on currency issues during enrich>>=
-from scholar.crossref import annotate_papers
-
-console.print(
-    "[cyan]Checking Crossref for retractions/corrections...[/cyan]"
-)
-checked = annotate_papers([d.paper for d in session_data.decisions])
-for decision, paper in zip(session_data.decisions, checked):
-    decision.paper = paper
-
 warnings = [
     text
-    for paper in checked
+    for paper in processed
     if (text := format_currency_warning(paper)) is not None
 ]
 if warnings:
@@ -2311,6 +2519,17 @@ if warnings:
         console.print(text)
 else:
     console.print("[green]No retractions or corrections found.[/green]")
+@
+
+Finally we count the papers that gained an abstract or a PDF link.
+
+<<report how many papers gained metadata>>=
+enriched_count = sum(
+    1 for orig, new in zip(originals, processed)
+    if (new.abstract and orig.abstract != new.abstract)
+    or (new.pdf_url and orig.pdf_url != new.pdf_url)
+)
+console.print(f"[green]Enriched {enriched_count} papers.[/green]")
 @
 
 
@@ -2684,6 +2903,272 @@ def test_enrich_keeps_decisions_saved_while_it_ran(tmp_path, monkeypatch):
     assert saved.research_context == "Does X support Y?"
     assert [d.status for d in saved.decisions] == [DecisionStatus.DISCARDED] * 2
     assert all(d.paper.abstract == "Enriched." for d in saved.decisions)
+@
+
+The selection, the field list and the chunked saves of
+\cref{sec:enrich-chunks} are tested through the real command as well.
+The enrichment and the Crossref check are replaced by stand-ins that
+record which papers and fields they were given (they are the command's
+boundary to the network); the session file, the merge on save and the
+id migration are real.
+
+<<test functions>>=
+class TestEnrichSelectionAndSaving:
+  """--pending-only, --fields and the save after every chunk (#137)."""
+
+  @staticmethod
+  def _session(tmp_path, monkeypatch, count, name="chunks"):
+    """Save a session of `count` pending papers; return its name."""
+    from scholar import Paper, SearchResult
+    from scholar.review import create_review_session, save_session
+
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+    papers = [
+      Paper(title=f"Paper {i}", authors=["a"], doi=f"10.1/c137-{i}",
+            sources=["m"])
+      for i in range(count)
+    ]
+    save_session(create_review_session(
+      [SearchResult(query="q", provider="m", timestamp="t",
+                    papers=papers)],
+      "q", session_name=name,
+    ))
+    return name
+
+  @staticmethod
+  def _saved(name):
+    """Return the saved decisions by DOI, read in a fresh registry."""
+    from scholar import isolated_registry
+    from scholar.review import load_session
+
+    with isolated_registry():
+      return {d.paper.doi: d for d in load_session(name).decisions}
+
+  @staticmethod
+  def _invoke(args, enrich, annotate=None):
+    """Run `scholar enrich` with stand-ins for the network steps."""
+    with patch("scholar.enrich.enrich_papers", side_effect=enrich), patch(
+      "scholar.crossref.annotate_papers",
+      side_effect=annotate or (lambda papers, **kw: list(papers)),
+    ):
+      return runner.invoke(app, ["enrich", *args])
+
+  @staticmethod
+  def _enriched(papers):
+    from dataclasses import replace
+
+    return [replace(p, abstract="Enriched.") for p in papers]
+
+  <<enrich selection and saving test methods>>
+@
+
+With [[--pending-only]], the decided papers reach neither the
+enrichment nor the Crossref check, and they are saved as they were:
+
+<<enrich selection and saving test methods>>=
+def test_pending_only_leaves_decided_papers_alone(
+  self, tmp_path, monkeypatch
+):
+  from scholar.review import DecisionStatus, load_session, save_session
+
+  name = self._session(tmp_path, monkeypatch, 3)
+  session = load_session(name)
+  session.decisions[0].status = DecisionStatus.KEPT
+  session.decisions[0].tags = ["theme"]
+  session.decisions[1].status = DecisionStatus.DISCARDED
+  session.decisions[1].tags = ["off-topic"]
+  save_session(session)
+  enriched, annotated = [], []
+
+  def enrich(papers, **kwargs):
+    enriched.append(([p.doi for p in papers], kwargs["fields"]))
+    return self._enriched(papers)
+
+  def annotate(papers, progress_callback=None):
+    annotated.append([p.doi for p in papers])
+    return list(papers)
+
+  result = self._invoke([name, "--pending-only"], enrich, annotate)
+  assert result.exit_code == 0, result.stdout
+  assert enriched == [(["10.1/c137-2"], ["abstract", "pdf_url", "keywords"])]
+  assert annotated == [["10.1/c137-2"]]
+  assert "of 1 pending papers" in result.stdout
+
+  saved = self._saved(name)
+  assert saved["10.1/c137-0"].status == DecisionStatus.KEPT
+  assert saved["10.1/c137-0"].tags == ["theme"]
+  assert saved["10.1/c137-0"].paper.abstract is None
+  assert saved["10.1/c137-1"].status == DecisionStatus.DISCARDED
+  assert saved["10.1/c137-1"].paper.abstract is None
+  assert saved["10.1/c137-2"].paper.abstract == "Enriched."
+@
+
+[[--fields]] reaches the enrichment as a list, and a name the
+enrichment cannot fill is a usage error that lists the valid ones:
+
+<<enrich selection and saving test methods>>=
+def test_fields_are_passed_on(self, tmp_path, monkeypatch):
+  name = self._session(tmp_path, monkeypatch, 1)
+  fields = []
+
+  def enrich(papers, **kwargs):
+    fields.append(kwargs["fields"])
+    return list(papers)
+
+  result = self._invoke([name, "--fields", "abstract"], enrich)
+  assert result.exit_code == 0, result.stdout
+  assert fields == [["abstract"]]
+  assert "Open access:" not in result.stdout
+
+def test_unknown_field_is_a_usage_error(self, tmp_path, monkeypatch):
+  name = self._session(tmp_path, monkeypatch, 1)
+  result = self._invoke(
+    [name, "--fields", "abstract,colour"], lambda papers, **kw: papers
+  )
+  assert result.exit_code == 2
+  try:
+    output = result.stdout + result.stderr
+  except ValueError:
+    output = result.stdout
+  assert "colour" in output
+  assert "keywords" in output
+@
+
+The help text names the valid fields by hand, since the command reads
+[[ENRICHMENT_FIELD_NAMES]] only when it runs; this keeps the two in
+step:
+
+<<enrich selection and saving test methods>>=
+def test_help_names_every_field(self):
+  from scholar.enrich import ENRICHMENT_FIELD_NAMES
+
+  result = runner.invoke(app, ["enrich", "--help"], env={"COLUMNS": "200"})
+  assert result.exit_code == 0
+  valid = result.stdout.split("Valid:")[1]
+  for name in ENRICHMENT_FIELD_NAMES:
+    assert name in valid
+@
+
+The session is saved after every chunk.
+With chunks of one paper, an interruption during the second leaves the
+first one enriched on disk, and the command says how far it got:
+
+<<enrich selection and saving test methods>>=
+def test_interrupt_keeps_finished_chunks(self, tmp_path, monkeypatch):
+  monkeypatch.setattr("scholar.cli.ENRICH_SAVE_EVERY", 1)
+  name = self._session(tmp_path, monkeypatch, 2)
+  calls = []
+
+  def enrich(papers, **kwargs):
+    calls.append(papers)
+    if len(calls) == 2:
+      raise KeyboardInterrupt
+    return self._enriched(papers)
+
+  result = self._invoke([name], enrich)
+  assert result.exit_code == 130
+  assert "Interrupted: saved 1 of 2 papers" in result.stdout
+  saved = self._saved(name)
+  assert saved["10.1/c137-0"].paper.abstract == "Enriched."
+  assert saved["10.1/c137-1"].paper.abstract is None
+@
+
+A time limit ends a process with SIGTERM, whose default action ends
+Python without running its exit handlers.
+While the command runs, SIGTERM is turned into the same interruption,
+and the previous handler is back afterwards.
+The stand-in checks that a handler of the command's own is installed
+before it sends the signal, so the test cannot kill the test run.
+
+<<enrich selection and saving test methods>>=
+def test_sigterm_is_an_interrupt(self, tmp_path, monkeypatch):
+  import signal
+
+  monkeypatch.setattr("scholar.cli.ENRICH_SAVE_EVERY", 1)
+  name = self._session(tmp_path, monkeypatch, 2)
+  before = signal.getsignal(signal.SIGTERM)
+  calls = []
+
+  def enrich(papers, **kwargs):
+    calls.append(papers)
+    if len(calls) == 2:
+      assert signal.getsignal(signal.SIGTERM) is not before
+      signal.raise_signal(signal.SIGTERM)
+    return self._enriched(papers)
+
+  result = self._invoke([name], enrich)
+  assert result.exit_code == 130, result.stdout
+  assert self._saved(name)["10.1/c137-0"].paper.abstract == "Enriched."
+  assert signal.getsignal(signal.SIGTERM) is before
+@
+
+Each save merges what other processes saved meanwhile
+(\cref{sec:session-integrity}), and that has to hold for every save,
+not only the last: a classification saved between two chunks survives,
+both for the paper already enriched and for the one being enriched.
+
+<<enrich selection and saving test methods>>=
+def test_decision_between_chunks_survives(self, tmp_path, monkeypatch):
+  from scholar import isolated_registry
+  from scholar.review import DecisionStatus, load_session, save_session
+
+  monkeypatch.setattr("scholar.cli.ENRICH_SAVE_EVERY", 1)
+  name = self._session(tmp_path, monkeypatch, 2)
+  calls = []
+
+  def enrich(papers, **kwargs):
+    calls.append(papers)
+    if len(calls) == 2:
+      with isolated_registry():
+        other = load_session(name)
+        for decision in other.decisions:
+          decision.status = DecisionStatus.DISCARDED
+          decision.tags = ["off-topic"]
+        save_session(other)
+    return self._enriched(papers)
+
+  result = self._invoke([name], enrich)
+  assert result.exit_code == 0, result.stdout
+  saved = self._saved(name).values()
+  assert [d.status for d in saved] == [DecisionStatus.DISCARDED] * 2
+  assert all(d.paper.abstract == "Enriched." for d in saved)
+@
+
+An adopted preprint changes a paper's id between two saves.
+The next save must not bring the old id back from the file as a paper
+\enquote{only the file has}, which would list the work twice:
+
+<<enrich selection and saving test methods>>=
+def test_adoption_leaves_no_duplicate(self, tmp_path, monkeypatch):
+  from dataclasses import replace
+  from scholar import isolated_registry
+  from scholar.notes import get_paper_id
+  from scholar.review import load_session
+
+  monkeypatch.setattr("scholar.cli.ENRICH_SAVE_EVERY", 1)
+  name = self._session(tmp_path, monkeypatch, 3)
+
+  def adopt_second(papers, **kwargs):
+    return [
+      replace(
+        p, doi="10.48550/arXiv.2401.13700",
+        pdf_url="https://arxiv.org/pdf/2401.13700",
+        published_versions=[
+          {"doi": p.doi, "relation": "preprint-of"}
+        ],
+      ) if p.doi == "10.1/c137-1" else p
+      for p in papers
+    ]
+
+  result = self._invoke([name], adopt_second)
+  assert result.exit_code == 0, result.stdout
+  with isolated_registry():
+    decisions = load_session(name).decisions
+  ids = [get_paper_id(d.paper) for d in decisions]
+  assert len(ids) == 3
+  assert sorted(ids) == sorted(set(ids))
+  assert "doi:10.48550/arxiv.2401.13700" in ids
+  assert "doi:10.1/c137-1" not in ids
 @
 
 <<test functions>>=
@@ -3823,9 +4308,34 @@ a small set of related operations:
 \item[path] Print directory---for scripting or manual inspection
 \end{description}
 
-If cache management grew more complex (e.g., per-provider clearing,
-expiration policies), we might refactor to subcommands like the [[notes]]
-command uses.
+If cache management grew more complex (e.g., expiration policies), we
+might refactor to subcommands like the [[notes]] command uses.
+
+\subsection{Clearing one provider's cache}
+
+[[clear --provider NAME]] (repeatable) deletes only [[NAME.pkl]].
+The cache never expires, so a single stale cache can be the problem
+while the rest is worth keeping: results cached off the subscribing
+network lack the abstracts Scopus returns on it, and the Scopus
+provider points the user here (\cref{sec:scopus-cache-doubt}).
+The names are those of the search and lookup caches that
+[[cache info]] lists, that is the registered providers plus the
+[[crossref]] and [[unpaywall]] lookup caches; the LLM caches it also
+lists are cleared only by [[--include-llm]].
+We check them against that set, since a typo would otherwise clear
+nothing and look like success, and exit with status 2 (a usage error)
+listing the valid names.
+[[--provider]] names exactly what is deleted, so it is refused together
+with [[--include-llm]], which would widen it; the same goes for the
+other actions, where it would be silently ignored.
+
+<<cache command>>=
+def cache_provider_names() -> list[str]:
+    """Names accepted by `cache clear --provider`, sorted."""
+    from scholar.providers import PROVIDERS
+
+    return sorted(set(PROVIDERS) | {"crossref", "unpaywall"})
+@
 
 \subsection{Keeping the LLM caches}
 
@@ -3858,13 +4368,22 @@ def cache(
             "(paid model output, kept by default)",
         ),
     ] = False,
+    provider: Annotated[
+        Optional[list[str]],
+        typer.Option(
+            "--provider",
+            help="With clear: delete only this provider's cache "
+            "(repeatable; not with --include-llm)",
+        ),
+    ] = None,
 ) -> None:
     """
     Manage the search result cache.
 
     Actions:
         clear  - Delete cached search results (LLM caches kept
-                 unless --include-llm)
+                 unless --include-llm; --provider NAME limits it
+                 to one provider's cache)
         info   - Show cache statistics (entries, size, location)
         path   - Print the cache directory path
     """
@@ -3872,7 +4391,27 @@ def cache(
 
     console = Console()
 
-    if action == "clear":
+    if provider and (action != "clear" or include_llm):
+        console.print(
+            "[red]--provider only works with clear, and not with "
+            "--include-llm.[/red]"
+        )
+        raise typer.Exit(2)
+    if provider:
+        valid = cache_provider_names()
+        unknown = [name for name in provider if name not in valid]
+        if unknown:
+            console.print(
+                f"[red]Unknown provider cache: {', '.join(unknown)}."
+                f"[/red] Valid names: {', '.join(valid)}."
+            )
+            raise typer.Exit(2)
+
+    if action == "clear" and provider:
+        count = clear_cache(providers=provider)
+        console.print(f"Cleared {count} cache file(s).")
+
+    elif action == "clear":
         count = clear_cache(include_llm=include_llm)
         console.print(f"Cleared {count} cache file(s).")
         kept = len(llm_cache_files())
@@ -3956,6 +4495,41 @@ class TestCacheCommand:
         result = runner.invoke(app, ["cache", "clear"])
         assert result.exit_code == 0
         assert "Cleared" in result.stdout
+
+    def test_cache_clear_provider(self, tmp_path, monkeypatch):
+        """Cache clear --provider deletes only the named caches."""
+        from scholar.cache import save_cache
+
+        monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path))
+        save_cache("scopus", {("q", 5, ""): []})
+        save_cache("openalex", {("q", 5, ""): []})
+        result = runner.invoke(app, ["cache", "clear", "--provider", "scopus"])
+        assert result.exit_code == 0
+        assert "Cleared 1 cache file(s)." in result.stdout
+        assert not (tmp_path / "scopus.pkl").exists()
+        assert (tmp_path / "openalex.pkl").exists()
+
+    def test_cache_clear_unknown_provider(self, tmp_path, monkeypatch):
+        """An unknown name exits 2, lists the valid ones, deletes nothing."""
+        from scholar.cache import save_cache
+
+        monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path))
+        save_cache("scopus", {("q", 5, ""): []})
+        result = runner.invoke(app, ["cache", "clear", "--provider", "scopsu"])
+        assert result.exit_code == 2
+        assert "scopus" in result.stdout and "crossref" in result.stdout
+        assert (tmp_path / "scopus.pkl").exists()
+
+    def test_cache_clear_provider_with_include_llm(
+        self, tmp_path, monkeypatch
+    ):
+        """--provider names what is deleted; --include-llm would widen it."""
+        monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path))
+        result = runner.invoke(
+            app,
+            ["cache", "clear", "--provider", "scopus", "--include-llm"],
+        )
+        assert result.exit_code == 2
 
     def test_cache_clear_keeps_llm_caches(self, tmp_path, monkeypatch):
         """Cache clear keeps LLM caches and says how to remove them."""
@@ -10744,59 +11318,418 @@ def test_bundled_tutorial_parses(name):
 @
 
 
-\section{Submodule Registration}
+\section{Lazily loaded subcommands}
+\label{sec:lazy-subcommands}
 
-To support future extensions like snowball and tuxedo, we provide a mechanism
-for submodules to register their commands with the main application.
+Two command groups come from separate projects, included as git
+submodules: [[scholar snowball]] (snowballing reviews) and
+[[scholar tuxedo]] (organising papers with LLMs).
+Each package offers one hook, [[register_commands(app)]], which adds its
+commands to a Typer app.
+That hook is all Scholar relies on: nothing here knows how either package
+builds its commands.
 
-Each submodule should provide a [[register_commands(app)]] function that adds
-its commands to the Typer app.
-We attempt to import each known submodule and call this function if it exists.
-We try both [[scholar.<name>]] (for nested packages) and [[<name>]] (for
-sibling packages installed separately) to support different installation
-configurations:
+Both packages are expensive to import.
+Importing [[tuxedo]] imports the [[openai]] client, and importing
+[[snowball]] imports [[pandas]] and its Textual TUI;
+[[python -X importtime]] put them at about 0.7~s and 0.9~s (November 2026).
+Scholar used to import both and call their hooks in [[main]], before the
+command line was parsed, so every command paid for them:
+[[scholar cache path]] took about 2.8~s and [[scholar --help]] about 3.4~s,
+although neither uses snowball or tuxedo
+(\url{https://github.com/dbosk/scholar/issues/130}).
+Agents and scripts call [[scholar]] many times in a row, so the fixed cost
+adds up to minutes.
 
-<<submodule registration>>=
-SUBMODULES = ["snowball", "tuxedo"]
+We therefore import a submodule only when its subcommand runs.
+To do that we need to know when Click needs which part of a command.
+A Click group is asked about its subcommands in three situations:
+\begin{description}
+\item[Help] [[scholar --help]] lists every subcommand with its short help.
+  The help formatter calls the group's [[list_commands]] and then
+  [[get_command]] for each name.
+\item[Dispatch] [[scholar snowball init]] needs the real command, with its
+  callback, options and subcommands.
+  The group's [[invoke]] gets it from [[resolve_command]].
+\item[Completion] Completing [[scholar sn]] lists names and short help, as
+  help does, through [[list_commands]] and [[get_command]].
+  Completing [[scholar snowball ]] must descend into the real command, and
+  Click's completion resolver descends with [[resolve_command]].
+\end{description}
+Help and name completion need only a name and a line of text, while
+dispatch and descent both pass through [[resolve_command]].
+So the group lists a placeholder for each submodule, a command that has the
+help text but no code, and its [[resolve_command]] replaces the placeholder
+with the real command, importing the submodule at that moment.
+The rest of this section builds the pieces: the help texts, how we find a
+submodule without importing it, how we load the real command, and the group
+that ties them together.
 
+\subsection{The listed help texts}
 
-def register_submodules() -> None:
+The placeholders need the help line that [[scholar --help]] shows, and the
+only way to get it from a package is to import it.
+So we keep a copy here, keyed by subcommand name; the key order is the
+order in which the subcommands are listed, after Scholar's own commands.
+A copy can drift from the original, so a test below compares each entry
+with the help of the real command.
+
+<<lazy subcommand group>>=
+LAZY_SUBCOMMANDS: dict[str, str] = {
+    "snowball": "Systematic literature review using snowballing.",
+    "tuxedo": "Organize literature review papers with LLMs.",
+}
+@
+
+\subsection{Finding a submodule without importing it}
+
+A submodule can be installed in two ways: nested in Scholar as
+[[scholar.<name>]] or as a sibling package [[<name>]].
+We look for both, nested first.
+[[importlib.util.find_spec]] asks the import system's finders where a
+module is, without running it.
+For [[scholar.<name>]] it imports the parent package [[scholar]], which is
+already loaded; the help test below checks that neither submodule is
+imported.
+Its docstring says it raises [[ValueError]] for a module in
+[[sys.modules]] without a spec, and a missing parent raises
+[[ModuleNotFoundError]]; both mean that this candidate is not the one we
+want.
+
+The old registration tried [[import scholar.<name>]] and then
+[[import <name>]] and ignored every [[ImportError]].
+That made a package that is installed but fails to import (a missing
+dependency, say) look exactly like an absent one: its command silently
+disappeared from [[scholar --help]].
+Deciding by the spec separates the two cases.
+A submodule without a spec is not listed at all; one with a spec is listed,
+and if its import fails, running it says why (see below).
+
+<<lazy subcommand group>>=
+def find_submodule(name: str) -> Optional[str]:
+    """Return the module that provides subcommand `name`, or None.
+
+    Tries `scholar.<name>` (nested package) before `<name>` (sibling
+    package). Nothing is imported apart from the parent package.
     """
-    Dynamically register subcommand modules if available.
-
-    This allows snowball and tuxedo to be added as submodules
-    without modifying this file. Each submodule should provide a
-    `register_commands(app)` function.
-
-    Tries both `scholar.<name>` and `<name>` import paths to support
-    different installation configurations.
-    """
-    for name in SUBMODULES:
-        module = None
-
-        # Try scholar.<name> first (for nested packages)
+    for module_name in (f"scholar.{name}", name):
         try:
-            module = __import__(f"scholar.{name}", fromlist=["register_commands"])
-        except ImportError:
-            pass
+            if importlib.util.find_spec(module_name) is not None:
+                return module_name
+        except (ImportError, ValueError):
+            continue
+    return None
+@
 
-        # Fall back to top-level <name> (for sibling packages)
-        if module is None:
+<<cli imports>>=
+import importlib
+import importlib.util
+@
+
+\subsection{Loading the real command}
+
+To get the real command we import the module and let its own
+[[register_commands]] add the command to a scratch Typer app.
+Typer turns that app into a Click group, and the command we want is the
+group's entry under [[name]].
+Going through the hook rather than importing, say,
+[[snowball.cli.app]] directly keeps us on the packages' public contract:
+snowball registers a Typer sub-app, tuxedo a single command that hands its
+arguments to its own Click group, and we need not know which.
+
+A module that imports but has no [[register_commands]] hook, or whose
+hook does not register [[name]], is as unusable as one that does not
+import, so we report it with the same exception type and let the caller
+handle all three alike.
+The missing hook is not hypothetical: [[find_spec]] also finds a plain
+directory of that name (a namespace package), such as an uninitialised
+submodule directory in the current directory.
+
+<<lazy subcommand group>>=
+def load_lazy_subcommand(name: str) -> TyperCommand | TyperGroup:
+    """Import the submodule behind subcommand `name` and return its command.
+
+    Raises ImportError when the submodule cannot be found or imported, or
+    when its `register_commands` does not register a command `name`.
+    """
+    module_name = find_submodule(name)
+    if module_name is None:
+        raise ImportError(f"no module scholar.{name} or {name}")
+    module = importlib.import_module(module_name)
+    register = getattr(module, "register_commands", None)
+    if register is None:
+        raise ImportError(f"{module_name} has no register_commands")
+    scratch = typer.Typer()
+    register(scratch)
+    command = typer.main.get_group(scratch).commands.get(name)
+    if command is None:
+        raise ImportError(f"{module_name} registers no command {name!r}")
+    return command
+@
+
+<<cli imports>>=
+from typer.core import TyperCommand, TyperGroup
+@
+
+\subsection{The group}
+
+The placeholder is its own class, so that [[resolve_command]] can tell it
+from Scholar's own commands by type.
+It has no callback: it is never run, because every path that would run it
+goes through [[resolve_command]] first.
+
+<<lazy subcommand group>>=
+class LazySubcommandStub(TyperCommand):
+    """Placeholder for a submodule subcommand that is not imported yet."""
+@
+
+The group adds a placeholder for each submodule that can be found, after
+Typer has added Scholar's own commands, so the submodules are listed last.
+This runs on every invocation, which is fine because [[find_submodule]]
+imports nothing; the help test below checks exactly that.
+
+In [[resolve_command]] we let Typer resolve the name first, which keeps its
+\enquote{No such command} error and its spelling suggestions.
+Only when the result is a placeholder do we load the real command and return
+it in the placeholder's stead.
+Both callers use the command they get back, Typer's [[invoke]] to run it and
+the completion resolver to descend into it, so the group need not remember
+it.
+If the import fails, [[ctx.fail]] ends the run with a usage error (exit
+code~2) whose one-line message names the subcommand and the reason, instead
+of a traceback.
+During completion, [[ctx.resilient_parsing]] is set, and a completion must
+never print errors into the user's shell.
+There we keep the placeholder: it has no options or subcommands, so
+completion offers nothing after the name.
+Resolving to no command instead would make Click complete from the parent
+group and offer Scholar's own command names in that position.
+
+<<lazy subcommand group>>=
+class LazySubcommandGroup(TyperGroup):
+    """A Typer group that imports submodule subcommands only when used."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        for name, help_text in LAZY_SUBCOMMANDS.items():
+            if name not in self.commands and find_submodule(name):
+                self.commands[name] = LazySubcommandStub(name, help=help_text)
+
+    def resolve_command(self, ctx, args):
+        """Resolve as Typer does, replacing a placeholder by its command."""
+        cmd_name, cmd, rest = super().resolve_command(ctx, args)
+        if isinstance(cmd, LazySubcommandStub):
             try:
-                module = __import__(name, fromlist=["register_commands"])
-            except ImportError:
-                pass
+                cmd = load_lazy_subcommand(cmd_name)
+            except ImportError as error:
+                if ctx.resilient_parsing:
+                    return cmd_name, cmd, rest
+                ctx.fail(f"{cmd_name} is unavailable: {error}")
+        return cmd_name, cmd, rest
+@
 
-        if module is not None and hasattr(module, "register_commands"):
-            module.register_commands(app)
+The application is created with this group class ([[cls=]] in
+\cref{sec:typer-application}), which is why [[<<lazy subcommand group>>]]
+is tangled before [[<<typer application>>]].
+
+\subsection{Testing the lazy subcommands}
+
+The property we want, \enquote{[[scholar --help]] imports neither
+submodule}, cannot be checked inside the test process: the other tests
+import both packages, and once a module is in [[sys.modules]] it stays
+there.
+So we run the CLI in a fresh interpreter, through [[main]] rather than
+[[app]], so that an eager import added back to [[main]] (as
+[[register_submodules]] used to be) also fails the test.
+The child prints to stderr which heavy modules it ended up importing.
+We list [[openai]] besides [[tuxedo]] because it is what made tuxedo slow,
+and [[scholar.crossref]] because [[<<currency reporting helpers>>]] used to
+import it at module level (\cref{sec:currency-reporting}).
+The child inherits the environment, so it uses the test's temporary cache
+and data directories rather than the developer's; it prints the cache
+directory it saw, and the tests check it.
+We assert on which modules were imported, not on time, so the test does
+not depend on the machine's speed.
+
+<<test functions>>=
+import os
+import subprocess
+import sys
+
+HEAVY_MODULES = ("tuxedo", "snowball", "openai", "scholar.crossref")
+CLI_CHILD_CODE = f"""
+import os, sys
+sys.argv = ["scholar", *sys.argv[1:]]
+import scholar.cli
+try:
+    scholar.cli.main()
+except SystemExit:
+    pass
+loaded = [name for name in {HEAVY_MODULES!r} if name in sys.modules]
+print("LOADED:" + ",".join(loaded), file=sys.stderr)
+print("CACHE:" + os.environ["SCHOLAR_CACHE_DIR"], file=sys.stderr)
+"""
+
+
+def run_cli_in_child(*args, env=None):
+    """Run `scholar <args>` through `main()` in a fresh interpreter.
+
+    Returns the completed process, the stdout of the CLI and the list of
+    heavy modules the run imported.
+    """
+    process = subprocess.run(
+        [sys.executable, "-c", CLI_CHILD_CODE, *args],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=120,
+    )
+    lines = process.stderr.splitlines()
+    loaded = next(line for line in lines if line.startswith("LOADED:"))
+    cache = next(line for line in lines if line.startswith("CACHE:"))
+    assert cache.removeprefix("CACHE:") == os.environ["SCHOLAR_CACHE_DIR"]
+    modules = [name for name in loaded.removeprefix("LOADED:").split(",")
+               if name]
+    return process, process.stdout, modules
+
+
+class TestLazySubcommands:
+    """Snowball and tuxedo are listed without being imported."""
+
+    <<lazy subcommand test methods>>
+@
+
+The help lists both subcommands and imports neither, nor
+[[scholar.crossref]]:
+
+<<lazy subcommand test methods>>=
+def test_help_lists_submodules_without_importing_them(self):
+    """`scholar --help` names snowball and tuxedo but imports neither."""
+    _, stdout, loaded = run_cli_in_child("--help")
+    assert "snowball" in stdout
+    assert "tuxedo" in stdout
+    assert loaded == []
+@
+
+Running a subcommand imports its package, and only that one: the help of
+[[scholar snowball]] shows snowball's own subcommands, which only the real
+command knows.
+
+<<lazy subcommand test methods>>=
+def test_subcommand_imports_its_submodule(self):
+    """`scholar snowball --help` loads snowball and shows its commands."""
+    _, stdout, loaded = run_cli_in_child("snowball", "--help")
+    assert "add-seed" in stdout
+    assert "snowball" in loaded
+    assert "tuxedo" not in loaded
+@
+
+Completion takes both routes.
+Completing the first word lists the placeholders, so it imports nothing;
+completing the word after [[snowball]] descends into the real command and
+lists its subcommands.
+Click reads the request from environment variables named after the program:
+[[_SCHOLAR_COMPLETE]], and [[COMP_WORDS]] and [[COMP_CWORD]] for bash.
+
+<<lazy subcommand test methods>>=
+def test_completion_of_first_word_imports_nothing(self):
+    """Completing `scholar ` lists the submodules from the placeholders."""
+    env = {**os.environ, "_SCHOLAR_COMPLETE": "complete_bash",
+           "COMP_WORDS": "scholar ", "COMP_CWORD": "1"}
+    _, stdout, loaded = run_cli_in_child(env=env)
+    assert {"snowball", "tuxedo", "search"} <= set(stdout.split())
+    assert loaded == []
+
+def test_completion_descends_into_submodule(self):
+    """Completing `scholar snowball ` lists snowball's subcommands."""
+    env = {**os.environ, "_SCHOLAR_COMPLETE": "complete_bash",
+           "COMP_WORDS": "scholar snowball ", "COMP_CWORD": "2"}
+    _, stdout, loaded = run_cli_in_child(env=env)
+    assert {"init", "add-seed", "review"} <= set(stdout.split())
+    assert "snowball" in loaded
+@
+
+[[LAZY_SUBCOMMANDS]] copies the help texts, so we compare each copy with
+the help of the real command; a package that rewords its help fails here
+instead of showing stale text in [[scholar --help]].
+
+<<lazy subcommand test methods>>=
+def test_listed_help_matches_the_real_command(self):
+    """Each copied help text equals the submodule's own help."""
+    for name, help_text in LAZY_SUBCOMMANDS.items():
+        assert load_lazy_subcommand(name).help == help_text
+@
+
+The two failure cases from \cref{sec:lazy-subcommands}: a submodule that
+cannot be found is not listed, and one that is found but fails to import
+ends with a one-line message and a usage error, not a traceback.
+We create the broken module ourselves, as a file on a temporary
+[[sys.path]] entry that raises [[ImportError]] when imported, as a package
+with a missing dependency does.
+
+<<lazy subcommand test methods>>=
+def test_missing_submodule_is_not_listed(self, monkeypatch):
+    """A subcommand whose module cannot be found is left out of help."""
+    monkeypatch.setitem(LAZY_SUBCOMMANDS, "nosuchsubmodule", "Never here.")
+    result = CliRunner().invoke(app, ["--help"])
+    assert result.exit_code == 0
+    assert "nosuchsubmodule" not in result.output
+    assert "snowball" in result.output
+
+def test_broken_submodule_fails_with_one_line(self, tmp_path, monkeypatch):
+    """A module that fails to import gives exit 2 and its reason."""
+    (tmp_path / "brokensubmodule.py").write_text(
+        'raise ImportError("needs the frobnicate package")\n'
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setitem(LAZY_SUBCOMMANDS, "brokensubmodule", "Broken.")
+    listed = CliRunner().invoke(app, ["--help"])
+    assert "brokensubmodule" in listed.output
+    result = CliRunner().invoke(app, ["brokensubmodule", "--help"])
+    assert result.exit_code == 2
+    assert isinstance(result.exception, SystemExit)
+    message = ("brokensubmodule is unavailable: "
+               "needs the frobnicate package")
+    assert message in result.output
+
+def test_submodule_without_hook_fails_with_one_line(
+        self, tmp_path, monkeypatch):
+    """A found module lacking register_commands is a usage error too."""
+    (tmp_path / "hooklesssubmodule").mkdir()  # a namespace package
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setitem(LAZY_SUBCOMMANDS, "hooklesssubmodule", "No hook.")
+    result = CliRunner().invoke(app, ["hooklesssubmodule", "--help"])
+    assert result.exit_code == 2
+    assert isinstance(result.exception, SystemExit)
+    assert "has no register_commands" in result.output
+@
+
+Completion must stay quiet about the broken module and offer nothing after
+its name, in particular not Scholar's own commands:
+
+<<lazy subcommand test methods>>=
+def test_broken_submodule_completes_to_nothing(self, tmp_path, monkeypatch):
+    """Completing after a broken subcommand offers nothing, silently."""
+    (tmp_path / "brokensubmodule.py").write_text(
+        'raise ImportError("needs the frobnicate package")\n'
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setitem(LAZY_SUBCOMMANDS, "brokensubmodule", "Broken.")
+    env = {"_SCHOLAR_COMPLETE": "complete_bash",
+           "COMP_WORDS": "scholar brokensubmodule ", "COMP_CWORD": "2"}
+    result = CliRunner().invoke(app, [], env=env, prog_name="scholar")
+    assert result.exit_code == 0
+    assert result.output.split() == []
 @
 
 
 \section{Entry Point}
 \label{sec:cli-main}
 
-The main entry point registers any available submodules and then runs the
-Typer application.
+The main entry point runs the Typer application.
+It registers nothing itself: the snowball and tuxedo subcommands are part of
+the application's group class and are imported only when they run
+(\cref{sec:lazy-subcommands}).
 
 Many commands read or write notes and per-query decisions, from the
 [[notes]] commands to the TUI.  When that file is unreadable, or a write
@@ -10812,7 +11745,6 @@ def main() -> None:
     from scholar.notes import NotesFileError
     from scholar.utils import backup_path
 
-    register_submodules()
     try:
         app()
     except NotesFileError as error:
@@ -10876,9 +11808,10 @@ class TestCLI:
 
 \subsection{Testing subcommand registration}
 
-Since submodules like snowball and tuxedo are dynamically registered via
-[[register_submodules]], we need to verify that the registration mechanism
-works correctly.
+Snowball and tuxedo reach the CLI through their [[register_commands]]
+hooks, called by [[LazySubcommandGroup]] when the subcommand runs
+(\cref{sec:lazy-subcommands}).
+No setup is needed: the application's group class provides them.
 These tests ensure that:
 \begin{enumerate}
 \item The [[register_commands]] function exists in each submodule.
@@ -10890,13 +11823,6 @@ These tests ensure that:
 
 class TestSubcommandRegistration:
     """Tests for subcommand registration from snowball and tuxedo."""
-
-    @pytest.fixture(autouse=True)
-    def register_submodules(self):
-        """Ensure submodules are registered before each test."""
-        from scholar.cli import register_submodules
-
-        register_submodules()
 
     def test_snowball_subcommand_registered(self):
         """Snowball subcommand is registered and shows help."""
