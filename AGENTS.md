@@ -838,6 +838,54 @@ its cache on import): `TestLazySubcommands` runs `main()` in a child
 interpreter and fails if `--help` imports tuxedo, snowball, openai or
 `scholar.crossref`.
 
+### LLM Screening Record and Review Samples
+
+Each decision applied by `llm classify` records `llm_model`,
+`llm_decided_at` (UTC ISO), `llm_prompt_version` (16 hex digits:
+`classification_prompt_version`, a hash of the prompt built for a fixed
+probe plus the run options and research context; not the session's
+tags or examples), `llm_reason` (cut to `MAX_REASON_CHARS` = 500) and
+`llm_abstract_truncated` (#168). They live on `ReviewDecision`, named
+once in `review.LLM_AUDIT_FIELDS` (`llm_audit_of()`), which load, save,
+the append copy, `decision_state` and the concurrent merge all use; old
+files load them as `None` (unknown) and nothing fills them in later.
+A human review leaves them untouched (they are the model's record).
+
+- **No invented values.** `parse_llm_response` returns one entry per
+  paper; an unusable answer (no answer, decision not kept/discarded, a
+  discard without tags, confidence missing/non-numeric/outside [0, 1])
+  gets `LLMDecision.answer_problem`, triggers the single retry, and is
+  then withheld with the category-rule ones (`LLMDecision.problem`);
+  `llm classify` lists them under "Left pending, no usable answer".
+  Answers without a valid `paper_index` are skipped (never index 0).
+- **Abstracts.** `MAX_ABSTRACT_CHARS` = 4000 for papers to classify
+  (marked `[abstract truncated]` in the prompt), `EXAMPLE_ABSTRACT_CHARS`
+  = 1000 for examples.
+- **Examples** are only `human`/`llm_reviewed`/`agent_reviewed` decisions
+  (`CONFIRMED_SOURCES`, compared by value); `--include-llm-examples`
+  adds unreviewed `llm`/`agent` ones after them.
+- **Samples (#173).** `scholar llm sample S [S...] --discarded|--kept
+  [--min-confidence C] -n N --seed SEED` pools unreviewed `llm`/`agent`
+  decisions, sorts them by (session, paper id), keys each with
+  `random.Random(seed).random()` (the only call Python promises to keep
+  stable across versions) and takes the N smallest; it stores a
+  `review.LLMSample` (seed, criteria, UTC date, population size and
+  digest, this session's papers with the machine's status) in every
+  pooled session (`ReviewSession.llm_samples`, merged by `sample_id`).
+  The TUI filter `s` (`sampled_for_review`) queues the unreviewed ones;
+  `sessions decide` reviews them. `--report [-f json]`
+  (`sample_reports`): a sampled decision counts as reviewed when decided
+  and no longer an unreviewed machine source, as changed when its
+  status differs from the recorded one; the rate gets a 95% Wilson
+  score interval (`wilson_interval`, Brown, Cai & DasGupta 2001, eq. 4;
+  its coverage dips for p near 0, noted in `llm_review.nw`).
+- **Report.** `build_review_provenance_latex` calls
+  `llm_review.build_llm_screening_latex` (one local import + call): an
+  "LLM screening" section with models, prompt versions, dates, the
+  truncated and unrecorded counts, and `sample_sentence` per sample
+  (other pooled sessions are loaded read-only). Nothing when the
+  session has no LLM decisions and no samples.
+
 ### Interactive Tutorials (`scholar tutorial`)
 
 `scholar tutorial list|run|review` is [pytorial](https://github.com/dbosk/pytorial)

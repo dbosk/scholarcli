@@ -9335,6 +9335,14 @@ def llm_classify(
                  "of dropping them.",
         ),
     ] = False,
+    include_llm_examples: Annotated[
+        bool,
+        typer.Option(
+            "--include-llm-examples",
+            help="Also use unreviewed LLM decisions as examples (by default "
+                 "only human or human-confirmed decisions are).",
+        ),
+    ] = False,
 ) -> None:
     """
     Classify pending papers using LLM.
@@ -9345,6 +9353,8 @@ def llm_classify(
     and classification proceeds with whatever examples are present. Pass
     --no-examples to skip examples entirely and run zero-shot classification
     using only the research context, even when examples are available.
+    Examples are decisions a human made or confirmed; unreviewed LLM
+    decisions are used too only with --include-llm-examples.
 
     With --full-text, supporting passages from each paper's PDF (matched
     against the research context) are added to the prompt, so classification
@@ -9361,6 +9371,12 @@ def llm_classify(
     must get exactly one of them; a paper that does not, even after the
     retry, is left pending and listed at the end. Note tags such as
     duplicate-record-of-cited-source are for humans and never assigned.
+    So is a paper whose answer is unusable (no answer, a decision other
+    than kept/discarded, a missing or out-of-range confidence): nothing
+    is filled in for the model.
+
+    Each decision records the model, the time (UTC), a prompt version,
+    the model's reason and whether the abstract was truncated.
 
     Example:
         scholar llm classify "my review" --count 20
@@ -9402,6 +9418,7 @@ def llm_classify(
             use_fulltext=full_text,
             vocabulary=set(tag) if tag else None,
             allow_new_tags=allow_new_tags,
+            include_llm_examples=include_llm_examples,
         )
 
         if dry_run:
@@ -9419,9 +9436,10 @@ def llm_classify(
         stats = get_review_statistics(session)
         console.print(f"[green]Classified {len(updated)} papers[/green]")
         console.print(f"  Model: {result.model_id}")
+        console.print(f"  Prompt version: {result.prompt_version}")
         console.print(f"  LLM unreviewed: {stats['llm_unreviewed']}")
         console.print(f"  Pending: {stats['pending']}")
-        <<report papers left pending by the category rule>>
+        <<report papers left pending by the classifier>>
 
     except ValueError as e:
         console.print(f"[red]Error: {escape(str(e))}[/red]")
@@ -10055,7 +10073,7 @@ def llm_synthesize(
 @
 
 
-\subsection{Papers left pending by the category rule}
+\subsection{Papers left pending by the classifier}
 
 When the session's vocabulary holds audit categories, the classifier
 withholds the decision of a paper whose answer still lacks exactly one
@@ -10065,22 +10083,35 @@ paper the batch never reached, so the run ends with a warning that
 names each one and says what was wrong; the reviewer can then decide
 it with [[sessions decide]] or leave it for the next batch.
 
-<<report papers left pending by the category rule>>=
-if result.withheld:
-    from scholar.notes import get_paper_id
+<<report papers left pending by the classifier>>=
+from scholar.notes import get_paper_id
 
-    titles = {get_paper_id(d.paper): d.paper.title for d in session.decisions}
+titles = {get_paper_id(d.paper): d.paper.title for d in session.decisions}
+for heading, withheld_here in (
+    ("no usable answer",
+     [d for d in result.withheld if d.answer_problem]),
+    ("not exactly one category tag",
+     [d for d in result.withheld if not d.answer_problem]),
+):
+    if not withheld_here:
+        continue
     console.print(
-        f"[yellow]Left pending, not exactly one category tag "
-        f"({len(result.withheld)}):[/yellow]"
+        f"[yellow]Left pending, {heading} ({len(withheld_here)}):[/yellow]"
     )
-    for withheld in result.withheld:
+    for withheld in withheld_here:
         title = titles.get(withheld.paper_id, withheld.paper_id)
         console.print(
             f"  {escape(title)} [dim]({escape(withheld.paper_id)}: "
-            f"{escape(withheld.category_problem)})[/dim]"
+            f"{escape(withheld.problem)})[/dim]"
         )
 @
+
+The classifier also withholds the decision of a paper whose answer is
+unusable (\cref{sec:llm-parse} in the LLM review module): no answer,
+a decision it cannot read, a missing or out-of-range confidence.
+Those are listed under their own heading, because the remedy differs:
+a category problem is about the vocabulary, an unusable answer about
+the model, and the next batch may well answer it.
 
 The summary reaches the user even though the other decisions of the
 batch were applied and saved:
@@ -10124,6 +10155,322 @@ class TestLLMClassifyWithheld:
         assert "Two Categories" in result.output
         assert "several category tags" in result.output
         assert session.decisions[0].status == review.DecisionStatus.PENDING
+
+    def test_unusable_answers_are_listed_apart(self, monkeypatch):
+        from datetime import datetime
+        from scholar import llm_review, review
+        from scholar.llm_review import LLMBatchResult, LLMDecision
+        from scholar.notes import get_paper_id
+
+        session = review.ReviewSession(
+            query="t", providers=["p"], timestamp=datetime.now(),
+            research_context="ctx", name="s",
+        )
+        paper = Paper(title="Forgotten", authors=["A"], doi="10.1/forgot")
+        session.decisions.append(
+            review.ReviewDecision(paper=paper, provider="p")
+        )
+        monkeypatch.setattr(review, "load_session", lambda x: session)
+        monkeypatch.setattr(review, "save_session", lambda s: None)
+        seen = {}
+
+        def fake_classify(**kwargs):
+            seen.update(kwargs)
+            return LLMBatchResult(
+                decisions=[], model_id="fake", timestamp="t",
+                prompt_version="0123456789abcdef",
+                withheld=[LLMDecision(
+                    paper_id=get_paper_id(paper), status="", tags=[],
+                    confidence=None, reasoning="",
+                    answer_problem="no answer for this paper",
+                )],
+            )
+
+        monkeypatch.setattr(llm_review, "classify_papers_with_llm",
+                            fake_classify)
+        result = runner.invoke(
+            app, ["llm", "classify", "s", "--include-llm-examples"]
+        )
+        assert result.exit_code == 0, result.output
+        assert seen["include_llm_examples"] is True
+        assert "Left pending, no usable answer (1)" in result.output
+        assert "category tag" not in result.output
+        assert "no answer for this paper" in result.output
+        assert "Prompt version: 0123456789abcdef" in result.output
+@
+
+
+\subsection{Sampling LLM decisions for review}
+\label{sec:llm-sample-command}
+
+[[scholar llm sample]] draws a seeded random sample of unreviewed LLM
+decisions for a human to review, and later reports how often the human
+changed them (\cref{sec:llm-sample} in the LLM review module).  One
+command does both, because they are two halves of one procedure: the
+draw records the sample in the sessions, and [[--report]] reads it
+back.
+
+Drawing needs the criteria spelled out: [[--discarded]], [[--kept]] or
+both, a size [[-n]] and a [[--seed]].  The seed has no default on
+purpose: a seed picked for the user would still be recorded, but a
+seed the user chose and wrote in their protocol is one the methods
+section can name before the sample is drawn.  Missing criteria are a
+usage error (exit code 2) and nothing is drawn.  The sample is
+recorded in every session given, which are then saved; the drawn
+papers are printed with their ids, so that each can be reviewed with
+[[sessions decide]] (the TUI's filter [[s]] lists them too).
+
+[[--report]] reports every sample stored in the given sessions.  A
+sample pooled over other sessions as well is reported over all of
+them: the other sessions are loaded read-only, and one that no longer
+exists is counted as \enquote{not found}.  [[-f json]] gives the same
+numbers for scripts, with the unreviewed papers listed by session and
+id.
+
+<<llm command>>=
+@llm_app.command("sample")
+def llm_sample(
+    session_names: Annotated[
+        list[str],
+        typer.Argument(
+            help="Sessions to sample from (pooled), or to report on.",
+            autocompletion=complete_session_name,
+        ),
+    ],
+    discarded: Annotated[
+        bool,
+        typer.Option("--discarded", help="Sample unreviewed LLM discards."),
+    ] = False,
+    kept: Annotated[
+        bool,
+        typer.Option("--kept", help="Sample unreviewed LLM inclusions."),
+    ] = False,
+    min_confidence: Annotated[
+        Optional[float],
+        typer.Option(
+            "--min-confidence",
+            help="Only decisions with at least this LLM confidence (0-1).",
+        ),
+    ] = None,
+    size: Annotated[
+        Optional[int],
+        typer.Option("--size", "-n", help="Number of decisions to draw."),
+    ] = None,
+    seed: Annotated[
+        Optional[int],
+        typer.Option("--seed", help="Seed of the random draw (required)."),
+    ] = None,
+    report: Annotated[
+        bool,
+        typer.Option(
+            "--report",
+            help="Report the stored samples instead of drawing one.",
+        ),
+    ] = False,
+    output_format: Annotated[
+        str,
+        typer.Option(
+            "--format", "-f",
+            help="Report format: table or json.",
+            autocompletion=complete_display_format,
+        ),
+    ] = "table",
+) -> None:
+    """
+    Draw a seeded random sample of unreviewed LLM decisions for review.
+
+    The sample is drawn from all given sessions together, recorded in
+    each of them (seed, criteria, date, papers) and queued for review:
+    the TUI lists it under filter s, and each paper can be decided with
+    `scholar sessions decide`. With --report, show for each stored
+    sample how many sampled decisions were reviewed, how many the
+    reviewer changed, and the disagreement rate with a 95% Wilson score
+    interval.
+
+    Examples:
+        scholar llm sample my-review --discarded --min-confidence 0.9 \\
+            -n 50 --seed 20261118
+        scholar llm sample my-review --report
+    """
+    from scholar.review import load_session, save_session
+
+    console = Console()
+    <<load the sessions to sample>>
+    if report:
+        <<report the stored samples>>
+        return
+    <<check the sampling criteria>>
+    <<draw and record the sample>>
+@
+
+<<load the sessions to sample>>=
+sessions = []
+for name in session_names:
+    session = load_session(name)
+    if session is None:
+        console.print(f"[red]Session not found: {escape(name)}[/red]")
+        raise typer.Exit(1)
+    sessions.append(session)
+@
+
+<<check the sampling criteria>>=
+problems = []
+if not discarded and not kept:
+    problems.append("give --discarded, --kept or both")
+if size is None or size < 1:
+    problems.append("give the sample size with -n (at least 1)")
+if seed is None:
+    problems.append("give the seed with --seed")
+if min_confidence is not None and not 0 <= min_confidence <= 1:
+    problems.append("--min-confidence must be between 0 and 1")
+if problems:
+    console.print(f"[red]Cannot draw: {'; '.join(problems)}.[/red]")
+    raise typer.Exit(2)
+@
+
+<<draw and record the sample>>=
+from scholar.llm_review import draw_llm_sample
+from scholar.notes import get_paper_id
+
+statuses = {s for s, wanted in (("discarded", discarded), ("kept", kept))
+            if wanted}
+try:
+    draw = draw_llm_sample(
+        sessions, statuses=statuses, size=size, seed=seed,
+        min_confidence=min_confidence,
+    )
+except ValueError as error:
+    console.print(f"[red]{escape(str(error))}[/red]")
+    raise typer.Exit(1)
+for session in sessions:
+    save_session(session)
+console.print(
+    f"[green]Sample {escape(draw.sample_id)}: drew {len(draw.drawn)} of "
+    f"{draw.population} eligible decisions[/green]"
+)
+for name, decision in draw.drawn:
+    console.print(
+        f"  {escape(name)}  {escape(get_paper_id(decision.paper))}  "
+        f"{decision.status.value}  {escape(decision.paper.title)}"
+    )
+console.print(
+    "Review them in the TUI (filter s) or with: scholar sessions decide "
+    "SESSION --keep|--discard --paper-id ID --source human"
+)
+@
+
+<<report the stored samples>>=
+from scholar.llm_review import sample_reports, sample_sentence, session_label
+
+given = {session_label(s) for s in sessions}
+named = {n for s in sessions for sample in s.llm_samples
+         for n in sample.sessions}
+for name in sorted(named - given):
+    other = load_session(name)
+    if other is not None:
+        sessions.append(other)
+reports = sample_reports(sessions)
+if output_format == "json":
+    print(json.dumps([
+        {
+            "sample_id": r.sample_id, "seed": r.seed,
+            "drawn_at": r.drawn_at, "criteria": r.criteria,
+            "sessions": r.sessions, "population": r.population,
+            "size": r.size, "reviewed": r.reviewed, "changed": r.changed,
+            "rate": r.rate,
+            "interval": list(r.interval) if r.interval else None,
+            "not_found": r.not_found,
+            "unreviewed": [list(u) for u in r.unreviewed],
+        }
+        for r in reports
+    ], indent=2))
+    return
+if not reports:
+    console.print("No samples have been drawn in these sessions.")
+for r in reports:
+    console.print(f"[bold]Sample {escape(r.sample_id)}[/bold]")
+    console.print(f"  {escape(sample_sentence(r))}")
+    for name, paper_id in r.unreviewed:
+        console.print(
+            f"  not yet reviewed: {escape(name)}  {escape(paper_id)}"
+        )
+@
+
+Let's run the procedure end to end on two saved sessions: draw a
+sample over both, review two of the drawn papers with
+[[sessions decide]] (one confirmed, one changed), and report.  The
+report agrees with what was done, and the draw refuses to run without
+a seed.
+
+<<test functions>>=
+class TestLLMSampleCommand:
+    <<llm sample command test methods>>
+
+<<llm sample command test methods>>=
+def _save(self, name, count):
+    from datetime import datetime
+    from scholar import review
+
+    session = review.ReviewSession(
+        query=name, providers=["p"], timestamp=datetime(2026, 11, 18),
+        name=name,
+    )
+    session.decisions = [
+        review.ReviewDecision(
+            paper=Paper(title=f"{name} {i}", authors=["A"],
+                        doi=f"10.5555/cli-sample-{name}-{i}"),
+            provider="p", status=review.DecisionStatus.DISCARDED,
+            tags=["off-topic"], source=review.ReviewSource.LLM_UNREVIEWED,
+            llm_confidence=0.95,
+        )
+        for i in range(count)
+    ]
+    review.save_session(session)
+
+def test_draw_review_and_report(self):
+    from scholar.review import load_session
+
+    self._save("cli-sample-a", 4)
+    self._save("cli-sample-b", 3)
+    result = runner.invoke(app, [
+        "llm", "sample", "cli-sample-a", "cli-sample-b", "--discarded",
+        "--min-confidence", "0.9", "-n", "5", "--seed", "7",
+    ])
+    assert result.exit_code == 0, result.output
+    assert "drew 5 of 7 eligible decisions" in result.output
+    drawn = [
+        (s.name, p["paper_id"])
+        for s in (load_session("cli-sample-a"), load_session("cli-sample-b"))
+        for p in s.llm_samples[0].papers
+    ]
+    assert len(drawn) == 5
+    for (name, paper_id), flag in zip(drawn[:2], ["--discard", "--keep"]):
+        decided = runner.invoke(app, [
+            "sessions", "decide", name, flag, "--paper-id", paper_id,
+            "--tag", "off-topic", "--source", "human",
+        ])
+        assert decided.exit_code == 0, decided.output
+
+    reported = runner.invoke(
+        app, ["llm", "sample", "cli-sample-a", "--report", "-f", "json"]
+    )
+    assert reported.exit_code == 0, reported.output
+    (report,) = json.loads(reported.output)
+    assert (report["size"], report["reviewed"], report["changed"]) == (
+        5, 2, 1
+    )
+    assert report["not_found"] == 0 and len(report["unreviewed"]) == 3
+    assert report["criteria"]["min_confidence"] == 0.9
+
+def test_draw_needs_seed_and_size(self):
+    self._save("cli-sample-c", 2)
+    result = runner.invoke(
+        app, ["llm", "sample", "cli-sample-c", "--discarded"]
+    )
+    assert result.exit_code == 2
+    assert "give the seed with --seed" in " ".join(result.output.split())
+    from scholar.review import load_session
+    assert load_session("cli-sample-c").llm_samples == []
 @
 
 
