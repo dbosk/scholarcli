@@ -447,7 +447,7 @@ SEARCH_FORMATS = ["auto", "table", "csv", "json", "bibtex", "bibtex+prov"]
 DISPLAY_FORMATS = ["table", "json"]
 EXPORT_FORMATS = ["csv", "latex", "table", "all"]
 TABLE_LANGUAGES = ["en", "sv"]
-DECISION_SOURCES = ["human", "llm"]
+DECISION_SOURCES = ["human", "agent", "llm"]
 SYNTHESIS_FORMATS = ["markdown", "latex"]
 
 
@@ -1278,6 +1278,219 @@ class TestSearchFailureRecorded:
         assert "failed (non-JSON response" in shown.stdout
 @
 
+The same path with two providers, one of which fails, is the situation
+of \url{https://github.com/dbosk/scholar/issues/164}.  The default
+[[--dedup]] merges the two results for display, and the session must
+still get one record per provider: the answering provider with its own
+count, the failing one marked failed, and nothing charged to the
+other.
+
+<<test functions>>=
+class TestSearchRecordsPerProvider:
+    """search -n records each provider's search on its own (#164)."""
+
+    def _providers(self, monkeypatch):
+        from scholar import providers
+
+        good = Mock()
+        good.name = "good"
+        good.MAX_LIMIT = None
+        good.search.return_value = [
+            Paper(title="Kept", authors=["A"], doi="10.1/rpp-kept"),
+        ]
+        dead = Mock()
+        dead.name = "dead"
+        dead.MAX_LIMIT = None
+        dead.search.return_value = []
+        dead.last_error = "non-JSON response"
+        dead.last_retries = 0
+        monkeypatch.setattr(
+            providers, "PROVIDERS", {"good": good, "dead": dead}
+        )
+
+    def test_each_provider_has_its_record(self, tmp_path, monkeypatch):
+        from scholar.review import load_session
+
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        self._providers(monkeypatch)
+        result = runner.invoke(app, [
+            "search", "q", "-p", "good", "-p", "dead", "-n", "two",
+            "-f", "json",
+        ])
+        assert result.exit_code == 0
+        session = load_session("two")
+        assert {
+            r.provider: (r.hits, r.error) for r in session.search_records
+        } == {"good": (1, None), "dead": (0, "non-JSON response")}
+        assert session.decisions[0].found_by == [("q", "good", "")]
+
+        shown = runner.invoke(app, ["sessions", "show", "two"])
+        assert "good: q" in shown.stdout
+        assert "hits: 1" in shown.stdout
+        assert "dead: q" in shown.stdout
+        assert "failed (non-JSON response)" in shown.stdout
+        assert "incomplete" not in shown.stdout
+
+    def test_merged_count_at_the_limit_is_not_capped(self, monkeypatch):
+        from scholar import providers
+
+        def provider(name, dois):
+            mock = Mock(last_error=None, last_retries=0, last_total=None)
+            mock.name = name
+            mock.MAX_LIMIT = None
+            mock.search.return_value = [
+                Paper(title=f"T{d}", authors=["A"], doi=f"10.1/cap-{d}")
+                for d in dois
+            ]
+            return mock
+
+        monkeypatch.setattr(providers, "PROVIDERS", {
+            "one": provider("one", [1, 2, 3]),
+            "two": provider("two", [3, 4, 5]),
+        })
+        result = runner.invoke(app, [
+            "search", "q", "-p", "one", "-p", "two", "-l", "5", "-f", "csv",
+        ])
+        assert "# Results: 5\n" in result.stdout
+        assert "# Capped at limit" not in result.stdout
+        assert "capped" not in result.stdout
+        assert "# Search: one: 3" in result.stdout
+
+        one = SearchResult(query="q", provider="one", timestamp="t",
+                           limit=5, papers=[
+                               Paper(title=f"T{d}", authors=["A"],
+                                     doi=f"10.1/cap-{d}") for d in (1, 2, 3)
+                           ])
+        two = SearchResult(query="q", provider="two", timestamp="t",
+                           limit=5, papers=[
+                               Paper(title=f"T{d}", authors=["A"],
+                                     doi=f"10.1/cap-{d}") for d in (3, 4, 5)
+                           ])
+        assert result_hits_label(one.merge(two)) == "5"
+
+    def test_csv_names_each_providers_search(self, monkeypatch):
+        self._providers(monkeypatch)
+        result = runner.invoke(app, [
+            "search", "q", "-p", "good", "-p", "dead", "-f", "csv",
+        ])
+        assert "# Search: good: 1" in result.stdout
+        assert "# Search: dead: failed (non-JSON response)" in result.stdout
+@
+
+A search cut at its limit must say so wherever its count appears
+(\url{https://github.com/dbosk/scholar/issues/166}): the CSV keeps its
+plain count and adds the reported total and the cap on lines of their
+own, and the session listing shows \enquote{1 of 2,130 (capped at 1)}.
+
+<<test functions>>=
+class TestSearchShowsTotals:
+    """A capped search shows the total and the cap (#166)."""
+
+    def _provider(self, monkeypatch):
+        from scholar import providers
+
+        mock = Mock(last_total=2130, last_total_estimated=False,
+                    last_error=None, last_retries=0)
+        mock.name = "big"
+        mock.MAX_LIMIT = None
+        mock.search.return_value = [
+            Paper(title="First", authors=["A"], doi="10.1/big-1"),
+        ]
+        monkeypatch.setattr(providers, "PROVIDERS", {"big": mock})
+
+    def test_csv_and_session(self, tmp_path, monkeypatch):
+        import json as _json
+
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        self._provider(monkeypatch)
+        result = runner.invoke(
+            app, ["search", "q", "-l", "1", "-n", "big", "-f", "csv"]
+        )
+        assert "# Results: 1\n" in result.stdout
+        assert "# Total reported: 2130" in result.stdout
+        assert "# Capped at limit: 1" in result.stdout
+
+        shown = runner.invoke(app, ["sessions", "show", "big"])
+        assert "hits: 1 of 2,130 (capped at 1)" in shown.stdout
+        data = _json.loads(runner.invoke(
+            app, ["sessions", "show", "big", "-f", "json"]
+        ).stdout)
+        assert data["search_records"][0]["total"] == 2130
+
+    def test_session_shows_the_fetch_date(self, tmp_path, monkeypatch):
+        from scholar import providers
+
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        self._provider(monkeypatch)
+        mock = providers.PROVIDERS["big"]
+        mock.last_fetched_at = "2026-10-02T08:00:00+00:00"
+        mock.last_from_cache = True
+        runner.invoke(app, ["search", "q", "-n", "dated", "-f", "csv"])
+        shown = runner.invoke(app, ["sessions", "show", "dated"])
+        assert "cached answer fetched 2026-10-02" in " ".join(
+            shown.stdout.split()
+        )
+@
+
+A provider skipped for its spent quota is a search that failed, not one
+that never happened (\url{https://github.com/dbosk/scholar/issues/165}):
+the session records it with the reason and the reset time, the search
+output says so, and a later skip does not erase an earlier answer.  The
+quota state is the real persisted limiter state, set as a spent quota
+would set it.
+
+<<test functions>>=
+class TestSkippedProviderRecorded:
+    """A quota-blocked provider is recorded as skipped (#165)."""
+
+    def _provider(self, monkeypatch):
+        from scholar import providers
+
+        mock = Mock()
+        mock.name = "blockable"
+        mock.MAX_LIMIT = None
+        mock.search.return_value = [
+            Paper(title="Answer", authors=["A"], doi="10.1/skip-answer"),
+        ]
+        monkeypatch.setattr(providers, "PROVIDERS", {"blockable": mock})
+        return mock
+
+    @staticmethod
+    def _block():
+        from scholar import ratelimit
+        ratelimit.get_limiter("blockable").record_limit_hit(
+            reason="daily quota spent", exhausted_daily=True
+        )
+
+    def test_skip_is_recorded_and_shown(self, tmp_path, monkeypatch):
+        from scholar.review import load_session
+
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        mock = self._provider(monkeypatch)
+        self._block()
+        result = runner.invoke(
+            app, ["search", "q", "-n", "skipped", "-f", "csv"]
+        )
+        mock.search.assert_not_called()
+        assert "# Results: failed (skipped: daily quota spent; resets " \
+            in result.stdout
+        record = load_session("skipped").search_records[0]
+        assert record.provider == "blockable"
+        assert record.hits == 0
+        assert record.error.startswith("skipped: daily quota spent")
+
+    def test_skip_keeps_an_earlier_answer(self, tmp_path, monkeypatch):
+        from scholar.review import load_session
+
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        self._provider(monkeypatch)
+        runner.invoke(app, ["search", "q", "-n", "kept", "-f", "csv"])
+        self._block()
+        runner.invoke(app, ["search", "q", "-n", "kept", "-f", "csv"])
+        records = load_session("kept").search_records
+        assert [(r.hits, r.error) for r in records] == [(1, None)]
+@
+
 \subsection{Semantic search: alone, unfiltered, at most fifty}
 \label{sec:search-semantic-checks}
 
@@ -1702,6 +1915,7 @@ import dataclasses
 
 
 \section{Research Questions}
+\label{sec:research-questions}
 
 The [[rq]] command starts from a research question rather than a fixed search
 string.
@@ -1838,8 +2052,7 @@ from scholar.providers import (
     get_provider,
     expand_provider_names,
 )
-from scholar.scholar import SearchResult, provider_outcome, applied_filters
-from scholar.scholar import provider_via
+from scholar.scholar import SearchResult, search_provider
 from scholar.review import create_review_session, save_session
 from scholar.llm_review import (
     classify_papers_with_llm,
@@ -1935,6 +2148,13 @@ provider_queries = generate_provider_queries(
 )
 @
 
+[[rq]] runs each provider's own query through [[search_provider]], the
+function behind [[Search.execute]] (\cref{sec:skipped-providers} in
+the [[scholar]] module), so a provider whose quota is spent is recorded
+as skipped, with its reason, exactly as in [[search]]
+(\url{https://github.com/dbosk/scholar/issues/165}); before, [[rq]]
+called the provider directly and never looked at the limiter first.
+
 <<execute rq provider searches>>=
 results: list[SearchResult] = []
 timestamp = datetime.now().isoformat()
@@ -1944,22 +2164,9 @@ for pname in provider_names:
         continue
 
     q = provider_queries.get(pname, rq_text)
-    papers = p.search(q, limit=effective_limit, filters=filters)
-    error, retries = provider_outcome(p)
-    applied = applied_filters(p, q, filters)
-    results.append(
-        SearchResult(
-            query=q,
-            provider=pname,
-            timestamp=timestamp,
-            papers=papers,
-            filters=applied.as_dict() if applied else None,
-            limit=effective_limit,
-            error=error,
-            retries=retries,
-            via=provider_via(p),
-        )
-    )
+    results.append(search_provider(
+        p, q, effective_limit, filters, timestamp=timestamp,
+    ))
 
 if not results:
     console.print("[yellow]No results returned[/yellow]")
@@ -2011,6 +2218,7 @@ console.print(f"[green]Saved session:[/green] {escape(str(session_path))}")
 console.print(f"  Total papers: {stats['total']}")
 console.print(f"  Labeled by LLM: {len(updated)}")
 console.print(f"  Pending: {stats['pending']}")
+print_withheld_papers(console, session, batch.withheld)
 @
 
 \subsection{Resolving the research question}
@@ -2273,6 +2481,137 @@ class TestRQCommand:
             for r in data["search_records"]
         )
         assert data["decisions"][0]["source"] == "llm"
+@
+
+[[rq]] goes through the same [[search_provider]], so a provider whose
+quota is spent is recorded as skipped there too, beside the provider
+that answered.  The model is the same kind of stand-in as above: it
+writes the queries and classifies the one paper.
+
+<<test functions>>=
+class TestRQRecordsSkippedProvider:
+    """rq records a quota-blocked provider as skipped (#165)."""
+
+    def test_skipped_provider_has_a_record(self, tmp_path, monkeypatch):
+        import json
+        import sys
+        import types
+
+        from scholar import providers, ratelimit
+        from scholar.review import load_session
+
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        good, blocked = Mock(), Mock()
+        good.name, blocked.name = "good", "blocked"
+        good.search.return_value = [
+            Paper(title="Found", authors=["A"], year=2024,
+                  doi="10.1/rq-skip", abstract="Abstract."),
+        ]
+        monkeypatch.setattr(
+            providers, "PROVIDERS", {"good": good, "blocked": blocked}
+        )
+        ratelimit.get_limiter("blocked").record_limit_hit(
+            reason="daily quota spent", exhausted_daily=True
+        )
+
+        class Reply:
+            def __init__(self, data):
+                self._text = json.dumps(data)
+
+            def text(self):
+                return self._text
+
+        class Model:
+            model_id = "dummy"
+
+            def prompt(self, prompt):
+                if "Papers to Classify" in prompt:
+                    return Reply({"classifications": [{
+                        "paper_index": 0, "decision": "kept",
+                        "tags": ["theme"], "confidence": 0.9,
+                        "reasoning": "Relevant.",
+                    }]})
+                return Reply({"queries": [
+                    {"provider": "good", "query": "good query"},
+                    {"provider": "blocked", "query": "blocked query"},
+                ]})
+
+        llm_mod = types.ModuleType("llm")
+        llm_mod.get_model = lambda model_id=None: Model()
+        monkeypatch.setitem(sys.modules, "llm", llm_mod)
+
+        result = runner.invoke(app, [
+            "rq", "A question?", "-p", "good", "-p", "blocked",
+            "--count", "1", "--no-enrich", "-n", "rq-skip",
+        ])
+        assert result.exit_code == 0, result.output
+        blocked.search.assert_not_called()
+        records = {
+            r.provider: r for r in load_session("rq-skip").search_records
+        }
+        assert records["good"].hits == 1
+        assert records["blocked"].query == "blocked query"
+        assert records["blocked"].error.startswith(
+            "skipped: daily quota spent; resets "
+        )
+@
+
+A paper that [[rq]]'s classification leaves pending is listed, as
+[[llm classify]] lists it: here the model's answer for the only paper
+is unreadable on both attempts.
+
+<<test functions>>=
+class TestRQListsWithheldPapers:
+    def test_unusable_answer_is_listed(self, tmp_path, monkeypatch):
+        import json
+        import sys
+        import types
+
+        from scholar import providers
+
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        mock_provider = Mock()
+        mock_provider.name = "mock"
+        mock_provider.is_available.return_value = True
+        mock_provider.search.return_value = [Paper(
+            title="Unanswered Paper", authors=["Alice"], year=2024,
+            doi="10.1234/rq-withheld", abstract="Abstract.",
+            sources=["mock"],
+        )]
+        monkeypatch.setattr(providers, "PROVIDERS", {"mock": mock_provider})
+
+        class Response:
+            def __init__(self, text):
+                self._text = text
+
+            def text(self):
+                return self._text
+
+        class Model:
+            model_id = "dummy"
+
+            def prompt(self, prompt):
+                if "Papers to Classify" in prompt:
+                    return Response(json.dumps({"classifications": [{
+                        "paper_index": 0, "decision": "maybe",
+                        "tags": ["theme"], "confidence": 0.9,
+                    }]}))
+                return Response(json.dumps({"queries": [
+                    {"provider": "mock", "query": "test query"}
+                ]}))
+
+        llm_mod = types.ModuleType("llm")
+        llm_mod.get_model = lambda model_id=None: Model()  # noqa: E731
+        monkeypatch.setitem(sys.modules, "llm", llm_mod)
+
+        result = runner.invoke(app, [
+            "rq", "Is the answer listed?", "--provider", "mock",
+            "--count", "1", "--no-enrich",
+        ])
+        assert result.exit_code == 0, result.output
+        assert "Left pending, no usable answer (1)" in result.output
+        assert "Unanswered Paper" in result.output
+        assert "invalid decision 'maybe'" in result.output
 @
 
 \section{Reporting currency issues}
@@ -4967,8 +5306,12 @@ def cache(
                 f"{sum(llm_caches.values())} entries "
                 "(kept by clear without --include-llm)",
             )
+        unmerged = stats["unmerged_files"]
+        if unmerged:
+            table.add_row("Unmerged files", f"{len(unmerged)} file(s), not used")
 
         console.print(table)
+        <<explain the unmerged files>>
 
         if stats["providers"]:
             console.print()
@@ -4989,6 +5332,33 @@ def cache(
         console.print(f"[red]Unknown action: {escape(action)}[/red]")
         console.print("Valid actions: clear, info, path")
         raise typer.Exit(1)
+@
+
+\subsection{Files beside unreadable caches}
+
+When a cache file cannot be read, a save keeps it and writes its own
+entries to a file beside it instead (\cref{sec:cache-concurrency}).
+Such a file is not used, and the warning that announced it is easily
+missed, so [[info]] counts these files and then names them, with what
+they are and what to do.
+The real problem is the unreadable cache file they sit beside: as long
+as it stays, every process that adds to that cache writes another such
+file.
+A [[clear]] deletes both, by the same rules as the caches
+(\cref{sec:cache-unmerged-files}).
+
+<<explain the unmerged files>>=
+if unmerged:
+    console.print()
+    console.print(
+        "Unmerged files hold entries that a process could not add to "
+        "a cache file it could not read; the cache file was kept as it "
+        "was. Check that file (the warning named it): while it stays "
+        "unreadable the cache is not used. "
+        "[bold]scholar cache clear[/bold] deletes both."
+    )
+    for path in unmerged:
+        console.print(f"  {escape(path)}", soft_wrap=True)
 @
 
 \subsection{Testing the cache command}
@@ -5103,6 +5473,40 @@ class TestCacheCommand:
         result = runner.invoke(app, ["cache", "invalid"])
         assert result.exit_code == 1
         assert "Unknown action" in result.stdout
+@
+
+Let's check the files beside unreadable caches through the command:
+a save meets a truncated [[s2]] cache file, [[info]] must name the file
+it wrote instead, and [[clear --provider s2]] must delete it with the
+cache file.
+
+<<test functions>>=
+class TestCacheCommandUnmergedFiles:
+    """cache info lists, cache clear deletes, the unmerged files."""
+
+    def test_info_and_clear(self, tmp_path, monkeypatch):
+        import pickle
+        from scholar.cache import load_cache, save_cache
+
+        monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path))
+        full = pickle.dumps({("q", i): "x" * 100 for i in range(20)})
+        (tmp_path / "s2.pkl").write_bytes(full[: len(full) // 2])
+        cache = load_cache("s2")
+        cache[("new", 10)] = []
+        save_cache("s2", cache)
+        (unmerged,) = tmp_path.glob("s2.pkl.unmerged-*")
+
+        result = runner.invoke(
+            app, ["cache", "info"], env={"COLUMNS": "500"}
+        )
+        assert result.exit_code == 0
+        assert "Unmerged files" in result.stdout
+        assert unmerged.name in result.stdout
+
+        result = runner.invoke(app, ["cache", "clear", "--provider", "s2"])
+        assert result.exit_code == 0
+        assert "Cleared 2 cache file(s)." in result.stdout
+        assert list(tmp_path.glob("s2.pkl*")) == []
 @
 
 
@@ -6359,6 +6763,16 @@ We print [[Paper.id]] rather than the bare DOI: it is exactly the string
 The three decision groups print the same line, so one helper builds it;
 only the tags differ, and a pending paper simply has none.
 
+The listing also says who decided (issue~\#163,
+\cref{sec:review-source}).  Above the paper lists, \enquote{Decided by:}
+counts the decisions by source, and each paper whose decision an agent
+or an LLM made without a human reviewing it carries that label after its
+title.  [[show]] is what an author reads before exporting, so it must
+not present a list of machine verdicts as a screened list.  The JSON
+form gives each decision its stored [[source]] and the counts under
+[[decision_sources]], keyed by the stored values, so a script can check
+what still needs review.
+
 Each line under \enquote{Queries by provider:} also says what the search
 returned, as recorded in the session (\cref{sec:search-result-error}):
 the hit count, or a highlighted \enquote{failed} with the reason.  This
@@ -6367,7 +6781,13 @@ grid, so it is where a dead provider has to stand out.  Records from
 before outcomes were stored show nothing, since nothing is known.
 A semantic search's record shows its ranked list as one
 (\enquote{top 50, ranked (not a count)}, \cref{sec:ranked-list}) and
-without the \enquote{hits:} prefix, which would read as a count.  The
+without the \enquote{hits:} prefix, which would read as a count.  A merged record from before searches were recorded per provider
+reads as one and drops the prefix for the same reason
+(\cref{sec:merged-records} in the review module).
+The line ends with when the search ran and, for an answer served from
+the cache, when that answer was fetched---or that the cache does not
+know (\url{https://github.com/dbosk/scholar/issues/167}); the
+session's own date above is only that of its last change.  The
 JSON form marks such a record with [["ranked": true]] (and leaves the
 key out otherwise), so a script reading [[hits]] can tell the two
 apart as well.
@@ -6388,17 +6808,24 @@ def _record_provider_label(record) -> str:
 
 def _record_outcome_markup(record) -> str:
     """Rich markup for a search record's outcome, or "" if unknown."""
-    ranked = is_ranked_provider(record.provider)
-    label = hits_label(
-        record.hits, record.error, record.retries, ranked=ranked
-    )
+    from scholar.review import search_outcome_label
+
+    label = search_outcome_label(record)
     if not label:
         return ""
     if record.error:
         return f" [yellow]— {escape(label)}[/yellow]"
-    if ranked:
+    if is_ranked_provider(record.provider) or record.is_merged:
         return f"[dim] — {escape(label)}[/dim]"
     return f"[dim] — hits: {escape(label)}[/dim]"
+
+
+def _record_dates_markup(record) -> str:
+    """Rich markup for when a search ran and was fetched, or ""."""
+    from scholar.review import search_dates_label
+
+    label = search_dates_label(record)
+    return f"[dim] — {escape(label)}[/dim]" if label else ""
 
 
 def session_paper_line(decision) -> str:
@@ -6407,12 +6834,16 @@ def session_paper_line(decision) -> str:
     Two lines: the title with provider and tags, then the paper id that
     `sessions decide --paper-id` accepts (`doi:...` or `hash:...`).
     """
+    from scholar.review import unreviewed_mark
+
     paper = decision.paper
     provider = f" [dim]({decision.provider})[/dim]" if decision.provider else ""
     tag_list = ", ".join(escape(t) for t in decision.tags)
     tags = f" [dim]\\[{tag_list}][/dim]" if decision.tags else ""
+    mark = unreviewed_mark(decision)
+    unreviewed = f" [magenta]({escape(mark)})[/magenta]" if mark else ""
     return (
-        f"  • {escape(paper.title or '')}{provider}{tags}\n"
+        f"  • {escape(paper.title or '')}{provider}{tags}{unreviewed}\n"
         f"    [dim]{escape(paper.id)}[/dim]"
     )
 
@@ -6443,7 +6874,9 @@ def sessions_show(
     Uses a pager for interactive viewing when output is a terminal.
     """
     import sys
-    from scholar.review import load_session
+    from scholar.review import (
+        decision_source_counts, decision_source_items, load_session,
+    )
 
     console = Console()
     session = load_session(name)
@@ -6466,6 +6899,11 @@ def sessions_show(
                     "hits": r.hits,
                     "error": r.error,
                     "retries": r.retries,
+                    "total": r.total,
+                    "total_estimated": r.total_estimated,
+                    "searched_at": r.searched_at,
+                    "fetched_at": r.fetched_at,
+                    "from_cache": r.from_cache,
                     **(
                         {"ranked": True}
                         if is_ranked_provider(r.provider) else {}
@@ -6476,6 +6914,11 @@ def sessions_show(
             ],
             "timestamp": session.timestamp.isoformat(),
             "themes": dict(session.theme_counts()),
+            "decision_sources": {
+                source.value: count
+                for source, count in
+                decision_source_counts(session.decisions).items()
+            },
             "decisions": [
                 {
                     "title": d.paper.title,
@@ -6485,6 +6928,7 @@ def sessions_show(
                     "paper_id": d.paper.id,
                     "status": d.status.value,
                     "tags": d.tags,
+                    "source": d.source.value,
                     "provider": d.provider,
                 }
                 for d in session.decisions
@@ -6511,6 +6955,7 @@ def sessions_show(
                         f"[dim]  {escape(_record_provider_label(record))}: "
                         f"{escape(record.query + suffix)}[/dim]"
                         + _record_outcome_markup(record)
+                        + _record_dates_markup(record)
                     )
             else:
                 # Fallback: show providers with session query
@@ -6520,6 +6965,14 @@ def sessions_show(
                         f"[dim]  {provider}: {escape(session.query)}[/dim]"
                     )
             con.print()
+
+            # Show who decided
+            sources = decision_source_items(session.decisions)
+            if sources:
+                con.print("[cyan bold]Decided by:[/cyan bold]")
+                for label, count in sources:
+                    con.print(f"  • {escape(label)}: {count}")
+                con.print()
 
             # Show themes overview
             themes = session.theme_counts()
@@ -6671,8 +7124,7 @@ def sessions_export(
         generate_latex_report,
         generate_csv_report,
         generate_audit_table,
-        ReviewSource,
-        DecisionStatus,
+        machine_review_rows,
     )
 
     if format_type not in EXPORT_FORMATS:
@@ -6724,49 +7176,14 @@ def sessions_export(
     if format_type in ("latex", "all") and not standalone:
         _print_fragment_hint(console, tex_path.with_suffix(".bib").name)
 
-    # If the session includes any LLM decisions, report agreement/change counts.
-    has_llm_decisions = any(
-        d.source in (ReviewSource.LLM_UNREVIEWED, ReviewSource.LLM_REVIEWED)
-        for d in session.decisions
-    )
-
-    if has_llm_decisions:
-        llm_confirmed = sum(
-            1
-            for d in session.decisions
-            if d.source == ReviewSource.LLM_REVIEWED and not d.is_example
-        )
-        llm_changed_total = sum(
-            1
-            for d in session.decisions
-            if d.source == ReviewSource.LLM_REVIEWED and d.is_example
-        )
-        llm_changed_kept_to_discarded = sum(
-            1
-            for d in session.decisions
-            if d.source == ReviewSource.LLM_REVIEWED
-            and d.is_example
-            and d.status == DecisionStatus.DISCARDED
-        )
-        llm_changed_discarded_to_kept = sum(
-            1
-            for d in session.decisions
-            if d.source == ReviewSource.LLM_REVIEWED
-            and d.is_example
-            and d.status == DecisionStatus.KEPT
-        )
-
-        table = Table(title="LLM Review", box=box.HORIZONTALS)
+    # If an LLM or an agent decided, report agreement/change counts.
+    review_rows = machine_review_rows(session.decisions)
+    if review_rows:
+        table = Table(title="LLM and agent review", box=box.HORIZONTALS)
         table.add_column("Category", style="cyan")
         table.add_column("Count", justify="right")
-        table.add_row("LLM confirmed", str(llm_confirmed))
-        table.add_row("LLM changed", str(llm_changed_total))
-        table.add_row(
-            "LLM changed (kept->discarded)", str(llm_changed_kept_to_discarded)
-        )
-        table.add_row(
-            "LLM changed (discarded->kept)", str(llm_changed_discarded_to_kept)
-        )
+        for label, count in review_rows:
+            table.add_row(label, str(count))
         console.print(table)
 @
 
@@ -6801,6 +7218,11 @@ class TestSessionsShowVia:
     ).output)
     assert [r.get("via") for r in data["search_records"]] == ["bulk", None]
 @
+
+The closing table of confirmed and changed machine decisions has the
+rows of the report's summary ([[machine_review_rows]],
+\cref{sec:report-provenance}), one group for the LLM and one for the
+agent, so what the terminal says and what the document says agree.
 
 A fragment cannot set up its own bibliography, so both commands that
 write one end with the same reminder of what the including document
@@ -7130,15 +7552,36 @@ Tags accumulate via [[add_tag]] (idempotent), so redeciding a paper refines
 rather than clobbers its tags; the status change itself is an overwrite,
 which is what redeciding means.
 
-Decisions carry their provenance. An agent that screens papers on an
-LLM's behalf must not record its verdicts as human decisions, because
-the TUI queues unreviewed LLM decisions for confirmation and the export
-counts how many of them the reviewer confirmed or changed. [[--source
-llm]] therefore stores the decision as [[LLM_UNREVIEWED]]. Conversely, a
-human decision on such a row \emph{is} the review: it goes through
-[[mark_as_reviewed]], which mirrors the TUI (confirmed when the status
-stands, changed and flagged as a training example when it does not),
-instead of overwriting the provenance with [[HUMAN]] as it used to.
+Decisions carry their provenance (\cref{sec:review-source}). An AI
+agent that screens papers must not record its verdicts as human
+decisions, because the audit table cites a human keep and the report
+counts it as screened by the author; nor as an LLM's, because no
+classifier run produced them. [[--source agent]] therefore stores the
+decision as [[AGENT_UNREVIEWED]], and [[--source llm]], for an agent
+that relays a classifier's verdicts, as [[LLM_UNREVIEWED]]. Both are
+queued in the TUI for confirmation. Conversely, a human decision on
+such a row \emph{is} the review: it goes through [[mark_as_reviewed]],
+which mirrors the TUI (confirmed when the status stands, changed and
+flagged as a training example when it does not) and keeps the machine's
+name in the reviewed source, instead of overwriting the provenance with
+[[HUMAN]] as it used to.
+
+Who decided is no longer assumed when nobody is there to ask
+(issue~\#162). The option used to default to [[human]], and an agent
+that left it out (as the skill that drives it told it to) was recorded
+as the author. Typing the command at a terminal is still a human
+deciding, so the default stays [[human]] when standard input is a
+terminal. Otherwise the command is run by a script or an agent, and it
+refuses to guess: without [[--source]] it stops with exit status~2, the
+status Typer uses for a usage error, before the session is loaded.
+
+The new values have a cost outside this code.  A Scholar installed
+before them reads [[agent]] and [[agent_reviewed]], like any value it
+does not know, as [[human]], and writes [[human]] back when it next
+saves the session, turning the agent's decisions into the author's
+without a trace.  Old binaries cannot be fixed from here, so every
+installation that touches a session must be updated before anyone
+records a decision with [[--source agent]].
 
 <<sessions command>>=
 @sessions_app.command("decide")
@@ -7185,22 +7628,32 @@ def sessions_decide(
         ),
     ] = None,
     source: Annotated[
-        str,
+        Optional[str],
         typer.Option(
             "--source", "-s",
-            help="Who decided: human (default) or llm. LLM decisions stay "
-                 "unreviewed so the TUI still asks for confirmation.",
+            help="Who decided: human, agent (an AI agent) or llm (a "
+                 "classifier's verdict). Agent and LLM decisions stay "
+                 "unreviewed so the TUI still asks for confirmation. "
+                 "Defaults to human at a terminal; required otherwise.",
             autocompletion=complete_decision_source,
         ),
-    ] = "human",
+    ] = None,
     confidence: Annotated[
         Optional[float],
         typer.Option(
             "--confidence", "-c",
-            help="The model's confidence (0-1) for an LLM decision "
-                 "(--source llm); ignored for human decisions.",
+            help="The machine's confidence (0-1) for an agent or LLM "
+                 "decision; ignored for human decisions.",
         ),
     ] = None,
+    force: Annotated[
+        bool,
+        typer.Option(
+            "--force",
+            help="Let an agent or LLM decision replace a decision a human "
+                 "made or reviewed (refused otherwise).",
+        ),
+    ] = False,
 ) -> None:
     """
     Record keep/discard decisions in a saved session, without the TUI.
@@ -7209,19 +7662,28 @@ def sessions_decide(
     requires at least one --tag as motivation. If any selector matches
     nothing, no changes are saved and the exit code is nonzero.
 
-    --source llm records an unreviewed LLM decision (an agent deciding on
-    the LLM's behalf), with the model's --confidence if given. A human
+    --source agent records an unreviewed decision of an AI agent, and
+    --source llm one of a classifier, with the machine's --confidence if
+    given (without it, any earlier confidence is cleared). A human
     decision on such a paper marks it reviewed, and changed if the
-    status differs.
+    status differs. Without --source the decision is a human one at a
+    terminal; scripts and agents must pass --source. An agent or LLM
+    decision never replaces one a human made or reviewed unless --force
+    is given; otherwise the whole batch is refused (exit 2).
+
+    When the status changes, the paper's old category tags are removed
+    before the new --tag values are added; all other tags are kept.
+    Redeciding the same status adds the tags.
 
     Examples:
-        scholar sessions decide my-review --keep --doi 10.1145/3568813 \\
-            --tag misconceptions
-        scholar sessions decide my-review --source llm --discard \\
+        scholar sessions decide my-review --source human --keep \\
+            --doi 10.1145/3568813 --tag misconceptions
+        scholar sessions decide my-review --source agent --discard \\
             --doi 10.1145/3568813 --tag off-topic-false-hit -c 0.9
     """
     from scholar.review import (
-        DecisionStatus, ReviewSource, load_session, save_session,
+        DecisionStatus, ReviewSource, clear_machine_audit, load_session,
+        save_session, tags_after_status_change,
     )
     from scholar.llm_review import mark_as_reviewed
 
@@ -7234,6 +7696,7 @@ def sessions_decide(
         raise typer.Exit(1)
 
     <<select decisions by doi and paper id>>
+    <<refuse to let a machine replace a human decision>>
 
     status = DecisionStatus.KEPT if keep else DecisionStatus.DISCARDED
     for decision in selected.values():
@@ -7259,9 +7722,11 @@ if not doi and not paper_id:
         "[red]Select at least one paper with --doi or --paper-id.[/red]"
     )
     raise typer.Exit(1)
+<<settle who decided>>
 if source not in DECISION_SOURCES:
     console.print(
-        f"[red]Invalid --source: {escape(source)}. Use human or llm.[/red]"
+        f"[red]Invalid --source: {escape(source)}. "
+        "Use human, agent or llm.[/red]"
     )
     raise typer.Exit(1)
 if discard and not tag:
@@ -7272,21 +7737,38 @@ if discard and not tag:
 <<validate the decide confidence>>
 @
 
-Recording one decision has three cases. An LLM decision is stored as
-unreviewed, with [[is_example]] cleared since nobody has corrected it
-yet. A human decision on an unreviewed LLM decision is a review and is
-delegated to [[mark_as_reviewed]]; agreement means the status stands.
-Any other human decision simply overwrites status and source. Tags are
-added afterwards in all three cases.
+The source is settled first, before anything else is checked:
+
+<<settle who decided>>=
+if source is None:
+    if sys.stdin is None or not sys.stdin.isatty():
+        console.print(
+            "[red]Not run at a terminal: pass --source human|agent|llm "
+            "to say who decided.[/red]"
+        )
+        raise typer.Exit(2)
+    source = "human"
+@
+
+Recording one decision has three cases. A machine decision (agent or
+LLM) is stored as unreviewed, with [[is_example]] cleared since nobody
+has corrected it yet, and with the audit fields of any earlier
+classifier run cleared ([[clear_machine_audit]],
+\cref{sec:review-source}), since they describe the decision being
+replaced. A human decision on an unreviewed machine
+decision is a review and is delegated to [[mark_as_reviewed]];
+agreement means the status stands. Any other human decision simply
+overwrites status and source.
 
 <<record one decision with its source>>=
-if source == "llm":
+previous_status = decision.status
+if source in MACHINE_DECISION_SOURCES:
     decision.status = status
-    decision.source = ReviewSource.LLM_UNREVIEWED
+    decision.source = ReviewSource(source)
     decision.is_example = False
-    if confidence is not None:
-        decision.llm_confidence = confidence
-elif decision.source == ReviewSource.LLM_UNREVIEWED:
+    clear_machine_audit(decision)
+    decision.llm_confidence = confidence
+elif decision.source.is_unreviewed:
     mark_as_reviewed(
         decision,
         user_agrees=decision.status == status,
@@ -7295,6 +7777,70 @@ elif decision.source == ReviewSource.LLM_UNREVIEWED:
 else:
     decision.status = status
     decision.source = ReviewSource.HUMAN
+<<replace the tags of a changed decision>>
+@
+
+The option's values are the stored values of the unreviewed sources,
+so [[ReviewSource(source)]] turns one into the other.
+
+A machine decision must not replace a human one silently.  Recording an
+agent's verdict on a paper the author had kept under a theme used to
+demote that decision to an unreviewed one and, on a discard, turn the
+author's themes into the agent's motivations; nothing said it had
+happened.  So before anything changes, every selected paper that a
+human decided, or whose machine decision a human reviewed, is a
+conflict when the new source is a machine.  Conflicts are handled like
+unmatched selectors: all of them are named, with the decision that
+stands, nothing is saved, and the command exits with status~2, the
+usage-error status of the missing [[--source]].  [[--force]] is the
+deliberate override.  An unknown stored source does not count as a
+human decision here (\cref{sec:review-source}), and a pending paper
+has no decision to protect, though its default source is [[human]].
+
+<<refuse to let a machine replace a human decision>>=
+if source in MACHINE_DECISION_SOURCES and not force:
+    conflicts = [
+        decision for decision in selected.values()
+        if decision.is_decided and decision.source in (
+            ReviewSource.HUMAN, ReviewSource.LLM_REVIEWED,
+            ReviewSource.AGENT_REVIEWED,
+        )
+    ]
+    for decision in conflicts:
+        console.print(
+            f"[red]{escape(decision.paper.id)} is already "
+            f"{decision.status.value} ({decision.source.value}); an "
+            f"{source} decision would replace it.[/red]"
+        )
+    if conflicts:
+        console.print(
+            "[yellow]No changes saved. Pass --force to replace a human "
+            "decision.[/yellow]"
+        )
+        raise typer.Exit(2)
+@
+
+<<sessions command>>=
+MACHINE_DECISION_SOURCES = ("agent", "llm")
+@
+
+Tags used to be only added, whatever happened to the status
+(\url{https://github.com/dbosk/scholar/issues/177}). A paper the LLM
+had kept as [[supports-claim]] and a reviewer then discarded with
+[[--tag no-evidence]] carried both tags, and the audit table, which
+reads the category from the tags, listed it as excluded although
+classified as bearing on the claim: the old classification survived
+the decision that overturned it. When the status changes, the new
+decision therefore removes the old category tags
+([[tags_after_status_change]], \cref{sec:audit-table}, which explains
+why nothing else is removed). When the status stands, redeciding
+refines the decision and the tags accumulate as before, the last
+category tag being the one that counts. [[add_tag]] is idempotent, so a
+repeated tag is not doubled.
+
+<<replace the tags of a changed decision>>=
+if decision.status != previous_status:
+    decision.tags = tags_after_status_change(decision.tags)
 for t in tag or []:
     decision.add_tag(t)
 @
@@ -7303,16 +7849,19 @@ An agent that records a classifier's verdicts through [[decide]] also
 has the classifier's confidence, and the audit table promises one for
 every machine-classified row (issue~\#90). [[--confidence]] stores it
 where [[scholar llm classify]] does, in [[llm_confidence]], so the two
-paths produce the same row. It belongs to the model, so it is stored
-only with [[--source llm]]: a human decision on an LLM row is a review,
+paths produce the same row; an agent deciding by itself can state its
+own confidence the same way. It belongs to the machine, so it is stored
+only with [[--source agent]] or [[llm]]: a human decision on a machine
+row is a review,
 and overwriting the model's number with the reviewer's would make the
 table misreport what the model said, while a plain human decision has
 no machine label to qualify. Given with a human source the option is
 therefore accepted but ignored, with a note, rather than refused, so a
-script that always passes it keeps working. Without the option an LLM
-decision keeps whatever confidence it had (none for a fresh row, which
-the table then marks as missing). Like the other checks, the range is
-validated before the session is loaded.
+script that always passes it keeps working. Without the option a
+machine decision has no confidence, and the table marks it as missing:
+a number left from an earlier classifier run would be shown as the
+confidence of a decision that run did not make. Like the other checks,
+the range is validated before the session is loaded.
 
 <<validate the decide confidence>>=
 if confidence is not None and not 0.0 <= confidence <= 1.0:
@@ -7320,7 +7869,7 @@ if confidence is not None and not 0.0 <= confidence <= 1.0:
         f"[red]--confidence must be between 0 and 1, got {confidence}.[/red]"
     )
     raise typer.Exit(1)
-if confidence is not None and source != "llm":
+if confidence is not None and source not in MACHINE_DECISION_SOURCES:
     console.print(
         "[yellow]--confidence is the model's; ignored for a human "
         "decision.[/yellow]"
@@ -7403,7 +7952,7 @@ class TestSessionsDecideCommand:
 
         self._make_session(tmp_path, monkeypatch)
         result = runner.invoke(app, [
-            "sessions", "decide", "headless",
+            "sessions", "decide", "headless", "--source", "human",
             "--keep", "--doi", "10.1/withdoi", "--tag", "core",
         ])
         assert result.exit_code == 0
@@ -7459,7 +8008,7 @@ class TestSessionsDecideCommand:
         assert load_session("headless").kept_papers() == []
 
         result = runner.invoke(app, [
-            "sessions", "decide", "headless",
+            "sessions", "decide", "headless", "--source", "human",
             "--keep", "--doi", "10.1/withdoi", "-c", "0.5",
         ])
         assert result.exit_code == 0
@@ -7477,14 +8026,14 @@ class TestSessionsDecideCommand:
             "--discard", "--doi", "10.1/withdoi", "--tag", "supports-claim",
         ])
         result = runner.invoke(app, [
-            "sessions", "decide", "headless",
+            "sessions", "decide", "headless", "--source", "human",
             "--keep", "--doi", "10.1/withdoi", "--tag", "ml",
         ])
         assert result.exit_code == 0
         decision = load_session("headless").kept_papers()[0]
         assert decision.source == ReviewSource.LLM_REVIEWED
         assert decision.is_example is True
-        assert decision.tags == ["supports-claim", "ml"]
+        assert decision.tags == ["ml"]
 
     def test_human_agreement_is_not_an_example(self, tmp_path, monkeypatch):
         """Confirming an LLM decision reviews it without making an example."""
@@ -7496,7 +8045,7 @@ class TestSessionsDecideCommand:
             "--keep", "--doi", "10.1/withdoi",
         ])
         runner.invoke(app, [
-            "sessions", "decide", "headless",
+            "sessions", "decide", "headless", "--source", "human",
             "--keep", "--doi", "10.1/withdoi",
         ])
         decision = load_session("headless").kept_papers()[0]
@@ -7520,7 +8069,7 @@ class TestSessionsDecideCommand:
         session = self._make_session(tmp_path, monkeypatch)
         no_doi_id = session.decisions[1].paper.id
         result = runner.invoke(app, [
-            "sessions", "decide", "headless",
+            "sessions", "decide", "headless", "--source", "human",
             "--discard", "--paper-id", no_doi_id,
             "--tag", "out-of-scope",
         ])
@@ -7535,7 +8084,7 @@ class TestSessionsDecideCommand:
         """--discard without --tag is rejected before loading."""
         self._make_session(tmp_path, monkeypatch)
         result = runner.invoke(app, [
-            "sessions", "decide", "headless",
+            "sessions", "decide", "headless", "--source", "human",
             "--discard", "--doi", "10.1/withdoi",
         ])
         assert result.exit_code == 1
@@ -7547,7 +8096,7 @@ class TestSessionsDecideCommand:
 
         self._make_session(tmp_path, monkeypatch)
         result = runner.invoke(app, [
-            "sessions", "decide", "headless", "--keep",
+            "sessions", "decide", "headless", "--source", "human", "--keep",
             "--doi", "10.1/withdoi", "--doi", "10.1/typo",
         ])
         assert result.exit_code == 1
@@ -7560,10 +8109,315 @@ class TestSessionsDecideCommand:
         """Asking for both statuses at once is an error."""
         self._make_session(tmp_path, monkeypatch)
         result = runner.invoke(app, [
-            "sessions", "decide", "headless",
+            "sessions", "decide", "headless", "--source", "human",
             "--keep", "--discard", "--doi", "10.1/withdoi",
         ])
         assert result.exit_code == 1
+@
+
+The tests above name the source, as every script must now.  The next
+ones check who is recorded when the source is left out, the agent
+source, and the tags of a decision that overturns an earlier one.
+CliRunner gives the command a standard input that is not a terminal,
+which is exactly the agent's situation.  The terminal case needs a real
+terminal, so that test runs the command in a subprocess whose standard
+input is a pseudo-terminal: the code under test then asks the operating
+system, as it does for the user, instead of a patched answer.
+
+<<test functions>>=
+class TestSessionsDecideSources:
+    """Who decided, as `sessions decide` records it."""
+
+    def _make_session(self, tmp_path, monkeypatch):
+        return TestSessionsDecideCommand()._make_session(
+            tmp_path, monkeypatch
+        )
+
+    def _decide(self, *args):
+        return runner.invoke(app, ["sessions", "decide", "headless", *args])
+
+    def test_a_script_must_say_who_decided(self, tmp_path, monkeypatch):
+        from scholar.review import load_session
+
+        self._make_session(tmp_path, monkeypatch)
+        result = self._decide("--keep", "--doi", "10.1/withdoi")
+        assert result.exit_code == 2
+        assert "pass --source human|agent|llm" in result.output
+        assert load_session("headless").kept_papers() == []
+
+    def test_a_terminal_defaults_to_human(self, tmp_path, monkeypatch):
+        import os
+        import subprocess
+        import sys
+
+        pty = pytest.importorskip("pty")
+        from scholar.review import ReviewSource, load_session
+
+        self._make_session(tmp_path, monkeypatch)
+        leader, follower = pty.openpty()
+        try:
+            completed = subprocess.run(
+                [sys.executable, "-c",
+                 "from scholar.cli import main; main()",
+                 "sessions", "decide", "headless",
+                 "--keep", "--doi", "10.1/withdoi"],
+                stdin=follower, capture_output=True, text=True,
+                timeout=120, env=dict(os.environ),
+            )
+        finally:
+            os.close(leader)
+            os.close(follower)
+        assert completed.returncode == 0, completed.stdout + completed.stderr
+        kept = load_session("headless").kept_papers()
+        assert [d.source for d in kept] == [ReviewSource.HUMAN]
+
+    def test_agent_decision_stays_unreviewed(self, tmp_path, monkeypatch):
+        from scholar.review import ReviewSource, load_session
+
+        self._make_session(tmp_path, monkeypatch)
+        result = self._decide(
+            "--source", "agent", "--keep", "--doi", "10.1/withdoi",
+            "--tag", "supports-claim", "-c", "0.8",
+        )
+        assert result.exit_code == 0, result.output
+        assert "ignored" not in result.output
+        decision = load_session("headless").kept_papers()[0]
+        assert decision.source == ReviewSource.AGENT_UNREVIEWED
+        assert decision.llm_confidence == 0.8
+        assert decision.is_example is False
+
+    def test_human_review_keeps_the_agent_name(self, tmp_path, monkeypatch):
+        from scholar.review import ReviewSource, load_session
+
+        self._make_session(tmp_path, monkeypatch)
+        self._decide("--source", "agent", "--keep", "--doi", "10.1/withdoi")
+        self._decide("--source", "agent", "--keep", "--paper-id",
+                     load_session("headless").decisions[1].paper.id)
+        assert self._decide(
+            "--source", "human", "--keep", "--doi", "10.1/withdoi",
+        ).exit_code == 0
+        no_doi = load_session("headless").decisions[1].paper.id
+        assert self._decide(
+            "--source", "human", "--discard", "--paper-id", no_doi,
+            "--tag", "off-topic-false-hit",
+        ).exit_code == 0
+        confirmed, changed = load_session("headless").decisions
+        assert confirmed.source == ReviewSource.AGENT_REVIEWED
+        assert confirmed.is_example is False
+        assert changed.source == ReviewSource.AGENT_REVIEWED
+        assert changed.is_example is True
+        assert changed.status.value == "discarded"
+
+    def test_overturning_a_keep_replaces_its_category(
+        self, tmp_path, monkeypatch
+    ):
+        from scholar.review import audit_excluded, load_session
+
+        self._make_session(tmp_path, monkeypatch)
+        self._decide("--source", "llm", "--keep", "--doi", "10.1/withdoi",
+                     "--tag", "supports-claim", "--tag", "ml")
+        result = self._decide(
+            "--source", "human", "--discard", "--doi", "10.1/withdoi",
+            "--tag", "no-abstract",
+        )
+        assert result.exit_code == 0, result.output
+        decision = load_session("headless").discarded_papers()[0]
+        assert decision.tags == ["ml", "no-abstract"]
+        assert not audit_excluded(decision)
+
+    def test_same_status_appends(self, tmp_path, monkeypatch):
+        from scholar.review import load_session
+
+        self._make_session(tmp_path, monkeypatch)
+        self._decide("--source", "human", "--keep", "--doi", "10.1/withdoi",
+                     "--tag", "supports-claim")
+        self._decide("--source", "human", "--keep", "--doi", "10.1/withdoi",
+                     "--tag", "ml")
+        assert load_session("headless").kept_papers()[0].tags == [
+            "supports-claim", "ml",
+        ]
+
+    def test_machine_decision_clears_audit_fields(
+        self, tmp_path, monkeypatch
+    ):
+        # No classifier audit field is registered on this branch yet, so
+        # `provider` stands in for one: registered, it must be cleared
+        # whenever a machine decision is recorded.
+        import scholar.review as review
+        from scholar.review import load_session
+
+        self._make_session(tmp_path, monkeypatch)
+        monkeypatch.setattr(review, "MACHINE_AUDIT_FIELDS", ("provider",))
+        assert self._decide(
+            "--source", "agent", "--keep", "--doi", "10.1/withdoi",
+        ).exit_code == 0
+        assert load_session("headless").kept_papers()[0].provider is None
+
+    def test_machine_decision_without_confidence_has_none(
+        self, tmp_path, monkeypatch
+    ):
+        from scholar.review import load_session
+
+        self._make_session(tmp_path, monkeypatch)
+        self._decide("--source", "llm", "--keep", "--doi", "10.1/withdoi",
+                     "-c", "0.5")
+        assert self._decide(
+            "--source", "agent", "--discard", "--doi", "10.1/withdoi",
+            "--tag", "off-topic-false-hit",
+        ).exit_code == 0
+        decision = load_session("headless").discarded_papers()[0]
+        assert decision.llm_confidence is None
+
+    def test_keep_discard_keep_keeps_the_themes(self, tmp_path, monkeypatch):
+        from scholar.review import load_session
+
+        self._make_session(tmp_path, monkeypatch)
+        for status, tag in [("--keep", "supports-claim"), ("--keep", "ml"),
+                            ("--discard", "no-abstract"),
+                            ("--keep", "qualifies-claim")]:
+            assert self._decide("--source", "human", status,
+                                "--doi", "10.1/withdoi",
+                                "--tag", tag).exit_code == 0
+        assert load_session("headless").kept_papers()[0].tags == [
+            "ml", "no-abstract", "qualifies-claim",
+        ]
+
+    def test_a_machine_does_not_replace_a_human_decision(
+        self, tmp_path, monkeypatch
+    ):
+        from scholar.review import DecisionStatus, ReviewSource, load_session
+
+        session = self._make_session(tmp_path, monkeypatch)
+        no_doi = session.decisions[1].paper.id
+        self._decide("--source", "human", "--keep", "--doi", "10.1/withdoi",
+                     "--tag", "ml")
+        result = self._decide(
+            "--source", "agent", "--discard", "--doi", "10.1/withdoi",
+            "--paper-id", no_doi, "--tag", "off-topic-false-hit",
+        )
+        assert result.exit_code == 2
+        assert "doi:10.1/withdoi is already kept (human)" in result.output
+        assert no_doi not in result.output
+        assert "No changes saved" in result.output
+        before = {d.paper.title: (d.status, d.source, d.tags)
+                  for d in load_session("headless").decisions}
+        assert before == {
+            "With DOI": (DecisionStatus.KEPT, ReviewSource.HUMAN, ["ml"]),
+            "No DOI": (DecisionStatus.PENDING, ReviewSource.HUMAN, []),
+        }
+
+        result = self._decide(
+            "--source", "agent", "--discard", "--doi", "10.1/withdoi",
+            "--paper-id", no_doi, "--tag", "off-topic-false-hit", "--force",
+        )
+        assert result.exit_code == 0, result.output
+        assert {d.source for d in load_session("headless").decisions} \
+            == {ReviewSource.AGENT_UNREVIEWED}
+
+    def test_a_reviewed_decision_is_protected_too(
+        self, tmp_path, monkeypatch
+    ):
+        self._make_session(tmp_path, monkeypatch)
+        self._decide("--source", "agent", "--keep", "--doi", "10.1/withdoi")
+        self._decide("--source", "human", "--keep", "--doi", "10.1/withdoi")
+        result = self._decide(
+            "--source", "llm", "--discard", "--doi", "10.1/withdoi",
+            "--tag", "off-topic-false-hit",
+        )
+        assert result.exit_code == 2
+        assert "(agent_reviewed)" in result.output
+@
+
+What [[decide]] records must then be visible where the author looks:
+[[sessions show]] (as text and JSON), [[llm status]] and the review
+table [[sessions export]] prints.
+
+<<test functions>>=
+class TestDecisionSourcesInViews:
+    def _agent_session(self, tmp_path, monkeypatch):
+        TestSessionsDecideCommand()._make_session(tmp_path, monkeypatch)
+        result = runner.invoke(app, [
+            "sessions", "decide", "headless", "--source", "agent",
+            "--keep", "--doi", "10.1/withdoi",
+        ])
+        assert result.exit_code == 0, result.output
+
+    def test_show_says_who_decided(self, tmp_path, monkeypatch):
+        self._agent_session(tmp_path, monkeypatch)
+        result = runner.invoke(app, ["sessions", "show", "headless"])
+        assert result.exit_code == 0, result.output
+        assert "Decided by:" in result.output
+        assert "human: 0" in result.output
+        assert "agent, unreviewed: 1" in result.output
+        assert "With DOI (mock) (agent, unreviewed)" in result.output
+
+    def test_show_json_carries_the_source(self, tmp_path, monkeypatch):
+        import json
+
+        self._agent_session(tmp_path, monkeypatch)
+        result = runner.invoke(
+            app, ["sessions", "show", "headless", "-f", "json"]
+        )
+        data = json.loads(result.stdout)
+        assert data["decision_sources"]["agent"] == 1
+        assert data["decision_sources"]["human"] == 0
+        assert [d["source"] for d in data["decisions"]] == ["agent", "human"]
+
+    def test_llm_status_counts_the_agent(self, tmp_path, monkeypatch):
+        import json
+
+        self._agent_session(tmp_path, monkeypatch)
+        result = runner.invoke(app, ["llm", "status", "headless"])
+        assert "Agent (unreviewed)" in result.output
+        stats = json.loads(runner.invoke(
+            app, ["llm", "status", "headless", "-f", "json"]
+        ).stdout)
+        assert (stats["agent_unreviewed"], stats["human"]) == (1, 0)
+
+    def test_export_reports_agent_review(self, tmp_path, monkeypatch):
+        self._agent_session(tmp_path, monkeypatch)
+        runner.invoke(app, [
+            "sessions", "decide", "headless", "--source", "human",
+            "--discard", "--doi", "10.1/withdoi", "--tag", "off-topic",
+        ])
+        result = runner.invoke(app, [
+            "sessions", "export", "headless", "-f", "csv",
+            "-o", str(tmp_path / "out"),
+        ])
+        assert result.exit_code == 0, result.output
+        assert "Agent changed (kept->discarded)" in result.output
+        assert "LLM confirmed" not in result.output
+
+    def test_audit_table_cites_only_reviewed_agent_rows(
+        self, tmp_path, monkeypatch
+    ):
+        from scholar.review import load_session
+
+        TestSessionsDecideCommand()._make_session(tmp_path, monkeypatch)
+        no_doi = load_session("headless").decisions[1].paper.id
+        for args in [
+            ("--source", "agent", "--keep", "--doi", "10.1/withdoi",
+             "--tag", "ml", "-c", "0.8"),
+            ("--source", "agent", "--keep", "--paper-id", no_doi,
+             "--tag", "ml", "-c", "0.6"),
+            ("--source", "human", "--keep", "--paper-id", no_doi),
+        ]:
+            assert runner.invoke(
+                app, ["sessions", "decide", "headless", *args]
+            ).exit_code == 0
+        out = tmp_path / "tab"
+        result = runner.invoke(app, [
+            "sessions", "export", "headless", "-f", "table",
+            "-o", str(out),
+        ])
+        assert result.exit_code == 0, result.output
+        rows = [line for line in out.with_suffix(".tex").read_text()
+                .splitlines() if "With DOI" in line or "No DOI" in line]
+        with_doi = next(row for row in rows if "With DOI" in row)
+        no_doi_row = next(row for row in rows if "No DOI" in row)
+        assert r"\emph{cited}" not in with_doi
+        assert "ml (0.80)" in with_doi
+        assert r"\emph{cited}: ml" in no_doi_row
 @
 
 
@@ -9596,6 +10450,14 @@ def llm_classify(
                  "of dropping them.",
         ),
     ] = False,
+    include_llm_examples: Annotated[
+        bool,
+        typer.Option(
+            "--include-llm-examples",
+            help="Also use unreviewed LLM decisions as examples (by default "
+                 "only human or human-confirmed decisions are).",
+        ),
+    ] = False,
 ) -> None:
     """
     Classify pending papers using LLM.
@@ -9606,6 +10468,8 @@ def llm_classify(
     and classification proceeds with whatever examples are present. Pass
     --no-examples to skip examples entirely and run zero-shot classification
     using only the research context, even when examples are available.
+    Examples are decisions a human made or confirmed; unreviewed LLM
+    decisions are used too only with --include-llm-examples.
 
     With --full-text, supporting passages from each paper's PDF (matched
     against the research context) are added to the prompt, so classification
@@ -9622,6 +10486,12 @@ def llm_classify(
     must get exactly one of them; a paper that does not, even after the
     retry, is left pending and listed at the end. Note tags such as
     duplicate-record-of-cited-source are for humans and never assigned.
+    So is a paper whose answer is unusable (no answer, a decision other
+    than kept/discarded, a missing or out-of-range confidence): nothing
+    is filled in for the model.
+
+    Each decision records the model, the time (UTC), a prompt version,
+    the model's reason and whether the abstract was truncated.
 
     Example:
         scholar llm classify "my review" --count 20
@@ -9663,6 +10533,7 @@ def llm_classify(
             use_fulltext=full_text,
             vocabulary=set(tag) if tag else None,
             allow_new_tags=allow_new_tags,
+            include_llm_examples=include_llm_examples,
         )
 
         if dry_run:
@@ -9680,9 +10551,10 @@ def llm_classify(
         stats = get_review_statistics(session)
         console.print(f"[green]Classified {len(updated)} papers[/green]")
         console.print(f"  Model: {result.model_id}")
+        console.print(f"  Prompt version: {result.prompt_version}")
         console.print(f"  LLM unreviewed: {stats['llm_unreviewed']}")
         console.print(f"  Pending: {stats['pending']}")
-        <<report papers left pending by the category rule>>
+        <<report papers left pending by the classifier>>
 
     except ValueError as e:
         console.print(f"[red]Error: {escape(str(e))}[/red]")
@@ -9713,8 +10585,8 @@ def llm_status(
     """
     Show LLM review status for a session.
 
-    Displays counts of human decisions, LLM decisions pending review,
-    reviewed LLM decisions, and training examples.
+    Displays counts of human decisions, LLM and agent decisions pending
+    review, reviewed LLM and agent decisions, and training examples.
     """
     from scholar.review import load_session
     from scholar.llm_review import get_review_statistics
@@ -9741,6 +10613,10 @@ def llm_status(
         table.add_row("Human decisions", str(stats["human"]))
         table.add_row("LLM (unreviewed)", str(stats["llm_unreviewed"]))
         table.add_row("LLM (reviewed)", str(stats["llm_reviewed"]))
+        table.add_row("Agent (unreviewed)", str(stats["agent_unreviewed"]))
+        table.add_row("Agent (reviewed)", str(stats["agent_reviewed"]))
+        if stats["unknown"]:
+            table.add_row("Unknown source", str(stats["unknown"]))
         table.add_row("Training examples", str(stats["examples"]))
         table.add_row("Pending", str(stats["pending"]))
         table.add_row("Total", str(stats["total"]), style="bold")
@@ -10316,7 +11192,7 @@ def llm_synthesize(
 @
 
 
-\subsection{Papers left pending by the category rule}
+\subsection{Papers left pending by the classifier}
 
 When the session's vocabulary holds audit categories, the classifier
 withholds the decision of a paper whose answer still lacks exactly one
@@ -10326,22 +11202,45 @@ paper the batch never reached, so the run ends with a warning that
 names each one and says what was wrong; the reviewer can then decide
 it with [[sessions decide]] or leave it for the next batch.
 
-<<report papers left pending by the category rule>>=
-if result.withheld:
+<<report papers left pending by the classifier>>=
+print_withheld_papers(console, session, result.withheld)
+<<llm command>>=
+def print_withheld_papers(console, session, withheld: list) -> None:
+    """List the papers the classifier left pending, grouped by reason."""
     from scholar.notes import get_paper_id
 
-    titles = {get_paper_id(d.paper): d.paper.title for d in session.decisions}
-    console.print(
-        f"[yellow]Left pending, not exactly one category tag "
-        f"({len(result.withheld)}):[/yellow]"
-    )
-    for withheld in result.withheld:
-        title = titles.get(withheld.paper_id, withheld.paper_id)
+    titles = {
+        get_paper_id(d.paper): d.paper.title for d in session.decisions
+    }
+    for heading, withheld_here in (
+        ("no usable answer", [d for d in withheld if d.answer_problem]),
+        ("not exactly one category tag",
+         [d for d in withheld if not d.answer_problem]),
+    ):
+        if not withheld_here:
+            continue
         console.print(
-            f"  {escape(title)} [dim]({escape(withheld.paper_id)}: "
-            f"{escape(withheld.category_problem)})[/dim]"
+            f"[yellow]Left pending, {heading} "
+            f"({len(withheld_here)}):[/yellow]"
         )
+        for decision in withheld_here:
+            title = titles.get(decision.paper_id, decision.paper_id)
+            console.print(
+                f"  {escape(title)} [dim]({escape(decision.paper_id)}: "
+                f"{escape(decision.problem)})[/dim]"
+            )
 @
+
+[[scholar rq]] classifies its results with the same classifier
+(\cref{sec:research-questions}), so it can leave papers pending for the same
+reasons; it lists them with the same function, after its summary.
+
+The classifier also withholds the decision of a paper whose answer is
+unusable (\cref{sec:llm-parse} in the LLM review module): no answer,
+a decision it cannot read, a missing or out-of-range confidence.
+Those are listed under their own heading, because the remedy differs:
+a category problem is about the vocabulary, an unusable answer about
+the model, and the next batch may well answer it.
 
 The summary reaches the user even though the other decisions of the
 batch were applied and saved:
@@ -10385,6 +11284,322 @@ class TestLLMClassifyWithheld:
         assert "Two Categories" in result.output
         assert "several category tags" in result.output
         assert session.decisions[0].status == review.DecisionStatus.PENDING
+
+    def test_unusable_answers_are_listed_apart(self, monkeypatch):
+        from datetime import datetime
+        from scholar import llm_review, review
+        from scholar.llm_review import LLMBatchResult, LLMDecision
+        from scholar.notes import get_paper_id
+
+        session = review.ReviewSession(
+            query="t", providers=["p"], timestamp=datetime.now(),
+            research_context="ctx", name="s",
+        )
+        paper = Paper(title="Forgotten", authors=["A"], doi="10.1/forgot")
+        session.decisions.append(
+            review.ReviewDecision(paper=paper, provider="p")
+        )
+        monkeypatch.setattr(review, "load_session", lambda x: session)
+        monkeypatch.setattr(review, "save_session", lambda s: None)
+        seen = {}
+
+        def fake_classify(**kwargs):
+            seen.update(kwargs)
+            return LLMBatchResult(
+                decisions=[], model_id="fake", timestamp="t",
+                prompt_version="0123456789abcdef",
+                withheld=[LLMDecision(
+                    paper_id=get_paper_id(paper), status="", tags=[],
+                    confidence=None, reasoning="",
+                    answer_problem="no answer for this paper",
+                )],
+            )
+
+        monkeypatch.setattr(llm_review, "classify_papers_with_llm",
+                            fake_classify)
+        result = runner.invoke(
+            app, ["llm", "classify", "s", "--include-llm-examples"]
+        )
+        assert result.exit_code == 0, result.output
+        assert seen["include_llm_examples"] is True
+        assert "Left pending, no usable answer (1)" in result.output
+        assert "category tag" not in result.output
+        assert "no answer for this paper" in result.output
+        assert "Prompt version: 0123456789abcdef" in result.output
+@
+
+
+\subsection{Sampling LLM decisions for review}
+\label{sec:llm-sample-command}
+
+[[scholar llm sample]] draws a seeded random sample of unreviewed LLM
+decisions for a human to review, and later reports how often the human
+changed them (\cref{sec:llm-sample} in the LLM review module).  One
+command does both, because they are two halves of one procedure: the
+draw records the sample in the sessions, and [[--report]] reads it
+back.
+
+Drawing needs the criteria spelled out: [[--discarded]], [[--kept]] or
+both, a size [[-n]] and a [[--seed]].  The seed has no default on
+purpose: a seed picked for the user would still be recorded, but a
+seed the user chose and wrote in their protocol is one the methods
+section can name before the sample is drawn.  Missing criteria are a
+usage error (exit code 2) and nothing is drawn.  The sample is
+recorded in every session given, which are then saved; the drawn
+papers are printed with their ids, so that each can be reviewed with
+[[sessions decide]] (the TUI's filter [[s]] lists them too).
+
+[[--report]] reports every sample stored in the given sessions.  A
+sample pooled over other sessions as well is reported over all of
+them: the other sessions are loaded read-only, and one that no longer
+exists is counted as \enquote{not found}.  [[-f json]] gives the same
+numbers for scripts, with the unreviewed papers listed by session and
+id.
+
+<<llm command>>=
+@llm_app.command("sample")
+def llm_sample(
+    session_names: Annotated[
+        list[str],
+        typer.Argument(
+            help="Sessions to sample from (pooled), or to report on.",
+            autocompletion=complete_session_name,
+        ),
+    ],
+    discarded: Annotated[
+        bool,
+        typer.Option("--discarded", help="Sample unreviewed LLM discards."),
+    ] = False,
+    kept: Annotated[
+        bool,
+        typer.Option("--kept", help="Sample unreviewed LLM inclusions."),
+    ] = False,
+    min_confidence: Annotated[
+        Optional[float],
+        typer.Option(
+            "--min-confidence",
+            help="Only decisions with at least this LLM confidence (0-1).",
+        ),
+    ] = None,
+    size: Annotated[
+        Optional[int],
+        typer.Option("--size", "-n", help="Number of decisions to draw."),
+    ] = None,
+    seed: Annotated[
+        Optional[int],
+        typer.Option("--seed", help="Seed of the random draw (required)."),
+    ] = None,
+    report: Annotated[
+        bool,
+        typer.Option(
+            "--report",
+            help="Report the stored samples instead of drawing one.",
+        ),
+    ] = False,
+    output_format: Annotated[
+        str,
+        typer.Option(
+            "--format", "-f",
+            help="Report format: table or json.",
+            autocompletion=complete_display_format,
+        ),
+    ] = "table",
+) -> None:
+    """
+    Draw a seeded random sample of unreviewed LLM decisions for review.
+
+    The sample is drawn from all given sessions together, recorded in
+    each of them (seed, criteria, date, papers) and queued for review:
+    the TUI lists it under filter s, and each paper can be decided with
+    `scholar sessions decide`. With --report, show for each stored
+    sample how many sampled decisions were reviewed, how many the
+    reviewer changed, and the disagreement rate with a 95% Wilson score
+    interval.
+
+    Examples:
+        scholar llm sample my-review --discarded --min-confidence 0.9 \\
+            -n 50 --seed 20261118
+        scholar llm sample my-review --report
+    """
+    from scholar.review import load_session, save_session
+
+    console = Console()
+    <<load the sessions to sample>>
+    if report:
+        <<report the stored samples>>
+        return
+    <<check the sampling criteria>>
+    <<draw and record the sample>>
+@
+
+<<load the sessions to sample>>=
+sessions = []
+for name in session_names:
+    session = load_session(name)
+    if session is None:
+        console.print(f"[red]Session not found: {escape(name)}[/red]")
+        raise typer.Exit(1)
+    sessions.append(session)
+@
+
+<<check the sampling criteria>>=
+problems = []
+if not discarded and not kept:
+    problems.append("give --discarded, --kept or both")
+if size is None or size < 1:
+    problems.append("give the sample size with -n (at least 1)")
+if seed is None:
+    problems.append("give the seed with --seed")
+if min_confidence is not None and not 0 <= min_confidence <= 1:
+    problems.append("--min-confidence must be between 0 and 1")
+if problems:
+    console.print(f"[red]Cannot draw: {'; '.join(problems)}.[/red]")
+    raise typer.Exit(2)
+@
+
+<<draw and record the sample>>=
+from scholar.llm_review import draw_llm_sample
+from scholar.notes import get_paper_id
+
+statuses = {s for s, wanted in (("discarded", discarded), ("kept", kept))
+            if wanted}
+try:
+    draw = draw_llm_sample(
+        sessions, statuses=statuses, size=size, seed=seed,
+        min_confidence=min_confidence,
+    )
+except ValueError as error:
+    console.print(f"[red]{escape(str(error))}[/red]")
+    raise typer.Exit(1)
+for session in sessions:
+    save_session(session)
+console.print(
+    f"[green]Sample {escape(draw.sample_id)}: drew {len(draw.drawn)} of "
+    f"{draw.population} eligible decisions[/green]"
+)
+for name, decision in draw.drawn:
+    console.print(
+        f"  {escape(name)}  {escape(get_paper_id(decision.paper))}  "
+        f"{decision.status.value}  {escape(decision.paper.title)}"
+    )
+console.print(
+    "Review them in the TUI (filter s) or with: scholar sessions decide "
+    "SESSION --keep|--discard --paper-id ID --source human"
+)
+@
+
+<<report the stored samples>>=
+from scholar.llm_review import sample_reports, sample_sentence, session_label
+
+given = {session_label(s) for s in sessions}
+named = {n for s in sessions for sample in s.llm_samples
+         for n in sample.sessions}
+for name in sorted(named - given):
+    other = load_session(name)
+    if other is not None:
+        sessions.append(other)
+reports = sample_reports(sessions)
+if output_format == "json":
+    print(json.dumps([
+        {
+            "sample_id": r.sample_id, "seed": r.seed,
+            "drawn_at": r.drawn_at, "criteria": r.criteria,
+            "sessions": r.sessions, "population": r.population,
+            "size": r.size, "reviewed": r.reviewed, "changed": r.changed,
+            "rate": r.rate,
+            "interval": list(r.interval) if r.interval else None,
+            "not_found": r.not_found,
+            "unreviewed": [list(u) for u in r.unreviewed],
+        }
+        for r in reports
+    ], indent=2))
+    return
+if not reports:
+    console.print("No samples have been drawn in these sessions.")
+for r in reports:
+    console.print(f"[bold]Sample {escape(r.sample_id)}[/bold]")
+    console.print(f"  {escape(sample_sentence(r))}")
+    for name, paper_id in r.unreviewed:
+        console.print(
+            f"  not yet reviewed: {escape(name)}  {escape(paper_id)}"
+        )
+@
+
+Let's run the procedure end to end on two saved sessions: draw a
+sample over both, review two of the drawn papers with
+[[sessions decide]] (one confirmed, one changed), and report.  The
+report agrees with what was done, and the draw refuses to run without
+a seed.
+
+<<test functions>>=
+class TestLLMSampleCommand:
+    <<llm sample command test methods>>
+
+<<llm sample command test methods>>=
+def _save(self, name, count):
+    from datetime import datetime
+    from scholar import review
+
+    session = review.ReviewSession(
+        query=name, providers=["p"], timestamp=datetime(2026, 11, 18),
+        name=name,
+    )
+    session.decisions = [
+        review.ReviewDecision(
+            paper=Paper(title=f"{name} {i}", authors=["A"],
+                        doi=f"10.5555/cli-sample-{name}-{i}"),
+            provider="p", status=review.DecisionStatus.DISCARDED,
+            tags=["off-topic"], source=review.ReviewSource.LLM_UNREVIEWED,
+            llm_confidence=0.95,
+        )
+        for i in range(count)
+    ]
+    review.save_session(session)
+
+def test_draw_review_and_report(self):
+    from scholar.review import load_session
+
+    self._save("cli-sample-a", 4)
+    self._save("cli-sample-b", 3)
+    result = runner.invoke(app, [
+        "llm", "sample", "cli-sample-a", "cli-sample-b", "--discarded",
+        "--min-confidence", "0.9", "-n", "5", "--seed", "7",
+    ])
+    assert result.exit_code == 0, result.output
+    assert "drew 5 of 7 eligible decisions" in " ".join(result.output.split())
+    drawn = [
+        (s.name, p["paper_id"])
+        for s in (load_session("cli-sample-a"), load_session("cli-sample-b"))
+        for p in s.llm_samples[0].papers
+    ]
+    assert len(drawn) == 5
+    for (name, paper_id), flag in zip(drawn[:2], ["--discard", "--keep"]):
+        decided = runner.invoke(app, [
+            "sessions", "decide", name, flag, "--paper-id", paper_id,
+            "--tag", "off-topic", "--source", "human",
+        ])
+        assert decided.exit_code == 0, decided.output
+
+    reported = runner.invoke(
+        app, ["llm", "sample", "cli-sample-a", "--report", "-f", "json"]
+    )
+    assert reported.exit_code == 0, reported.output
+    (report,) = json.loads(reported.output)
+    assert (report["size"], report["reviewed"], report["changed"]) == (
+        5, 2, 1
+    )
+    assert report["not_found"] == 0 and len(report["unreviewed"]) == 3
+    assert report["criteria"]["min_confidence"] == 0.9
+
+def test_draw_needs_seed_and_size(self):
+    self._save("cli-sample-c", 2)
+    result = runner.invoke(
+        app, ["llm", "sample", "cli-sample-c", "--discarded"]
+    )
+    assert result.exit_code == 2
+    assert "give the seed with --seed" in " ".join(result.output.split())
+    from scholar.review import load_session
+    assert load_session("cli-sample-c").llm_samples == []
 @
 
 
@@ -10609,7 +11824,8 @@ gets its own line with the reason, worded by [[hits_label]] as in every
 other view, and so does one that answered only in part.
 
 <<cli imports>>=
-from scholar.scholar import hits_label, is_ranked_provider
+from scholar.scholar import hits_label, is_ranked_provider, result_total
+from scholar.scholar import result_dates
 
 <<formatter classes>>=
 class TableFormatter:
@@ -10649,17 +11865,60 @@ class TableFormatter:
             self.console.print(table)
 
             ranked = is_ranked_provider(result.provider)
-            label = hits_label(
-                len(result.papers), result.error, ranked=ranked
-            )
+            label = result_hits_label(result)
             if result.error:
                 self.console.print(
                     f"[yellow]Results: {escape(label)}[/yellow]"
                 )
             elif not result.papers:
                 self.console.print("[dim]No results found.[/dim]")
-            elif ranked:
+            elif ranked or label != str(len(result.papers)):
                 self.console.print(f"[dim]Results: {escape(label)}[/dim]")
+            for line in part_hits_lines(result):
+                self.console.print(f"[dim]{escape(line)}[/dim]")
+@
+
+A count that stopped at the limit is shown with the total the provider
+reported and the cap (\enquote{100 of 2,130 (capped at 100)},
+[[count_label]] in the [[scholar]] module), so that the table does not
+present the first page of an answer as all of it
+(\url{https://github.com/dbosk/scholar/issues/166}).  A merged result
+has no total of its own; below it, each provider's search gets a line
+with its own count, total and error
+(\url{https://github.com/dbosk/scholar/issues/164}), since the merged
+count cannot say which provider answered what.  Both views and the CSV
+share the two helpers.  Whether a search was capped is decided for each
+provider's own search, never for the merged count: the union of two
+providers' three hits each, one shared, is five, and with a limit of
+five it would read as \enquote{capped} although neither provider came
+near its limit.
+
+<<formatter classes>>=
+def result_hits_label(result) -> str:
+    """The hits label of a result, with its total and cap if known.
+
+    A merged result is never called capped: its count is the
+    deduplicated union, which can equal the limit by chance; each of
+    its parts is judged on its own (`part_hits_lines`).
+    """
+    total, estimated = result_total(result)
+    merged = bool(getattr(result, "parts", None))
+    return hits_label(
+        len(result.papers), result.error,
+        ranked=is_ranked_provider(result.provider),
+        total=total, limit=None if merged else getattr(result, "limit", None),
+        estimated=estimated,
+    )
+
+
+def part_hits_lines(result) -> list[str]:
+    """One line per provider search of a merged result; none otherwise."""
+    parts = getattr(result, "parts", None)
+    if not isinstance(parts, list) or not parts:
+        return []
+    return [
+        f"{part.provider}: {result_hits_label(part)}" for part in parts
+    ]
 @
 
 Let's verify the table formatter produces correct output:
@@ -10706,7 +11965,12 @@ provider, so it is where a failure must show: it reads
 [[failed (reason)]] instead of 0 (or [[N, incomplete (reason)]]),
 deliberately not a number, so a script that parses it stops instead of
 recording a zero.  Retries get a line of their own, which keeps the
-count of an answered search a plain number:
+count of an answered search a plain number, and so do the total the
+provider reported ([[# Total reported:]]) and a count that stopped at
+the limit ([[# Capped at limit:]]), for the same reason
+(\url{https://github.com/dbosk/scholar/issues/166}).  A merged result
+adds one [[# Search:]] line per provider with that provider's own
+outcome (\url{https://github.com/dbosk/scholar/issues/164}):
 
 <<formatter classes>>=
 class CSVFormatter:
@@ -10726,6 +11990,17 @@ class CSVFormatter:
             print(f"# Results: {label}")
             if result.retries:
                 print(f"# Retries: {result.retries}")
+            total, estimated = result_total(result)
+            if total is not None:
+                about = " (estimate)" if estimated else ""
+                print(f"# Total reported: {total}{about}")
+            if (not result.error and result.limit
+                    and not getattr(result, "parts", None)
+                    and len(result.papers) == result.limit
+                    and (total is None or total > len(result.papers))):
+                print(f"# Capped at limit: {result.limit}")
+            for line in part_hits_lines(result):
+                print(f"# Search: {line}")
             print()
 
             # Header row
@@ -10771,7 +12046,10 @@ reconstructs --- the search is fully described by its query, providers,
 filters, and limit, and JSON is the natural place to expose all four to a
 machine reader.  The [[error]] and [[retries]] of the result go along
 for the same reason: a consumer counting papers must be able to tell a
-failed provider from an empty answer.
+failed provider from an empty answer.  So do the [[total]] the provider
+reported (\url{https://github.com/dbosk/scholar/issues/166}) and, for a
+merged result, the [[searches]] it was made of, each with its own
+count, total and error (\url{https://github.com/dbosk/scholar/issues/164}).
 
 <<formatter classes>>=
 class JSONFormatter:
@@ -10789,6 +12067,20 @@ class JSONFormatter:
                 "limit": result.limit,
                 "error": result.error,
                 "retries": result.retries,
+                "total": result_total(result)[0],
+                "total_estimated": result_total(result)[1],
+                **({"searches": [
+                    {
+                        "query": part.query,
+                        "provider": part.provider,
+                        "hits": len(part.papers),
+                        "total": result_total(part)[0],
+                        "total_estimated": result_total(part)[1],
+                        "error": part.error,
+                        "retries": part.retries,
+                    }
+                    for part in result.parts
+                ]} if getattr(result, "parts", None) else {}),
                 "papers": [
                     {
                         "title": p.title,
@@ -11040,10 +12332,12 @@ def _search_flags(filters: dict | None, limit: int | None) -> list[str]:
 
 With the helpers in place, the command is just the query, the [[-p]] flags,
 and the reconstructed filter flags joined into one line.  The merged joins
-reach [[prov found-via]] too, since a session stores the merged result of a
-multi-provider [[search -n]] as one search record, so [[_search_command]]
-takes the four parts rather than a result and serves both callers;
-[[_found_via]] applies it to a live result.
+reach [[prov found-via]] too: sessions saved before
+\url{https://github.com/dbosk/scholar/issues/164} stored the merged
+result of a multi-provider [[search -n]] as one search record, and their
+papers still link to it.  So [[_search_command]] takes the four parts
+rather than a result and serves both callers; [[_found_via]] applies it
+to a live result.
 
 <<formatter classes>>=
 def _search_command(
@@ -11072,18 +12366,60 @@ def _found_via(result) -> str:
 @
 
 Each paper is preceded by the comment block and then the reused entry.  The
-[[DATE]] comes from the search timestamp already carried on the result rather
-than the wall clock: it records when the search that surfaced the paper
-actually ran, and it keeps the output deterministic under test.
+[[DATE]] is the date the database answered the search that surfaced the
+paper, not the wall clock.  It used to be the result's [[timestamp]],
+the time of the run, so an answer served from the cache was dated
+today however old it was
+(\url{https://github.com/dbosk/scholar/issues/167}).  Now it is the
+date the answer was fetched (\cref{sec:search-dates} in the [[scholar]]
+module), taken from the searches that returned this paper: for a merged
+result, the parts in its [[found_in]], so a paper only OpenAlex returned
+is dated by OpenAlex's answer.  A cached answer whose fetch date the
+cache does not know says so instead of giving a date.  Only a result
+that records no dates at all (built by code outside scholar, or by the
+tests) falls back to its timestamp's date, as before.  Several dates
+are written as a range.
 
 <<formatter classes>>=
+def _prov_date(result, paper) -> str:
+    """The DATE of a provenance block: when the answer was fetched."""
+    parts = result.search_parts() if hasattr(result, "search_parts") \
+        else [result]
+    found_in = getattr(result, "found_in", None) or []
+    if len(parts) > 1:
+        index = next(
+            (i for i, p in enumerate(result.papers) if p is paper), None
+        )
+        if index is not None and index < len(found_in) and found_in[index]:
+            parts = [parts[i] for i in found_in[index]]
+    dates, unknown = set(), False
+    for part in parts:
+        searched, fetched, cached = result_dates(part)
+        if fetched:
+            dates.add(fetched[:10])
+        elif cached:
+            unknown = True
+        elif searched:
+            dates.add(searched[:10])
+        elif part.timestamp:
+            dates.add(part.timestamp.split("T")[0])
+    if not dates:
+        return "unknown (cached answer, fetch date not recorded)" \
+            if unknown else ""
+    date = min(dates) if len(dates) == 1 else \
+        f"{min(dates)} to {max(dates)}"
+    if unknown:
+        date += "; some answers cached, fetch date not recorded"
+    return date
+
+
 class BibTeXProvFormatter(BibTeXFormatter):
     """Output BibTeX entries wrapped in a provenance comment block."""
 
     def format(self, results: list) -> None:
         """Output results as provenance-stub BibTeX."""
         for result, paper, key in _keyed_papers(results):
-            date = result.timestamp.split("T")[0] if result.timestamp else ""
+            date = _prov_date(result, paper)
             print(f"% === provenance: {key} ===")
             print("% CLAIM: TODO")
             print(f"% FOUND-VIA: {_found_via(result)}")
@@ -11133,6 +12469,62 @@ collapse those joins back into one runnable command:
             "% FOUND-VIA: scholar search test "
             "-p semantic_scholar -p dblp" in out
         )
+@
+
+The [[DATE]] of a cached answer is the date it was fetched, not the
+day of the run, and a cached answer without a known fetch date says
+so; in a merged result each paper is dated by the providers that
+returned it (\url{https://github.com/dbosk/scholar/issues/167}):
+
+<<test functions>>=
+    def test_bibtex_prov_date_is_the_fetch_date(self, capsys):
+        """DATE gives when the answer was fetched, never the run's day."""
+        cached = SearchResult(
+            query="q", provider="openalex",
+            timestamp="2026-11-18T10:00:00",
+            papers=[Paper(title="Old", authors=["Alice"], year=2024)],
+            searched_at="2026-11-18T09:00:00+00:00",
+            fetched_at="2026-10-02T08:00:00+00:00", from_cache=True,
+        )
+        unknown = SearchResult(
+            query="q", provider="dblp", timestamp="2026-11-18T10:00:00",
+            papers=[Paper(title="Older", authors=["Bob"], year=2020)],
+            searched_at="2026-11-18T09:00:00+00:00", from_cache=True,
+        )
+        BibTeXProvFormatter().format([cached, unknown])
+        out = capsys.readouterr().out
+        assert "% DATE: 2026-10-02\n" in out
+        assert (
+            "% DATE: unknown (cached answer, fetch date not recorded)"
+            in out
+        )
+        assert "2026-11-18" not in out.split("% DATE:")[1].split("\n")[0]
+
+    def test_bibtex_prov_date_follows_found_in(self, capsys):
+        """A merged paper is dated by the providers that returned it."""
+        only_oa = Paper(title="OA", authors=["Alice"], year=2024,
+                        doi="10.1/date-oa")
+        both = Paper(title="Both", authors=["Bob"], year=2024,
+                     doi="10.1/date-both")
+        oa = SearchResult(
+            query="q", provider="openalex", timestamp="t",
+            papers=[only_oa, both],
+            searched_at="2026-11-18T09:00:00+00:00",
+            fetched_at="2026-10-02T08:00:00+00:00", from_cache=True,
+        )
+        dblp = SearchResult(
+            query="q", provider="dblp", timestamp="t", papers=[both],
+            searched_at="2026-11-18T09:00:00+00:00",
+            fetched_at="2026-11-18T09:00:00+00:00", from_cache=False,
+        )
+        BibTeXProvFormatter().format([oa.merge(dblp)])
+        dates = [
+            line for line in capsys.readouterr().out.splitlines()
+            if line.startswith("% DATE:")
+        ]
+        assert dates == [
+            "% DATE: 2026-10-02", "% DATE: 2026-10-02 to 2026-11-18",
+        ]
 @
 
 A double quote in the query is preserved literally inside [[shlex.quote]]'s

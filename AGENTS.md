@@ -80,7 +80,99 @@ Providers self-register via `register_provider()` at module load time.
   `OpenAlexSemanticProvider` sets `HONOURS_SEARCH_IN = False`. The report's provider table has a
   Filters column (`filter_flags`, `scholar.py`, shared with
   `_search_flags`) and appears also when two records share
-  (query, provider).
+  (query, provider), when the records have several queries, or when
+  any record knows its outcome or dates (then with a Date column).
+  The report's search parameters describe all records (#163, search
+  part): `search_parameter_items` (Query/Queries, Providers from
+  `searched_providers` incl. merged ones, Searched period from
+  `search_period`), and the abstract's "The search covered ..." uses
+  `searched_providers`, not `session.providers` (last append only).
+  `searched_providers` lists only providers that answered at least one
+  search; skipped / failed-outright ones go to "Not searched: ieee
+  (skipped: …)" (`unsearched_providers`, `provider_failure`, which
+  splits merged errors at their provider prefixes); a provider a merged
+  record with papers names as failed is listed with "(failed or
+  incomplete in a merged record)", as in the caption
+  (`searched_providers_text`). Failed and skipped
+  records have no `search_source_date` and stay out of the periods.
+- One record per provider search (#164). `SearchResult.parts` /
+  `found_in` (not compared): `merge` keeps the single-provider results
+  it was made of and, per merged paper, the indices of the parts that
+  returned it (`parts_returning`: same `Paper.id`, or the part's
+  provider in `sources`; computed before enrichment, which keeps the
+  order). `create_review_session` records one `SearchRecord` per part
+  (`search_parts_of`, Mock-safe) and links each paper to its parts only
+  (`paper_search_links`); the decision's `provider` names those
+  providers. Pre-#164 merged records (provider `openalex, dblp`, query
+  `q | q`) load unchanged: `SearchRecord.is_merged`,
+  `search_outcome_label` ("merged record (providers …): outcome cannot
+  be split"); the audit caption counts them as a query of each provider
+  and marks each provider their error names (the merge prefixed each
+  error with its provider; `merged_record_failures`) as "failed or
+  incomplete for k of n queries, in a merged record"; providers named
+  in a merged record without papers count as not searched for it.
+  A merged record is superseded once per-provider records of the same
+  query (positional `q1 | q2` ↔ providers) and filters exist for every
+  provider it names (`merged_record_cover`; the covering record must
+  have answered, not failed outright or been skipped, and have a limit
+  at least the merged one's unless that is unknown);
+  `supersede_merged_records`
+  (end of `create_review_session` and of `merge_concurrent_changes`)
+  drops it, drops its links where the paper links to a covering record,
+  else links the paper to all covering records. Partly covered: kept.
+- Totals and caps (#166). Providers set `last_total` (+
+  `last_total_estimated`) from the field they already page on
+  (OpenAlex `meta.count`, DBLP `@total`, WoS `total`/`RecordsFound`,
+  IEEE `total_records`, HAL `numFound`, Scopus
+  `opensearch:totalResults`, arXiv feed header; none with arXiv's
+  client-side year filter; an absent field is `None`, not 0), reset
+  next to `last_error`. `search_provider` reads them Mock-safely
+  (`provider_total`) into `SearchResult.total`/`total_estimated`,
+  stored on `SearchRecord`. `hits_label(..., total=, limit=,
+  estimated=)` / `count_label`: "100 of 2,130 (capped at 100)" (capped
+  when hits == limit and the total does not show nothing was left);
+  plain counts read as before. CSV keeps `# Results: N` numeric and
+  adds `# Total reported:` / `# Capped at limit:` / per-provider
+  `# Search:` lines; JSON adds `total` and `searches`. Audit caption:
+  "capped at the limit for k of n queries" (`search_was_capped`). A
+  narrower re-run (same key, smaller limit, both answered) never
+  replaces a wider record: the wider one is kept, nothing new is
+  recorded, links already share the key (`search_width`: None/0 =
+  all; legacy records never count as wider).
+  `ReviewSession.add_search_record(record)` carries records over whole.
+  All record rules are one sort key, `record_rank(r)` =
+  `(answered, width, searched_at, hits, complete)` (legacy width,
+  unknown dates and unknown hits rank lowest); `preferred_record(a, b)`
+  keeps the higher, `a` on equal keys (a total preorder: no cycles, no
+  order dependence). So a search's record is its latest answered run of
+  the widest scope, with that run's own outcome (a newer partial run
+  reads "incomplete"); the date beats hits because PRISMA asks when each
+  source was last searched; older runs' links stay on the same key.
+  `create_review_session` (new run first) and
+  `merge_concurrent_changes` (own record first, for a shared key) both
+  use it.
+- Search dates (#167). `SearchResult`/`SearchRecord` have `searched_at`
+  (UTC ISO, the run; `utils.utc_now_iso`), `fetched_at` (when the
+  service answered; for a cache hit the original fetch, `None` =
+  unknown) and `from_cache`. Providers report them through
+  `last_fetched_at`/`last_from_cache`, set by four helpers in
+  `providers.py` (`start_answer`, `answer_from_cache`, `fetching_now`,
+  `cache_answer`) at each `search()`'s reset, cache hit, fetch and
+  store. The fetch time and total of a cached answer live in a side
+  entry of the same cache dict, `cache[(FETCH_META_KEY, key)]`
+  (`cache.fetch_meta` / `remember_fetch` / `is_fetch_meta_key`): one
+  top-level entry per answer, assigned via `__setitem__`, so the
+  `PersistentCache` marks it changed and the merge-on-save keeps other
+  processes' facts; reading never marks the cache changed. Old entries
+  keep loading and read as "fetch date unknown"; no CACHE_VERSION bump.
+  `search_dates_label` ("searched 2026-11-18, cached answer fetched
+  2026-10-02") in `sessions show`; `search_source_date` feeds the audit
+  caption's "Searched A to B." (+ "Search date unknown for k of n
+  searches."); `bibtex+prov`'s `DATE` is the fetch date of the parts
+  that returned the paper, "unknown (cached answer, fetch date not
+  recorded)" when the cache does not know, the timestamp's date only
+  for results without any dates. The session's `timestamp` is
+  unchanged.
 
 ### Search Flow
 
@@ -153,22 +245,24 @@ cached under the relevance key plus `"bulk"` (old relevance entries,
 including the wrong zeros of Boolean queries, are never served for a
 bulk search; plain-word entries keep serving). **The cache holds
 built-in types only** (an older scholar unpickles the shared file): the
-papers as a plain list, the total beside it as
-`cache[("__s2_total__", key)] = (total, True)` (`s2_cached_total`,
-missing → None); the snippet backend likewise keeps
-`("__s2_ranked__", key) = (scores, fetched_at)`. A test unpickles a
-written cache with `scholar.providers` unimportable. `search` sets
-`last_total` and `last_total_estimated = True` (the description calls
-both totals "Approximate"; read by the records change, #166, not by
-`Search.execute` yet), and `last_via` (`"bulk"`, `"bulk, most cited
-first"` or None). `--in title-abstract` is honoured on bulk (it
-matches title+abstract by default): `SemanticScholarProvider.
-applied_filters` reads `_routed` (query, bulk) noted by `search`; only
-the relevance search warns, once per search. `via` flows
-`provider_via()` → `SearchResult.via` (kept through `merge` as
-`"s2: bulk"` and `deduplicate`) → `result_via()` →
-`SearchRecord.via` (saved/loaded as `"via"`, old files → None; not part
-of the record key) → `sessions show` ("s2 (via bulk): q", JSON
+papers as a plain list; fetch time and total go through the shared
+hooks (`start_answer`/`answer_from_cache`/`fetching_now`/
+`cache_answer`) into the `(FETCH_META_KEY, key)` dict side entry; the
+snippet backend also keeps `("__s2_ranked__", key) = (scores,
+fetched_at)`. A test unpickles a written cache with
+`scholar.providers` unimportable. `search` sets `last_total` and
+`last_total_estimated = True` (the description calls both totals
+"Approximate"), and `last_via` (`"bulk"`, `"bulk, most cited first"`
+or None). `--in title-abstract` is honoured on bulk (it matches
+title+abstract by default): `SemanticScholarProvider.applied_filters`
+reads `_routed` (query, bulk) noted by `search`, so `search_provider`
+re-reads `applied_filters` after the search; only the relevance search
+warns, once per search. `via` flows `provider_via()` (in
+`search_provider`) → `SearchResult.via` (kept through `merge` as
+`"s2: bulk"` and `deduplicate`) → `result_via(part)` per part in
+`create_review_session` → `SearchRecord.via` (saved/loaded as `"via"`,
+old files → None; not part of the record key nor of `record_rank`, so
+a newer or wider bulk re-run replaces a relevance record, as intended) → `sessions show` ("s2 (via bulk): q", JSON
 `via` when set). Bulk stems terms and matches title+abstract only
 (`scholar syntax` says so). Not verified live: what `-` does before a
 parenthesis or phrase.
@@ -616,12 +710,50 @@ confirmation goes to stderr so `-f json`/`-f bibtex` stdout stays pure.
 `sessions show` prints each paper's id (`doi:…`/`hash:…`, the value
 `--paper-id` takes) under its title, and `show -f json` carries `doi` and
 `paper_id`, so a decision never needs a CSV detour.
-`--source llm` stores the decision as an unreviewed LLM decision
-(agent-driven screening that the TUI still queues for confirmation),
-with `--confidence/-c 0..1` in `llm_confidence` like `llm classify`
-(validated; ignored with a note for human decisions); a
-human `decide` on such a row marks it `llm_reviewed`, with `is_example`
-set when the status changed, mirroring the TUI.
+`--source human|agent|llm` says who decided (#162). It defaults to
+`human` only when stdin is a terminal; otherwise (scripts, agents) a
+missing `--source` exits 2 before loading the session. `agent` (an AI
+agent's own verdict) and `llm` (a classifier's verdict relayed) store
+unreviewed decisions (`ReviewSource.AGENT_UNREVIEWED`/`LLM_UNREVIEWED`,
+values `agent`/`llm`) that the TUI queues for confirmation, with
+`--confidence/-c 0..1` in `llm_confidence` like `llm classify`
+(validated; ignored with a note for human decisions; a machine decision
+without `-c` gets None, never an earlier run's number); a human `decide`
+(or TUI confirm) on such a row marks it `agent_reviewed`/`llm_reviewed`
+(`ReviewSource.reviewed`), with `is_example` set when the status
+changed. Ask a source `is_unreviewed` / `is_machine` instead of
+listing members. A machine `decide` also calls
+`review.clear_machine_audit(decision)`, which sets every field named in
+`review.MACHINE_AUDIT_FIELDS` to None (empty here; classifier audit
+fields register there so a replaced decision does not keep the old
+run's model/prompt/reason). A machine `decide` never replaces a decided
+paper whose source is `human`, `llm_reviewed` or `agent_reviewed`:
+the batch is refused unsaved (exit 2, each conflict named) unless
+`--force`. When `decide` changes a record's status, only its old
+category tags (`AUDIT_CATEGORIES`) are dropped before the new `--tag`s
+are added (`review.tags_after_status_change`, #177); themes,
+motivations and notes stay (dropping motivations lost themes on
+keep→discard→keep). Same status: tags append as before.
+**Unknown stored sources** (e.g. `manual`, which no Scholar version
+wrote, or a hand-edited `Agent`) load as `ReviewSource` pseudo-members
+via `_missing_` (`is_unknown`; value kept verbatim on save), count as
+unreviewed (never cited, not in `example_papers`, queued in the TUI;
+a human review makes them `human`), are shown as "unknown source
+'<value>'", and are warned about once per file and process
+(`warn_about_unknown_sources`).
+**Old installs:** a Scholar older than this change reads `agent`,
+`agent_reviewed` (and any unknown source) as `human` and writes that
+back on its next save. Reinstall every scholar installation (pipx,
+other venvs) before anyone uses `--source agent`.
+Who decided is shown everywhere decisions are counted (#163): the
+LaTeX report (summary "Decided: <source>" rows, abstract sentence,
+"(agent, unreviewed)" marks in the paper lists and overview table),
+`llm synthesize` (both formats' summary), `sessions show` ("Decided
+by:", marks after titles; JSON `source` per decision and
+`decision_sources`), `llm status` (Agent rows) and the export's
+confirmed/changed table (`machine_review_rows`, LLM and agent apart).
+Labels come from `review.DECISION_SOURCE_LABELS` /
+`decision_source_items` (decided papers only).
 Together these let scripted/agent-driven systematic reviews produce the same
 session record and `sessions export` audit trail as TUI reviews.
 
@@ -808,8 +940,10 @@ report body builders (`build_review_provenance_latex`,
   (`author_surname`; a blank author gives an empty surname) reduced to case-folded letters and digits, year ignored; joined
   provider strings like `openalex; dblp` are split, mapped to codes and
   deduplicated; the best-placed decision wins). The *last* category tag
-  is the decision (`decide -t` appends); confidence is shown for
-  unreviewed and human-confirmed LLM rows, not for changed ones, and
+  is the decision (`decide -t` appends while the status stays the
+  same; a status change replaces the old category, #177); confidence is
+  shown for unreviewed and human-confirmed LLM or agent rows, not for
+  changed ones, and
   such a row without one shows `AUDIT_STRINGS[lang]["no_confidence"]`
   (`n/a`, `saknas`) because the caption promises a confidence. The
   escapers decode HTML entities, strip inline markup, repair
@@ -820,10 +954,11 @@ report body builders (`build_review_provenance_latex`,
   note tags (`AUDIT_STRINGS[lang]["notes"]`: `recorded-not-cited`,
   `duplicate-record-of-cited-source`, `extended-tech-report`, …) and
   theme tags (the rest; with `--theme` given, only the listed tags).
-  *Cited* = kept by a human decision (source `human` or `llm_reviewed`)
-  with a theme tag or no tags; otherwise the last category tag
-  (`audit_category`), with the confidence for unreviewed LLM rows; notes
-  are appended in parentheses, note-only rows are "other". An LLM keep
+  *Cited* = kept by a decision that is not `is_unreviewed` (source
+  `human`, `llm_reviewed` or `agent_reviewed`) with a theme tag or no
+  tags; otherwise the last category tag (`audit_category`), with the
+  confidence for unreviewed LLM or agent rows; notes are appended in
+  parentheses, note-only rows are "other". An LLM's or an agent's keep
   is a candidate, not a citation. Order: cited (0), `supports-claim` (1),
   `qualifies-claim` (2), `adjacent-subtopic` (3),
   `off-topic-false-hit` (4), pending (5), other (6). The status wins
@@ -899,6 +1034,61 @@ heavy imports out of `cli.py`'s module level (`scholar.crossref` loads
 its cache on import): `TestLazySubcommands` runs `main()` in a child
 interpreter and fails if `--help` imports tuxedo, snowball, openai or
 `scholar.crossref`.
+
+### LLM Screening Record and Review Samples
+
+Each decision applied by `llm classify` records `llm_model`,
+`llm_decided_at` (UTC ISO), `llm_prompt_version` (16 hex digits:
+`classification_prompt_version`, a hash of the prompt built for a fixed
+probe plus the run options and research context; not the session's
+tags or examples), `llm_reason` (cut to `MAX_REASON_CHARS` = 500) and
+`llm_abstract_truncated` (#168). They live on `ReviewDecision`, named
+once in `review.LLM_AUDIT_FIELDS` (`llm_audit_of()`), which load, save,
+the append copy, `decision_state` and the concurrent merge all use; old
+files load them as `None` (unknown) and nothing fills them in later.
+A human review leaves them untouched (they are the model's record).
+
+- **No invented values.** `parse_llm_response` returns one entry per
+  paper; an unusable answer (no answer, decision not kept/discarded, a
+  discard without tags, confidence missing/non-numeric/outside [0, 1])
+  gets `LLMDecision.answer_problem`, triggers the single retry, and is
+  then withheld with the category-rule ones (`LLMDecision.problem`);
+  `llm classify` and `rq` list them (`print_withheld_papers`) under
+  "Left pending, no usable answer".
+  Answers without a valid `paper_index` are skipped (never index 0).
+- **Abstracts.** `MAX_ABSTRACT_CHARS` = 4000 for papers to classify
+  (marked `[abstract truncated]` in the prompt), `EXAMPLE_ABSTRACT_CHARS`
+  = 1000 for examples.
+- **Examples** are only `human`/`llm_reviewed`/`agent_reviewed` decisions
+  (`CONFIRMED_SOURCES`, compared by value); `--include-llm-examples`
+  adds unreviewed `llm`/`agent` ones after them.
+- **Samples (#173).** `scholar llm sample S [S...] --discarded|--kept
+  [--min-confidence C] -n N --seed SEED` pools unreviewed `llm`/`agent`
+  decisions, sorts them by (session, paper id), keys each with
+  `random.Random(seed).random()` (the only call Python promises to keep
+  stable across versions) and takes the N smallest; it stores a
+  `review.LLMSample` (seed, criteria, UTC date, population size and
+  digest, this session's papers with the machine's status) in every
+  pooled session (`ReviewSession.llm_samples`, merged by `sample_id`,
+  which ends in uuid4 digits so two draws in one second never collide).
+  `test_golden_draw` pins the drawn papers for seed 42.
+  The TUI filter `s` (`sampled_for_review`) queues the unreviewed ones;
+  `sessions decide` reviews them. `--report [-f json]`
+  (`sample_reports`): a sampled decision counts as reviewed when decided
+  and no longer an unreviewed machine source, as changed when its
+  status differs from the recorded one; the rate gets the 95% modified
+  Wilson interval (`modified_wilson_interval`, Brown, Cai & DasGupta
+  2001, eq. 4 with the Poisson bound of eq. 10, p. 112, for x <= x*,
+  x* = 2 for n <= 50 else 3), because plain Wilson coverage dips near
+  p = 0, where disagreement rates live. The sentence says the rate
+  covers only the reviewed part while some is unreviewed.
+- **Report.** `build_review_provenance_latex` calls
+  `llm_review.build_llm_screening_latex` (one local import + call): an
+  "LLM screening" section with models, prompt versions, dates, the
+  truncated (from each decision's flag, no character count) and
+  unrecorded counts, and `sample_sentence` per sample
+  (other pooled sessions are loaded read-only). Nothing when the
+  session has no LLM decisions and no samples.
 
 ### Interactive Tutorials (`scholar tutorial`)
 
@@ -1044,6 +1234,41 @@ with `--include-llm` (exit 2 / `ValueError`).
 
 Environment variable: `SCHOLAR_CACHE_DIR` to override cache location.
 
+**Concurrent processes** (#175: two processes racing emptied the real
+cache). `load_cache` returns a `PersistentCache` (a `dict` subclass with
+a `changed` flag set by every mutating method). `save_cache` (and so the
+`atexit` hook `save_all_caches`):
+
+- skips a `PersistentCache` that was not changed (plain dicts are always
+  saved), so read-only processes never write. The flag does not see
+  changes *inside* a value: to add to a cached entry, reassign the key
+  (`cache[k] = {**cache[k], "field": x}`), as the synthesis does for
+  its report abstract;
+- under `utils.file_lock` on `.<name>.pkl.lock`, re-reads the file and
+  writes the union (in-memory wins on a shared key) with
+  `utils.atomic_write_bytes` (temp file, fsync, `os.replace`), so a
+  reader never sees a partial file and a save never drops another
+  process's entries. Cache saves wait up to `CACHE_LOCK_TIMEOUT` (60 s,
+  not the sessions' 10 s: a save re-reads and writes the whole file,
+  0.6 s for 6 MB). Past it the save runs unlocked: still atomic, never
+  truncated, but entries can be lost if another process replaces the
+  file in between;
+- never writes over a file it cannot read (`read_cache_file` catches
+  any unpickling error; `load_cache` warns with the path and returns an
+  empty cache): the file is kept and the entries go to a unique
+  `<name>.pkl.unmerged-<UTC time>-<random>` beside it (mkstemp), with a
+  warning. Nothing merges it back; `cache info` lists these files with
+  a hint and `cache clear` deletes them by the caches' rules
+  (`--provider`, LLM caches kept without `--include-llm`).
+
+The files stay plain pickled dicts, readable by older versions.
+`clear_cache` deletes each file under the same lock, but a process
+running at the time keeps its loaded entries in memory and writes them
+back at exit if it changes its cache (union cannot tell deleted from
+lost entries); clear again once the other processes have ended.
+Not covered: an older scholar without the lock writing in place, and
+processes on different machines.
+
 The keyed REST providers cache manually (search wrapper +
 `_search_uncached` returning `(papers, cacheable)`) instead of via
 `@cachedmethod`, so a rate-limited or errored empty result is never
@@ -1080,9 +1305,13 @@ requests/day and each `scholar` run is a fresh process.
   (`_now`), shared across processes. Daily quotas
   bucket on the UTC calendar day and self-correct via the provider's
   own rejection if the guess is wrong.
-- `Search.execute` pre-checks `check_available()` and **skips** a
-  blocked provider with one `logger.warning` (no `SearchResult` is
-  recorded for it). `providers check` reports `quota exhausted`
+- `search_provider()` (`scholar.py`, behind `Search.execute` and
+  `rq`) pre-checks `check_available()` and **skips** a blocked
+  provider with one `logger.warning`; its `SearchResult` has no papers
+  and `error="skipped: <reason>; resets <time>"`, so it is recorded
+  as a failed search and never overwrites an answered record (#165).
+  The search still exits 0 (as when every provider fails).
+  `providers check` reports `quota exhausted`
   (yellow, exit 0) from persisted state without burning a probe.
 - CLI: `scholar providers limits` shows usage/remaining/reset per
   quota group; `--reset <name|all>` clears state (use after a key

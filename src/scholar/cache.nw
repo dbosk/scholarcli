@@ -38,6 +38,10 @@ Each provider maintains its own cache dictionary, which we persist to disk
 using [[pickle]].
 The cache never expires automatically---users clear it manually when they want
 fresh results.
+Several [[scholar]] processes often share one cache directory, so a save
+adds to the file under a lock instead of replacing it, writes
+atomically, never overwrites a file it cannot read, and is skipped for a
+cache the process did not change (\cref{sec:cache-concurrency}).
 
 The cache files are stored in a platform-appropriate location:
 \begin{itemize}
@@ -76,12 +80,15 @@ import os
 import pickle
 import subprocess
 import sys
+import threading
+import time
 import pytest
 from pathlib import Path
 from unittest.mock import patch
 
 from scholar.cache import *
 from scholar import *
+from scholar.utils import file_lock
 
 
 <<test functions>>
@@ -170,62 +177,353 @@ The tradeoff is that cache files aren't human-readable, but since they're
 only for performance optimization (not user data), this is acceptable.
 User-generated content (notes) uses JSON for the opposite reasons.
 
-\subsection{Atomic Writes (Not Implemented)}
+\subsection{Several processes, one cache directory}
+\label{sec:cache-concurrency}
 
-Ideally, we'd use atomic writes (write to temp file, then rename) to
-prevent corruption during crashes. For simplicity, we write directly.
-The worst case is a corrupted cache file, which just means a cache miss---the
-[[load_cache]] function gracefully returns an empty dictionary.
+Users and agents routinely run several [[scholar]] processes at once: a
+long [[scholar enrich]] in one terminal, searches in another, an agent's
+checks in the background.
+Each process loads the caches it needs when their modules are imported
+and writes them back when it exits (\cref{sec:cache-autosave}).
+The first version of this module wrote each file in place, with a plain
+[[open(..., "wb")]], and treated a file it could not read as an empty
+cache.
+Together the two emptied the real cache directory
+(\url{https://github.com/dbosk/scholar/issues/175}).
+One process was half-way through rewriting [[s2.pkl]] when another read
+it.
+The reader got a truncated pickle, took it for an empty cache, and at
+exit wrote that empty cache over the writer's complete file.
+Every entry in a search cache stands for a request that cost quota, and
+the synthesis caches hold paid model output, so the loss could not be
+repaired by anything but paying again.
 
-\section{Dependencies}
+Four rules now govern how a cache reaches its file.
+\begin{description}
+\item[A file that cannot be read is never written over]
+  [[load_cache]] still returns an empty cache, so the program works, but
+  the save does not trust that emptiness: it reads the file again, under
+  the lock, before writing.
+  If the file reads now (the writer has finished), the save merges with
+  it as usual.
+  If it still does not, the file is left exactly as it is and this
+  process's entries go to a file beside it,
+  [[<name>.pkl.unmerged-<pid>]], with a warning naming both.
+  The cache is then not lost but no longer used either, so the warning
+  is what tells the user to look.
+\item[A save adds to the file instead of replacing it]
+  Under an exclusive lock ([[utils.file_lock]] on a hidden sidecar
+  [[.<name>.pkl.lock]], \cref{sec:file-lock}), the save re-reads the
+  file and writes the union of its entries and ours.
+  On a key that both hold, our entry wins.
+  The key names the request (the query, the limit, the filters, a cache
+  version), so both values answer the same request and either may be
+  served; taking ours keeps the rule simple and keeps the file in step
+  with what this process showed its user.
+  Since the in-memory cache started as a copy of the file, the union
+  also repairs a file that a process without the lock---an older
+  [[scholar]] still installed somewhere---emptied or cut short.
+  The lock is what makes the merge sound: without it, two processes
+  could both re-read the old file and the second to write would drop
+  the first one's entries.
+\item[Writes are atomic] The merged cache goes to a temporary file in
+  the same directory, which is flushed to disk and renamed over the old
+  one ([[utils.atomic_write_bytes]], \cref{sec:atomic-write}).
+  A reader therefore sees the old file or the new one, never a part of
+  either; that removes the truncated reads that started the loss.
+\item[An unchanged cache is not saved] Most processes only read their
+  caches: [[sessions show]], a search that the cache answers, an import
+  check.
+  With merging, saving such a cache would cost a full re-read and
+  re-serialisation of a file that can be tens of megabytes, at every
+  exit, for nothing.
+  Skipping it keeps the cost of an exit proportional to what the process
+  changed, and it gives the strongest guarantee of all to the commonest
+  case: a process that changed nothing cannot change any file.
+  We measured the exit hook with twenty caches of 12.7\,MB in total
+  (November 2026, one laptop, best of three): nothing changed took
+  under a millisecond, one changed cache 68\,ms, all twenty 2.1\,s.
+  Writing all twenty in place, as every exit used to, took 0.5\,s:
+  merging costs a re-read and two [[fsync]]s per changed cache, which is
+  why the skip matters.
+\end{description}
+
+What this does not cover: an older [[scholar]] without these rules may
+still run alongside, writing in place and without the lock.
+Our atomic writes cannot give it a partial file, but its writes can give
+us one, which the first rule then protects instead of overwriting.
+And the lock coordinates processes on one machine only, as for sessions
+(\cref{sec:file-lock}).
+
+Nor is the lock unconditional.
+[[file_lock]] gives up after a timeout and lets the body run unlocked,
+so that one stuck process cannot hang every other
+(\cref{sec:file-lock}).
+An unlocked save is still atomic, so it never leaves a truncated file,
+but it can lose entries: if another process replaces the file between
+our re-read and our replace, our replace drops what that process added.
+The default timeout of ten seconds was chosen for sessions, whose saves
+hold the lock for milliseconds.
+A cache save holds it for a re-read and a write of the whole file, which
+grows with the cache: we measured 0.6\,s for a changed 6\,MB cache
+(November 2026, one laptop).
+With many processes exiting at once on one large cache, the last in the
+queue would wait for all the others, and ten seconds runs out after a
+handful.
+Cache saves therefore wait up to [[CACHE_LOCK_TIMEOUT]], a minute.
+Waiting costs little: only an exiting process waits, and it waits long
+only behind a queue or a holder that is stuck (suspended mid-save, say);
+not waiting costs entries that were paid for.
+Past the minute the save goes ahead unlocked with [[file_lock]]'s
+warning, and the loss described above becomes possible.
+[[cache clear]] keeps the default: it is interactive, and an unlocked
+delete loses no entry; at worst a save under way undoes it.
+
+<<constants>>=
+CACHE_LOCK_TIMEOUT = 60  # seconds; a cache save re-reads and writes it all
+@
+
+The rest of the section builds the pieces in the order a cache meets
+them: the dictionary that knows whether it changed, the loading, and the
+saving.
+
+\subsection{Knowing whether a cache changed}
+
+To skip unchanged caches the save must know whether a cache changed.
+Comparing key sets at exit would miss a value replaced under an existing
+key, and keeping a copy of every cache to compare against would double
+its memory.
+Instead [[load_cache]] returns a [[dict]] subclass that sets a flag when
+it is changed.
+The providers keep using it as the plain dictionary they always had
+(they read and assign items, and [[cachetools]]' decorators do the
+same).
+
+Every mutating method has to set the flag, not only [[__setitem__]]:
+the C implementations of [[dict.update]], [[setdefault]], [[pop]] and
+[[clear]] do not go through [[__setitem__]], so overriding that alone
+would let an [[update]] slip by unsaved.
+What the flag cannot see is a change \emph{inside} a value: after
+[[cache[key]["field"] = x]] the cache holds the same object under the
+same key, and nothing tells it the object changed.
+Code that adds to a cached value must therefore assign the key anew,
+[[cache[key] = {**cache[key], "field": x}]], as the synthesis does for
+its report abstract (\cref{llm-review-module}).
+The provider caches only ever assign whole values.
+The file always receives a plain [[dict]] ([[save_cache]] copies the
+entries), so cache files stay readable by older versions of
+[[scholar]], which matters while one is still installed.
+
+<<cache load and save functions>>=
+class PersistentCache(dict):
+    """A cache dictionary that remembers whether it was changed.
+
+    `load_cache` returns one, and `save_cache` skips it while `changed`
+    is false.  Saving it successfully clears the flag.
+    """
+
+    changed = False
+
+    def __setitem__(self, key, value):
+        super().__setitem__(key, value)
+        self.changed = True
+
+    def __delitem__(self, key):
+        super().__delitem__(key)
+        self.changed = True
+
+    def __ior__(self, other):
+        self.update(other)
+        return self
+
+    def clear(self):
+        super().clear()
+        self.changed = True
+
+    def pop(self, key, *default):
+        if key in self:
+            self.changed = True
+        return super().pop(key, *default)
+
+    def popitem(self):
+        item = super().popitem()
+        self.changed = True
+        return item
+
+    def setdefault(self, key, default=None):
+        if key not in self:
+            self.changed = True
+        return super().setdefault(key, default)
+
+    def update(self, *args, **kwargs):
+        super().update(*args, **kwargs)
+        self.changed = True
+@
+
+\subsection{Loading a cache}
+
+Loading and saving both read the file, so the reading is one function.
+It tells the three outcomes apart, because they call for different
+actions: no file is an empty cache, a readable file is its entries, and
+an unreadable file is an empty cache \emph{and} an error that the save
+must respect.
+We catch every exception the unpickling raises, not only the
+[[pickle]] and I/O errors.
+A damaged file can make [[pickle]] raise almost anything
+([[EOFError]] for a truncated one, [[AttributeError]] or
+[[ModuleNotFoundError]] when a pickled class has moved, [[ValueError]],
+[[IndexError]]), and before, anything outside the short list crashed the
+import of the provider module.
+Catching broadly is safe now because a file we could not read is kept,
+whatever the reason.
+A file that unpickles to something other than a dictionary is not a
+cache file either.
 
 <<imports>>=
 import pickle
 from typing import Any
-@
-
-\subsection{Graceful Degradation}
-
-When loading a cache, we return an empty dictionary if the file doesn't
-exist or is corrupted.
-This ensures the application continues working even if cache files are damaged.
-
 <<cache load and save functions>>=
-def load_cache(provider_name: str) -> dict[Any, Any]:
+def read_cache_file(
+    cache_file: Path,
+) -> tuple[dict[Any, Any], Exception | None]:
+    """Read the cache entries pickled in `cache_file`.
+
+    Returns `(entries, None)` for a readable file, `({}, None)` when the
+    file does not exist, and `({}, error)` when it exists but cannot be
+    read as a cache.
+    """
+    try:
+        with open(cache_file, "rb") as f:
+            entries = pickle.load(f)
+    except FileNotFoundError:
+        return {}, None
+    except Exception as error:
+        return {}, error
+    if not isinstance(entries, dict):
+        return {}, TypeError(
+            f"it holds a {type(entries).__name__}, not a dict"
+        )
+    return entries, None
+
+
+def load_cache(provider_name: str) -> PersistentCache:
     """
     Load the cache for a provider from disk.
 
-    Returns an empty dictionary if no cache exists or if loading fails.
+    Returns an empty cache if no cache file exists or if it cannot be
+    read; an unreadable file is logged and is never overwritten by
+    `save_cache`.
     """
     cache_file = get_cache_dir() / f"{provider_name}.pkl"
-    if not cache_file.exists():
-        logger.debug(f"No cache file found for {provider_name}")
-        return {}
-    try:
-        with open(cache_file, "rb") as f:
-            cache = pickle.load(f)
-            logger.debug(f"Loaded cache for {provider_name}: {len(cache)} entries")
-            return cache
-    except (pickle.PickleError, EOFError, OSError) as e:
-        logger.warning(f"Failed to load cache for {provider_name}: {e}")
-        return {}
+    entries, error = read_cache_file(cache_file)
+    if error is not None:
+        logger.warning(
+            "Failed to load cache %s (%s); starting with an empty cache, "
+            "and the file will not be overwritten",
+            cache_file, error,
+        )
+    else:
+        logger.debug(
+            "Loaded cache for %s: %d entries", provider_name, len(entries)
+        )
+    return PersistentCache(entries)
 @
 
-Saving is straightforward---we write the dictionary to a pickle file.
-We use atomic writes would be safer, but for simplicity we write directly.
+\subsection{Saving a cache}
 
+[[save_cache]] applies the rules of \cref{sec:cache-concurrency} in
+order: skip an unchanged cache, then, holding the lock, re-read the file
+and either merge with it or, if it cannot be read, keep it and write
+beside it.
+A plain dictionary has no flag, so it is always saved; that is what the
+tests and other callers that build a cache by hand expect.
+Only an I/O error or a value that cannot be pickled can stop a save;
+either is logged, since the save usually runs in the exit hook, where
+nobody could act on an exception.
+
+<<imports>>=
+from scholar.utils import atomic_write_bytes, file_lock
 <<cache load and save functions>>=
 def save_cache(provider_name: str, cache: dict[Any, Any]) -> None:
     """
-    Save the cache for a provider to disk.
+    Save the cache for a provider to disk, adding to what is there.
+
+    Under a lock, the file is re-read and replaced atomically by the
+    union of its entries and `cache` (on a shared key, `cache` wins).
+    A `PersistentCache` that was not changed is not saved.  A file that
+    cannot be read is kept as it is, and `cache` goes to
+    `<name>.pkl.unmerged-<pid>` beside it instead.
     """
+    if isinstance(cache, PersistentCache) and not cache.changed:
+        logger.debug(f"Cache for {provider_name} unchanged, not saved")
+        return
     cache_file = get_cache_dir() / f"{provider_name}.pkl"
     try:
-        with open(cache_file, "wb") as f:
-            pickle.dump(cache, f)
-        logger.debug(f"Saved cache for {provider_name}: {len(cache)} entries")
-    except OSError as e:
+        with file_lock(cache_file, timeout=CACHE_LOCK_TIMEOUT):
+            on_disk, error = read_cache_file(cache_file)
+            if error is not None:
+                <<keep the unreadable file, save [[cache]] beside it>>
+                return
+            <<replace the file with the union of [[on_disk]] and [[cache]]>>
+    except (OSError, pickle.PicklingError) as e:
         logger.warning(f"Failed to save cache for {provider_name}: {e}")
+@
+
+The merge builds a new dictionary rather than updating either side: the
+in-memory cache stays what the process put in it, and [[on_disk]] is
+discarded anyway.
+Only after the file is replaced is the cache marked unchanged, so a
+failed write is retried by the next save, the exit hook's included.
+
+<<replace the file with the union of [[on_disk]] and [[cache]]>>=
+merged = {**on_disk, **cache}
+atomic_write_bytes(cache_file, pickle.dumps(merged))
+if isinstance(cache, PersistentCache):
+    cache.changed = False
+logger.debug(
+    f"Saved cache for {provider_name}: {len(merged)} entries "
+    f"({len(merged) - len(on_disk)} new)"
+)
+@
+
+Each file beside an unreadable one gets a name of its own, made by
+[[tempfile.mkstemp]], which creates the file exclusively and so never
+picks a name that exists.
+The name carries the UTC time it was written, so a listing sorts the
+files by age.
+A name made of the process id alone, as the first version did, was not
+enough: process ids are reused, and a later process that met the same
+unreadable file would have replaced an earlier one's entries.
+The name does not end in [[.pkl]], so [[load_cache]] never takes it for
+a cache; [[cache info]] lists these files and [[cache clear]] deletes
+them (\cref{sec:cache-unmerged-files}).
+Nothing merges one back automatically: the file it belongs to could not
+be read, so there is nothing safe to merge it into.
+The cache stays marked as changed, so a later save in the same process
+tries the merge again.
+An empty cache is not worth such a file (a process that ran
+[[cache clear]] meets this only if the file reappeared unreadable).
+
+<<imports>>=
+import tempfile
+from datetime import datetime, timezone
+<<constants>>=
+UNMERGED_SUFFIX = ".unmerged-"
+<<keep the unreadable file, save [[cache]] beside it>>=
+if cache:
+    written = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    fd, name = tempfile.mkstemp(
+        dir=cache_file.parent,
+        prefix=f"{cache_file.name}{UNMERGED_SUFFIX}{written}-",
+    )
+    os.close(fd)
+    unmerged = Path(name)
+    atomic_write_bytes(unmerged, pickle.dumps(dict(cache)))
+    logger.warning(
+        "Cannot read cache %s (%s), so it is left as it is; "
+        "this process's %d entries are in %s",
+        cache_file, error, len(cache), unmerged,
+    )
 @
 
 \subsection{Testing load and save}
@@ -260,6 +558,405 @@ class TestLoadSaveCache:
         cache_file.write_bytes(b"not valid pickle data")
         result = load_cache("corrupted")
         assert result == {}
+@
+
+The failure of \cref{sec:cache-concurrency} starts with a truncated
+file, so the tests start there too: the first half of a real pickle, as
+a reader sees it while a writer is still at work.
+Such a file must survive the exit hook whether or not the process
+changed its cache, and once the file reads again (the writer finished),
+the save must merge with it rather than give up.
+The exit hook is called directly, with a registry of the test's own
+([[CACHE_REGISTRY]] is replaced, so the caches of the modules imported
+for the test run stay out of it).
+
+<<test functions>>=
+TRUNCATED_ENTRIES = {("query", i): "result " * 50 for i in range(40)}
+TRUNCATED_PICKLE = pickle.dumps(TRUNCATED_ENTRIES)
+TRUNCATED_PICKLE = TRUNCATED_PICKLE[: len(TRUNCATED_PICKLE) // 2]
+
+
+class TestUnreadableCacheFile:
+    """A cache file that fails to load is never written over (#175)."""
+
+    def test_load_warns_naming_the_file(self, monkeypatch, caplog):
+        """The warning says which file could not be read."""
+        cache_file = get_cache_dir() / "s2.pkl"
+        cache_file.write_bytes(TRUNCATED_PICKLE)
+        with caplog.at_level("WARNING", logger="scholar.cache"):
+            assert load_cache("s2") == {}
+        assert str(cache_file) in caplog.text
+
+    def test_unchanged_cache_leaves_the_file_alone(self, monkeypatch):
+        """The exit save does not write an empty cache over the file."""
+        monkeypatch.setattr("scholar.cache.CACHE_REGISTRY", {})
+        cache_file = get_cache_dir() / "s2.pkl"
+        cache_file.write_bytes(TRUNCATED_PICKLE)
+        register_cache("s2", load_cache("s2"))
+        save_all_caches()
+        assert cache_file.read_bytes() == TRUNCATED_PICKLE
+        assert sorted(p.name for p in get_cache_dir().iterdir()
+                      if not p.name.startswith(".")) == ["s2.pkl"]
+
+    def test_new_entries_go_beside_the_file(self, monkeypatch, caplog):
+        """Entries added after a failed load are kept in a side file."""
+        monkeypatch.setattr("scholar.cache.CACHE_REGISTRY", {})
+        cache_file = get_cache_dir() / "s2.pkl"
+        cache_file.write_bytes(TRUNCATED_PICKLE)
+        cache = load_cache("s2")
+        register_cache("s2", cache)
+        cache[("new query", 10)] = ["fetched"]
+        with caplog.at_level("WARNING", logger="scholar.cache"):
+            save_all_caches()
+        assert cache_file.read_bytes() == TRUNCATED_PICKLE
+        beside = list(get_cache_dir().glob("s2.pkl.unmerged-*"))
+        assert len(beside) == 1
+        with open(beside[0], "rb") as f:
+            assert pickle.load(f) == {("new query", 10): ["fetched"]}
+        assert str(beside[0]) in caplog.text
+
+    def test_merges_once_the_file_reads_again(self, monkeypatch):
+        """A file completed after our failed load is merged, not lost."""
+        monkeypatch.setattr("scholar.cache.CACHE_REGISTRY", {})
+        cache_file = get_cache_dir() / "s2.pkl"
+        cache_file.write_bytes(TRUNCATED_PICKLE)
+        cache = load_cache("s2")
+        register_cache("s2", cache)
+        cache_file.write_bytes(pickle.dumps(TRUNCATED_ENTRIES))
+        cache[("new query", 10)] = ["fetched"]
+        save_all_caches()
+        assert load_cache("s2") == {
+            **TRUNCATED_ENTRIES, ("new query", 10): ["fetched"]
+        }
+
+    def test_a_missing_class_makes_the_file_unreadable(self, monkeypatch):
+        """A pickle naming a class that is gone neither crashes nor is
+        overwritten."""
+        monkeypatch.setattr("scholar.cache.CACHE_REGISTRY", {})
+        cache_file = get_cache_dir() / "dblp.pkl"
+        old_class = b"cno_such_module\nThing\n."
+        cache_file.write_bytes(old_class)
+        cache = load_cache("dblp")
+        register_cache("dblp", cache)
+        cache["new"] = 1
+        save_all_caches()
+        assert cache_file.read_bytes() == old_class
+@
+
+The other rules need a second writer.
+Within one process a direct [[save_cache]] of a plain dictionary plays
+the other process: it writes the file after our cache was loaded, which
+is all the merge has to cope with.
+The skip is checked on the file's modification time, dated back to 2001
+first so that a rewrite shows even on a file system with coarse
+timestamps, and on an [[update]], the method the flag is easiest to
+miss on.
+
+<<test functions>>=
+class TestSaveMergesWithTheFile:
+    """A save adds to the file; unchanged caches are not saved (#175)."""
+
+    def test_keeps_entries_another_process_wrote(self, monkeypatch):
+        cache = load_cache("openalex")
+        save_cache("openalex", {"theirs": 1})
+        cache["ours"] = 2
+        save_cache("openalex", cache)
+        assert load_cache("openalex") == {"theirs": 1, "ours": 2}
+
+    def test_our_entry_wins_on_a_shared_key(self, monkeypatch):
+        cache = load_cache("openalex")
+        save_cache("openalex", {"key": "theirs", "other": 1})
+        cache["key"] = "ours"
+        save_cache("openalex", cache)
+        assert load_cache("openalex") == {"key": "ours", "other": 1}
+
+    def test_unchanged_cache_is_not_rewritten(self, monkeypatch):
+        monkeypatch.setattr("scholar.cache.CACHE_REGISTRY", {})
+        save_cache("crossref", {"10.1/x": {"retracted": False}})
+        cache_file = get_cache_dir() / "crossref.pkl"
+        os.utime(cache_file, ns=(10**18, 10**18))
+        register_cache("crossref", load_cache("crossref"))
+        save_all_caches()
+        assert cache_file.stat().st_mtime_ns == 10**18
+
+    def test_an_update_is_saved(self, monkeypatch):
+        monkeypatch.setattr("scholar.cache.CACHE_REGISTRY", {})
+        cache = load_cache("crossref")
+        register_cache("crossref", cache)
+        cache.update({"10.1/y": {"retracted": True}})
+        save_all_caches()
+        assert load_cache("crossref") == {"10.1/y": {"retracted": True}}
+
+    def test_unreadable_file_at_save_is_kept(self, monkeypatch):
+        """A file damaged after our load is not replaced either."""
+        cache = load_cache("hal")
+        cache_file = get_cache_dir() / "hal.pkl"
+        cache_file.write_bytes(TRUNCATED_PICKLE)
+        cache["ours"] = 1
+        save_cache("hal", cache)
+        assert cache_file.read_bytes() == TRUNCATED_PICKLE
+        (beside,) = get_cache_dir().glob("hal.pkl.unmerged-*")
+        with open(beside, "rb") as f:
+            assert pickle.load(f) == {"ours": 1}
+@
+
+Atomicity is a property of the moment in the middle of a write, so the
+test stops a save there.
+The value it saves pickles only when the test lets it: its
+[[__reduce__]] signals that the write has started and waits.
+At that moment the file must still hold the old cache, complete.
+A save that writes in place fails here, since opening the file for
+writing has already emptied it.
+
+<<test functions>>=
+class PausingValue:
+    """A value whose pickling waits until the test lets it go on."""
+
+    def __init__(self):
+        self.started = threading.Event()
+        self.proceed = threading.Event()
+
+    def __reduce__(self):
+        self.started.set()
+        self.proceed.wait(timeout=10)
+        return (str, ("written",))
+
+
+def test_a_reader_never_sees_a_partial_cache_file(monkeypatch):
+    """While a save is under way, the file holds the old cache."""
+    save_cache("openalex", {"old": "entry"})
+    cache_file = get_cache_dir() / "openalex.pkl"
+    cache = load_cache("openalex")
+    value = PausingValue()
+    cache["new"] = value
+    writer = threading.Thread(target=save_cache, args=("openalex", cache))
+    writer.start()
+    try:
+        assert value.started.wait(timeout=10)
+        with open(cache_file, "rb") as f:
+            assert pickle.load(f) == {"old": "entry"}
+    finally:
+        value.proceed.set()
+        writer.join(timeout=10)
+    assert load_cache("openalex") == {"old": "entry", "new": "written"}
+@
+
+A save must also outwait a lock held longer than the session timeout.
+The test shortens that timeout to a fifth of a second and has a second
+thread hold the lock for half a second, as a slow save of another
+process would, writing that process's entries before it lets go.
+A save that gave up after the session timeout would go ahead unlocked,
+and one of the two writes would drop the other's entries.
+
+<<test functions>>=
+def test_a_cache_save_outwaits_the_session_lock_timeout(monkeypatch):
+    """A slow save ahead of us costs time, not entries."""
+    monkeypatch.setattr("scholar.utils.LOCK_TIMEOUT", 0.2)
+    cache_file = get_cache_dir() / "scopus.pkl"
+    holding = threading.Event()
+
+    def slow_save_of_another_process():
+        with file_lock(cache_file):
+            holding.set()
+            time.sleep(0.5)
+            cache_file.write_bytes(pickle.dumps({"theirs": 1}))
+
+    other = threading.Thread(target=slow_save_of_another_process)
+    other.start()
+    assert holding.wait(timeout=10)
+    cache = load_cache("scopus")
+    cache["ours"] = 2
+    save_cache("scopus", cache)
+    other.join(timeout=10)
+    assert load_cache("scopus") == {"theirs": 1, "ours": 2}
+@
+
+The bug itself needs real processes: each loads at start-up and saves in
+its exit hook, and no test inside the pytest process can observe that.
+The script below is such a process.
+It waits for a common start time, so that the processes of one round
+load, add and save at nearly the same moment, then loads the shared
+cache, adds keys of its own and exits.
+The file is seeded with a megabyte of entries so that a write takes long
+enough for another process's load to fall into it.
+Before the fix, each round kept only the keys of whichever process wrote
+last, and a load that fell into a write emptied the file; now every key
+of every round, and the seed, must survive.
+
+<<test functions>>=
+CONCURRENT_CACHE_WRITER = """
+import sys, time
+from scholar.cache import load_cache, register_cache
+
+name, start = sys.argv[1], float(sys.argv[2])
+while time.time() < start:
+    time.sleep(0.001)
+cache = load_cache("shared")
+register_cache("shared", cache)
+for i in range(50):
+    cache[(name, i)] = name * 500
+"""
+
+
+def test_processes_saving_at_once_keep_each_others_entries():
+    """Concurrent exit saves lose no entries (#175)."""
+    import time
+
+    seed = {("seed", i): "s" * 2000 for i in range(500)}
+    save_cache("shared", seed)
+    env = dict(os.environ, SCHOLAR_CACHE_DIR=str(get_cache_dir()))
+    names = []
+    for round_ in range(4):
+        start = time.time() + 1.5
+        round_names = [f"r{round_}p{p}" for p in range(3)]
+        writers = [
+            subprocess.Popen(
+                [sys.executable, "-c", CONCURRENT_CACHE_WRITER,
+                 name, str(start)],
+                env=env, stderr=subprocess.PIPE, text=True,
+            )
+            for name in round_names
+        ]
+        for writer in writers:
+            _, stderr = writer.communicate(timeout=60)
+            assert writer.returncode == 0, stderr[-2000:]
+        names += round_names
+    saved = load_cache("shared")
+    assert set(seed) <= set(saved)
+    missing = [name for name in names if (name, 49) not in saved]
+    assert missing == []
+@
+
+
+\section{When a cached answer was fetched}
+\label{sec:fetch-meta}
+
+A cache entry is an answer without a date.  A search served from it
+used to be stamped with the time of the run, so a session, the report
+and the [[DATE]] of a [[bibtex+prov]] block claimed that the database
+had been searched today when the answer was months old
+(\url{https://github.com/dbosk/scholar/issues/167}).  PRISMA asks for
+the date each source was last searched, and the cache is the one place
+that can know it.
+
+So a provider that stores an answer also stores when it fetched it,
+and the total the service reported with it, since a cached answer
+should not lose that either (\cref{sec:reported-total} in the providers
+chapter).  The facts go into a side table kept in the same cache
+dictionary: beside the answer at [[key]], an entry at
+[[(FETCH_META_KEY, key)]] holds its facts.  Wrapping the cached answers
+themselves would have changed the shape of every entry, so every entry
+already on disk would have to be read through a fallback or thrown
+away; throwing them away would mean re-fetching them, against the
+provider's quota.  With a side table nothing that exists changes: an
+entry stored before has no facts, and [[fetch_meta]] answers an empty
+dictionary for it, which callers read as \enquote{fetch date unknown}.
+The side entries go wherever their cache goes: saved and loaded with
+it, and emptied with it by [[clear_cache]].  Their keys begin with a
+string no provider uses, so they cannot collide with an answer, and
+[[is_fetch_meta_key]] tells them apart where entries are counted.
+
+Each fact is an entry of its own, not a value inside one shared
+table, for the sake of the [[PersistentCache]] (\cref{sec:cache-concurrency}):
+only an assignment through [[__setitem__]] marks the cache changed, so
+a fact written into a nested table after the table existed would never
+be saved; and [[save_cache]] merges with what other processes saved by
+top-level key, so one shared table would let the last process to save
+erase the facts the others stored.  Reading the facts assigns nothing,
+so a search served from the cache leaves the cache unchanged and
+unsaved, as before.
+
+<<constants>>=
+FETCH_META_KEY = "__fetch_meta__"
+<<cache load and save functions>>=
+def is_fetch_meta_key(key: Any) -> bool:
+    """Whether `key` is that of a side entry of fetch facts."""
+    return (
+        isinstance(key, tuple) and len(key) == 2
+        and key[0] == FETCH_META_KEY
+    )
+
+
+def fetch_meta(cache: dict[Any, Any], key: Any) -> dict[str, Any]:
+    """The facts stored about the cached answer at `key`, or `{}`.
+
+    The facts are `fetched_at` (UTC ISO time of the fetch), `total`
+    and `total_estimated` (what the service reported). Answers cached
+    before facts were stored have none. Reading changes nothing.
+    """
+    facts = cache.get((FETCH_META_KEY, key))
+    return dict(facts) if isinstance(facts, dict) else {}
+
+
+def remember_fetch(
+    cache: dict[Any, Any], key: Any, **facts: Any
+) -> None:
+    """Store `facts` about the cached answer at `key` in its side entry."""
+    cache[(FETCH_META_KEY, key)] = facts
+@
+
+Let's verify that the facts survive a save and a load with the answer
+they describe, and that an answer cached without them, as every answer
+on disk today was, reads as having none:
+
+<<test functions>>=
+class TestFetchMeta:
+    """Facts about cached answers live in a side table (#167)."""
+
+    def test_round_trip(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path))
+        cache = {("q", 100, ""): []}
+        remember_fetch(cache, ("q", 100, ""),
+                       fetched_at="2026-10-02T08:00:00+00:00", total=7)
+        save_cache("meta_provider", cache)
+        loaded = load_cache("meta_provider")
+        assert loaded[("q", 100, "")] == []
+        assert fetch_meta(loaded, ("q", 100, "")) == {
+            "fetched_at": "2026-10-02T08:00:00+00:00", "total": 7,
+        }
+
+    def test_old_entries_have_no_facts(self):
+        cache = {("q", 100, ""): []}
+        assert fetch_meta(cache, ("q", 100, "")) == {}
+        remember_fetch(cache, ("other", 5, ""), fetched_at="x")
+        assert fetch_meta(cache, ("q", 100, "")) == {}
+
+    def test_reading_leaves_the_cache_unchanged(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path))
+        cache = load_cache("meta_read")
+        cache[("q", 100, "")] = []
+        remember_fetch(cache, ("q", 100, ""), fetched_at="x")
+        save_cache("meta_read", cache)
+        loaded = load_cache("meta_read")
+        assert fetch_meta(loaded, ("q", 100, "")) == {"fetched_at": "x"}
+        assert loaded.changed is False
+
+    def test_a_second_answer_marks_and_persists(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path))
+        cache = load_cache("meta_add")
+        cache[("q", 100, "")] = []
+        remember_fetch(cache, ("q", 100, ""), fetched_at="first")
+        save_cache("meta_add", cache)
+        assert cache.changed is False
+        remember_fetch(cache, ("r", 5, ""), fetched_at="second")
+        assert cache.changed is True
+        save_cache("meta_add", cache)
+        loaded = load_cache("meta_add")
+        assert fetch_meta(loaded, ("q", 100, "")) == {"fetched_at": "first"}
+        assert fetch_meta(loaded, ("r", 5, "")) == {"fetched_at": "second"}
+
+    def test_two_processes_keep_each_others_facts(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path))
+        first, second = load_cache("meta_two"), load_cache("meta_two")
+        remember_fetch(first, ("a", 1, ""), fetched_at="by first")
+        remember_fetch(second, ("b", 1, ""), fetched_at="by second")
+        save_cache("meta_two", first)
+        save_cache("meta_two", second)
+        loaded = load_cache("meta_two")
+        assert fetch_meta(loaded, ("a", 1, "")) == {"fetched_at": "by first"}
+        assert fetch_meta(loaded, ("b", 1, "")) == {"fetched_at": "by second"}
 @
 
 
@@ -319,8 +1016,23 @@ exits.
 We therefore also empty the registered in-memory dictionary of every file
 we delete.
 Emptying it in place, rather than dropping it from the registry, keeps the
-owning provider's reference valid: the exit hook then writes an empty
-cache, which is what the user asked for.
+owning provider's reference valid: the exit hook then merges an empty
+cache with a file that is gone, which leaves an empty cache, as the user
+asked.
+
+Other processes are a different matter.
+Each deletion holds the file's lock (\cref{sec:cache-concurrency}), so it
+never falls between another process's re-read and its replace, where the
+replace would put the deleted file back with every entry it had.
+But a process that was running at the time of the clear still holds the
+cache it loaded at start-up, and if it changes that cache, its exit save
+writes the union back, the old entries included: the union rule cannot
+tell entries deleted on purpose from entries lost to a bad write.
+A process that changed nothing saves nothing, so only processes that
+fetched something after the clear bring entries back.
+We accept this rather than record deletions across processes: a
+[[cache clear]] is rare and deliberate, whereas a lost cache costs quota,
+and the cure is to clear again once the other processes have ended.
 
 <<cache management functions>>=
 def clear_cache(
@@ -336,7 +1048,9 @@ def clear_cache(
 
     Also empties the in-memory copy of every deleted cache that is
     registered for saving at exit, so the exit hook cannot write the
-    old contents back.
+    old contents back.  Each file is deleted under the lock that
+    `save_cache` takes, so a deletion never falls inside another
+    process's save.
 
     Returns the number of cache files deleted.
     """
@@ -346,23 +1060,31 @@ def clear_cache(
     count = 0
     logger.info("Clearing all cache files")
     for cache_file in cache_dir.glob("*.pkl"):
-        if providers is not None:
-            if cache_file.stem not in providers:
+        if not selected_for_clearing(cache_file.stem, include_llm, providers):
+            continue
+        with file_lock(cache_file):
+            try:
+                cache_file.unlink()
+                count += 1
+                logger.debug(f"Deleted cache file: {cache_file.name}")
+            except OSError as e:
+                logger.warning(f"Failed to delete {cache_file.name}: {e}")
                 continue
-        elif is_llm_cache(cache_file.stem) and not include_llm:
-            continue
-        try:
-            cache_file.unlink()
-            count += 1
-            logger.debug(f"Deleted cache file: {cache_file.name}")
-        except OSError as e:
-            logger.warning(f"Failed to delete {cache_file.name}: {e}")
-            continue
-        registered = CACHE_REGISTRY.get(cache_file.stem)
-        if registered is not None:
-            registered.clear()
+            registered = CACHE_REGISTRY.get(cache_file.stem)
+            if registered is not None:
+                registered.clear()
+    count += clear_unmerged_files(include_llm, providers)
     logger.info(f"Cleared {count} cache file(s)")
     return count
+
+
+def selected_for_clearing(
+    name: str, include_llm: bool, providers: list[str] | None
+) -> bool:
+    """Return whether `clear_cache` deletes the files of cache `name`."""
+    if providers is not None:
+        return name in providers
+    return include_llm or not is_llm_cache(name)
 @
 
 Sometimes one cache is stale and the others are not.
@@ -381,6 +1103,100 @@ nothing.
 Checking that a name is one a user could mean is the caller's job,
 because the registry of providers lives above this module.
 
+\subsection{Files saved beside unreadable caches}
+\label{sec:cache-unmerged-files}
+
+The files that [[save_cache]] writes beside an unreadable cache file
+(\cref{sec:cache-concurrency}) belong to that cache: they hold entries
+of the same kind, fetched at the same cost.
+Left out of [[cache info]] they would go unnoticed, since the warning
+that announced them scrolls away; left out of [[cache clear]] they
+would survive a clear the user meant to be complete.
+So both commands treat them as files of the cache they are named after,
+by the same rules: [[--provider]] selects them by that name, and those
+of an LLM cache are kept unless [[include_llm]] is given.
+They count among the deleted files that [[clear_cache]] returns.
+Hidden names are skipped, because they are the temporary files of a
+write in progress (\cref{sec:atomic-write}).
+
+<<cache management functions>>=
+def unmerged_cache_files() -> list[Path]:
+    """Return the files saved beside unreadable caches, by name."""
+    return sorted(
+        path
+        for path in get_cache_dir().glob(f"*.pkl{UNMERGED_SUFFIX}*")
+        if not path.name.startswith(".")
+    )
+
+
+def unmerged_cache_name(path: Path) -> str:
+    """Return the cache that the unmerged file `path` belongs to."""
+    return path.name.split(f".pkl{UNMERGED_SUFFIX}", 1)[0]
+
+
+def clear_unmerged_files(
+    include_llm: bool = False, providers: list[str] | None = None
+) -> int:
+    """Delete the unmerged files `clear_cache` selects; return how many."""
+    count = 0
+    for path in unmerged_cache_files():
+        name = unmerged_cache_name(path)
+        if not selected_for_clearing(name, include_llm, providers):
+            continue
+        try:
+            path.unlink()
+            count += 1
+        except OSError as e:
+            logger.warning(f"Failed to delete {path.name}: {e}")
+    return count
+@
+
+Let's check both commands against files of three caches: a search
+cache, a second one that a [[--provider]] clear does not name, and an
+LLM cache.
+
+<<test functions>>=
+class TestUnmergedCacheFiles:
+    """Files beside unreadable caches are listed and cleared (#175)."""
+
+    def make_unmerged(self, name):
+        cache_file = get_cache_dir() / f"{name}.pkl"
+        cache_file.write_bytes(TRUNCATED_PICKLE)
+        cache = load_cache(name)
+        cache["ours"] = 1
+        save_cache(name, cache)
+
+    def caches_with_unmerged_files(self):
+        return sorted(
+            path.name.split(".pkl.unmerged-")[0]
+            for path in get_cache_dir().glob("*.pkl.unmerged-*")
+        )
+
+    def test_a_reused_process_id_keeps_both_files(self):
+        """Two saves of one process write two files, not one."""
+        self.make_unmerged("s2")
+        self.make_unmerged("s2")
+        assert self.caches_with_unmerged_files() == ["s2", "s2"]
+
+    def test_stats_list_them(self):
+        self.make_unmerged("s2")
+        stats = get_cache_stats()
+        (path,) = stats["unmerged_files"]
+        assert Path(path).name.startswith("s2.pkl.unmerged-")
+
+    def test_clear_deletes_them_by_the_cache_rules(self):
+        for name in ("s2", "openalex", "llm_synthesis_theme"):
+            self.make_unmerged(name)
+        clear_cache(providers=["s2"])
+        assert self.caches_with_unmerged_files() == [
+            "llm_synthesis_theme", "openalex"
+        ]
+        clear_cache()
+        assert self.caches_with_unmerged_files() == ["llm_synthesis_theme"]
+        clear_cache(include_llm=True)
+        assert self.caches_with_unmerged_files() == []
+@
+
 \subsection{Cache statistics}
 
 The statistics report the LLM caches apart from the search caches.
@@ -389,6 +1205,12 @@ whether to clear needs to see which entries a plain clear would remove
 and which it would keep.
 The totals still cover every file, because they answer a different
 question: how much the cache directory holds.
+The files saved beside unreadable caches are listed by path instead
+(\cref{sec:cache-unmerged-files}): their entries are not in use, so
+counting them would overstate what the cache serves, and the user who
+has to look at them needs to know where they are.
+The side entries of fetch facts (\cref{sec:fetch-meta}) are not entries
+a user cached, so they are not counted.
 
 <<cache management functions>>=
 def get_cache_stats() -> dict[str, Any]:
@@ -403,6 +1225,8 @@ def get_cache_stats() -> dict[str, Any]:
       (kept by `clear_cache` unless `include_llm` is true)
     - total_entries: Total number of cached entries in all files
     - total_size_bytes: Total size of all cache files
+    - unmerged_files: Paths of the files saved beside unreadable caches
+      (not counted in the totals)
     """
     cache_dir = get_cache_dir()
     providers: dict[str, int] = {}
@@ -414,7 +1238,10 @@ def get_cache_stats() -> dict[str, Any]:
         total_size += cache_file.stat().st_size
         counts = llm_caches if is_llm_cache(name) else providers
         try:
-            counts[name] = len(load_cache(name))
+            cache = load_cache(name)
+            counts[name] = sum(
+                1 for key in cache if not is_fetch_meta_key(key)
+            )
         except Exception:
             counts[name] = 0
 
@@ -424,6 +1251,7 @@ def get_cache_stats() -> dict[str, Any]:
         "llm_caches": llm_caches,
         "total_entries": sum(providers.values()) + sum(llm_caches.values()),
         "total_size_bytes": total_size,
+        "unmerged_files": [str(path) for path in unmerged_cache_files()],
     }
 @
 
@@ -537,6 +1365,39 @@ class TestCacheManagement:
         assert stats["total_size_bytes"] > 0
 @
 
+Let's verify that a clear waits for a save in progress.
+A second thread plays the saving process and holds the file's lock;
+[[file_lock]] excludes threads of one process as it excludes processes
+(\cref{sec:file-lock}).
+While it holds the lock the file must survive, and once it lets go the
+clear must go ahead.
+
+<<test functions>>=
+def test_clear_cache_waits_for_a_save_in_progress():
+    """clear_cache deletes a file only under its lock."""
+    save_cache("scopus", {"a": 1})
+    cache_file = get_cache_dir() / "scopus.pkl"
+    holding, release = threading.Event(), threading.Event()
+
+    def save_in_progress():
+        with file_lock(cache_file):
+            holding.set()
+            release.wait(timeout=10)
+
+    saver = threading.Thread(target=save_in_progress)
+    saver.start()
+    assert holding.wait(timeout=10)
+    clearer = threading.Thread(target=clear_cache)
+    clearer.start()
+    clearer.join(timeout=0.5)
+    waited = clearer.is_alive() and cache_file.exists()
+    release.set()
+    saver.join(timeout=10)
+    clearer.join(timeout=10)
+    assert waited
+    assert not cache_file.exists()
+@
+
 
 \section{Automatic cache persistence}
 \label{sec:cache-autosave}
@@ -584,18 +1445,14 @@ class TestAutoPersistence:
     def test_register_and_save_all(self, tmp_path, monkeypatch):
         """Registered caches are saved on save_all_caches."""
         monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path))
-        # Clear any existing registrations
-        CACHE_REGISTRY.clear()
-        # Register a cache
+        # A registry of the test's own: clearing the real one would
+        # drop the registrations that the imported modules made.
+        monkeypatch.setattr("scholar.cache.CACHE_REGISTRY", {})
         cache = {("query", 100): [Paper(title="Test", authors=["A"])]}
         register_cache("test_provider", cache)
-        # Save all caches
         save_all_caches()
-        # Verify it was saved
         loaded = load_cache("test_provider")
         assert loaded == cache
-        # Clean up
-        CACHE_REGISTRY.clear()
 @
 
 
@@ -879,6 +1736,9 @@ The regression test runs a test in a separate pytest process whose
 home directories ([[XDG_CACHE_HOME]], [[XDG_DATA_HOME]]) point into
 [[tmp_path]] and already hold a cache, and checks that the run neither
 changed nor added a file there.
+The comparison covers the two home directories only, not the inner
+run's own temporary directories, where its tests may leave files such as
+the lock files of \cref{sec:cache-concurrency}.
 A separate process is needed because the leak happens at import and at
 exit, which a test inside the current process can observe neither of.
 The inner test is one of the CLI's cache tests, but any test that
@@ -918,7 +1778,8 @@ def test_a_test_run_leaves_the_real_directories_alone(tmp_path):
                 path.read_bytes(),
                 path.stat().st_mtime_ns,
             )
-            for path in tmp_path.rglob("*")
+            for home in (cache_home, data_home)
+            for path in home.rglob("*")
             if path.is_file()
         }
 

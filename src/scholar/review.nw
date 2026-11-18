@@ -110,6 +110,7 @@ from cachetools import cachedmethod
 from scholar.scholar import Paper, SearchFilters, merge_version_of
 from scholar.scholar import filters_key, filter_flags
 from scholar.scholar import hits_label, result_outcome, result_via
+from scholar.scholar import parts_returning, result_total, result_dates
 from scholar.scholar import RANKED_PROVIDERS, is_ranked_provider
 from scholar.notes import (
     get_paper_id, get_query_hash, get_data_dir,
@@ -147,6 +148,7 @@ class DecisionStatus(Enum):
 @
 
 \subsection{Review Source}
+\label{sec:review-source}
 
 When using LLM-assisted review, we track where each decision originated.
 This enables:
@@ -159,12 +161,413 @@ This enables:
   prioritized for human review.
 \end{description}
 
+Machines decide in two ways, and a report must keep them apart.  An
+LLM classifies papers through [[scholar llm classify]], one prompt per
+batch, with a confidence per paper.  An AI \emph{agent} (an assistant
+driving Scholar from the command line on the user's behalf) reads the
+hits and records its own verdicts with [[sessions decide --source
+agent]].  Both are machine decisions that no human has looked at, and
+both used to be recorded as something else: an agent had to choose
+between [[human]], which made the audit table cite its keeps as if the
+author had read them, and [[llm]], which credited a classifier run that
+never happened (\url{https://github.com/dbosk/scholar/issues/162}).
+
+So each machine source comes in two states.  The unreviewed one is what
+the machine recorded; the reviewed one is what a human's confirmation
+(or correction) turns it into.  The reviewed state keeps the machine's
+name, because \enquote{a human confirmed what the agent proposed} is a
+different fact from \enquote{a human decided}: the first says the
+screening was delegated and checked, the second that it was not
+delegated at all.  Five values therefore cover every decision Scholar
+records.
+
 <<review data structures>>=
 class ReviewSource(Enum):
     """Source of a review decision."""
     HUMAN = "human"              # User decided directly
     LLM_UNREVIEWED = "llm"       # LLM decided, not yet reviewed by user
     LLM_REVIEWED = "llm_reviewed"  # LLM decided, user confirmed or changed
+    AGENT_UNREVIEWED = "agent"   # AI agent decided, not yet reviewed
+    AGENT_REVIEWED = "agent_reviewed"  # agent decided, user confirmed/changed
+
+    <<unknown review sources>>
+    <<review source properties>>
+@
+
+A session file can hold a source Scholar never wrote.  Real sessions
+contain decisions with the source [[manual]], a value no version of
+Scholar has produced (no commit in the history has it as a string, so
+there is no legacy meaning to map it to), and a hand-edited [[Agent]]
+would be another.  Loading used to turn every such value into
+[[human]], so a decision of unknown origin became a citable human
+decision: the report claimed more than is known about who decided
+(\url{https://github.com/dbosk/scholar/issues/162}).
+
+An unknown value is therefore kept as it is.  [[_missing_]] is the hook
+[[Enum]] calls when a value matches no member; instead of failing it
+returns a pseudo-member that carries the stored value, so the value
+goes back to the file unchanged on save, and the same value always
+gives the same object (it is cached in the enum's own value map, as
+[[enum.Flag]] does for its combinations).  The pseudo-members are not
+listed when the enum is iterated.  The properties below treat them as
+unreviewed: never cited, queued for review, and turned into a human
+decision when a human reviews them, since then a human has decided.
+
+<<unknown review sources>>=
+@classmethod
+def _missing_(cls, value):
+    """Keep an unknown stored value as a pseudo-member (`is_unknown`)."""
+    if not isinstance(value, str):
+        return None
+    pseudo = object.__new__(cls)
+    pseudo._value_ = value
+    pseudo._name_ = "UNKNOWN"
+    return cls._value2member_map_.setdefault(value, pseudo)
+
+@property
+def is_unknown(self) -> bool:
+    """True for a stored value that is none of the known sources."""
+    return self not in type(self).__members__.values()
+@
+
+Most readers of a decision ask one of three questions, and the
+properties answer them so that no caller lists the members itself (a
+list that forgets the agent is how a sixth source would slip into the
+\enquote{cited} column).  [[is_unreviewed]] asks whether the decision
+still waits for a human: such a decision is queued for confirmation in
+the TUI and can never be cited.  [[is_machine]] asks whether a machine
+proposed it, reviewed or not, so that the report can say how much of
+the screening was delegated.  [[reviewed]] is the state a human review
+moves a decision to; a decision that needs no review maps to itself,
+and one of unknown source becomes a human decision.
+
+<<review source properties>>=
+@property
+def is_unreviewed(self) -> bool:
+    """True for a decision that waits for a human: an unreviewed machine
+    decision, or one of unknown source."""
+    return self.is_unknown or self in (
+        ReviewSource.LLM_UNREVIEWED, ReviewSource.AGENT_UNREVIEWED,
+    )
+
+@property
+def is_machine(self) -> bool:
+    """True if an LLM or an agent proposed the decision, reviewed or not."""
+    return self in (
+        ReviewSource.LLM_UNREVIEWED, ReviewSource.LLM_REVIEWED,
+        ReviewSource.AGENT_UNREVIEWED, ReviewSource.AGENT_REVIEWED,
+    )
+
+@property
+def reviewed(self) -> "ReviewSource":
+    """The source of this decision once a human has reviewed it."""
+    if self.is_unknown:
+        return ReviewSource.HUMAN
+    return {
+        ReviewSource.LLM_UNREVIEWED: ReviewSource.LLM_REVIEWED,
+        ReviewSource.AGENT_UNREVIEWED: ReviewSource.AGENT_REVIEWED,
+    }.get(self, self)
+@
+
+Reports count decisions by source (issue~\#163): a review whose 84 of
+93 decisions are unreviewed LLM output reads very differently from one
+a person screened, and the report used to show both as \enquote{93
+papers (9 kept, 84 discarded)}.  The labels below are the single
+wording of the five sources, in the order reports list them: the human
+decisions first, then the machine decisions a human reviewed, then the
+unreviewed ones, which are the ones a reader must discount.  Unknown
+sources come last, each named by its stored value.  Only decided papers
+are counted, since a pending paper carries the default source [[human]]
+without anyone having decided anything.
+
+<<review data structures>>=
+DECISION_SOURCE_LABELS: dict[ReviewSource, str] = {
+    ReviewSource.HUMAN: "human",
+    ReviewSource.LLM_REVIEWED: "LLM, reviewed by a human",
+    ReviewSource.AGENT_REVIEWED: "agent, reviewed by a human",
+    ReviewSource.LLM_UNREVIEWED: "LLM, unreviewed",
+    ReviewSource.AGENT_UNREVIEWED: "agent, unreviewed",
+}
+
+
+def source_label(source: ReviewSource) -> str:
+    """The report wording of `source`, naming an unknown stored value."""
+    if source.is_unknown:
+        return f"unknown source '{source.value}'"
+    return DECISION_SOURCE_LABELS[source]
+
+
+def decision_source_counts(decisions) -> dict[ReviewSource, int]:
+    """Count the decided papers in `decisions` by source, in report order.
+
+    The known sources are always present; unknown ones follow, sorted by
+    their stored value.
+    """
+    counts = {source: 0 for source in DECISION_SOURCE_LABELS}
+    unknown: dict[ReviewSource, int] = {}
+    for decision in decisions:
+        if decision.is_decided:
+            bucket = unknown if decision.source.is_unknown else counts
+            bucket[decision.source] = bucket.get(decision.source, 0) + 1
+    for source in sorted(unknown, key=lambda s: s.value):
+        counts[source] = unknown[source]
+    return counts
+
+
+def decision_source_items(decisions) -> list[tuple[str, int]]:
+    """Return `(label, count)` for each source that decided a paper.
+
+    Sources without decisions are left out; the human row is always
+    there when anything was decided, so that "0 human" is said aloud.
+    """
+    counts = decision_source_counts(decisions)
+    if not any(counts.values()):
+        return []
+    return [
+        (source_label(source), count)
+        for source, count in counts.items()
+        if count or source is ReviewSource.HUMAN
+    ]
+
+
+def decision_sources_sentence(decisions) -> str:
+    """One sentence stating who decided, e.g. for an abstract.
+
+    Empty when nothing is decided. Labels contain commas, so the parts
+    are separated by semicolons.
+    """
+    items = decision_source_items(decisions)
+    if not items:
+        return ""
+    parts = "; ".join(f"{count} {label}" for label, count in items)
+    return f"Decisions by source: {parts}."
+@
+
+A decision recorded by [[sessions decide --source agent]] or [[--source
+llm]] replaces whatever was decided before, and a classifier run may
+have stored fields saying how it decided (the model, the prompt, the
+reason).  Left in place, they would describe a decision that no longer
+exists, and a report would attribute the agent's verdict to that model
+run.  [[clear_machine_audit]] forgets them; it names no field itself
+but reads [[MACHINE_AUDIT_FIELDS]], so the code that adds such a field
+registers it there and every replacing path clears it.  The classifier's
+confidence is not among them: [[sessions decide]] keeps or replaces it
+deliberately (\cref{sec:sessions-decide}).
+
+<<review data structures>>=
+MACHINE_AUDIT_FIELDS: tuple[str, ...] = ()
+
+
+def clear_machine_audit(decision) -> None:
+    """Forget the audit fields a classifier run stored on `decision`."""
+    for name in MACHINE_AUDIT_FIELDS:
+        setattr(decision, name, None)
+@
+
+The report's paper lists name the unreviewed machine decisions where
+they stand, not only in the counts, so that a reader who looks up one
+paper learns that nobody has checked it.  The mark is the same label.
+
+<<review data structures>>=
+def unreviewed_mark(decision) -> str:
+    """Label of an unreviewed or unknown-source decision, or "" otherwise."""
+    if decision.source.is_unreviewed:
+        return source_label(decision.source)
+    return ""
+@
+
+Let's pin the five values, which are what the session files store, and
+the questions the properties answer:
+
+<<test functions>>=
+class TestAgentDecisionSource:
+    """The agent source and the questions reports ask of a source."""
+
+    def test_stored_values(self):
+        assert ReviewSource("agent") is ReviewSource.AGENT_UNREVIEWED
+        assert ReviewSource("agent_reviewed") is ReviewSource.AGENT_REVIEWED
+        assert ReviewSource("llm") is ReviewSource.LLM_UNREVIEWED
+
+    def test_unreviewed_and_machine(self):
+        unreviewed = {s for s in ReviewSource if s.is_unreviewed}
+        assert unreviewed == {
+            ReviewSource.LLM_UNREVIEWED, ReviewSource.AGENT_UNREVIEWED,
+        }
+        assert [s for s in ReviewSource if not s.is_machine] == [
+            ReviewSource.HUMAN
+        ]
+
+    def test_review_keeps_the_machine_name(self):
+        assert ReviewSource.AGENT_UNREVIEWED.reviewed \
+            is ReviewSource.AGENT_REVIEWED
+        assert ReviewSource.LLM_UNREVIEWED.reviewed \
+            is ReviewSource.LLM_REVIEWED
+        assert ReviewSource.HUMAN.reviewed is ReviewSource.HUMAN
+        assert ReviewSource.AGENT_REVIEWED.reviewed \
+            is ReviewSource.AGENT_REVIEWED
+
+    def test_counts_only_decided_papers(self):
+        def d(status, source):
+            return ReviewDecision(
+                paper=Paper(title="T", authors=["A"]), provider="p",
+                status=status, source=source,
+            )
+        decisions = [
+            d(DecisionStatus.KEPT, ReviewSource.HUMAN),
+            d(DecisionStatus.PENDING, ReviewSource.HUMAN),
+            d(DecisionStatus.DISCARDED, ReviewSource.AGENT_UNREVIEWED),
+            d(DecisionStatus.DISCARDED, ReviewSource.AGENT_UNREVIEWED),
+            d(DecisionStatus.KEPT, ReviewSource.LLM_REVIEWED),
+        ]
+        assert decision_source_items(decisions) == [
+            ("human", 1),
+            ("LLM, reviewed by a human", 1),
+            ("agent, unreviewed", 2),
+        ]
+        assert decision_sources_sentence(decisions) == (
+            "Decisions by source: 1 human; 1 LLM, reviewed by a human; "
+            "2 agent, unreviewed."
+        )
+        assert unreviewed_mark(decisions[2]) == "agent, unreviewed"
+        assert unreviewed_mark(decisions[4]) == ""
+
+    def test_human_row_is_said_aloud(self):
+        decisions = [ReviewDecision(
+            paper=Paper(title="T", authors=["A"]), provider="p",
+            status=DecisionStatus.KEPT, source=ReviewSource.LLM_UNREVIEWED,
+        )]
+        assert decision_source_items(decisions) == [
+            ("human", 0), ("LLM, unreviewed", 1),
+        ]
+        assert decision_sources_sentence([]) == ""
+@
+
+The new values are stored as they are, so a session file written before
+they existed loads exactly as before, and a session that holds them
+survives a save, a load and a concurrent save by another process
+(\cref{sec:session-integrity}): a human's confirmation of an agent
+decision is a decision change like any other.
+
+<<test functions>>=
+class TestAgentSourcePersistence:
+    def _session(self, sources):
+        session = ReviewSession(
+            query="q", providers=["p"], timestamp=datetime(2026, 11, 18),
+            name="agent-src",
+        )
+        session.decisions = [
+            ReviewDecision(
+                paper=Paper(title=f"Paper {i}", authors=["A"], year=2024,
+                            doi=f"10.1/agent-src-{i}"),
+                provider="p", status=DecisionStatus.KEPT, source=source,
+                llm_confidence=0.6 if source.is_machine else None,
+            )
+            for i, source in enumerate(sources)
+        ]
+        return session
+
+    def test_round_trip(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        sources = list(ReviewSource)
+        save_session(self._session(sources))
+        loaded = load_session("agent-src")
+        assert [d.source for d in loaded.decisions] == sources
+        assert loaded.llm_review_statistics()["agent_unreviewed"] == 1
+        assert loaded.llm_review_statistics()["agent_reviewed"] == 1
+
+    def test_old_session_file_loads_unchanged(self, tmp_path, monkeypatch):
+        import json
+
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        path = save_session(self._session([
+            ReviewSource.HUMAN, ReviewSource.LLM_UNREVIEWED,
+            ReviewSource.LLM_REVIEWED, ReviewSource.HUMAN,
+        ]))
+        data = json.loads(path.read_text())
+        del data["decisions"][3]["source"]
+        path.write_text(json.dumps(data))
+        loaded = load_session("agent-src")
+        assert [d.source for d in loaded.decisions] == [
+            ReviewSource.HUMAN, ReviewSource.LLM_UNREVIEWED,
+            ReviewSource.LLM_REVIEWED, ReviewSource.HUMAN,
+        ]
+
+    def test_concurrent_save_keeps_a_confirmation(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        save_session(self._session([ReviewSource.AGENT_UNREVIEWED]))
+        enrich = load_session("agent-src")
+        review_ = load_session("agent-src")
+        review_.decisions[0].source = ReviewSource.AGENT_REVIEWED
+        save_session(review_)
+        enrich.decisions[0].paper.abstract = "Enriched."
+        save_session(enrich)
+        assert load_session("agent-src").decisions[0].source \
+            is ReviewSource.AGENT_REVIEWED
+@
+
+A stored source Scholar does not know survives a load and a save as it
+is, is never cited nor used as an example, is named in the counts, and
+is reported once:
+
+<<test functions>>=
+class TestUnknownReviewSource:
+    def _session(self):
+        session = ReviewSession(
+            query="q", providers=["p"], timestamp=datetime(2026, 11, 18),
+            name="unknown-src",
+        )
+        session.decisions = [
+            ReviewDecision(
+                paper=Paper(title="Kept", authors=["A"], year=2024,
+                            doi="10.1/unknown-src"),
+                provider="p", status=DecisionStatus.KEPT, tags=["ml"],
+                source=ReviewSource("manual"), is_example=True,
+            ),
+        ]
+        return session
+
+    def test_value_is_kept(self):
+        source = ReviewSource("manual")
+        assert source is ReviewSource("manual")
+        assert source.value == "manual" and source.is_unknown
+        assert source.is_unreviewed and not source.is_machine
+        assert source.reviewed is ReviewSource.HUMAN
+        assert source not in list(ReviewSource)
+        assert not ReviewSource.HUMAN.is_unknown
+
+    def test_round_trip_and_one_warning(self, tmp_path, monkeypatch, caplog):
+        import json
+        import logging
+
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        path = save_session(self._session())
+        data = json.loads(path.read_text())
+        data["decisions"][0]["source"] = "Agent"
+        path.write_text(json.dumps(data))
+        with caplog.at_level(logging.WARNING, logger="scholar.review"):
+            loaded = load_session("unknown-src")
+            save_session(loaded)
+            load_session("unknown-src")
+        warnings = [r for r in caplog.records if "unknown source" in r.message]
+        assert len(warnings) == 1
+        assert "'Agent'" in warnings[0].getMessage()
+        assert json.loads(path.read_text())["decisions"][0]["source"] \
+            == "Agent"
+
+    def test_never_cited_nor_an_example(self):
+        session = self._session()
+        decision = session.decisions[0]
+        label, order = audit_reason(
+            decision, theme_names={}, strings=AUDIT_STRINGS["en"],
+        )
+        assert order != AUDIT_ORDER_CITED
+        assert session.example_papers() == []
+        assert decision_source_items(session.decisions) == [
+            ("human", 0), ("unknown source 'manual'", 1),
+        ]
+        assert unreviewed_mark(decision) == "unknown source 'manual'"
 @
 
 \subsection{Review Decision}
@@ -229,6 +632,10 @@ class ReviewDecision:
         source: Where the decision came from (human or LLM).
         is_example: True if this paper is a training example for LLM.
         llm_confidence: Confidence score from LLM (0.0-1.0), if applicable.
+        llm_model, llm_decided_at, llm_prompt_version, llm_reason,
+            llm_abstract_truncated: what `scholar llm classify` recorded
+            about its decision (see `LLM_AUDIT_FIELDS`); `None` when
+            unknown, as for decisions made before they were recorded.
         found_by: The `(query, provider, filters key)` keys of the search
             records whose results contained the paper, in the order
             recorded; empty when not recorded (sessions saved before the
@@ -242,6 +649,7 @@ class ReviewDecision:
     source: ReviewSource = ReviewSource.HUMAN
     is_example: bool = False
     llm_confidence: float | None = None
+    <<LLM audit fields of a decision>>
     found_by: list[tuple[str, str, str | None]] = field(default_factory=list)
 
     def __post_init__(self):
@@ -412,6 +820,333 @@ class TestReviewDecision:
 @
 
 
+\subsection{What the LLM classifier recorded}
+\label{sec:llm-audit-fields}
+
+A decision that [[scholar llm classify]] made used to keep only its
+source and the model's confidence.  The model, the date, the prompt and
+the model's own reason were logged and then lost, so a report could say
+that \enquote{an LLM} screened the papers but not which one, when, or
+under which instructions---and a report that says less than happened
+invites the reader to assume more.  So each decision now keeps what the
+classifier knew when it decided:
+\begin{description}
+\item[ [[llm_model]] ] the model id the [[llm]] package reports, so two
+  rounds with different models can be told apart;
+\item[ [[llm_decided_at]] ] when the batch was answered, in UTC (ISO 8601),
+  since a session may be classified over several days and on more than
+  one machine;
+\item[ [[llm_prompt_version]] ] a short hash of the prompt template and the
+  options of the run (\cref{sec:prompt-version}), so that decisions made
+  under the same procedure share a version and a changed procedure shows
+  up as a new one;
+\item[ [[llm_reason]] ] the model's stated reason, truncated, which is what a
+  reviewer reads first when checking a doubtful row;
+\item[ [[llm_abstract_truncated]] ] whether the model saw only the start of
+  the abstract, because a decision made on a cut-off abstract rests on
+  less than the reader would assume.
+\end{description}
+All five default to [[None]], which means \emph{unknown}: decisions
+made before these fields existed, human decisions, and decisions
+recorded with [[sessions decide --source llm]] on a paper the classifier
+never decided.  None of them is
+ever filled in with a guess.  The fields describe the machine's
+decision, so a human who later confirms or changes it leaves them as
+they are: they are the record of what the model said, which is what a
+comparison of the two needs (\cref{sec:llm-sample}).
+
+<<LLM audit fields of a decision>>=
+llm_model: str | None = None
+llm_decided_at: str | None = None
+llm_prompt_version: str | None = None
+llm_reason: str | None = None
+llm_abstract_truncated: bool | None = None
+@
+
+The fields travel together everywhere a decision is copied, saved,
+loaded or merged.  Naming them once keeps those places from drifting
+apart: a sixth field added to the dataclass but forgotten in one copy
+would be silently dropped the next time the session is appended to.
+
+<<review data structures>>=
+LLM_AUDIT_FIELDS: tuple[str, ...] = (
+    "llm_model",
+    "llm_decided_at",
+    "llm_prompt_version",
+    "llm_reason",
+    "llm_abstract_truncated",
+)
+
+
+def llm_audit_of(decision: ReviewDecision) -> dict:
+    """Return the LLM audit fields of `decision`, by name."""
+    return {name: getattr(decision, name) for name in LLM_AUDIT_FIELDS}
+@
+
+They describe how a classifier run decided, so a decision that replaces
+the classifier's must forget them: we register them with
+[[clear_machine_audit]] (\cref{sec:review-source}).
+
+<<review data structures>>=
+MACHINE_AUDIT_FIELDS = MACHINE_AUDIT_FIELDS + LLM_AUDIT_FIELDS
+@
+
+<<test functions>>=
+def test_replacing_decision_forgets_the_classifier_run():
+    decision = ReviewDecision(
+        paper=Paper(title="C", authors=["A"], doi="10.5555/clear-audit"),
+        provider="p", status=DecisionStatus.KEPT,
+        source=ReviewSource.LLM_UNREVIEWED, llm_model="m-1",
+        llm_decided_at="2026-11-18T10:00:00+00:00",
+        llm_prompt_version="abcd", llm_reason="Fits.",
+        llm_abstract_truncated=True,
+    )
+    clear_machine_audit(decision)
+    assert llm_audit_of(decision) == {name: None for name in LLM_AUDIT_FIELDS}
+@
+
+Let's check the round trip: the fields survive a save and a load, a
+session saved before they existed loads them as unknown, an append of
+new search results keeps them on a paper that was already decided, and
+a save from a process that loaded the session before the classifier
+saved does not erase them.
+
+<<test functions>>=
+class TestLLMAuditFields:
+    """The LLM classifier's record of a decision is kept, never invented."""
+
+    <<LLM audit field test methods>>
+
+<<LLM audit field test methods>>=
+AUDIT = {
+    "llm_model": "fake-model",
+    "llm_decided_at": "2026-11-18T09:30:00+00:00",
+    "llm_prompt_version": "abc123def4567890",
+    "llm_reason": "Studies the claim directly.",
+    "llm_abstract_truncated": True,
+}
+
+def _session(self, name):
+    session = ReviewSession(
+        query="q", providers=["openalex"], timestamp=datetime(2026, 11, 18),
+        name=name,
+    )
+    session.decisions.append(ReviewDecision(
+        paper=Paper(title="Audited", authors=["A"],
+                    doi=f"10.5555/llm-audit-{name}"),
+        provider="openalex", status=DecisionStatus.DISCARDED,
+        tags=["off-topic"], source=ReviewSource.LLM_UNREVIEWED,
+        llm_confidence=0.9, **self.AUDIT,
+    ))
+    return session
+
+def test_field_names_are_importable(self):
+    from scholar.review import LLM_AUDIT_FIELDS as names
+
+    assert set(names) == set(self.AUDIT)
+
+def test_fields_survive_save_and_load(self):
+    save_session(self._session("audit-roundtrip"))
+    loaded = load_session("audit-roundtrip").decisions[0]
+    assert llm_audit_of(loaded) == self.AUDIT
+
+def test_old_session_loads_them_as_unknown(self, tmp_path, monkeypatch):
+    import json
+
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+    sessions_dir = tmp_path / "review_sessions"
+    sessions_dir.mkdir(parents=True)
+    (sessions_dir / "audit-old.json").write_text(json.dumps({
+        "query": "q", "name": "audit-old", "providers": ["openalex"],
+        "timestamp": "2026-01-01T00:00:00", "snowball_rounds": [],
+        "decisions": [{
+            "paper_id": "doi:10.5555/llm-audit-old", "provider": "openalex",
+            "status": "discarded", "tags": ["off-topic"], "source": "llm",
+            "is_example": False, "llm_confidence": 0.7,
+            "paper": {"title": "Old", "authors": ["A"],
+                      "doi": "10.5555/llm-audit-old"},
+        }],
+    }))
+    loaded = load_session("audit-old")
+    assert llm_audit_of(loaded.decisions[0]) == dict.fromkeys(
+        LLM_AUDIT_FIELDS
+    )
+    assert loaded.llm_samples == []
+
+def test_append_keeps_them(self):
+    from scholar.scholar import SearchResult
+
+    save_session(self._session("audit-append"))
+    paper = Paper(title="Audited", authors=["A"],
+                  doi="10.5555/llm-audit-audit-append",
+                  sources=["openalex"])
+    appended = create_review_session([SearchResult(
+        query="q", provider="openalex", timestamp="t", papers=[paper],
+    )], "q", session_name="audit-append")
+    assert llm_audit_of(appended.decisions[0]) == self.AUDIT
+
+def test_concurrent_save_keeps_them(self):
+    session = self._session("audit-race")
+    for name in LLM_AUDIT_FIELDS:
+        setattr(session.decisions[0], name, None)
+    session.decisions[0].source = ReviewSource.HUMAN
+    save_session(session)
+    stale = load_session("audit-race")
+    classify = load_session("audit-race")
+    for name, value in self.AUDIT.items():
+        setattr(classify.decisions[0], name, value)
+    classify.decisions[0].source = ReviewSource.LLM_UNREVIEWED
+    save_session(classify)
+    stale.decisions[0].paper.abstract = "Enriched."
+    save_session(stale)
+    assert llm_audit_of(load_session("audit-race").decisions[0]) \
+        == self.AUDIT
+@
+
+
+\subsection{Samples of machine decisions drawn for review}
+\label{sec:llm-sample-record}
+
+An LLM's confidence is its own report, and nothing in a session says
+how often its unreviewed decisions are wrong.  [[scholar llm sample]]
+(\cref{sec:llm-sample} in the LLM review module) answers that by
+drawing a seeded random sample of unreviewed machine decisions for a
+human to review.  The sample has to be stored in the session, for two
+reasons.  The rate can only be computed later, once the human has
+reviewed the sample, and by then the sampled rows look like any other
+reviewed row; and a reader of the report must be able to check that
+the sample was drawn as described, which needs the seed, the criteria
+and the drawn papers, not only the rate.
+
+So an [[LLMSample]] keeps how it was drawn ([[seed]], [[criteria]],
+[[drawn_at]] in UTC, the [[sessions]] pooled and the size and a digest
+of the [[population]] drawn from) and, for the drawn papers of this
+session, the machine's decision at the time: its status, source and
+confidence.  Storing the status is what lets the report count a
+\enquote{changed} decision without relying on a side effect of the
+review, such as [[is_example]], which the TUI also sets for other
+reasons.  One sample drawn over several sessions is stored in each of
+them under the same [[sample_id]], each with its own papers, so that a
+report on one session can still state the whole sample's size.
+
+<<review data structures>>=
+@dataclass
+class LLMSample:
+    """A seeded random sample of machine decisions drawn for human review.
+
+    `papers` holds the drawn papers of this session only, each as
+    `{"paper_id", "status", "source", "confidence"}` with the machine's
+    decision when the sample was drawn; `size` and `population` are those
+    of the whole sample, over all `sessions`.
+    """
+    sample_id: str
+    seed: int
+    drawn_at: str
+    criteria: dict
+    sessions: list[str]
+    population: int
+    population_digest: str
+    size: int
+    papers: list[dict] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        """Return the sample as JSON-ready data."""
+        return {
+            "sample_id": self.sample_id,
+            "seed": self.seed,
+            "drawn_at": self.drawn_at,
+            "criteria": dict(self.criteria),
+            "sessions": list(self.sessions),
+            "population": self.population,
+            "population_digest": self.population_digest,
+            "size": self.size,
+            "papers": [dict(p) for p in self.papers],
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "LLMSample":
+        """Rebuild a sample saved by `to_dict`."""
+        return cls(
+            sample_id=data["sample_id"],
+            seed=data["seed"],
+            drawn_at=data["drawn_at"],
+            criteria=dict(data.get("criteria") or {}),
+            sessions=list(data.get("sessions") or []),
+            population=data.get("population", 0),
+            population_digest=data.get("population_digest", ""),
+            size=data.get("size", 0),
+            papers=[dict(p) for p in data.get("papers") or []],
+        )
+@
+
+A session lists its samples in [[llm_samples]], oldest first; sessions
+saved before samples existed load with none.  Samples only accumulate,
+like snowball rounds, so a concurrent save adds the samples that only
+the file has (\cref{sec:session-integrity}).
+
+<<load the LLM review samples>>=
+session.llm_samples = [
+    LLMSample.from_dict(sample) for sample in data.get("llm_samples") or []
+]
+<<serialise the LLM review samples>>=
+"llm_samples": [sample.to_dict() for sample in session.llm_samples],
+<<merge the LLM review samples from disk>>=
+own_samples = {sample.sample_id for sample in session.llm_samples}
+for sample in on_disk.llm_samples:
+    if sample.sample_id not in own_samples:
+        session.llm_samples.append(sample)
+@
+
+The sample survives a save and a load unchanged, and a sample drawn by
+another process while this one held the session is kept when this one
+saves:
+
+<<test functions>>=
+class TestLLMSampleRecord:
+    """Samples drawn for review are stored with the session."""
+
+    <<LLM sample record test methods>>
+
+<<LLM sample record test methods>>=
+def _sample(self, sample_id="2026-11-18T10:00:00+00:00/7"):
+    return LLMSample(
+        sample_id=sample_id, seed=7, drawn_at="2026-11-18T10:00:00+00:00",
+        criteria={"statuses": ["discarded"], "min_confidence": 0.8},
+        sessions=["sample-a", "sample-b"], population=40,
+        population_digest="0123abcd", size=10,
+        papers=[{"paper_id": "doi:10.5555/s1", "status": "discarded",
+                 "source": "llm", "confidence": 0.95}],
+    )
+
+def _save_empty(self, name):
+    save_session(ReviewSession(
+        query="q", providers=["openalex"], timestamp=datetime(2026, 11, 18),
+        name=name,
+    ))
+
+def test_round_trip(self):
+    self._save_empty("sample-roundtrip")
+    session = load_session("sample-roundtrip")
+    session.llm_samples.append(self._sample())
+    save_session(session)
+    assert load_session("sample-roundtrip").llm_samples == [self._sample()]
+
+def test_concurrent_save_keeps_a_sample(self):
+    self._save_empty("sample-race")
+    stale = load_session("sample-race")
+    sampler = load_session("sample-race")
+    sampler.llm_samples.append(self._sample())
+    save_session(sampler)
+    stale.research_context = "Why?"
+    save_session(stale)
+    final = load_session("sample-race")
+    assert [s.sample_id for s in final.llm_samples] == [
+        self._sample().sample_id
+    ]
+    assert final.research_context == "Why?"
+@
+
+
 \subsection{Snowball Round}
 
 When performing manual snowballing (adding references or citing papers to the
@@ -455,7 +1190,16 @@ repeated before the answer was accepted.  Records written before these
 fields existed load with [[hits]] unknown ([[None]]), no error and no
 retries: we cannot reconstruct what an old search returned, and claiming
 \enquote{answered} for it is no worse than what such a record has always
-claimed.
+claimed.  The record also keeps the [[total]] the service reported, and
+whether it was an estimate, so that a count cut at the limit reads as
+one (\url{https://github.com/dbosk/scholar/issues/166}); older records
+load with the total unknown.  And it keeps when the search ran and when
+its answer was fetched (\cref{sec:search-dates} in the [[scholar]]
+module), which differ for an answer served from the cache, so that a
+report can state the date each source was searched
+(\url{https://github.com/dbosk/scholar/issues/167}).  Older records
+load with both dates unknown, and the session's own [[timestamp]],
+reset at every append, is no stand-in for them.
 
 \label{sec:search-record-key}
 A search is identified by its query, its provider \emph{and} its
@@ -484,6 +1228,12 @@ class SearchRecord:
     the number of papers the search produced (``None`` for records that
     predate it), ``error`` why the provider failed (``None`` when it
     answered), and ``retries`` how often the search was repeated.
+    ``total`` is the number of matching records the service reported
+    (``None`` when unknown), ``total_estimated`` whether it called that
+    an estimate. ``searched_at`` is when the search ran, ``fetched_at``
+    when its answer was fetched from the service (UTC ISO times;
+    ``None`` when unknown) and ``from_cache`` whether the answer came
+    from the cache (``None`` when unknown).
     ``via`` names the endpoint that answered when the provider has
     several (``None``: the provider's default, or not recorded).
     """
@@ -494,6 +1244,11 @@ class SearchRecord:
     hits: int | None = None
     error: str | None = None
     retries: int = 0
+    total: int | None = None
+    total_estimated: bool = False
+    searched_at: str | None = None
+    fetched_at: str | None = None
+    from_cache: bool | None = None
     via: str | None = None
 
     @property
@@ -509,6 +1264,8 @@ class SearchRecord:
         recorded since stores its limit.
         """
         return self.filters is None and self.limit is None
+
+    <<search record properties>>
 @
 
 [[via]] names the endpoint that answered when a provider has more than
@@ -518,6 +1275,14 @@ a Semantic Scholar search that went to its bulk search (and
 It is not part of the key: which endpoint a provider uses follows from
 the query and the limit, so it does not tell two searches apart that
 the key would merge.
+Nor is it part of [[record_rank]], by which a session keeps one of two
+records of a search (\cref{sec:wider-record}): a bulk run of a query
+that the relevance search once answered is the same search, and the
+newer or wider run replaces the older record like any other.
+That is intended.  For a Boolean query the relevance answer was the
+zero of \url{https://github.com/dbosk/scholar/issues/161}, and for a
+plain-word query the bulk record is the wider one, [[--limit 0]]
+against a limit.
 It is stored with the record and read back with [[rec.get]], so a
 session saved before it existed loads with [[None]], which reads as
 \enquote{not recorded}, never as a claim about the endpoint.
@@ -545,6 +1310,506 @@ filters (\cref{sec:legacy-records}).  Keeping it beside the new record
 would make [[found-via]] print, for it, a command without filters that
 may never have been run.
 
+\label{sec:merged-records}
+A second kind of old record cannot be split either.  Until
+\url{https://github.com/dbosk/scholar/issues/164} a multi-provider
+[[search -n]] stored its merged result as one record: provider
+[[openalex, dblp]], query [[q | q]], the deduplicated count of all
+providers together and their errors joined, each prefixed with its
+provider.  Searches now record one record per provider
+(\cref{sec:review-found-by}), but sessions hold hundreds of the old
+ones, and their papers link to them.  They load unchanged, since
+rewriting them would invent per-provider counts that were never
+stored.  What changes is how they are read: [[is_merged]] recognises
+them by the comma that no provider name contains, and
+[[search_outcome_label]] says what such a record is---\enquote{merged
+record (providers openalex, dblp): outcome cannot be split}, with the
+total and the provider-labelled errors after it---instead of a count
+that a reader would take for each provider's.
+
+<<search record properties>>=
+@property
+def merged_providers(self) -> list[str]:
+    """The providers of a merged record, or `[provider]` for one search."""
+    return [p.strip() for p in self.provider.split(",") if p.strip()]
+
+@property
+def is_merged(self) -> bool:
+    """Whether the record is a merged one from before #164."""
+    return len(self.merged_providers) > 1
+@
+
+The label is the one place that decides how a record's outcome reads,
+for [[sessions show]] and the report alike; for a record of one search
+it is [[hits_label]] (\cref{sec:search-result-error} in the
+[[scholar]] module).
+
+<<review data structures>>=
+def search_outcome_label(record: SearchRecord) -> str:
+    """Describe a search record's outcome; "" when nothing is known.
+
+    A merged record (see `SearchRecord.is_merged`) is labelled as such,
+    since its count and errors cannot be attributed to its providers.
+    """
+    if record.is_merged:
+        details = []
+        if record.hits is not None:
+            details.append(f"{record.hits} papers in total")
+        if record.error:
+            details.append(f"errors: {record.error}")
+        label = (
+            f"merged record (providers {', '.join(record.merged_providers)})"
+            ": outcome cannot be split"
+        )
+        return label + (f" ({'; '.join(details)})" if details else "")
+    return hits_label(
+        record.hits, record.error, record.retries,
+        ranked=is_ranked_provider(record.provider),
+        total=record.total, limit=record.limit,
+        estimated=record.total_estimated,
+    )
+@
+
+A record's dates are described in words for the same views.  An
+answer fetched during the run needs only the run's date; a cached one
+names the date it was fetched, or says that the cache does not know it
+(an answer cached before fetch dates were kept), never the run's date
+in its place (\url{https://github.com/dbosk/scholar/issues/167}).
+[[search_source_date]] is the one date a coverage statement can use,
+the date the database itself was asked: the fetch date when known,
+otherwise the run's date unless the answer came from the cache.  A
+provider that does not say whether it answered from a cache (one from
+outside scholar) is taken to have been asked when the search ran, the
+only date there is.  A search that failed outright, or was skipped,
+has no such date: the database answered nothing, and a date would let
+the coverage statement count it as searched.  The caption and the
+report leave such records out of their period
+([[answered_records]]).
+
+<<review data structures>>=
+def search_dates_label(record: SearchRecord) -> str:
+    """Describe when a search ran and its answer was fetched; "" if unknown."""
+    searched = (record.searched_at or "")[:10]
+    fetched = (record.fetched_at or "")[:10]
+    if not searched and not fetched:
+        return ""
+    if record.from_cache:
+        cached = (
+            f"cached answer fetched {fetched}" if fetched
+            else "cached answer, fetch date unknown"
+        )
+        return f"searched {searched}, {cached}" if searched else cached
+    if not searched:
+        return f"fetched {fetched}"
+    if fetched and fetched != searched:
+        return f"searched {searched}, fetched {fetched}"
+    return f"searched {searched}"
+
+
+def search_source_date(record: SearchRecord) -> str | None:
+    """The date (YYYY-MM-DD) the database answered the search, if known.
+
+    None for a search that failed outright or was skipped, since the
+    database answered nothing.
+    """
+    if record.error and not record.hits:
+        return None
+    if record.fetched_at:
+        return record.fetched_at[:10]
+    if record.from_cache or not record.searched_at:
+        return None
+    return record.searched_at[:10]
+
+
+def answered_records(records: list[SearchRecord]) -> list[SearchRecord]:
+    """The records whose search did not fail outright (or was skipped)."""
+    return [r for r in records if not (r.error and not r.hits)]
+@
+
+<<test functions>>=
+class TestSearchDatesLabel:
+    """Dates of a search, worded for display (#167)."""
+
+    def test_labels(self):
+        def record(**dates):
+            return SearchRecord("q", "openalex", None, 100, hits=1, **dates)
+
+        run = "2026-11-18T09:00:00+00:00"
+        october = "2026-10-02T08:00:00+00:00"
+        assert search_dates_label(record()) == ""
+        assert search_dates_label(record(
+            searched_at=run, fetched_at=run, from_cache=False,
+        )) == "searched 2026-11-18"
+        assert search_dates_label(record(
+            searched_at=run, fetched_at=october, from_cache=True,
+        )) == "searched 2026-11-18, cached answer fetched 2026-10-02"
+        assert search_dates_label(record(
+            searched_at=run, from_cache=True,
+        )) == "searched 2026-11-18, cached answer, fetch date unknown"
+
+    def test_source_date(self):
+        run = "2026-11-18T09:00:00+00:00"
+        october = "2026-10-02T08:00:00+00:00"
+        assert search_source_date(SearchRecord(
+            "q", "p", searched_at=run, fetched_at=october, from_cache=True,
+        )) == "2026-10-02"
+        assert search_source_date(SearchRecord(
+            "q", "p", searched_at=run, from_cache=True,
+        )) is None
+        assert search_source_date(SearchRecord(
+            "q", "p", searched_at=run,
+        )) == "2026-11-18"
+        assert search_source_date(SearchRecord("q", "p")) is None
+
+    def test_failed_or_skipped_search_has_no_date(self):
+        run = "2026-11-18T09:00:00+00:00"
+        skipped = SearchRecord(
+            "q", "ieee", hits=0, searched_at=run,
+            error="skipped: daily quota spent; resets 01:00",
+        )
+        assert search_source_date(skipped) is None
+        partial = SearchRecord("q", "dblp", hits=3, error="cut short",
+                               searched_at=run, fetched_at=run,
+                               from_cache=False)
+        assert search_source_date(partial) == "2026-11-18"
+        answered = SearchRecord("q", "openalex", hits=2,
+                                fetched_at="2026-10-02T08:00:00+00:00")
+        assert audit_dates_sentence(
+            AUDIT_STRINGS["en"], [skipped, answered]
+        ) == "Searched 2026-10-02."
+@
+
+The dates must reach the session file from a search result and come
+back, and a record saved before they existed must load with them
+unknown:
+
+<<test functions>>=
+class TestRecordDates:
+    """Search records keep their dates through a save (#167)."""
+
+    def test_round_trip_and_old_records(self):
+        import json
+        from scholar.review import _get_sessions_dir
+        from scholar.scholar import SearchResult
+        result = SearchResult(
+            query="q", provider="openalex", timestamp="t", papers=[],
+            limit=5, searched_at="2026-11-18T09:00:00+00:00",
+            fetched_at="2026-10-02T08:00:00+00:00", from_cache=True,
+        )
+        save_session(create_review_session([result], "q",
+                                           session_name="dated"))
+        record = load_session("dated").search_records[0]
+        assert (record.searched_at, record.fetched_at, record.from_cache) \
+            == ("2026-11-18T09:00:00+00:00", "2026-10-02T08:00:00+00:00",
+                True)
+        path = _get_sessions_dir() / "dated.json"
+        data = json.loads(path.read_text())
+        for rec in data["search_records"]:
+            for field_name in ("searched_at", "fetched_at", "from_cache"):
+                del rec[field_name]
+        path.write_text(json.dumps(data))
+        record = load_session("dated").search_records[0]
+        assert (record.searched_at, record.fetched_at, record.from_cache) \
+            == (None, None, None)
+        assert search_dates_label(record) == ""
+@
+
+<<test functions>>=
+class TestMergedRecords:
+    """Merged records from before #164 are labelled, never split."""
+
+    def test_merged_record_is_recognised(self):
+        record = SearchRecord("q | q", "openalex, dblp", None, 100,
+                              hits=25, error="dblp: non-JSON response")
+        assert record.is_merged
+        assert record.merged_providers == ["openalex", "dblp"]
+        assert not SearchRecord("q", "dblp", None, 100).is_merged
+
+    def test_label_does_not_split_the_outcome(self):
+        record = SearchRecord("q | q", "openalex, dblp", None, 100,
+                              hits=25, error="dblp: non-JSON response")
+        assert search_outcome_label(record) == (
+            "merged record (providers openalex, dblp): outcome cannot be "
+            "split (25 papers in total; errors: dblp: non-JSON response)"
+        )
+
+    def test_single_search_label_is_hits_label(self):
+        record = SearchRecord("q", "dblp", None, 100, hits=0,
+                              error="HTTP 503")
+        assert search_outcome_label(record) == "failed (HTTP 503)"
+@
+
+\label{sec:superseded-merged}
+A merged record cannot be split, but it can be superseded.  When the
+user re-runs its query with the current code, the new run records one
+search per provider, and those records stood beside the old merged one
+(a copy of a real session went from 4 to 6 records for one re-run):
+the caption's \enquote{for k of n queries} and the report then counted
+that query twice for each of its providers.  Once there is a record of
+the same query and filters for \emph{every} provider the merged record
+names ([[merged_record_cover]]), the merged record says nothing those
+records do not, except a count that could never be attributed, so it is
+dropped ([[supersede_merged_records]]).  A merged record that only some
+providers have re-run stays: dropping it would lose the only record of
+the others.
+
+A record covers only if it can stand in for the provider's part of the
+merged search.  It must have answered: a skipped search or an HTTP~500
+says nothing about what the provider holds, and dropping the merged
+record for it would turn an answered search into a failed one.  And it
+must have asked for at least as much: a re-run with [[-l 5]] cannot
+stand in for a merged search with [[-l 100]], whose papers it may not
+include.  A merged record whose limit is unknown (the merge of two
+different limits stores none) is covered by any answered record, since
+nothing is known to compare with.  Without these two conditions a plain
+load and save of real sessions dropped merged records that no answered
+search covered; with them, a merged record is dropped only where it
+really counted a search twice.
+
+The papers linked to the merged record keep a link to the search, now
+per provider.  A paper that the new run returned already has links to
+the records of the providers that returned it ([[found_in]],
+\cref{sec:review-found-by}), which is more precise than the old link,
+so the old link is simply dropped.  A paper that the new run did not
+return is linked to the records of all the merged providers, which is
+what the old link said: one of them returned it.
+
+The positions of the query parts and the providers correspond, since
+the merge joined both in the same order ([[q1 | q2]] with
+[[openalex, dblp]]); a query whose parts are all equal, the usual case,
+covers every provider.  The rule runs wherever records come together:
+at the end of [[create_review_session]], and at the end of a save's
+merge with the file (\cref{sec:session-integrity}), since another
+process may have re-run the query, or may still hold the merged record
+this process dropped.
+
+<<review session functions>>=
+def merged_record_cover(
+    record: SearchRecord, records: list[SearchRecord]
+) -> list[SearchRecord] | None:
+    """The per-provider records that supersede a merged `record`, or None.
+
+    One record of the same query and filters is needed for each
+    provider the merged record names, one that answered and asked for
+    at least the merged record's limit (any limit when that is
+    unknown); None if any is missing.
+    """
+    if not record.is_merged:
+        return None
+    providers = record.merged_providers
+    queries = record.query.split(" | ")
+    if len(queries) != len(providers):
+        if len(set(queries)) != 1:
+            return None
+        queries = queries[:1] * len(providers)
+    key = filters_key(record.filters)
+
+    def wide_enough(other: SearchRecord) -> bool:
+        if record.limit is None:
+            return True
+        return other.limit is not None and (
+            search_width(other.limit) >= search_width(record.limit)
+        )
+
+    cover = []
+    for provider, query in zip(providers, queries):
+        match = next((
+            r for r in records
+            if not r.is_merged and r.provider == provider
+            and r.query == query and filters_key(r.filters) == key
+            and not failed_outright(r) and wide_enough(r)
+        ), None)
+        if match is None:
+            return None
+        cover.append(match)
+    return cover
+
+
+def supersede_merged_records(session: "ReviewSession") -> None:
+    """Drop each merged record that per-provider records fully cover.
+
+    Links to it are dropped where the paper links to a covering record
+    already, and otherwise replaced by links to all covering records.
+    """
+    for record in list(session.search_records):
+        cover = merged_record_cover(record, session.search_records)
+        if cover is None:
+            continue
+        session.search_records.remove(record)
+        cover_keys = [r.key for r in cover]
+        for decision in session.decisions:
+            old = [
+                link for link in decision.found_by
+                if link[:2] == (record.query, record.provider)
+                and link[2] in (None, record.key[2])
+            ]
+            if not old:
+                continue
+            links = [link for link in decision.found_by if link not in old]
+            if not any(link in cover_keys for link in links):
+                links += cover_keys
+            decision.found_by = without_superseded_links(
+                list(dict.fromkeys(links))
+            )
+@
+
+Let's verify the three cases with sessions written as old files are:
+a re-run on every provider replaces the merged record and repoints its
+links (a paper the re-run returned to its own provider, a paper it did
+not return to both); a re-run on one of the two providers leaves the
+merged record; and a save that meets the merged record in the file
+drops it again.
+
+<<test functions>>=
+class TestSupersededMergedRecords:
+    """Per-provider re-runs supersede an old merged record."""
+
+    MERGED = SearchRecord("q | q", "openalex, dblp", None, 100, hits=7)
+
+    def _covered(self, dblp, merged=None):
+        openalex = SearchRecord("q", "openalex", None, 100, hits=4)
+        return merged_record_cover(merged or self.MERGED, [openalex, dblp])
+
+    def test_answered_cover(self):
+        dblp = SearchRecord("q", "dblp", None, 100, hits=3)
+        assert self._covered(dblp) is not None
+        assert self._covered(SearchRecord("q", "dblp", None, 1000, hits=3))
+
+    def test_failed_or_skipped_cover_does_not_count(self):
+        for error in ("HTTP 500", "skipped: daily quota spent; resets 01:00"):
+            dblp = SearchRecord("q", "dblp", None, 100, hits=0, error=error)
+            assert self._covered(dblp) is None
+        partial = SearchRecord("q", "dblp", None, 100, hits=2, error="cut")
+        assert self._covered(partial) is not None
+
+    def test_narrower_cover_does_not_count(self):
+        dblp = SearchRecord("q", "dblp", None, 5, hits=3)
+        assert self._covered(dblp) is None
+        unknown = SearchRecord("q | q", "openalex, dblp", {"year": "2020"},
+                               None, hits=7)
+        assert merged_record_cover(unknown, [
+            SearchRecord("q", "openalex", {"year": "2020"}, 5, hits=4),
+            SearchRecord("q", "dblp", {"year": "2020"}, 5, hits=3),
+        ]) is not None
+
+    def test_other_filters_or_query_do_not_count(self):
+        dblp = SearchRecord("q", "dblp", {"year": "2020"}, 100, hits=3)
+        assert self._covered(dblp) is None
+        merged = SearchRecord("q | r", "openalex, dblp", None, 100, hits=7)
+        dblp = SearchRecord("q", "dblp", None, 100, hits=3)
+        assert self._covered(dblp, merged) is None
+        assert self._covered(SearchRecord("r", "dblp", None, 100, hits=3),
+                             merged) is not None
+
+    @staticmethod
+    def _old_session(name):
+        import json
+        from scholar.review import _get_sessions_dir
+        merged_link = {"query": "q | q", "provider": "openalex, dblp",
+                       "filters": ""}
+
+        def decision(doi):
+            return {
+                "paper_id": f"doi:{doi}", "provider": "openalex, dblp",
+                "status": "kept", "tags": [], "source": "human",
+                "found_by": [merged_link],
+                "paper": {"title": doi, "authors": ["A"], "doi": doi,
+                          "sources": ["openalex"]},
+            }
+
+        path = _get_sessions_dir() / f"{name}.json"
+        path.write_text(json.dumps({
+            "query": "q", "name": name, "providers": ["openalex, dblp"],
+            "timestamp": datetime.now().isoformat(),
+            "search_records": [{
+                "query": "q | q", "provider": "openalex, dblp",
+                "filters": None, "limit": 100, "hits": 2, "error": None,
+                "retries": 0,
+            }],
+            "decisions": [decision("10.1/sm-again"), decision("10.1/sm-old")],
+        }))
+        return path
+
+    @staticmethod
+    def _result(provider, dois):
+        from scholar.scholar import SearchResult
+        return SearchResult(
+            query="q", provider=provider, timestamp="t", limit=100,
+            papers=[Paper(title=d, authors=["A"], doi=d) for d in dois],
+        )
+
+    def test_full_cover_replaces_and_repoints(self):
+        self._old_session("sm-full")
+        merged = self._result("openalex", ["10.1/sm-again"]).merge(
+            self._result("dblp", [])
+        )
+        created = create_review_session([merged], "q",
+                                        session_name="sm-full")
+        assert [r.provider for r in created.search_records] == [
+            "openalex", "dblp",
+        ]
+        save_session(created)
+        session = load_session("sm-full")
+        assert [r.provider for r in session.search_records] == [
+            "openalex", "dblp",
+        ]
+        links = {d.paper.doi: d.found_by for d in session.decisions}
+        assert links["10.1/sm-again"] == [("q", "openalex", "")]
+        assert links["10.1/sm-old"] == [
+            ("q", "openalex", ""), ("q", "dblp", ""),
+        ]
+
+    def test_failed_cover_keeps_record_and_links(self):
+        self._old_session("sm-failed")
+        merged = self._result("openalex", ["10.1/sm-again"]).merge(
+            self._result("dblp", [])
+        )
+        merged.parts[1].error = "HTTP 500"
+        save_session(create_review_session([merged], "q",
+                                           session_name="sm-failed"))
+        session = load_session("sm-failed")
+        assert sorted(r.provider for r in session.search_records) == [
+            "dblp", "openalex", "openalex, dblp",
+        ]
+        old = next(d for d in session.decisions
+                   if d.paper.doi == "10.1/sm-old")
+        assert old.found_by == [("q | q", "openalex, dblp", "")]
+
+    def test_partial_cover_keeps_the_merged_record(self):
+        self._old_session("sm-part")
+        save_session(create_review_session(
+            [self._result("openalex", ["10.1/sm-again"])], "q",
+            session_name="sm-part",
+        ))
+        session = load_session("sm-part")
+        assert sorted(r.provider for r in session.search_records) == [
+            "openalex", "openalex, dblp",
+        ]
+        old = next(d for d in session.decisions
+                   if d.paper.doi == "10.1/sm-old")
+        assert old.found_by == [("q | q", "openalex, dblp", "")]
+
+    def test_a_save_drops_it_from_the_file_too(self):
+        self._old_session("sm-save")
+        stale = load_session("sm-save")
+        merged = self._result("openalex", ["10.1/sm-again"]).merge(
+            self._result("dblp", [])
+        )
+        save_session(create_review_session([merged], "q",
+                                           session_name="sm-save"))
+        stale.decisions[0].status = DecisionStatus.DISCARDED
+        stale.decisions[0].tags = ["off-topic"]
+        save_session(stale)
+        session = load_session("sm-save")
+        assert [r.provider for r in session.search_records] == [
+            "openalex", "dblp",
+        ]
+        assert all(
+            link[1] != "openalex, dblp"
+            for d in session.decisions for link in d.found_by
+        )
+@
+
 
 \subsection{Review Session}
 
@@ -562,6 +1827,8 @@ compatibility with older session files.
 
 The [[snowball_rounds]] field tracks manual snowballing operations, recording
 which papers were used as sources and how many new papers were discovered.
+The [[llm_samples]] field keeps the samples of machine decisions drawn for
+human review (\cref{sec:llm-sample-record}).
 
 \paragraph{Performance optimization.}
 With large paper sessions (1000+ papers), repeatedly computing
@@ -613,6 +1880,7 @@ class ReviewSession:
     research_context: str | None = None  # Research goals for LLM review
     search_records: list[SearchRecord] = field(default_factory=list)
     snowball_rounds: list[SnowballRound] = field(default_factory=list)
+    llm_samples: list[LLMSample] = field(default_factory=list)
     # Internal cache for computed properties (not persisted)
     _cache: dict = field(default_factory=dict, repr=False, compare=False)
     # State as loaded or last saved, for merging on save (not persisted)
@@ -712,7 +1980,7 @@ class ReviewSession:
         """
         return [
             d for d in self.decisions
-            if d.is_decided and d.tags and (
+            if d.is_decided and d.tags and not d.source.is_unknown and (
                 d.source == ReviewSource.HUMAN or d.is_example
             )
         ]
@@ -725,6 +1993,8 @@ class ReviewSession:
         - human: Human-only decisions
         - llm_unreviewed: LLM decisions pending review
         - llm_reviewed: LLM decisions confirmed by user
+        - agent_unreviewed: agent decisions pending review
+        - agent_reviewed: agent decisions confirmed by user
         - examples: Training examples for LLM
         - pending: Papers not yet decided
         """
@@ -732,21 +2002,19 @@ class ReviewSession:
             1 for d in self.decisions
             if d.source == ReviewSource.HUMAN and d.is_decided
         )
-        llm_unreviewed = sum(
-            1 for d in self.decisions
-            if d.source == ReviewSource.LLM_UNREVIEWED
-        )
-        llm_reviewed = sum(
-            1 for d in self.decisions
-            if d.source == ReviewSource.LLM_REVIEWED
-        )
+
+        def count(source: ReviewSource) -> int:
+            return sum(1 for d in self.decisions if d.source == source)
+
         examples = len(self.example_papers())
         pending = len(self.pending_papers())
 
         return {
             "human": human,
-            "llm_unreviewed": llm_unreviewed,
-            "llm_reviewed": llm_reviewed,
+            "llm_unreviewed": count(ReviewSource.LLM_UNREVIEWED),
+            "llm_reviewed": count(ReviewSource.LLM_REVIEWED),
+            "agent_unreviewed": count(ReviewSource.AGENT_UNREVIEWED),
+            "agent_reviewed": count(ReviewSource.AGENT_REVIEWED),
             "examples": examples,
             "pending": pending,
         }
@@ -768,7 +2036,11 @@ with its key (query, provider and filters, \cref{sec:search-record-key})
 is present yet, preventing duplicates when
 appending results to an existing session; its [[filters]] and [[limit]]
 arguments default to [[None]] so older callers that only know the query and
-provider keep working. The [[query_provider_pairs]] property derives the
+provider keep working.  [[add_search_record]] does the same for a record
+that already exists, such as one from the previous session: adding the
+record itself, rather than rebuilding it from its fields, keeps every
+field of it, also those added after this code was written.
+The [[query_provider_pairs]] property derives the
 [[(query, provider)]] pairs from the records, so every reader written against
 the old field is unaffected; a pair may now occur twice, once per set of
 filters, as it is two searches. The [[queries_for_provider]] method retrieves all
@@ -798,6 +2070,11 @@ def add_query_provider_pair(
     hits: int | None = None,
     error: str | None = None,
     retries: int = 0,
+    total: int | None = None,
+    total_estimated: bool = False,
+    searched_at: str | None = None,
+    fetched_at: str | None = None,
+    from_cache: bool | None = None,
     via: str | None = None,
 ) -> None:
     """
@@ -813,10 +2090,16 @@ def add_query_provider_pair(
     filters and limit applied so the search can be reproduced exactly,
     and its outcome (hits, error, retries).
     """
-    record = SearchRecord(
+    self.add_search_record(SearchRecord(
         query, provider, filters, limit,
-        hits=hits, error=error, retries=retries, via=via,
-    )
+        hits=hits, error=error, retries=retries,
+        total=total, total_estimated=total_estimated,
+        searched_at=searched_at, fetched_at=fetched_at,
+        from_cache=from_cache, via=via,
+    ))
+
+def add_search_record(self, record: SearchRecord) -> None:
+    """Add `record` unless a record with its key is already present."""
     if record.key not in {r.key for r in self.search_records}:
         self.search_records.append(record)
 
@@ -1416,7 +2699,9 @@ def create_review_session(
                         len(previous_decisions.decisions))
     
     # Create review session
-    providers = list(dict.fromkeys(r.provider for r in results))
+    providers = list(dict.fromkeys(
+        part.provider for r in results for part in search_parts_of(r)
+    ))
     logger.debug("Session includes providers: %s", providers)
     session = ReviewSession(
         query=query,
@@ -1431,27 +2716,29 @@ def create_review_session(
     if previous_session:
         session._baseline = previous_session._baseline
 
-    # Build search records (query, provider, filters, limit, outcome)
+    # Build search records (query, provider, filters, limit, outcome),
+    # one per provider search, also inside a merged result
     for result in results:
-        error, retries = result_outcome(result)
-        session.add_query_provider_pair(
-            result.query, result.provider, result.filters, result.limit,
-            hits=len(result.papers), error=error, retries=retries,
-            via=result_via(result),
-        )
+        for part in search_parts_of(result):
+            error, retries = result_outcome(part)
+            total, estimated = result_total(part)
+            searched_at, fetched_at, from_cache = result_dates(part)
+            session.add_query_provider_pair(
+                part.query, part.provider, part.filters, part.limit,
+                hits=len(part.papers), error=error, retries=retries,
+                total=total, total_estimated=estimated,
+                searched_at=searched_at, fetched_at=fetched_at,
+                from_cache=from_cache, via=result_via(part),
+            )
 
     # Merge with previous session's searches (if any), preserving their filters
     replaced_links: dict[tuple, tuple] = {}
     if previous_session:
         current_run = list(session.search_records)
         for record in previous_session.search_records:
-            <<keep an earlier answer over a failed re-run>>
+            <<keep the preferred record of each search>>
             <<let a re-run replace a legacy record>>
-            session.add_query_provider_pair(
-                record.query, record.provider, record.filters, record.limit,
-                hits=record.hits, error=record.error, retries=record.retries,
-                via=record.via,
-            )
+            session.add_search_record(record)
     
     # Collect paper IDs from current search results
     current_paper_ids = set()
@@ -1466,6 +2753,7 @@ def create_review_session(
     # Convert search results to review decisions, merging with previous
     <<convert search results to decisions>>
     <<point links at the records that replaced theirs>>
+    supersede_merged_records(session)
     
     logger.info("Created session with %d papers (%d kept, %d discarded, %d pending)",
                len(session.decisions), len(session.kept_papers()),
@@ -1486,7 +2774,82 @@ earlier record that answered replaces a failed re-run of the same pair.
 The failure itself is not lost from view: it was reported when it
 happened, and the session keeps the answer that its papers came from.
 
-<<keep an earlier answer over a failed re-run>>=
+That holds for a re-run that failed \emph{outright}, with no papers.
+A re-run that failed part-way, \enquote{incomplete}, did answer, in
+part, and its papers are added to the session; it is the latest answer
+of the search, and it replaces the earlier record with its own outcome,
+marked incomplete.  Keeping the earlier record would have been wrong
+twice: a Boolean query that the old relevance search answered with 0
+and the bulk search now answers with five papers before it is cut
+short would keep \enquote{0} beside five new decisions, and the date
+the source was last searched would be the old one.  A wider earlier
+record still wins over a narrower re-run (\cref{sec:wider-record}).
+
+These rules, and the one for limits below (\cref{sec:wider-record}),
+decide between two records of one search, and they are needed in two
+places: here, between this run's record and the session's, and when a
+save meets a record of the same search that another process saved
+meanwhile (\cref{sec:session-integrity}).  Applied in one place only,
+the other undid them: a process still holding the narrow record of
+[[-l 5]] saved it over the [[-l 0]] record another process had just
+saved, with fifty papers linked to it.  So the rules are one function,
+[[preferred_record]], which both places call.
+
+What the rules make of a session is this: the record of a search, its
+query, provider and filters, is its \emph{latest answered search of the
+widest scope}, and the record reports that search's own outcome, its
+count, its error and its dates.
+
+The function compares one sort key per record, [[record_rank]], rather
+than going through cases.  A first version went through cases (an
+answer over a failure, then the wider limit, then a partial answer
+with more hits over an answer with fewer, then the later run), and
+cases interact: an undated record tied with a dated one, so which
+survived a concurrent save depended on which process saved last, and
+three records could beat each other in a circle (ten hits on 18
+November over a partial twenty on 10 November over thirty on
+1 November over the first).  A key compared lexicographically cannot
+do either: it orders all records, a total preorder, and the outcome of
+a comparison does not depend on the order of the arguments, except
+between records whose keys are equal.  The key is, in order of weight:
+\begin{description}
+\item[Answered] An answer, also a partial one, beats a failure
+  outright ([[failed_outright]]).
+\item[Width] The wider limit wins, no limit ([[None]] or 0) the widest
+  (\cref{sec:wider-record}).  A legacy record's limit is unknown, not
+  unlimited, so it ranks below every known limit: a re-run that
+  answered replaces it, as the legacy rule says
+  (\cref{sec:legacy-records}).
+\item[Run] The later run wins, and a dated record beats an undated one.
+\item[Hits] Of runs of the same date, or of undated records such as
+  legacy ones, the one with more hits wins; an unknown count ranks
+  lowest.
+\item[Complete] Of equal counts, the one without an error wins.
+\end{description}
+The date ranks above the count because the session must say when each
+source was last searched, which PRISMA asks for: an older complete
+answer of thirty hits must not displace a newer complete one of ten,
+or the session would date the search to the older run although it was
+run again since.  The count cannot rank above the date for partial
+answers and below it for complete ones either: any such mix makes the
+circle above possible again, which no key can express.  So a newer
+answer always replaces an older one of the same scope, complete or not,
+and shows its own outcome; a newer partial answer reads
+\enquote{incomplete}, which is what the latest search was.
+
+The papers that older runs of the same search returned keep their
+links: a link names the search by its key, query, provider and
+filters (\cref{sec:search-record-key}), which the replacing record has
+too, so they stay attached to the search's one record.  That record
+may then count fewer hits than it has linked papers, when the older run
+returned more; the papers were found by that search, and the count says
+what its latest run returned.
+
+Two records with equal keys are a true tie, and the first argument
+wins, so the caller decides: the new run here, the process's own record
+in a save.
+
+<<keep the preferred record of each search>>=
 for i, current in enumerate(session.search_records):
     same_search = current.key == record.key or (
         record.is_legacy
@@ -1494,10 +2857,126 @@ for i, current in enumerate(session.search_records):
         and (current.query, current.provider)
         == (record.query, record.provider)
     )
-    if same_search and current.error and not record.error:
+    if same_search and preferred_record(current, record) is record:
         session.search_records[i] = record
         if current.key != record.key:
             replaced_links[current.key] = record.key
+<<review session functions>>=
+def failed_outright(record: SearchRecord) -> bool:
+    """Whether the search failed without a single paper."""
+    return bool(record.error) and not record.hits
+
+
+def record_rank(record: SearchRecord) -> tuple:
+    """The sort key by which a session keeps one of two records.
+
+    `(answered, width, searched_at, hits, complete)`: higher is better;
+    a legacy record's width, an unknown run time and an unknown hit
+    count rank lowest.
+    """
+    width = (
+        float("-inf") if record.is_legacy else search_width(record.limit)
+    )
+    return (
+        0 if failed_outright(record) else 1,
+        width,
+        record.searched_at or "",
+        -1 if record.hits is None else record.hits,
+        0 if record.error else 1,
+    )
+
+
+def preferred_record(a: SearchRecord, b: SearchRecord) -> SearchRecord:
+    """Of two records of one search, the one a session keeps.
+
+    The one with the higher `record_rank`; on equal ranks, `a`.
+    """
+    return a if record_rank(a) >= record_rank(b) else b
+@
+
+<<test functions>>=
+class TestPreferredRecord:
+    """The one order of two records of a search."""
+
+    @staticmethod
+    def _r(limit=100, hits=None, error=None, searched_at=None, **kw):
+        return SearchRecord("q", "p", None, limit, hits=hits, error=error,
+                            searched_at=searched_at, **kw)
+
+    def test_order(self):
+        answer = self._r(hits=12)
+        failed = self._r(hits=0, error="HTTP 503")
+        assert preferred_record(failed, answer) is answer
+        assert preferred_record(answer, failed) is answer
+        wide = self._r(limit=10_000, hits=50)
+        narrow = self._r(limit=5, hits=5)
+        assert preferred_record(narrow, wide) is wide
+        assert preferred_record(wide, narrow) is wide
+        partial = self._r(hits=20, error="cut short")
+        assert preferred_record(answer, partial) is partial
+        assert preferred_record(partial, self._r(hits=30)).hits == 30
+        old = self._r(hits=3, searched_at="2026-10-01T00:00:00+00:00")
+        new = self._r(hits=3, searched_at="2026-11-01T00:00:00+00:00")
+        assert preferred_record(old, new) is new
+        assert preferred_record(new, old) is new
+        tie, same = self._r(hits=1), self._r(hits=1)
+        assert preferred_record(tie, same) is tie
+        assert preferred_record(same, tie) is same
+
+    def test_dated_beats_undated_in_both_orders(self):
+        undated = self._r(hits=5)
+        dated = self._r(hits=5, searched_at="2026-11-18T09:00:00+00:00")
+        assert preferred_record(undated, dated) is dated
+        assert preferred_record(dated, undated) is dated
+
+    def test_former_cycle_is_ordered(self):
+        ten = self._r(hits=10, searched_at="2026-11-18T00:00:00+00:00")
+        twenty = self._r(hits=20, error="cut short",
+                         searched_at="2026-11-10T00:00:00+00:00")
+        thirty = self._r(hits=30, searched_at="2026-11-01T00:00:00+00:00")
+        for a, b in [(ten, twenty), (twenty, thirty), (thirty, ten)]:
+            assert preferred_record(a, b) is preferred_record(b, a)
+        import functools
+        import itertools
+        winners = {
+            id(functools.reduce(preferred_record, order))
+            for order in itertools.permutations([ten, twenty, thirty])
+        }
+        assert winners == {id(ten)}
+
+    def test_newer_complete_answer_beats_older_with_more_hits(self):
+        older = self._r(hits=30, searched_at="2026-11-01T00:00:00+00:00")
+        newer = self._r(hits=10, searched_at="2026-11-18T00:00:00+00:00")
+        assert preferred_record(older, newer) is newer
+        assert preferred_record(newer, older) is newer
+        partial = self._r(hits=3, error="cut short",
+                          searched_at="2026-11-18T00:00:00+00:00")
+        assert preferred_record(older, partial) is partial
+
+    def test_symmetric_and_transitive_on_a_generated_set(self):
+        import itertools
+        records = [
+            self._r(limit=limit, hits=hits, error=error, searched_at=when)
+            for limit in (5, 100, None)
+            for hits, error in ((None, None), (0, None), (0, "HTTP 503"),
+                                (5, None), (5, "cut"), (20, "cut"))
+            for when in (None, "2026-10-01T00:00:00+00:00",
+                         "2026-11-01T00:00:00+00:00")
+        ] + [SearchRecord("q", "p", hits=None)]
+        for a, b in itertools.product(records, repeat=2):
+            if record_rank(a) != record_rank(b):
+                assert preferred_record(a, b) is preferred_record(b, a)
+        for a, b, c in itertools.product(records[::3], repeat=3):
+            if (preferred_record(a, b) is a
+                    and preferred_record(b, c) is b):
+                assert record_rank(a) >= record_rank(c)
+
+    def test_legacy_limit_is_unknown(self):
+        legacy = SearchRecord("q", "p", hits=None)
+        current = self._r(limit=5, hits=5)
+        assert preferred_record(current, legacy) is current
+        failed = self._r(limit=5, hits=0, error="HTTP 503")
+        assert preferred_record(failed, legacy) is legacy
 @
 
 \label{sec:legacy-records}
@@ -1517,6 +2996,206 @@ of it.  [[replaced_links]] maps each replaced key to its successor, and
 once all decisions are built every link is moved
 ([[<<point links at the records that replaced theirs>>]]); duplicates
 that the move creates are merged, keeping the first.
+
+\label{sec:wider-record}
+A re-run with a smaller limit is the opposite case: it answered, but
+asked for less.  The limit is not part of the key
+(\cref{sec:search-record-key}), so a run with [[-l 5]] after one with
+[[-l 0]] is the same search, and the newer record used to win.  The
+session then said \enquote{limit 5, hits 5} for fifty linked papers,
+and [[found-via]] built its command from that record, a command that
+returns five of them (\url{https://github.com/dbosk/scholar/issues/166}).
+A narrower run of the same query, provider and filters fetches the
+first part of what the wider one fetched, so the wider record already
+accounts for its papers: we keep the wider record and record nothing
+new.  The narrower run's papers link to the key they share with it, so
+their links name the wider record without being moved.  (Should the
+service have reordered its ranking in between, a paper of the narrower
+run may not have been among the wider run's; re-run today, the wider
+search returns it, which is what the link claims.)
+
+\enquote{Wider} compares the limits, with no limit ([[None]], or 0)
+the widest; [[-l 0]] is stored as the large internal cap and so is
+wide already.  A legacy record's missing limit means \emph{unknown},
+not unlimited, so a legacy record is never wider; it has its own rule
+below.  A wider record that failed outright does not stand in for a
+narrower answer; otherwise the wider record wins, also over a narrower
+re-run that failed part-way with more papers than it counts (the wider
+record then shows fewer hits than the papers linked to it, a known and
+accepted case).  [[preferred_record]] above applies the rule.
+
+<<review session functions>>=
+def search_width(limit: int | None) -> float:
+    """How many results a search with `limit` may fetch; no limit is all."""
+    return float("inf") if not limit else float(limit)
+@
+
+Let's verify the run of \url{https://github.com/dbosk/scholar/issues/166}:
+fifty papers with the internal cap of [[-l 0]], then five with [[-l 5]].
+The session keeps the wide record, every paper links to it, and the
+report labels it with its total.  The other direction, a wider run
+after a narrower one, replaces the narrow record as before; a failed
+wide run does not displace a narrow answer; and the total survives a
+save, while a record saved before it existed loads with the total
+unknown.
+
+<<test functions>>=
+class TestWiderRecordKept:
+    """A narrower re-run never replaces a wider record (#166)."""
+
+    WIDE = 10_000
+
+    @staticmethod
+    def _result(papers, limit, total=None, error=None):
+        from scholar.scholar import SearchResult
+        return SearchResult(
+            query="q", provider="openalex", timestamp="t", papers=papers,
+            limit=limit, total=total, error=error,
+        )
+
+    @staticmethod
+    def _papers(n):
+        return [Paper(title=f"P{i}", authors=["A"], doi=f"10.1/wide-{i}")
+                for i in range(n)]
+
+    def test_narrow_rerun_keeps_wide_record(self):
+        papers = self._papers(50)
+        save_session(create_review_session(
+            [self._result(papers, self.WIDE, total=50)], "q",
+            session_name="wide",
+        ))
+        save_session(create_review_session(
+            [self._result(papers[:5], 5, total=50)], "q",
+            session_name="wide",
+        ))
+        session = load_session("wide")
+        assert [(r.limit, r.hits, r.total)
+                for r in session.search_records] == [(self.WIDE, 50, 50)]
+        record = session.search_records[0]
+        assert all(
+            session.search_record(*link) is record
+            for d in session.decisions for link in d.found_by
+        )
+
+    def test_wider_rerun_replaces_narrow_record(self):
+        papers = self._papers(6)
+        save_session(create_review_session(
+            [self._result(papers[:5], 5, total=6)], "q",
+            session_name="widen",
+        ))
+        session = create_review_session(
+            [self._result(papers, self.WIDE, total=6)], "q",
+            session_name="widen",
+        )
+        assert [(r.limit, r.hits) for r in session.search_records] == [
+            (self.WIDE, 6),
+        ]
+
+    def test_failed_wide_record_does_not_displace_answer(self):
+        papers = self._papers(3)
+        save_session(create_review_session(
+            [self._result([], self.WIDE, error="HTTP 503")], "q",
+            session_name="failed-wide",
+        ))
+        session = create_review_session(
+            [self._result(papers, 5, total=3)], "q",
+            session_name="failed-wide",
+        )
+        assert [(r.limit, r.hits, r.error)
+                for r in session.search_records] == [(5, 3, None)]
+
+    def test_total_round_trip_and_old_records(self):
+        import json
+        from scholar.review import _get_sessions_dir
+        save_session(create_review_session(
+            [self._result(self._papers(5), 5, total=2130)], "q",
+            session_name="totals",
+        ))
+        session = load_session("totals")
+        record = session.search_records[0]
+        assert (record.total, record.total_estimated) == (2130, False)
+        assert search_outcome_label(record) == (
+            "5 of 2,130 (capped at 5)"
+        )
+        path = _get_sessions_dir() / "totals.json"
+        data = json.loads(path.read_text())
+        for rec in data["search_records"]:
+            del rec["total"], rec["total_estimated"]
+        path.write_text(json.dumps(data))
+        record = load_session("totals").search_records[0]
+        assert (record.total, record.total_estimated) == (None, False)
+        assert search_outcome_label(record) == "5 (capped at 5)"
+@
+
+The same order must hold when a save meets the other process's record
+of the same search (\cref{sec:session-integrity}).  The reviewer's
+case: the session is at [[-l 5]]; process~B re-runs with [[-l 0]] and
+saves fifty hits; process~A, still holding the [[-l 5]] record, saves
+a decision.  The file must keep B's wide record with its dates.  And the
+mirror: A holds the wide re-run when B saves its narrow copy, and A's
+wide record must survive A's save.
+
+<<test functions>>=
+class TestConcurrentRecordOrder:
+    """A save keeps the preferred record of a shared search."""
+
+    WIDE = 10_000
+
+    @staticmethod
+    def _result(papers, limit, when):
+        from scholar.scholar import SearchResult
+        return SearchResult(
+            query="q", provider="openalex", timestamp="t", papers=papers,
+            limit=limit, total=50, searched_at=when, fetched_at=when,
+            from_cache=False,
+        )
+
+    @staticmethod
+    def _papers(n):
+        return [Paper(title=f"P{i}", authors=["A"], doi=f"10.1/cro-{i}")
+                for i in range(n)]
+
+    def _narrow_session(self, name):
+        save_session(create_review_session(
+            [self._result(self._papers(5), 5, "2026-10-01T00:00:00+00:00")],
+            "q", session_name=name,
+        ))
+
+    def test_stale_narrow_save_keeps_the_wide_record(self):
+        self._narrow_session("cro")
+        stale = load_session("cro")
+        save_session(create_review_session(
+            [self._result(self._papers(50), self.WIDE,
+                          "2026-11-18T09:00:00+00:00")],
+            "q", session_name="cro",
+        ))
+        stale.decisions[0].status = DecisionStatus.KEPT
+        save_session(stale)
+        session = load_session("cro")
+        assert [(r.limit, r.hits, r.searched_at)
+                for r in session.search_records] == [
+            (self.WIDE, 50, "2026-11-18T09:00:00+00:00"),
+        ]
+        assert len(session.decisions) == 50
+        assert session.decisions[0].status == DecisionStatus.KEPT
+
+    def test_own_wide_record_survives_a_narrow_file(self):
+        self._narrow_session("cro-mirror")
+        wide = create_review_session(
+            [self._result(self._papers(50), self.WIDE,
+                          "2026-11-18T09:00:00+00:00")],
+            "q", session_name="cro-mirror",
+        )
+        other = load_session("cro-mirror")
+        other.decisions[0].status = DecisionStatus.KEPT
+        save_session(other)
+        save_session(wide)
+        session = load_session("cro-mirror")
+        assert [(r.limit, r.hits) for r in session.search_records] == [
+            (self.WIDE, 50),
+        ]
+        assert session.decisions[0].status == DecisionStatus.KEPT
+@
 
 <<let a re-run replace a legacy record>>=
 if record.is_legacy:
@@ -1590,6 +3269,91 @@ class TestSearchRecordOutcome:
         )
         record = session.search_record_for("dblp")
         assert (record.hits, record.error) == (1, None)
+@
+
+A partial re-run is not a failed one.  The case found in the review of
+the S2 bulk search: an old relevance answer of 0 for [[a AND b]], then
+a newer bulk re-run with five papers, cut short.  The record must show
+the five, marked incomplete.  A newer partial re-run with fewer papers
+than the earlier answer replaces it too, since it is the latest search,
+and the papers of the earlier run stay; only between undated records
+does the count decide; and a wider earlier answer still wins over a
+narrower partial one.
+
+<<test functions>>=
+class TestPartialRerun:
+    """A partial re-run with more hits replaces an earlier answer."""
+
+    @staticmethod
+    def _result(papers, error=None, limit=100, when=None):
+        from scholar.scholar import SearchResult
+        return SearchResult(
+            query="a AND b", provider="s2", timestamp="t", papers=papers,
+            limit=limit, error=error, searched_at=when,
+        )
+
+    @staticmethod
+    def _papers(n):
+        return [Paper(title=f"P{i}", authors=["A"], doi=f"10.1/pr-{i}")
+                for i in range(n)]
+
+    def test_partial_with_more_hits_replaces_zero(self):
+        save_session(create_review_session(
+            [self._result([], when="2026-10-01T00:00:00+00:00")],
+            "a AND b", session_name="partial",
+        ))
+        session = create_review_session(
+            [self._result(self._papers(5), error="search cut short",
+                          when="2026-11-18T00:00:00+00:00")],
+            "a AND b", session_name="partial",
+        )
+        record = session.search_record_for("s2")
+        assert (record.hits, record.error) == (5, "search cut short")
+        assert len(session.decisions) == 5
+
+    def test_newer_partial_with_fewer_hits_replaces_answer(self):
+        save_session(create_review_session(
+            [self._result(self._papers(12),
+                          when="2026-10-01T00:00:00+00:00")], "a AND b",
+            session_name="partial-less",
+        ))
+        session = create_review_session(
+            [self._result(self._papers(3), error="search cut short",
+                          when="2026-11-18T00:00:00+00:00")],
+            "a AND b", session_name="partial-less",
+        )
+        record = session.search_record_for("s2")
+        assert (record.hits, record.error, record.searched_at) == (
+            3, "search cut short", "2026-11-18T00:00:00+00:00",
+        )
+        assert search_outcome_label(record) == (
+            "3, incomplete (search cut short)"
+        )
+        assert len(session.decisions) == 12
+
+    def test_undated_partial_with_fewer_hits_keeps_answer(self):
+        save_session(create_review_session(
+            [self._result(self._papers(12))], "a AND b",
+            session_name="partial-undated",
+        ))
+        session = create_review_session(
+            [self._result(self._papers(3), error="search cut short")],
+            "a AND b", session_name="partial-undated",
+        )
+        record = session.search_record_for("s2")
+        assert (record.hits, record.error) == (12, None)
+
+    def test_wider_answer_beats_narrower_partial(self):
+        save_session(create_review_session(
+            [self._result(self._papers(2), limit=10_000)], "a AND b",
+            session_name="partial-wide",
+        ))
+        session = create_review_session(
+            [self._result(self._papers(5), error="cut", limit=5)],
+            "a AND b", session_name="partial-wide",
+        )
+        record = session.search_record_for("s2")
+        assert (record.limit, record.hits, record.error) == (10_000, 2, None)
 @
 
 Filters are part of a search's key (\cref{sec:search-record-key}).
@@ -2086,13 +3850,55 @@ this run, a renamed or adopted entry, a previous decision, or a new one),
 the decision records the search that returned it ([[record_search]]).  The
 link has to be made here: this loop is the only place that still knows
 which [[SearchResult]], and so which search record, a paper came from.
-The result's query, provider and [[filters_key]] of its filters are
-exactly the key [[add_query_provider_pair]] recorded above, merged
-results included ([[q | q]], [[openalex, dblp]]), so the link always
-names a stored record.
+A link is a part's query, provider and [[filters_key]] of its filters,
+exactly the key [[add_query_provider_pair]] recorded above, so the link
+always names a stored record.
 A decision rebuilt from the previous session copies that session's links,
-and the new one is added to them: a paper returned by three queries keeps
-all three.
+and the new ones are added to them: a paper returned by three queries
+keeps all three.
+
+A merged result (the default [[search -n]] over several providers) is
+recorded part by part (\cref{sec:search-result-parts} in the [[scholar]]
+module): one record per provider, with that provider's own count and
+error, never one record [[openalex, dblp]] whose failure would be
+charged to every provider in it
+(\url{https://github.com/dbosk/scholar/issues/164}).  Its papers are
+still the deduplicated ones, so deduplication stays a matter of papers,
+and each paper is linked to the parts that returned it
+([[paper_search_links]]).  The decision's [[provider]] names the same
+providers, so a paper only OpenAlex returned no longer reads as found
+by DBLP as well.  Results built without parts (by [[rq]], by
+[[--no-dedup]], in tests, by code outside scholar) are their own one
+part; a [[Mock]] standing in for a result has no list of parts and is
+treated so too.  Should a merged result's [[found_in]] not fit its
+papers---code that filtered the papers after merging---the links are
+computed again from the papers themselves.
+
+<<review session functions>>=
+def search_parts_of(result) -> list:
+    """The single-provider searches of a `SearchResult`-like object."""
+    parts = getattr(result, "parts", None)
+    if isinstance(parts, list) and parts:
+        return list(parts)
+    return [result]
+
+
+def paper_search_links(result) -> list[list[tuple[str, str, str]]]:
+    """For each paper of `result`, the keys of the searches that returned it.
+
+    A key is `(query, provider, filters key)` of one part of the result
+    (see `search_parts_of`); a result that is not a merge links every
+    paper to itself.
+    """
+    parts = search_parts_of(result)
+    keys = [(p.query, p.provider, filters_key(p.filters)) for p in parts]
+    if len(parts) == 1:
+        return [[keys[0]] for _ in result.papers]
+    found_in = getattr(result, "found_in", None)
+    if not isinstance(found_in, list) or len(found_in) != len(result.papers):
+        found_in = parts_returning(result.papers, parts)
+    return [[keys[i] for i in indices] for indices in found_in]
+@
 
 <<convert search results to decisions>>=
 decision_lookup: dict[str, ReviewDecision] = {
@@ -2112,8 +3918,10 @@ for d in session.decisions:
             provenance_lookup[key] = d
 
 for result in results:
-    link = (result.query, result.provider, filters_key(result.filters))
-    for paper in result.papers:
+    for paper, links in zip(result.papers, paper_search_links(result)):
+        found_by_provider = ", ".join(
+            dict.fromkeys(provider for _, provider, _ in links)
+        ) or result.provider
         paper = without_homonym_numbers(
             _normalize_paper_identifiers(paper)
         )
@@ -2125,7 +3933,8 @@ for result in results:
                 existing.paper = existing.paper.merge_with(paper)
             except ValueError:
                 pass
-            existing.record_search(*link)
+            for link in links:
+                existing.record_search(*link)
             continue
 
         renamed = renamed_lookup.pop(paper_id, None)
@@ -2137,13 +3946,15 @@ for result in results:
             ).merge_with(paper)
             decision_lookup.pop(old_id, None)
             decision_lookup[paper_id] = renamed
-            renamed.record_search(*link)
+            for link in links:
+                renamed.record_search(*link)
             continue
 
         adopted = provenance_lookup.get(paper_id)
         if adopted is not None:
             adopted.paper = merge_version_of(adopted.paper, paper)
-            adopted.record_search(*link)
+            for link in links:
+                adopted.record_search(*link)
             continue
 
         replaced = None
@@ -2160,7 +3971,8 @@ for result in results:
             replaced.paper = merge_version_of(paper, replaced.paper)
             decision_lookup[paper_id] = replaced
             provenance_lookup[old_id] = replaced
-            replaced.record_search(*link)
+            for link in links:
+                replaced.record_search(*link)
             continue
 
         # Check for previous decision (prefer session data over notes)
@@ -2182,12 +3994,13 @@ for result in results:
             # Use previous decision but with fresh paper data
             decision = ReviewDecision(
                 paper=paper,  # Fresh paper data from search
-                provider=result.provider,
+                provider=found_by_provider,
                 status=prev_dec.status,
                 tags=prev_dec.tags,
                 source=prev_dec.source,
                 is_example=prev_dec.is_example,
                 llm_confidence=prev_dec.llm_confidence,
+                **llm_audit_of(prev_dec),
                 found_by=list(prev_dec.found_by),
             )
         elif prev_record:
@@ -2209,7 +4022,7 @@ for result in results:
 
             decision = ReviewDecision(
                 paper=paper,
-                provider=result.provider,
+                provider=found_by_provider,
                 status=status,
                 tags=tags,
                 source=source,
@@ -2220,11 +4033,13 @@ for result in results:
             # New paper, no previous decision
             decision = ReviewDecision(
                 paper=paper,
-                provider=result.provider,
+                provider=found_by_provider,
                 status=DecisionStatus.PENDING,
             )
 
-        decision.record_search(*link)
+
+        for link in links:
+            decision.record_search(*link)
         session.decisions.append(decision)
         decision_lookup[paper_id] = decision
 @
@@ -2305,6 +4120,90 @@ class TestFoundByLinks:
         assert set(links["10.1/fb-first"]) == {
             ("q1", "openalex", ""), ("q2", "openalex", ""),
         }
+@
+
+The case of \url{https://github.com/dbosk/scholar/issues/164}: the
+default search merges OpenAlex, which answered, with DBLP, which
+failed.  The session must hold two records with their own outcomes, the
+paper only OpenAlex returned must link to OpenAlex alone, and a merged
+record already in the session from before, of providers this run does
+not all cover, must load and stay as it was (one that the run covers is
+superseded, \cref{sec:superseded-merged}; this test used OpenAlex and
+DBLP before that rule existed).
+The merge is the real [[SearchResult.merge]] that the search command
+runs.
+
+<<test functions>>=
+class TestRecordsPerProvider:
+    """A merged result is recorded as one search per provider (#164)."""
+
+    @staticmethod
+    def _merged():
+        from scholar.scholar import SearchResult
+        both = Paper(title="Both", authors=["A"], doi="10.1/pp-both")
+        only = Paper(title="Only OA", authors=["B"], doi="10.1/pp-oa")
+        openalex = SearchResult(
+            query="q", provider="openalex", timestamp="t",
+            papers=[both, only], limit=100,
+        )
+        dblp = SearchResult(
+            query="q", provider="dblp", timestamp="t", papers=[both],
+            limit=100, error="non-JSON response",
+        )
+        return openalex.merge(dblp)
+
+    def test_one_record_per_provider(self):
+        session = create_review_session(
+            [self._merged()], "q", session_name="per-provider",
+        )
+        outcomes = {
+            r.provider: (r.query, r.hits, r.error)
+            for r in session.search_records
+        }
+        assert outcomes == {
+            "openalex": ("q", 2, None),
+            "dblp": ("q", 1, "non-JSON response"),
+        }
+        assert session.providers == ["openalex", "dblp"]
+
+    def test_papers_link_to_the_providers_that_returned_them(self):
+        session = create_review_session(
+            [self._merged()], "q", session_name="per-provider",
+        )
+        found = {
+            d.paper.doi: (d.provider, d.found_by) for d in session.decisions
+        }
+        assert found["10.1/pp-oa"] == ("openalex", [("q", "openalex", "")])
+        assert found["10.1/pp-both"] == (
+            "openalex, dblp", [("q", "openalex", ""), ("q", "dblp", "")],
+        )
+
+    def test_old_merged_record_loads_unchanged(self):
+        # A merged record of providers this run does not all cover
+        # (scopus was not re-run), so it is not superseded
+        # (sec:superseded-merged) and must stay as it was.
+        import json
+        from scholar.review import _get_sessions_dir
+        old = {"query": "q | q", "provider": "openalex, scopus",
+               "filters": None, "limit": 100, "hits": 25,
+               "error": "scopus: HTTP 500", "retries": 0}
+        path = _get_sessions_dir() / "merged-old.json"
+        path.write_text(json.dumps({
+            "query": "q", "name": "merged-old",
+            "providers": ["openalex, scopus"],
+            "timestamp": datetime.now().isoformat(),
+            "search_records": [old], "decisions": [],
+        }))
+        session = create_review_session(
+            [self._merged()], "q", session_name="merged-old",
+        )
+        save_session(session)
+        records = json.loads(path.read_text())["search_records"]
+        assert [r["provider"] for r in records] == [
+            "openalex", "dblp", "openalex, scopus",
+        ]
+        merged = records[2]
+        assert {k: merged[k] for k in old} == old
 @
 
 Extracting tags from a [[ReviewDecisionRecord]] is useful for backward compatibility
@@ -2604,6 +4503,11 @@ def read_session_file(session_path: Path) -> ReviewSession:
                     hits=rec.get("hits"),
                     error=rec.get("error"),
                     retries=rec.get("retries") or 0,
+                    total=rec.get("total"),
+                    total_estimated=rec.get("total_estimated") is True,
+                    searched_at=rec.get("searched_at"),
+                    fetched_at=rec.get("fetched_at"),
+                    from_cache=rec.get("from_cache"),
                     via=rec.get("via"),
                 )
                 for rec in data["search_records"]
@@ -2625,6 +4529,7 @@ def read_session_file(session_path: Path) -> ReviewSession:
                     direction=round_data["direction"],
                     papers_added=round_data["papers_added"],
                 ))
+        <<load the LLM review samples>>
 
         for dec_data in data["decisions"]:
             paper_data = dec_data["paper"]
@@ -2640,10 +4545,7 @@ def read_session_file(session_path: Path) -> ReviewSession:
 
             # Load LLM-related fields with backward compatibility
             source_str = dec_data.get("source", "human") or "human"
-            try:
-                source = ReviewSource(source_str)
-            except ValueError:
-                source = ReviewSource.HUMAN
+            source = ReviewSource(str(source_str))
             is_example = dec_data.get("is_example", False) or False
             llm_confidence = dec_data.get("llm_confidence")
             found_by = without_superseded_links([
@@ -2660,6 +4562,7 @@ def read_session_file(session_path: Path) -> ReviewSession:
                     source=source,
                     is_example=is_example,
                     llm_confidence=llm_confidence,
+                    **{name: dec_data.get(name) for name in LLM_AUDIT_FIELDS},
                     found_by=found_by,
                 )
             )
@@ -2668,8 +4571,36 @@ def read_session_file(session_path: Path) -> ReviewSession:
     except (json.JSONDecodeError, KeyError, OSError, ValueError,
             TypeError) as e:
         raise SessionFileError(session_path, e) from e
+    warn_about_unknown_sources(session_path, session)
     session._baseline = SessionBaseline.of(session)
     return session
+@
+
+A decision of unknown source (\cref{sec:review-source}) loads as it is,
+and is treated as unreviewed; the user is told once per session file
+and process, since [[save_session]] re-reads the file on every save and
+a warning per save would bury the first.
+
+<<review session functions>>=
+_WARNED_UNKNOWN_SOURCES: set[tuple[str, tuple[str, ...]]] = set()
+
+
+def warn_about_unknown_sources(session_path: Path, session) -> None:
+    """Warn once that `session` holds decisions of unknown source."""
+    values = tuple(sorted({
+        d.source.value for d in session.decisions if d.source.is_unknown
+    }))
+    key = (str(session_path), values)
+    if not values or key in _WARNED_UNKNOWN_SOURCES:
+        return
+    _WARNED_UNKNOWN_SOURCES.add(key)
+    count = sum(1 for d in session.decisions if d.source.is_unknown)
+    logger.warning(
+        "%s: %d decision(s) with unknown source %s; they are kept as "
+        "they are and treated as unreviewed (never cited) until a human "
+        "decides them",
+        session_path.name, count, ", ".join(repr(v) for v in values),
+    )
 @
 
 The file is re-read, merged and replaced under [[file_lock]]
@@ -2698,6 +4629,11 @@ data = {
             "hits": r.hits,
             "error": r.error,
             "retries": r.retries,
+            "total": r.total,
+            "total_estimated": r.total_estimated,
+            "searched_at": r.searched_at,
+            "fetched_at": r.fetched_at,
+            "from_cache": r.from_cache,
             "via": r.via,
         }
         for r in session.search_records
@@ -2711,6 +4647,7 @@ data = {
         }
         for r in session.snowball_rounds
     ],
+    <<serialise the LLM review samples>>
     "decisions": [
         {
             "paper_id": get_paper_id(d.paper),
@@ -2720,6 +4657,7 @@ data = {
             "source": d.source.value,
             "is_example": d.is_example,
             "llm_confidence": d.llm_confidence,
+            **llm_audit_of(d),
             "found_by": [
                 _found_by_link_data(link) for link in d.found_by
             ],
@@ -2925,7 +4863,16 @@ the same ids.)  Search records and snowball rounds only
 ever accumulate, so we add any that only the file has; a record is the
 file's own when no record here has its key (query, provider and
 filters, \cref{sec:search-record-key}), so a run of the same query with
-other filters in another process is kept beside ours.  So do a paper's
+other filters in another process is kept beside ours.  When both hold a
+record of the same search, the two are not merged field by field but
+one is kept, by the same rules as when a search is re-run
+([[preferred_record]], \cref{sec:wider-record}): without that, a
+process still holding the narrow record of a [[-l 5]] run saved it over
+the [[-l 0]] record another process had saved meanwhile, and fifty
+papers linked to a search that returns five.  This needs no baseline,
+since the rules judge the records themselves; when they cannot tell the
+two apart, ours is kept, as before.  The links need no repointing,
+since both records have the same key.  So do a paper's
 links to the searches that returned it ([[found_by]],
 \cref{sec:review-found-by}): each is a fact about a search that ran, not
 a judgement, so the links the file holds for a paper are added to the
@@ -2934,7 +4881,10 @@ links this process holds, whatever the decision rules decide.
 The baseline keeps one comparable state per paper id.  We compare the
 whole decision state rather than the status alone, because a change of
 tags or source (an LLM decision confirmed in the TUI) is as deliberate as
-a change of status.
+a change of status.  The classifier's record of its decision
+(\cref{sec:llm-audit-fields}) belongs to that state too, so a decision
+taken from the file brings its model, date and reason along instead of
+pairing the file's status with this process's stale record.
 
 <<review data structures>>=
 def decision_state(decision: ReviewDecision) -> tuple:
@@ -2945,6 +4895,7 @@ def decision_state(decision: ReviewDecision) -> tuple:
         decision.source,
         decision.is_example,
         decision.llm_confidence,
+        *llm_audit_of(decision).values(),
     )
 
 
@@ -3020,6 +4971,8 @@ def merge_concurrent_changes(
             decision.source = theirs.source
             decision.is_example = theirs.is_example
             decision.llm_confidence = theirs.llm_confidence
+            for name, value in llm_audit_of(theirs).items():
+                setattr(decision, name, value)
         else:
             <<warn that both processes decided the paper>>
 
@@ -3029,14 +4982,21 @@ def merge_concurrent_changes(
 
     <<merge research context from disk>>
 
-    own_keys = {r.key for r in session.search_records}
+    own_index = {r.key: i for i, r in enumerate(session.search_records)}
     for record in on_disk.search_records:
-        if record.key not in own_keys and record.key not in replaced:
+        if record.key in own_index:
+            i = own_index[record.key]
+            session.search_records[i] = preferred_record(
+                session.search_records[i], record
+            )
+        elif record.key not in replaced:
             session.search_records.append(record)
     own_rounds = {r.timestamp for r in session.snowball_rounds}
     for snowball_round in on_disk.snowball_rounds:
         if snowball_round.timestamp not in own_rounds:
             session.snowball_rounds.append(snowball_round)
+    <<merge the LLM review samples from disk>>
+    supersede_merged_records(session)
 
     session._invalidate_cache()
 @
@@ -3144,6 +5104,77 @@ if on_disk is not None:
 The window that remains, between reading the file and replacing it, is
 milliseconds instead of hours, and [[save_session]] closes it by holding
 [[file_lock]] across both.
+
+A save can also fail for want of space.  A review that ran with a full
+temporary volume left three copied sessions with more search records
+than before (73 became 85 in one), which did not happen again on a
+clean run.  Let's verify what a full disk does to a save: the write
+fails part-way (the temporary file is written, its [[fsync]] reports
+[[ENOSPC]]), the error reaches the caller, the session file is
+byte for byte what it was, no temporary file is left, and neither a
+second save of the same session object nor a fresh append of the same
+search adds a record or a paper that a clean run would not.  The
+records are compared with what a clean run produces.
+
+<<test functions>>=
+class TestSaveOnAFullDisk:
+    """A save that runs out of space changes nothing."""
+
+    @staticmethod
+    def _result(query, n, prefix):
+        from scholar.scholar import SearchResult
+        return SearchResult(
+            query=query, provider="openalex", timestamp="t", limit=100,
+            papers=[Paper(title=f"{prefix}{i}", authors=["A"],
+                          doi=f"10.1/full-{prefix}-{i}") for i in range(n)],
+        )
+
+    @staticmethod
+    def _full_disk(monkeypatch):
+        import errno
+        import os
+
+        def fsync(fd):
+            raise OSError(errno.ENOSPC, "No space left on device")
+
+        monkeypatch.setattr(os, "fsync", fsync)
+
+    def _records(self, name):
+        session = load_session(name)
+        return sorted((r.query, r.provider, r.hits)
+                      for r in session.search_records), len(session.decisions)
+
+    def test_failed_save_changes_nothing(self, monkeypatch):
+        import errno
+        from scholar.review import _get_sessions_dir
+
+        for name in ("full", "clean"):
+            save_session(create_review_session(
+                [self._result("q1", 3, "a")], "q1", session_name=name,
+            ))
+        save_session(create_review_session(
+            [self._result("q2", 2, "b")], "q2", session_name="clean",
+        ))
+
+        path = _get_sessions_dir() / "full.json"
+        before = path.read_bytes()
+        appended = create_review_session(
+            [self._result("q2", 2, "b")], "q2", session_name="full",
+        )
+        with monkeypatch.context() as patched:
+            self._full_disk(patched)
+            with pytest.raises(OSError) as raised:
+                save_session(appended)
+        assert raised.value.errno == errno.ENOSPC
+        assert path.read_bytes() == before
+        assert not list(path.parent.glob(".full.json.*.tmp"))
+
+        save_session(appended)
+        save_session(create_review_session(
+            [self._result("q2", 2, "b")], "q2", session_name="full",
+        ))
+        assert self._records("full") == self._records("clean")
+@
 
 Now the regression test for the incident.  Process~A (the enrichment)
 loads the session; process~B sets the research context and classifies,
@@ -5148,13 +7179,17 @@ def search_outcomes(
     return [
         (
             r.query, r.provider, " ".join(filter_flags(r.filters)),
-            hits_label(
-                r.hits, r.error, r.retries,
-                ranked=is_ranked_provider(r.provider),
-            ),
+            search_outcome_label(r),
         )
         for r in session.search_records
     ]
+
+
+def search_dates(session: ReviewSession) -> list[str]:
+    """The dates label of each search, parallel to `search_outcomes`."""
+    if not session.search_records:
+        return ["" for _ in get_query_provider_pairs(session)]
+    return [search_dates_label(r) for r in session.search_records]
 
 
 def searches_share_query(session: ReviewSession) -> bool:
@@ -5169,12 +7204,244 @@ def search_table_needed(session: ReviewSession) -> bool:
         provider_queries_differ(session)
         or any_search_failed(session)
         or searches_share_query(session)
+        or len(searched_queries(session)) > 1
+        or any(
+            r.hits is not None or r.searched_at or r.fetched_at
+            for r in session.search_records
+        )
     )
 
 
 def any_search_failed(session: ReviewSession) -> bool:
     """Whether any recorded search failed."""
     return any(r.error for r in session.search_records)
+@
+
+The parameters above the table used to be the session's [[query]] and
+[[providers]], which each append overwrites: a session of six searches
+on six providers reported \enquote{The search covered scopus}, the
+provider of the last append
+(\url{https://github.com/dbosk/scholar/issues/163}).  They are now
+derived from all search records: every provider any record names (the
+providers of a merged record each count, \cref{sec:merged-records}),
+the one query if all records share it and otherwise their number, and
+the period in which the databases answered ([[search_source_date]]),
+with the number of searches whose date is unknown.  A provider is
+listed among those searched only if it answered at least one search,
+as in the caption of the audit table: one that was skipped or failed
+outright every time was not searched, and the report says so, with the
+reason, under \enquote{Not searched}, so that a reader sees the gap
+instead of a database the review never reached.  A provider that an
+old merged record with papers names as failed may have answered part
+of that search or nothing of it, which the record cannot tell; it is
+listed among the providers searched, with the note the caption gives
+it, \enquote{failed or incomplete in a merged record}
+([[searched_providers_text]]), so the report and the caption say the
+same.  The table itself
+appears whenever a record knows its outcome or its dates, so that each
+search is described with them, in a Date column when any date is
+known; only a session whose records know neither, from before outcomes
+were kept, still gets the table under the old conditions alone, and
+its report looks as it did.  Sessions without any records fall back to
+the session's own fields.
+
+<<review report generation>>=
+def provider_failure(record: SearchRecord, name: str) -> str | None:
+    """Why provider `name` answered nothing in `record`, or None.
+
+    A merged record's error is split at its provider prefixes; a
+    provider it names failed outright only if the record has no papers.
+    """
+    if not record.is_merged:
+        return record.error if failed_outright(record) else None
+    if record.hits or name not in merged_record_failures(record):
+        return None
+    for segment in (record.error or "").split("; "):
+        prefix, _, reason = segment.partition(":")
+        if prefix.strip() == name:
+            return reason.strip()
+    return record.error
+
+
+def searched_providers(session: ReviewSession) -> list[str]:
+    """The providers that answered at least one search, in order."""
+    if not session.search_records:
+        return list(session.providers)
+    names: list[str] = []
+    for record in session.search_records:
+        for name in record.merged_providers:
+            if name not in names and provider_failure(record, name) is None:
+                names.append(name)
+    return names
+
+
+def unsearched_providers(session: ReviewSession) -> list[tuple[str, str]]:
+    """`(provider, reason)` for each provider that answered no search."""
+    answered = set(searched_providers(session))
+    reasons: dict[str, str] = {}
+    for record in session.search_records:
+        for name in record.merged_providers:
+            if name not in answered and name not in reasons:
+                reasons[name] = provider_failure(record, name) or ""
+    return list(reasons.items())
+
+
+def searched_providers_text(session: ReviewSession) -> str:
+    """The providers searched, each failure in a merged record noted.
+
+    A provider that a merged record with papers names as failed
+    answered in part or not at all, which the record cannot tell;
+    it is noted as the audit caption notes it.
+    """
+    noted = {
+        name for record in session.search_records
+        if record.hits for name in merged_record_failures(record)
+    }
+    return ", ".join(
+        f"{name} (failed or incomplete in a merged record)"
+        if name in noted else name
+        for name in searched_providers(session)
+    )
+
+
+def unsearched_text(session: ReviewSession) -> str:
+    """The providers that answered no search, each with its reason."""
+    return ", ".join(
+        f"{name} ({reason})" if reason else name
+        for name, reason in unsearched_providers(session)
+    )
+
+
+def searched_queries(session: ReviewSession) -> list[str]:
+    """The distinct queries of the session's search records, in order."""
+    if not session.search_records:
+        return [session.query]
+    return list(dict.fromkeys(r.query for r in session.search_records))
+
+
+def search_period(session: ReviewSession) -> str:
+    """When the databases answered, "A to B", with unknown dates counted.
+
+    "" when no record knows its date.
+    """
+    dates = [
+        search_source_date(r)
+        for r in answered_records(session.search_records)
+    ]
+    known = sorted(d for d in dates if d)
+    if not known:
+        return ""
+    if known[0] == known[-1]:
+        period = known[0]
+    else:
+        period = f"{known[0]} to {known[-1]}"
+    unknown = len(dates) - len(known)
+    if unknown:
+        period += f" (date unknown for {unknown} of {len(dates)} searches)"
+    return period
+
+
+def search_parameter_items(session: ReviewSession) -> list[tuple[str, str]]:
+    """The `(label, value)` items describing all of the session's searches."""
+    queries = searched_queries(session)
+    if len(queries) == 1:
+        items = [("Query", queries[0])]
+    else:
+        items = [("Queries", f"{len(queries)}, see the table of searches")]
+    items.append(
+        ("Providers", searched_providers_text(session) or "none")
+    )
+    not_searched = unsearched_text(session)
+    if not_searched:
+        items.append(("Not searched", not_searched))
+    period = search_period(session)
+    if period:
+        items.append(("Searched", period))
+    return items
+@
+
+<<test functions>>=
+class TestReportDescribesAllSearches:
+    """The report's search parameters cover every record (#163)."""
+
+    @staticmethod
+    def _session():
+        session = ReviewSession(
+            query="last", providers=["scopus"], timestamp=datetime.now(),
+        )
+        session.search_records = [
+            SearchRecord("first", "openalex", None, 100, hits=12,
+                         fetched_at="2026-10-02T08:00:00+00:00"),
+            SearchRecord("first | first", "dblp, hal", None, 100, hits=3),
+            SearchRecord("last", "scopus", None, 25, hits=25, total=93,
+                         searched_at="2026-11-18T09:00:00+00:00",
+                         fetched_at="2026-11-18T09:00:00+00:00",
+                         from_cache=False),
+        ]
+        return session
+
+    def test_items(self):
+        assert searched_providers(self._session()) == [
+            "openalex", "dblp", "hal", "scopus",
+        ]
+        assert search_parameter_items(self._session()) == [
+            ("Queries", "3, see the table of searches"),
+            ("Providers", "openalex, dblp, hal, scopus"),
+            ("Searched", "2026-10-02 to 2026-11-18 "
+                         "(date unknown for 1 of 3 searches)"),
+        ]
+
+    def test_markdown_lists_every_search(self):
+        lines = build_search_parameters_markdown(self._session())
+        assert "- Providers: openalex, dblp, hal, scopus" in lines
+        assert "| Provider | Query | Hits | Date |" in lines
+        assert ("| scopus | last | 25 of 93 (capped at 25) | "
+                "searched 2026-11-18 |") in lines
+        assert any("merged record (providers dblp, hal)" in line
+                   for line in lines)
+
+    def test_skipped_and_failed_providers_are_not_searched(self):
+        session = self._session()
+        session.search_records += [
+            SearchRecord("first", "ieee", None, 100, hits=0,
+                         error="skipped: daily quota spent; resets 01:00"),
+            SearchRecord("first | first", "wos, arxiv", None, 100, hits=0,
+                         error="wos: HTTP 401; arxiv: HTTP 503"),
+            SearchRecord("last", "hal", None, 100, hits=0,
+                         error="HTTP 500"),
+            SearchRecord("first", "hal", None, 100, hits=4),
+        ]
+        assert searched_providers(session) == [
+            "openalex", "dblp", "hal", "scopus",
+        ]
+        items = dict(search_parameter_items(session))
+        assert items["Not searched"] == (
+            "ieee (skipped: daily quota spent; resets 01:00), "
+            "wos (HTTP 401), arxiv (HTTP 503)"
+        )
+        assert "Not searched: ieee (skipped: daily quota spent" in (
+            build_review_report_abstract(session)
+        )
+
+    def test_failure_in_a_merged_record_is_noted(self):
+        session = self._session()
+        session.search_records[1].error = "dblp: non-JSON response"
+        expected = (
+            "openalex, dblp (failed or incomplete in a merged record), "
+            "hal, scopus"
+        )
+        assert dict(search_parameter_items(session))["Providers"] == expected
+        assert f"The search covered {expected}" in (
+            build_review_report_abstract(session)
+        )
+
+    def test_latex_and_abstract(self):
+        text = "\n".join(build_search_parameters_latex(self._session()))
+        assert r"\item[Providers] openalex, dblp, hal, scopus" in text
+        assert "Base query" not in text
+        assert "The search covered openalex, dblp, hal, scopus" in (
+            build_review_report_abstract(self._session())
+        )
 @
 
 The research context and the search parameters exist in a Markdown and a
@@ -5185,7 +7452,8 @@ ran a query different from the base query, since otherwise it would
 repeat the base query once per provider---or when a search failed,
 since the failure must be visible either way, or when two searches
 share their query and provider, since only the table's filters column
-tells them apart.
+tells them apart, or when any record knows its outcome or dates (see
+above).
 
 <<review report generation>>=
 def build_research_context_markdown(
@@ -5211,34 +7479,36 @@ def build_search_parameters_markdown(
 ) -> list[str]:
     """Build search parameters (including executed queries) as Markdown lines."""
     heading = "#" * heading_level
-    providers = ", ".join(session.providers)
 
-    lines: list[str] = [
-        f"{heading} Search Parameters",
-        "",
-        f"- Base query: {session.query}",
-        f"- Providers: {providers}",
-        "",
-    ]
+    lines: list[str] = [f"{heading} Search Parameters", ""]
+    lines.extend(
+        f"- {label}: {value}"
+        for label, value in search_parameter_items(session)
+    )
+    lines.append("")
 
     if search_table_needed(session):
         heading2 = "#" * (heading_level + 1)
         outcomes = search_outcomes(session)
+        dates = search_dates(session)
         with_hits = any(label for *_, label in outcomes)
         with_flags = any(flags for _, _, flags, _ in outcomes)
+        with_dates = any(dates)
         columns = ["Provider", "Query"]
         columns += ["Filters"] if with_flags else []
         columns += ["Hits"] if with_hits else []
+        columns += ["Date"] if with_dates else []
         lines.extend([
             f"{heading2} Provider-specific queries",
             "",
             "| " + " | ".join(columns) + " |",
             "|" + " --- |" * len(columns),
         ])
-        for query, provider, flags, label in outcomes:
+        for (query, provider, flags, label), date in zip(outcomes, dates):
             cells = [provider, query]
             cells += [f"`{flags}`" if flags else ""] if with_flags else []
             cells += [label] if with_hits else []
+            cells += [date] if with_dates else []
             lines.append("| " + " | ".join(cells) + " |")
         lines.append("")
 
@@ -5271,23 +7541,20 @@ def build_search_parameters_latex(
     heading_command: str = r"\section",
 ) -> list[str]:
     """Build search parameters (including executed queries) as LaTeX lines."""
-    providers = ", ".join(session.providers)
-
     lines: list[str] = [f"{heading_command}{{Search Parameters}}", ""]
+    lines.append(r"\begin{description}")
     lines.extend(
-        [
-            r"\begin{description}",
-            f"\\item[Base query] {escape_latex(session.query)}",
-            f"\\item[Providers] {escape_latex(providers)}",
-            r"\end{description}",
-            "",
-        ]
+        f"\\item[{label}] {escape_latex(value)}"
+        for label, value in search_parameter_items(session)
     )
+    lines.extend([r"\end{description}", ""])
 
     if search_table_needed(session):
         outcomes = search_outcomes(session)
+        dates = search_dates(session)
         with_hits = any(label for *_, label in outcomes)
         with_flags = any(flags for _, _, flags, _ in outcomes)
+        with_dates = any(dates)
         spec = "lp{8cm}" if with_hits else "lp{10cm}"
         header = ["Provider", "Query"]
         if with_flags:
@@ -5296,6 +7563,11 @@ def build_search_parameters_latex(
         if with_hits:
             spec += "p{3.5cm}"
             header.append("Hits")
+        if with_dates:
+            spec = spec.replace("p{8cm}", "p{5cm}").replace(
+                "p{6cm}", "p{4cm}"
+            ) + "p{3.5cm}"
+            header.append("Date")
         lines.extend(
             [
                 f"{sub_heading(heading_command)}{{Provider-specific queries}}",
@@ -5305,12 +7577,14 @@ def build_search_parameters_latex(
                 r"\midrule",
             ]
         )
-        for query, provider, flags, label in outcomes:
+        for (query, provider, flags, label), date in zip(outcomes, dates):
             cells = [escape_latex(provider), escape_latex(query)]
             if with_flags:
                 cells.append(latex_flags(flags))
             if with_hits:
                 cells.append(escape_latex(label))
+            if with_dates:
+                cells.append(escape_latex(date))
             lines.append(" & ".join(cells) + r" \\")
         lines.extend(
             [
@@ -5322,6 +7596,12 @@ def build_search_parameters_latex(
 
     return lines
 @
+
+Until \url{https://github.com/dbosk/scholar/issues/163} one plain search
+that answered got no table, and so its count appeared nowhere in the
+report; the last test below asserted that.  It now asserts the opposite
+for such a search, and keeps the old expectation for a record that
+knows no outcome, whose report looks as it did.
 
 Let's verify the table for one query run twice on OpenAlex, over the
 full text and with [[--in title-abstract]] (the counts are those of the
@@ -5360,12 +7640,19 @@ class TestReportShowsSearchFilters:
             r"openalex & Q & \texttt{-{}-in title-abstract} & 192 \\"
         ) in text
 
-    def test_no_table_for_one_plain_search(self):
+    def test_no_table_for_one_plain_search_without_outcome(self):
         session = self._session()
-        session.search_records = session.search_records[:1]
+        session.search_records = [SearchRecord("Q", "openalex", None, 1000)]
         assert not any(
             "Provider-specific" in line
             for line in build_search_parameters_markdown(session)
+        )
+
+    def test_one_plain_search_with_outcome_is_described(self):
+        session = self._session()
+        session.search_records = session.search_records[:1]
+        assert "| openalex | Q | 2130 |" in (
+            build_search_parameters_markdown(session)
         )
 @
 
@@ -5860,7 +8147,8 @@ biblatex owns the formatting and the title stays consistent with the
 bibliography entry. The matrix table has one column per tag, which does
 not fit a page with horizontal headers, hence the rotated headers; a
 [[\checkmark]] marks membership because an empty cell reads more easily
-than a word in a dense grid.
+than a word in a dense grid. The list table puts the mark of an unreviewed
+machine decision after the title, as the paper lists below do.
 
 <<review report generation>>=
 def format_list_table(
@@ -5883,7 +8171,8 @@ def format_list_table(
         year = decision.paper.year or "---"
         tags = ", ".join(escape_latex(t) for t in sorted(decision.tags))
         lines.append(
-            f"\\citetitle{{{cite_key(decision)}}} & {year} & {tags} \\\\"
+            f"\\citetitle{{{cite_key(decision)}}}"
+            f"{unreviewed_suffix_latex(decision)} & {year} & {tags} \\\\"
         )
     lines.append(r"\end{longtable}")
     return lines
@@ -5931,6 +8220,7 @@ def format_matrix_table(
 @
 
 \subsection{Provenance sections}
+\label{sec:report-provenance}
 
 The report body has two halves that other documents want separately. The
 provenance half describes how the corpus was assembled: research context,
@@ -5953,69 +8243,109 @@ def build_review_provenance_latex(
         build_search_parameters_latex(session, heading_command=heading_command)
     )
     <<add summary counts>>
+    <<add the LLM screening paragraphs>>
     <<add snowballing section>>
     return lines
 @
 
-When the LLM took part in the review, the summary reports how many of its
-decisions the reviewer confirmed or changed, split by direction; a session
-without LLM decisions omits those lines so the table does not suggest a
-step that never happened. A changed decision is recognised by
-[[is_example]]: corrected decisions become training examples for later
-LLM rounds, which is exactly the set we want to count.
+\label{sec:report-llm-screening}
+When an LLM took part in the screening, the report also says which
+model decided, under which prompt versions and when, and states any
+sample of its decisions that was drawn for human review and what that
+review found.  The LLM review module writes those paragraphs
+(\cref{sec:llm-sample} there), because it owns both the record and the
+statistics; the report only places them after the summary.  The import
+is local because the LLM review module imports this one.
 
-<<add summary counts>>=
-has_llm_decisions = any(
-    d.source in (ReviewSource.LLM_UNREVIEWED, ReviewSource.LLM_REVIEWED)
-    for d in session.decisions
+<<add the LLM screening paragraphs>>=
+from scholar.llm_review import build_llm_screening_latex
+lines.extend(build_llm_screening_latex(session, heading_command=heading_command))
+@
+
+<<test functions>>=
+class TestReportLLMScreening:
+    def test_report_states_the_model(self):
+        session = ReviewSession(
+            query="q", providers=["p"], timestamp=datetime(2026, 11, 18),
+        )
+        session.decisions = [ReviewDecision(
+            paper=Paper(title="L", authors=["A"],
+                        doi="10.5555/report-screening"),
+            provider="p", status=DecisionStatus.DISCARDED, tags=["t"],
+            source=ReviewSource.LLM_UNREVIEWED, llm_model="m-1",
+            llm_decided_at="2026-11-18T10:00:00+00:00",
+        )]
+        lines = build_review_provenance_latex(session)
+        assert r"\section{LLM screening}" in lines
+        assert any("model m-1: 1" in line for line in lines)
+@
+
+The summary says who decided before it says anything else about the
+decisions (issue~\#163).  The kept, discarded and pending counts are
+followed by one row per decision source ([[decision_source_items]],
+\cref{sec:review-source}), so a review whose discards are mostly
+unreviewed LLM output says so in the same place it gives the number of
+discards.
+
+When a machine took part in the review, the summary also reports how
+many of its decisions the reviewer confirmed or changed, split by
+direction; a session without such decisions omits those lines so the
+table does not suggest a step that never happened.  A changed decision
+is recognised by [[is_example]]: corrected decisions become training
+examples for later LLM rounds, which is exactly the set we want to
+count.  The LLM and the agent get separate rows because they are
+separate procedures, and a reader judging how reliable the screening
+was needs the agreement rate of each.  [[sessions export]] prints the
+same rows, so [[machine_review_rows]] computes them once.
+
+<<review report generation>>=
+MACHINE_SOURCES = (
+    ("LLM", ReviewSource.LLM_UNREVIEWED),
+    ("Agent", ReviewSource.AGENT_UNREVIEWED),
 )
 
-llm_confirmed = 0
-llm_changed_total = 0
-llm_changed_kept_to_discarded = 0
-llm_changed_discarded_to_kept = 0
 
-if has_llm_decisions:
-    llm_confirmed = sum(
-        1
-        for d in session.decisions
-        if d.source == ReviewSource.LLM_REVIEWED and not d.is_example
-    )
-    llm_changed_total = sum(
-        1
-        for d in session.decisions
-        if d.source == ReviewSource.LLM_REVIEWED and d.is_example
-    )
-    llm_changed_kept_to_discarded = sum(
-        1
-        for d in session.decisions
-        if d.source == ReviewSource.LLM_REVIEWED
-        and d.is_example
-        and d.status == DecisionStatus.DISCARDED
-    )
-    llm_changed_discarded_to_kept = sum(
-        1
-        for d in session.decisions
-        if d.source == ReviewSource.LLM_REVIEWED
-        and d.is_example
-        and d.status == DecisionStatus.KEPT
-    )
+def machine_review_rows(decisions) -> list[tuple[str, int]]:
+    """Return `(label, count)` rows of confirmed and changed machine decisions.
 
+    Rows appear per machine (LLM, agent) only when it decided something.
+    """
+    rows: list[tuple[str, int]] = []
+    for name, unreviewed in MACHINE_SOURCES:
+        reviewed = unreviewed.reviewed
+        mine = [d for d in decisions if d.source in (unreviewed, reviewed)]
+        if not mine:
+            continue
+        changed = [d for d in mine if d.source is reviewed and d.is_example]
+        rows.extend([
+            (f"{name} confirmed", sum(
+                1 for d in mine if d.source is reviewed and not d.is_example
+            )),
+            (f"{name} changed", len(changed)),
+            (f"{name} changed (kept->discarded)", sum(
+                1 for d in changed if d.status == DecisionStatus.DISCARDED
+            )),
+            (f"{name} changed (discarded->kept)", sum(
+                1 for d in changed if d.status == DecisionStatus.KEPT
+            )),
+        ])
+    return rows
+@
+
+<<add summary counts>>=
 summary_items = [
     f"\\item[Kept] {len(session.kept_papers())}",
     f"\\item[Discarded] {len(session.discarded_papers())}",
     f"\\item[Pending] {len(session.pending_papers())}",
 ]
-
-if has_llm_decisions:
-    summary_items.extend(
-        [
-            f"\\item[LLM confirmed] {llm_confirmed}",
-            f"\\item[LLM changed] {llm_changed_total}",
-            f"\\item[LLM changed (kept->discarded)] {llm_changed_kept_to_discarded}",
-            f"\\item[LLM changed (discarded->kept)] {llm_changed_discarded_to_kept}",
-        ]
-    )
+summary_items.extend(
+    f"\\item[Decided: {escape_latex(label)}] {count}"
+    for label, count in decision_source_items(session.decisions)
+)
+summary_items.extend(
+    f"\\item[{label}] {count}"
+    for label, count in machine_review_rows(session.decisions)
+)
 
 lines.extend(
     [
@@ -6157,6 +8487,31 @@ list per tag. A paper with several tags appears under each of them; that
 repetition is intended, because a reader looking up one theme should see
 everything filed under it. Without tags the papers form a single list.
 
+Each entry carries the mark of an unreviewed machine decision
+([[unreviewed_mark]], \cref{sec:review-source}) after the citation.  The
+lists are where a reader of the report meets the papers one by one, and
+a paper an agent kept without anyone reading it must not look like one
+the author screened.
+
+<<review report generation>>=
+def unreviewed_suffix_latex(decision: ReviewDecision) -> str:
+    """LaTeX suffix marking an unreviewed machine decision, or ""."""
+    mark = unreviewed_mark(decision)
+    return f" \\emph{{({escape_latex(mark)})}}" if mark else ""
+
+
+def paper_item_latex(
+    decision: ReviewDecision,
+    cite_key: Callable[[ReviewDecision], str],
+) -> str:
+    """One list entry of the report: the full citation and its mark."""
+    return (
+        f"\\item \\fullcite{{{cite_key(decision)}}}"
+        + unreviewed_suffix_latex(decision)
+    )
+@
+
+
 <<add kept papers by theme>>=
 if session.kept_papers():
     lines.extend([
@@ -6172,13 +8527,13 @@ if session.kept_papers():
             lines.append(f"{sub}{{{escape_latex(theme)}}}")
             lines.append(r"\begin{enumerate}")
             for decision in papers_with_theme:
-                lines.append(f"\\item \\fullcite{{{cite_key(decision)}}}")
+                lines.append(paper_item_latex(decision, cite_key))
             lines.append(r"\end{enumerate}")
             lines.append("")
     else:
         lines.append(r"\begin{enumerate}")
         for decision in session.kept_papers():
-            lines.append(f"\\item \\fullcite{{{cite_key(decision)}}}")
+            lines.append(paper_item_latex(decision, cite_key))
         lines.append(r"\end{enumerate}")
         lines.append("")
 @
@@ -6200,13 +8555,13 @@ if session.discarded_papers():
             lines.append(f"{sub}{{{escape_latex(motivation)}}}")
             lines.append(r"\begin{enumerate}")
             for decision in papers_with_motivation:
-                lines.append(f"\\item \\fullcite{{{cite_key(decision)}}}")
+                lines.append(paper_item_latex(decision, cite_key))
             lines.append(r"\end{enumerate}")
             lines.append("")
     else:
         lines.append(r"\begin{enumerate}")
         for decision in session.discarded_papers():
-            lines.append(f"\\item \\fullcite{{{cite_key(decision)}}}")
+            lines.append(paper_item_latex(decision, cite_key))
         lines.append(r"\end{enumerate}")
         lines.append("")
 @
@@ -6240,7 +8595,9 @@ class TestReviewDecisionsBuilder:
 
 The report's abstract is deterministic: it restates the research question
 and the counts, which is all a reader needs to decide whether to open the
-document.
+document.  The counts include who decided
+([[decision_sources_sentence]]), since a reader deciding whether to
+trust the review needs that before the number of papers means anything.
 
 <<review report generation>>=
 def build_review_report_abstract(session: ReviewSession) -> str:
@@ -6257,11 +8614,18 @@ def build_review_report_abstract(session: ReviewSession) -> str:
     else:
         lead = "This report documents a systematic literature review session."
 
-    providers = ", ".join(session.providers)
+    providers = searched_providers_text(session) or "no database"
     summary = (
         f"{lead} The search covered {providers} and yielded {total} papers "
         f"({kept} kept, {discarded} discarded, {pending} pending)."
     )
+    not_searched = unsearched_text(session)
+    if not_searched:
+        summary += f" Not searched: {not_searched}."
+
+    sources = decision_sources_sentence(session.decisions)
+    if sources:
+        summary += " " + sources
 
     if session.snowball_rounds:
         summary += " Manual snowballing was used to discover additional papers."
@@ -6371,6 +8735,71 @@ class TestReportModes:
         assert (tmp_path / "report.bib").read_text().startswith("@article{")
 @
 
+The report must say who decided, in the summary, in the abstract and
+next to each paper (issue~\#163).  One session with every kind of
+decision checks all three places at once; the human decision must stay
+unmarked, since the marks are only useful if they single out the
+decisions nobody checked.
+
+<<test functions>>=
+class TestReportDecisionSources:
+    def _session(self):
+        def d(title, status, source, tags, is_example=False):
+            return ReviewDecision(
+                paper=Paper(title=title, authors=[title], year=2024),
+                provider="p", status=status, tags=tags, source=source,
+                is_example=is_example,
+            )
+        session = ReviewSession(
+            query="q", providers=["p"], timestamp=datetime(2026, 11, 18),
+        )
+        session.decisions = [
+            d("Human", DecisionStatus.KEPT, ReviewSource.HUMAN, ["ml"]),
+            d("Agent", DecisionStatus.KEPT,
+              ReviewSource.AGENT_UNREVIEWED, ["ml"]),
+            d("Model", DecisionStatus.DISCARDED,
+              ReviewSource.LLM_UNREVIEWED, ["off-topic"]),
+            d("Checked", DecisionStatus.DISCARDED,
+              ReviewSource.AGENT_REVIEWED, ["off-topic"], is_example=True),
+            d("Open", DecisionStatus.PENDING, ReviewSource.HUMAN, []),
+        ]
+        return session
+
+    def test_summary_counts_decisions_by_source(self, tmp_path):
+        path = tmp_path / "report.tex"
+        generate_latex_report(self._session(), path)
+        content = path.read_text()
+        assert r"\item[Decided: human] 1" in content
+        assert r"\item[Decided: agent, reviewed by a human] 1" in content
+        assert r"\item[Decided: LLM, unreviewed] 1" in content
+        assert r"\item[Decided: agent, unreviewed] 1" in content
+        assert r"\item[Agent confirmed] 0" in content
+        assert r"\item[Agent changed (kept->discarded)] 1" in content
+        assert r"\item[LLM confirmed] 0" in content
+
+    def test_abstract_says_who_decided(self):
+        abstract = build_review_report_abstract(self._session())
+        assert "Decisions by source: 1 human; " \
+            "1 agent, reviewed by a human; 1 LLM, unreviewed; " \
+            "1 agent, unreviewed." in abstract
+
+    def test_lists_mark_unreviewed_machine_decisions(self):
+        session = self._session()
+        keys = {d.paper.title: d.paper.title.lower()
+                for d in session.decisions}
+        lines = build_review_decisions_latex(
+            session, lambda d: keys[d.paper.title]
+        )
+        assert r"\item \fullcite{agent} \emph{(agent, unreviewed)}" in lines
+        assert r"\item \fullcite{model} \emph{(LLM, unreviewed)}" in lines
+        assert r"\item \fullcite{human}" in lines
+        assert r"\item \fullcite{checked}" in lines
+        assert any(
+            line.startswith(r"\citetitle{agent} \emph{(agent, unreviewed)} &")
+            for line in lines
+        )
+@
+
 \subsection{Audit table}
 \label{sec:audit-table}
 
@@ -6453,6 +8882,18 @@ AUDIT_STRINGS: dict[str, dict] = {
         "openalex_note": "not open access",
         "search_failed": "failed for {n} of {total} {queries}",
         "search_incomplete": "incomplete for {n} of {total} {queries}",
+        "search_failed_merged": (
+            "failed or incomplete for {n} of {total} {queries},"
+            " in a merged record"
+        ),
+        "search_capped": "capped at the limit for {n} of {total} {queries}",
+        "searched_range": "Searched {start} to {end}.",
+        "searched_on": "Searched {start}.",
+        "dates_unknown": (
+            "Search date unknown for {n} of {total} {searches}."
+        ),
+        "search": "search",
+        "searches": "searches",
         "query": "query",
         "queries": "queries",
         "title": "Title",
@@ -6524,6 +8965,18 @@ AUDIT_STRINGS: dict[str, dict] = {
         "openalex_note": "inte open access",
         "search_failed": "misslyckades för {n} av {total} {queries}",
         "search_incomplete": "ofullständig för {n} av {total} {queries}",
+        "search_failed_merged": (
+            "misslyckades eller ofullständig för {n} av {total}"
+            " {queries}, i en sammanslagen post"
+        ),
+        "search_capped": "nådde träffgränsen för {n} av {total} {queries}",
+        "searched_range": "Sökt {start} till {end}.",
+        "searched_on": "Sökt {start}.",
+        "dates_unknown": (
+            "Sökdatum okänt för {n} av {total} {searches}."
+        ),
+        "search": "sökning",
+        "searches": "sökningar",
         "query": "sökfråga",
         "queries": "sökfrågor",
         "title": "Titel",
@@ -6619,9 +9072,11 @@ both tags on it; looking only at the first tag would file the paper
 under the category and count no cited rows at all. The rule therefore
 splits the tags into category tags, note tags and theme tags and takes
 the theme from the last group. Second, an LLM keep is a candidate, not
-a citation: only a decision a human made (or reviewed) counts as cited,
-which is also what the [[decision_source]] column of the CSV export
-says. Third, when the caller names its themes with [[--theme]], that
+a citation, and so is an agent's: only a decision a human made (or
+reviewed) counts as cited, which is also what the [[decision_source]]
+column of the CSV export says. The test is
+[[ReviewSource.is_unreviewed]] (\cref{sec:review-source}), so the two
+machine sources cannot drift apart. Third, when the caller names its themes with [[--theme]], that
 list is an allowlist: any other tag that is neither a category nor a
 known note is shown as a note, so a stray tag cannot pass for a theme.
 Without the list, every tag that is not a category or a note is a
@@ -6633,8 +9088,8 @@ decision: tags accumulate in the order they were given, so a reviewer
 who changes an LLM's \enquote{supports} to \enquote{false hit} leaves
 both, and taking the first once counted an explicitly rejected paper as
 supporting evidence in a published appendix. The confidence is shown
-for the rows whose category is the machine's: unreviewed LLM decisions
-and the ones a human confirmed as they stood. A human who changed the
+for the rows whose category is the machine's: unreviewed LLM or agent
+decisions and the ones a human confirmed as they stood. A human who changed the
 decision owns the new label, so no confidence goes with it. Finally, a
 theme that merely repeats the word \enquote{cited} adds nothing and is
 not repeated.
@@ -6695,11 +9150,10 @@ def audit_reason(
         theme_tags = [
             t for t in tags if t not in AUDIT_CATEGORIES and t not in notes
         ]
-    human_decision = decision.source != ReviewSource.LLM_UNREVIEWED
+    human_decision = not decision.source.is_unreviewed
     kept = decision.status == DecisionStatus.KEPT
-    machine_label = decision.source == ReviewSource.LLM_UNREVIEWED or (
-        decision.source == ReviewSource.LLM_REVIEWED
-        and not decision.is_example
+    machine_label = decision.source.is_unreviewed or (
+        decision.source.is_machine and not decision.is_example
     )
     confidence = ""
     if machine_label and decision.llm_confidence is not None:
@@ -6878,6 +9332,79 @@ class TestAuditReason:
         assert self._reason(DecisionStatus.DISCARDED, ["needs_fulltext"]) \
             == (r"needs\_fulltext", AUDIT_ORDER_OTHER)
         assert AUDIT_ORDER_PENDING < AUDIT_ORDER_OTHER
+@
+
+An agent's decisions follow the same rule as an LLM's: unreviewed, a
+keep is a candidate with the agent's confidence beside its category;
+reviewed by a human, it can be cited.  Before the agent source existed
+an agent recorded its keeps as [[human]] and the table cited them
+(issue~\#162), so the first case is the regression this pins.
+
+<<test functions>>=
+class TestAuditReasonAgentSource:
+    def _reason(self, status, tags, source, conf=None, is_example=False):
+        decision = ReviewDecision(
+            paper=Paper(title="P", authors=["A"], year=2024),
+            provider="p", status=status, tags=tags, source=source,
+            llm_confidence=conf, is_example=is_example,
+        )
+        return audit_reason(
+            decision, theme_names={}, strings=AUDIT_STRINGS["en"],
+        )
+
+    def test_unreviewed_agent_keep_is_not_cited(self):
+        agent = ReviewSource.AGENT_UNREVIEWED
+        assert self._reason(DecisionStatus.KEPT, ["ml"], agent, 0.7) \
+            == ("ml (0.70)", AUDIT_ORDER_OTHER)
+        assert self._reason(DecisionStatus.KEPT, [], agent) \
+            == ("pending, unclassified", AUDIT_ORDER_PENDING)
+        assert self._reason(
+            DecisionStatus.KEPT, ["supports-claim"], agent,
+        ) == ("supports the claim (n/a)", 1)
+
+    def test_reviewed_agent_keep_is_cited(self):
+        reviewed = ReviewSource.AGENT_REVIEWED
+        assert self._reason(DecisionStatus.KEPT, ["ml"], reviewed, 0.7) \
+            == (r"\emph{cited}: ml", AUDIT_ORDER_CITED)
+        assert self._reason(
+            DecisionStatus.KEPT, ["supports-claim"], reviewed, 0.7,
+        ) == ("supports the claim (0.70)", 1)
+        assert self._reason(
+            DecisionStatus.KEPT, ["supports-claim"], reviewed, 0.7,
+            is_example=True,
+        ) == ("supports the claim", 1)
+@
+
+Because the category is read from the tags, a decision that overturns
+an earlier one must not leave the earlier category behind
+(\url{https://github.com/dbosk/scholar/issues/177}).  When a record's
+status changes, [[sessions decide]] removes the old category tags,
+since the new decision brings its own, and keeps every other tag.
+Removing more was tried and lost data: dropping a discarded record's
+motivations along with its category also dropped the themes of a paper
+that had been kept, discarded and kept again, and a theme is the
+author's own reading of the paper.  A motivation left on a re-kept
+paper does less harm: the cited rule reads the status first, so the
+paper is cited all the same, and at worst the reason column names the
+leftover tag, which the author can remove.
+
+<<review report generation>>=
+def tags_after_status_change(tags: list[str]) -> list[str]:
+    """Return the tags a record keeps when a new decision changes its status.
+
+    Only the category tags (`AUDIT_CATEGORIES`) go; themes, motivations
+    and notes stay.
+    """
+    return [t for t in tags if t not in AUDIT_CATEGORIES]
+@
+
+<<test functions>>=
+class TestTagsAfterStatusChange:
+    def test_only_category_tags_go(self):
+        assert tags_after_status_change(
+            ["supports-claim", "ml", "no-abstract", "extended-tech-report",
+             "off-topic-false-hit"],
+        ) == ["ml", "no-abstract", "extended-tech-report"]
 @
 
 The same paper often arrives from several providers, sometimes with and
@@ -7196,8 +9723,9 @@ def audit_databases_sentence(
         for provider in row.providers:
             if provider not in used and provider not in RANKED_SHORT_NAMES:
                 used.append(provider)
-    for short, (failed, _, total) in shortfalls.items():
-        if failed < total and short not in used:
+    for short, tally in shortfalls.items():
+        failed, total, merged_outright = tally[0], tally[2], tally[5]
+        if failed + merged_outright < total and short not in used:
             used.append(short)
     names: list[str] = []
     for key, short in PROVIDER_SHORT_NAMES.items():
@@ -7252,37 +9780,108 @@ queries} is exactly true when one year range failed and the other
 answered.  Counting the words once would hide either the failure or
 the answer, so the wording stays as it is.
 
+A merged record from before searches were recorded per provider
+(\cref{sec:merged-records}) counts as one query for each of its
+providers.  Its count cannot be split, but its error can be read: the
+merge prefixed each provider's error with the provider
+([[dblp: non-JSON response]]), so the error names the providers that
+failed (\cref{sec:search-result-error} in the [[scholar]] module).
+Before \url{https://github.com/dbosk/scholar/issues/164} the caption
+charged every provider of the record with its failure, and OpenAlex,
+IEEE and arXiv read \enquote{incomplete} when only DBLP had failed;
+a first repair marked none of them unless all had failed, which hid
+the failure in 61 of the 62 merged records with errors in real
+sessions.  So each provider the error names is marked, and only it
+([[merged_record_failures]]).  Whether it failed outright or part-way
+is not recorded per provider, so the note says \enquote{failed or
+incomplete \dots, in a merged record}.  A record with no papers at all
+tells more: every provider it names failed outright, and such a
+provider counts as not searched for that query when the caption
+decides whether to name it.
+
+A search that answered can still have stopped at its limit, and the
+coverage statement should not let a reader take it for the whole
+answer (\url{https://github.com/dbosk/scholar/issues/166}).  So a
+fifth count is of the searches that reached their limit while the
+service reported more, or reported no total at all: \enquote{capped at
+the limit for 2 of 5 queries}.  It is the same test as the
+\enquote{capped at} of [[count_label]] in the [[scholar]] module.
+
 <<review report generation>>=
+def merged_record_failures(record: SearchRecord) -> list[str]:
+    """The providers of a merged record that its error names as failed.
+
+    The merge prefixes each provider's error with the provider, as in
+    "dblp: non-JSON response; scopus: HTTP 500".
+    """
+    if not record.is_merged or not record.error:
+        return []
+    named = {
+        segment.split(":", 1)[0].strip()
+        for segment in record.error.split("; ") if ":" in segment
+    }
+    return [p for p in record.merged_providers if p in named]
+
+
+def search_was_capped(record: SearchRecord) -> bool:
+    """Whether an answered search stopped at its limit with more left.
+
+    True when the hits reached a positive limit and the service
+    reported more, or reported no total; see `count_label`.
+    """
+    if record.error or record.is_merged or not record.limit:
+        return False
+    if record.hits is None or record.hits != record.limit:
+        return False
+    return record.total is None or record.total > record.hits
+
+
 def audit_search_shortfalls(
     records: list[SearchRecord],
-) -> dict[str, tuple[int, int, int]]:
-    """Count failed, incomplete and all searches per provider code."""
+) -> dict[str, tuple[int, int, int, int, int, int]]:
+    """Count searches per provider code: failed, incomplete, all, failed
+    or incomplete inside a merged record, capped, and failed outright
+    inside a merged record without papers."""
     counts: dict[str, list[int]] = {}
     for record in records:
         if is_ranked_provider(record.provider):
             continue
+        failed_here = {
+            short for name in merged_record_failures(record)
+            for short in provider_short_names(name)
+        }
         for short in provider_short_names(record.provider):
-            tally = counts.setdefault(short, [0, 0, 0])
+            tally = counts.setdefault(short, [0, 0, 0, 0, 0, 0])
             tally[2] += 1
-            if record.error and record.hits:
+            if record.is_merged:
+                if short in failed_here:
+                    tally[3] += 1
+                    if not record.hits:
+                        tally[5] += 1
+            elif record.error and record.hits:
                 tally[1] += 1
             elif record.error:
                 tally[0] += 1
+            elif search_was_capped(record):
+                tally[4] += 1
     return {short: tuple(tally) for short, tally in counts.items()}
 
 
 def audit_search_notes(
-    shortfall: tuple[int, int, int] | None, strings: dict
+    shortfall: tuple[int, int, int, int, int, int] | None, strings: dict
 ) -> list[str]:
-    """Localised notes on a database's failed and incomplete searches."""
+    """Localised notes on a database's failed, incomplete and capped
+    searches."""
     if not shortfall:
         return []
-    failed, incomplete, total = shortfall
+    failed, incomplete, total, merged_failed, capped, _ = shortfall
     queries = strings["query"] if total == 1 else strings["queries"]
     notes = []
     for count, template in (
         (failed, strings["search_failed"]),
         (incomplete, strings["search_incomplete"]),
+        (merged_failed, strings["search_failed_merged"]),
+        (capped, strings["search_capped"]),
     ):
         if count:
             notes.append(
@@ -7390,6 +9989,154 @@ class TestAuditDatabasesFailures:
                 build_audit_table_latex(session, label="x", lang=lang)
             )
             assert expected in text
+@
+
+A merged record charges only the providers its error names, and says
+that the failure comes from a merged record, in both languages; a
+provider whose every query failed in a merged record without papers is
+not named.  (The first test asserted, before this was repaired, that a
+DBLP failure in a merged record marked no provider at all.)
+
+<<test functions>>=
+class TestAuditMergedRecords:
+    """Merged records from before #164 in the databases sentence."""
+
+    ROWS = [AuditRow("t", "2020", ["OA", "DBLP"], DecisionStatus.KEPT,
+                     "r", 0)]
+
+    def test_one_failure_marks_only_its_provider(self):
+        records = [SearchRecord("q | q", "openalex, dblp", None, 100,
+                                hits=25, error="dblp: non-JSON response")]
+        assert audit_databases_sentence(
+            self.ROWS, AUDIT_STRINGS["en"], records
+        ) == (
+            "Databases: OpenAlex (OA; not open access), DBLP (failed or "
+            "incomplete for 1 of 1 query, in a merged record)."
+        )
+
+    def test_all_failed_says_merged(self):
+        records = [
+            SearchRecord("q | q", "openalex, dblp", None, 100, hits=0,
+                         error="openalex: HTTP 503; dblp: HTTP 503"),
+            SearchRecord("r", "dblp", None, 100, hits=4),
+        ]
+        rows = [AuditRow("t", "2020", ["DBLP"], DecisionStatus.KEPT,
+                         "r", 0)]
+        assert audit_databases_sentence(
+            rows, AUDIT_STRINGS["en"], records
+        ) == (
+            "Databases: DBLP (failed or incomplete for 1 of 2 queries, "
+            "in a merged record)."
+        )
+        assert "i en sammanslagen post" in audit_databases_sentence(
+            rows, AUDIT_STRINGS["sv"], records
+        )
+@
+
+A search that reached its limit with more left is named as capped, in
+both languages; one that reached it with nothing left, or did not
+reach it, is not:
+
+<<test functions>>=
+class TestAuditCapped:
+    """Searches stopped at their limit are noted (#166)."""
+
+    def test_capped_note(self):
+        records = [
+            SearchRecord("q1", "dblp", None, 100, hits=100, total=2130),
+            SearchRecord("q2", "dblp", None, 100, hits=100),
+            SearchRecord("q3", "dblp", None, 100, hits=100, total=100),
+            SearchRecord("q4", "dblp", None, 100, hits=12, total=12),
+        ]
+        rows = [AuditRow("t", "2020", ["DBLP"], DecisionStatus.KEPT,
+                         "r", 0)]
+        assert audit_databases_sentence(
+            rows, AUDIT_STRINGS["en"], records
+        ) == "Databases: DBLP (capped at the limit for 2 of 4 queries)."
+        assert "nådde träffgränsen för 2 av 4 sökfrågor" in (
+            audit_databases_sentence(rows, AUDIT_STRINGS["sv"], records)
+        )
+@
+
+The caption also says when the databases were searched: the range of
+the dates on which they answered ([[search_source_date]]), as PRISMA
+asks for the date each source was last searched
+(\url{https://github.com/dbosk/scholar/issues/167}).  A cached answer
+counts on the date it was fetched, not on the day of the run that
+served it.  Searches whose date is unknown---records from before dates
+were kept, cached answers whose fetch date the cache does not know---are
+counted in a sentence of their own rather than silently left out of
+the range, and a session with no dates at all gets no sentence, as
+before.
+
+<<review report generation>>=
+def audit_dates_sentence(
+    strings: dict, records: list[SearchRecord] | None
+) -> str:
+    """Say when the searches of `records` were answered; "" if never known."""
+    records = records or []
+    dates = [search_source_date(r) for r in answered_records(records)]
+    known = sorted(d for d in dates if d)
+    if not known:
+        return ""
+    if known[0] == known[-1]:
+        sentence = strings["searched_on"].format(start=known[0])
+    else:
+        sentence = strings["searched_range"].format(
+            start=known[0], end=known[-1]
+        )
+    unknown = len(dates) - len(known)
+    if unknown:
+        noun = strings["search"] if len(dates) == 1 else strings["searches"]
+        sentence += " " + strings["dates_unknown"].format(
+            n=unknown, total=len(dates), searches=noun
+        )
+    return sentence
+@
+
+<<test functions>>=
+class TestAuditDates:
+    """The caption says when the databases answered (#167)."""
+
+    def test_range_and_unknown(self):
+        records = [
+            SearchRecord("q1", "openalex", searched_at="2026-11-18T09:00:00"
+                         "+00:00", fetched_at="2026-10-02T08:00:00+00:00",
+                         from_cache=True),
+            SearchRecord("q2", "dblp", searched_at="2026-11-18T09:00:00"
+                         "+00:00", fetched_at="2026-11-18T09:00:00+00:00",
+                         from_cache=False),
+            SearchRecord("q3", "hal", searched_at="2026-11-18T09:00:00"
+                         "+00:00", from_cache=True),
+            SearchRecord("q4", "hal"),
+        ]
+        assert audit_dates_sentence(AUDIT_STRINGS["en"], records) == (
+            "Searched 2026-10-02 to 2026-11-18. "
+            "Search date unknown for 2 of 4 searches."
+        )
+        assert audit_dates_sentence(AUDIT_STRINGS["sv"], records) == (
+            "Sökt 2026-10-02 till 2026-11-18. "
+            "Sökdatum okänt för 2 av 4 sökningar."
+        )
+
+    def test_one_day_and_none(self):
+        one = [SearchRecord("q", "dblp", fetched_at="2026-11-18T09:00:00"
+                            "+00:00")]
+        assert audit_dates_sentence(AUDIT_STRINGS["en"], one) == (
+            "Searched 2026-11-18."
+        )
+        assert audit_dates_sentence(
+            AUDIT_STRINGS["en"], [SearchRecord("q", "dblp")]
+        ) == ""
+
+    def test_caption_carries_the_dates(self):
+        session = _audit_session()
+        session.search_records = [
+            SearchRecord("q", "dblp", hits=2,
+                         fetched_at="2026-10-02T08:00:00+00:00"),
+        ]
+        text = "\n".join(build_audit_table_latex(session, label="x"))
+        assert "Searched 2026-10-02." in text
 @
 
 A query run with two filter sets counts as two queries, as argued above:
@@ -7587,6 +10334,7 @@ def build_audit_table_latex(
     databases = " ".join(filter(None, [
         audit_databases_sentence(rows, strings, session.search_records),
         audit_semantic_sentence(rows, strings, session.search_records),
+        audit_dates_sentence(strings, session.search_records),
     ]))
     if bearing_only:
         template = strings["bearing"]
@@ -8421,6 +11169,10 @@ LLM provenance columns, so that a spreadsheet or a script can recompute
 any of the tables above. The last column is the session's paper id, the
 selector [[sessions decide --paper-id]] accepts, so a record without a
 DOI can be decided from the CSV without opening the TUI.
+The review columns ([[llm_review_outcome]], [[llm_change_direction]])
+describe how a human handled a machine decision and apply to the agent's
+decisions as much as to the LLM's; their names predate the agent source,
+and [[decision_source]] says which machine it was.
 
 <<review report generation>>=
 def generate_csv_report(session: ReviewSession, output_path: Path) -> None:
@@ -8435,7 +11187,8 @@ def generate_csv_report(session: ReviewSession, output_path: Path) -> None:
     - provider: search provider that returned the paper
     - decision_source: where the keep/discard decision originated
     - llm_confidence: 0.0-1.0 confidence for LLM decisions (if available)
-    - llm_review_outcome: human/unreviewed/confirmed/changed
+    - llm_review_outcome: human/unreviewed/confirmed/changed (for LLM
+      and agent decisions alike; `decision_source` tells them apart)
     - llm_change_direction: kept->discarded or discarded->kept (only for changed)
 
     Args:
@@ -8447,14 +11200,13 @@ def generate_csv_report(session: ReviewSession, output_path: Path) -> None:
     def llm_review_outcome(decision: ReviewDecision) -> str:
         if decision.source == ReviewSource.HUMAN:
             return "human"
-        if decision.source == ReviewSource.LLM_UNREVIEWED:
+        if decision.source.is_unreviewed:
             return "unreviewed"
-        if decision.source == ReviewSource.LLM_REVIEWED:
-            return "changed" if decision.is_example else "confirmed"
-        return ""
+        return "changed" if decision.is_example else "confirmed"
 
     def llm_change_direction(decision: ReviewDecision) -> str:
-        if decision.source != ReviewSource.LLM_REVIEWED or not decision.is_example:
+        reviewed = decision.source.is_machine and not decision.source.is_unreviewed
+        if not reviewed or not decision.is_example:
             return ""
         if decision.status == DecisionStatus.DISCARDED:
             return "kept->discarded"
@@ -8512,6 +11264,44 @@ def generate_csv_report(session: ReviewSession, output_path: Path) -> None:
                     get_paper_id(paper),
                 ]
             )
+@
+
+An agent's decisions get the same review columns as an LLM's, told apart
+by [[decision_source]]:
+
+<<test functions>>=
+class TestCsvReportAgentSource:
+    def test_agent_rows_carry_their_review_outcome(self, tmp_path):
+        import csv
+
+        def d(title, status, source, is_example=False):
+            return ReviewDecision(
+                paper=Paper(title=title, authors=["A"], year=2024),
+                provider="p", status=status, tags=["t"], source=source,
+                is_example=is_example,
+            )
+        session = ReviewSession(
+            query="q", providers=["p"], timestamp=datetime(2026, 11, 18),
+        )
+        session.decisions = [
+            d("Unreviewed", DecisionStatus.KEPT,
+              ReviewSource.AGENT_UNREVIEWED),
+            d("Changed", DecisionStatus.KEPT,
+              ReviewSource.AGENT_REVIEWED, is_example=True),
+            d("Confirmed", DecisionStatus.KEPT, ReviewSource.AGENT_REVIEWED),
+        ]
+        path = tmp_path / "r.csv"
+        generate_csv_report(session, path)
+        rows = {
+            r["title"]: (r["decision_source"], r["llm_review_outcome"],
+                         r["llm_change_direction"])
+            for r in csv.DictReader(path.open())
+        }
+        assert rows == {
+            "Unreviewed": ("agent", "unreviewed", ""),
+            "Changed": ("agent_reviewed", "changed", "discarded->kept"),
+            "Confirmed": ("agent_reviewed", "confirmed", ""),
+        }
 @
 
 \subsection{Testing Report Generation}

@@ -201,6 +201,25 @@ section of the core module).  A third-party provider without the
 attributes simply always reads as having answered, which is what every
 provider read as before.
 
+\label{sec:reported-total}
+A third optional attribute, [[last_total]], is the number of matching
+records the service \emph{reported} for the last search, or [[None]]
+when it reports none or the answer was not read; [[last_total_estimated]]
+says that the service calls the number an estimate.  A search fetches
+at most its limit, so its hit count alone cannot say whether the
+service had more: 100 hits of a search limited to 100 may be all there
+was or the first page of 2\,130
+(\url{https://github.com/dbosk/scholar/issues/166}).  The total is what
+tells the two apart.  A provider resets it with [[last_error]] and sets
+it from the first page it reads: OpenAlex's [[meta.count]], DBLP's
+[[@total]], Web of Science's [[total]] and [[RecordsFound]], IEEE
+Xplore's [[total_records]], HAL's [[numFound]], Scopus's
+[[opensearch:totalResults]] and arXiv's feed total.  Each is read where
+the provider already reads it to stop paging, so no field is newly
+assumed.  A provider that filters records after fetching them (arXiv's
+year filter) reports none, because the service's total counts records
+the filter removes.
+
 <<provider protocol>>=
 class SearchProvider(Protocol):
     """Protocol for search providers."""
@@ -277,6 +296,67 @@ class SearchProvider(Protocol):
             NotImplementedError: If this provider doesn't support reference retrieval.
         """
         ...
+@
+
+\subsection{When the answer was fetched}
+\label{sec:fetch-time}
+
+Two more optional attributes say where a search's answer came from:
+[[last_from_cache]] is true when it was served from the cache, and
+[[last_fetched_at]] is the UTC time at which it was fetched from the
+service ([[utc_now_iso]], \cref{sec:utc-timestamps} in the [[utils]]
+module).  For a fresh answer that is now; for a cached one it is the
+time of the original fetch, which the cache keeps beside the answer
+(\cref{sec:fetch-meta} in the [[cache]] module), or [[None]] for an
+answer cached before it kept it.  Without them a cached answer was
+recorded as searched today, months after the database was asked
+(\url{https://github.com/dbosk/scholar/issues/167}).  The search code
+reads them as tolerantly as the others: a provider without them, a
+third-party one say, reads as \enquote{fetch date unknown}.
+
+Every provider's [[search()]] has the same three places for this, so
+four small functions serve all of them.  [[start_answer]] resets the
+attributes where [[last_error]] is reset; [[answer_from_cache]] returns
+a cached answer and takes its facts from the side table, the total
+included when the provider has none of its own for it;
+[[fetching_now]] stamps the moment a request for a fresh answer starts;
+and [[cache_answer]] stores an answer together with its facts.  Each
+works on the provider's [[_cache]], the dictionary every bundled
+provider keeps.
+
+<<provider protocol>>=
+def start_answer(provider) -> None:
+    """Reset what `provider` says about its last answer's origin."""
+    provider.last_from_cache = False
+    provider.last_fetched_at = None
+
+
+def answer_from_cache(provider, key):
+    """Return the cached answer at `key`, noting when it was fetched."""
+    facts = fetch_meta(provider._cache, key)
+    provider.last_from_cache = True
+    provider.last_fetched_at = facts.get("fetched_at")
+    if getattr(provider, "last_total", None) is None:
+        provider.last_total = facts.get("total")
+        provider.last_total_estimated = bool(facts.get("total_estimated"))
+    return provider._cache[key]
+
+
+def fetching_now(provider) -> None:
+    """Note that `provider` is fetching a fresh answer from its service."""
+    provider.last_from_cache = False
+    provider.last_fetched_at = utc_now_iso()
+
+
+def cache_answer(provider, key, papers) -> None:
+    """Cache `papers` at `key` with when they were fetched and the total."""
+    provider._cache[key] = papers
+    remember_fetch(
+        provider._cache, key,
+        fetched_at=getattr(provider, "last_fetched_at", None),
+        total=getattr(provider, "last_total", None),
+        total_estimated=getattr(provider, "last_total_estimated", False),
+    )
 @
 
 \subsection{API keys: argument first, then the environment}
@@ -2725,6 +2805,7 @@ def search(
     self.last_retries = 0
     self.last_total = None
     self.last_total_estimated = False
+    start_answer(self)
     bulk = s2_uses_bulk(query, limit)
     self.last_via = s2_via(query, limit)
     self._routed = (query, bulk)
@@ -2738,21 +2819,20 @@ def search(
     if bulk:
         cache_key += (S2_VIA_BULK,)
     if cache_key in self._cache:
-        papers = self._cache[cache_key]
-        total = s2_cached_total(self._cache, cache_key)
+        papers = answer_from_cache(self, cache_key)
     else:
+        fetching_now(self)
         fetch = self._search_bulk if bulk else self._search_uncached
         papers, total, cacheable = fetch(query, limit, filters)
+        self.last_total = total
+        self.last_total_estimated = total is not None
         if cacheable:
-            self._cache[cache_key] = papers
-            self._cache[(S2_TOTAL_TAG, cache_key)] = (total, True)
+            cache_answer(self, cache_key, papers)
         else:
             self.last_error = SEARCH_CUT_SHORT
-    self.last_total = total
-    self.last_total_estimated = total is not None
     if self.last_error is None:
         stop = s2_bulk_cap_error if bulk else s2_relevance_ceiling_error
-        self.last_error = stop(papers, limit, total)
+        self.last_error = stop(papers, limit, self.last_total)
     return papers
 <<refuse another database's field syntax>>=
 database = s2_foreign_field_syntax(query)
@@ -2793,47 +2873,35 @@ same of both: \enquote{Approximate number of matching search results}
 (the [[PaperRelevanceSearchBatch]] and [[PaperBulkSearchBatch]]
 schemas), so the provider marks it as an estimate for both
 ([[last_total_estimated]]).
-The two attributes follow the protocol of [[last_error]]: reset on
-every search and set from the answer.
-[[Search.execute]] does not read them yet; the change that records
-totals in sessions (issue~\#166) does.
+The two attributes follow the protocol of [[last_error]]
+(\cref{sec:reported-total}): reset on every search, set from the
+answer, and read by [[search_provider]] onto the result.
 [[last_via]] names the endpoint: [[S2_VIA_BULK]] for the bulk search
 without a limit, [[S2_VIA_BULK_BY_CITATIONS]] for one with a limit,
 and [[None]] for the provider's default, the relevance search.
-[[Search.execute]] copies it onto the result as [[via]], and the
+[[search_provider]] copies it onto the result as [[via]], and the
 session record keeps it (\cref{sec:search-result-via} in the scholar
 module).
 
-A cache hit has to report the total too, or a search run again from
-the cache would read as \enquote{total unknown} although it was known.
-The total is therefore cached beside the papers, under a key of its
-own, [[(S2_TOTAL_TAG, key)]].
-It is not attached to the list of papers, as a list subclass that
-carries the total would be: the cache file is shared with every
-installed version of scholar, and a version that does not have the
-subclass cannot unpickle the file at all.
-An earlier draft of this change did that, and an older scholar then
-failed at import, on every command.
-So the cache holds built-in types only: the papers as a plain list, as
-before, and the total as a plain tuple of the number and whether it is
-an estimate.
-An older version never asks for the extra key; an entry cached before
-this change has no such key, and its total reads as unknown, never as
-a wrong number.
+A cache hit has to report the total and the fetch date too, or a
+search run again from the cache would read as \enquote{total unknown}
+and \enquote{fetched today}.
+The provider uses the shared hooks for that (\cref{sec:fetch-time}):
+[[start_answer]] where the attributes are reset, [[fetching_now]]
+before a fetch, [[cache_answer]] to store the answer with its fetch
+time and total in the cache's side entry, and [[answer_from_cache]] to
+read them back on a hit.
+The side entry is a plain dictionary and the answer a plain list of
+papers, so the cache holds built-in types only.
+That matters because the cache file is shared with every installed
+version of scholar: an earlier draft of this change cached a list
+subclass that carried the total, and an older scholar, which does not
+have that class, failed to unpickle the file at import, on every
+command.
+An entry cached before has no side entry, and its total and date read
+as unknown, never as wrong values.
 
-<<semantic scholar constants>>=
-S2_TOTAL_TAG = "__s2_total__"
 <<semantic scholar helpers>>=
-def s2_cached_total(cache: dict, key: tuple) -> int | None:
-    """The total cached beside `key`, or None if none was cached."""
-    entry = cache.get((S2_TOTAL_TAG, key))
-    if isinstance(entry, tuple) and entry:
-        total = entry[0]
-        if isinstance(total, int) and not isinstance(total, bool):
-            return total
-    return None
-
-
 def s2_total(data) -> int | None:
     """The `total` of a Semantic Scholar answer, or None if it has none.
 
@@ -3297,6 +3365,30 @@ def test_a_429_midway_is_incomplete_and_not_cached(self, monkeypatch):
     == f"3, incomplete ({SEARCH_CUT_SHORT})"
   assert (self.BOOLEAN, 0, "", "bulk") not in provider._cache
 
+def test_the_session_records_fetch_date_and_total(self, monkeypatch):
+  """The record of an S2 search has its total and fetch date, also when
+  the answer comes from the cache."""
+  from scholar.review import create_review_session
+
+  _replay_s2(monkeypatch, [S2_BULK_SINGLE_PAGE])
+  provider = SemanticScholarProvider(api_key=None)
+  monkeypatch.setitem(PROVIDERS, "s2", provider)
+
+  [first] = Search(self.BOOLEAN).execute(providers=["s2"], limit=0)
+  [again] = Search(self.BOOLEAN).execute(providers=["s2"], limit=0)
+
+  assert (first.total, first.total_estimated) == (784, True)
+  assert first.fetched_at and first.from_cache is False
+  assert (again.total, again.from_cache) == (784, True)
+  assert again.fetched_at == first.fetched_at
+  [record] = create_review_session(
+    [again], self.BOOLEAN, session_name="s2-dates"
+  ).search_records
+  assert (record.total, record.total_estimated) == (784, True)
+  assert record.fetched_at == first.fetched_at
+  assert (record.from_cache, record.via) == (True, "bulk")
+  assert record.searched_at
+
 def test_an_empty_token_ends_the_paging(self, monkeypatch):
   sent = _replay_s2(monkeypatch, [dict(S2_BULK_PAGE_1, token="")])
   provider = SemanticScholarProvider(api_key=None)
@@ -3393,7 +3485,7 @@ def test_the_cache_holds_built_in_types_only(self, monkeypatch, tmp_path):
     "cache = pickle.load(open(sys.argv[1], 'rb'))\n"
     "assert 'scholar.providers' not in sys.modules\n"
     "kinds = {type(v).__name__ for v in cache.values()}\n"
-    "assert kinds <= {'list', 'tuple'}, kinds\n"
+    "assert kinds <= {'list', 'tuple', 'dict'}, kinds\n"
     "print(len(cache))\n"
   )
   run = subprocess.run(
@@ -5120,6 +5212,8 @@ class OpenAlexProvider:
         the API's per-request maximum (200 results per page).
         """
         self.last_error = None
+        self.last_total = None
+        start_answer(self)
         cache_key = (
             self.CACHE_VERSION,
             query,
@@ -5127,7 +5221,8 @@ class OpenAlexProvider:
             filters.cache_key() if filters else "",
         )
         if cache_key in self._cache:
-            return self._cache[cache_key]
+            return answer_from_cache(self, cache_key)
+        fetching_now(self)
         try:
             papers = self._search_uncached(query, limit, filters)
         except PagesCutShort as cut:
@@ -5136,7 +5231,7 @@ class OpenAlexProvider:
         except Exception as failure:
             self.last_error = self._failure_reason(failure)
             return []
-        self._cache[cache_key] = papers
+        cache_answer(self, cache_key, papers)
         return papers
 
     def _search_uncached(
@@ -5196,6 +5291,9 @@ while True:
         <<keep the pages that arrived before [[failure]]>>
     if page is None:
         break
+    if self.last_total is None:
+        count = (getattr(page, "meta", None) or {}).get("count")
+        self.last_total = count if isinstance(count, int) else None
     for work in page:
         all_papers.append(self._convert_work(work))
         if len(all_papers) >= limit:
@@ -8401,10 +8499,12 @@ def search(
     """
     self.last_error = None
     self.last_retries = 0
+    self.last_total = None
+    start_answer(self)
     sanitized = self._sanitize_query(query)
     cache_key = (query, limit, filters.cache_key() if filters else "")
     if cache_key in self._cache:
-        papers = self._cache[cache_key]
+        papers = answer_from_cache(self, cache_key)
         self._warn_if_overconstrained(sanitized, papers)
         return papers
 
@@ -8415,6 +8515,7 @@ def search(
             sanitized, query,
         )
 
+    fetching_now(self)
     try:
         papers = self._fetch_pages(sanitized, limit, filters)
         papers = self._retry_zero_hits(sanitized, limit, filters, papers)
@@ -8431,7 +8532,7 @@ def search(
         return []
 
     self._warn_if_overconstrained(sanitized, papers)
-    self._cache[cache_key] = papers
+    cache_answer(self, cache_key, papers)
     return papers
 @
 
@@ -8809,6 +8910,9 @@ def _fetch_pages(
         hits, total = self._fetch_one_page(
             effective_query, current_page_size, offset
         )
+        if offset == 0:
+            # `_parse_total` reads an absent @total as 0: unknown then
+            self.last_total = total if total or not hits else None
         if not hits:
             # No more results available
             break
@@ -9920,12 +10024,15 @@ def search(
 ) -> list[Paper]:
     """Search Web of Science for papers matching the query."""
     self.last_error = None
+    self.last_total = None
+    start_answer(self)
     cache_key = (query, limit, filters.cache_key() if filters else "")
     if cache_key in self._cache:
-        return self._cache[cache_key]
+        return answer_from_cache(self, cache_key)
+    fetching_now(self)
     papers, cacheable = self._search_uncached(query, limit, filters)
     if cacheable:
-        self._cache[cache_key] = papers
+        cache_answer(self, cache_key, papers)
     else:
         self.last_error = SEARCH_CUT_SHORT
     return papers
@@ -10038,6 +10145,8 @@ def _search_starter(
             # Check if we've fetched all available results
             metadata = data.get("metadata", {})
             total = metadata.get("total", 0)
+            if self.last_total is None and "total" in metadata:
+                self.last_total = total
             if len(all_papers) >= total:
                 break
 
@@ -10118,6 +10227,8 @@ def _search_expanded(
 
             # Check if we've fetched all available results
             total = query_result.get("RecordsFound", 0)
+            if self.last_total is None and "RecordsFound" in query_result:
+                self.last_total = total
             if first_record > total:
                 break
 
@@ -11970,12 +12081,15 @@ def search(
     the API's per-request maximum (200 results per page).
     """
     self.last_error = None
+    self.last_total = None
+    start_answer(self)
     cache_key = (query, limit, filters.cache_key() if filters else "")
     if cache_key in self._cache:
-        return self._cache[cache_key]
+        return answer_from_cache(self, cache_key)
+    fetching_now(self)
     papers, cacheable = self._search_uncached(query, limit, filters)
     if cacheable:
-        self._cache[cache_key] = papers
+        cache_answer(self, cache_key, papers)
     else:
         self.last_error = SEARCH_CUT_SHORT
     return papers
@@ -12038,6 +12152,8 @@ def _search_uncached(
 
             # Check if we've fetched all available results
             total = data.get("total_records", 0)
+            if self.last_total is None and "total_records" in data:
+                self.last_total = total
             if start_record > total:
                 break
 
@@ -12897,11 +13013,12 @@ class PacedArxivClient(arxiv.Client):
         super().__init__(delay_seconds=0.0, **kwargs)
         self._limiter = limiter
         self._session = network.new_session()
+        self.last_total: int | None = None
 
     def _parse_feed(self, url, first_page=True, _try_index=0):
         self._limiter.acquire()
         try:
-            return super()._parse_feed(
+            feed = super()._parse_feed(
                 url, first_page=first_page, _try_index=_try_index
             )
         except arxiv.HTTPError as e:
@@ -12910,7 +13027,24 @@ class PacedArxivClient(arxiv.Client):
                     reason="rate limited (HTTP 429)"
                 )
             raise
+        if first_page:
+            total = getattr(getattr(feed, "header", None),
+                            "total_results", None)
+            self.last_total = total if isinstance(total, int) else None
+        return feed
+
+    def results(self, search, offset=0):
+        self.last_total = None
+        return super().results(search, offset)
 @
+
+The client also keeps the total of the first page it parses
+([[last_total]]), the number of records arXiv reports for the query;
+the package reads it from the feed header ([[feed.header.total_results]]
+in [[arxiv]] 4.1, where [[Client._results]] uses it to stop paging), and
+the provider passes it on.  Each search through [[results]] starts by
+forgetting the previous search's total, so a search whose first page
+never arrives cannot report the total of the one before.
 
 Let's verify that each page request is paced at the declared rate and
 counted, and that a final 429 puts arXiv on cooldown.
@@ -13007,11 +13141,14 @@ class ArxivProvider:
         allowing immediate retry.
         """
         self.last_error = None
+        self.last_total = None
+        start_answer(self)
         # Check cache first
         cache_key = (query, limit, filters.cache_key() if filters else "")
         if cache_key in self._cache:
             logger.debug(f"arxiv: Cache hit for '{query}'")
-            return self._cache[cache_key]
+            return answer_from_cache(self, cache_key)
+        fetching_now(self)
 
         logger.debug(f"arxiv: Searching for '{query}' with limit={limit}")
 
@@ -13150,10 +13287,12 @@ for attempt in range(self.MAX_RETRIES):
             all_papers.append(paper)
 
         logger.debug(f"arxiv: Retrieved {len(all_papers)} papers")
+        if not (filters and filters.year):
+            self.last_total = getattr(self._client, "last_total", None)
 
         # Only cache successful results
         if all_papers:
-            self._cache[cache_key] = all_papers
+            cache_answer(self, cache_key, all_papers)
 
         return all_papers
 
@@ -14836,10 +14975,13 @@ def search(
     exceeds the page size.
     """
     self.last_error = None
+    self.last_total = None
+    start_answer(self)
     cache_key = (query, limit, filters.cache_key() if filters else "")
     if cache_key in self._cache:
-        return self._cache[cache_key]
+        return answer_from_cache(self, cache_key)
 
+    fetching_now(self)
     try:
         papers = self._fetch_pages(query, limit, filters)
     except RateLimited as e:
@@ -14853,7 +14995,7 @@ def search(
         self.last_error = str(e) or type(e).__name__
         return []
 
-    self._cache[cache_key] = papers
+    cache_answer(self, cache_key, papers)
     return papers
 @
 
@@ -14889,6 +15031,9 @@ def _fetch_pages(
         docs, total = self._fetch_one_page(
             query, filter_queries, min(page_size, remaining), start
         )
+        if start == 0 and isinstance(total, int):
+            # an absent numFound reads as 0: unknown when docs came
+            self.last_total = total if total or not docs else None
         if not docs:
             break
 
@@ -15816,6 +15961,8 @@ class ScopusProvider:
         exceeds the per-request maximum of 25 results.
         """
         self.last_error = None
+        self.last_total = None
+        start_answer(self)
         standard_key = (
             query,
             limit,
@@ -15823,12 +15970,13 @@ class ScopusProvider:
         )
         complete_key = standard_key + (SCOPUS_COMPLETE_VIEW,)
         <<return cached scopus results the view allows>>
+        fetching_now(self)
         papers, cacheable = self._search_uncached(
             query, limit, filters
         )
         if cacheable:
             key = complete_key if self._complete_ok else standard_key
-            self._cache[key] = papers
+            cache_answer(self, key, papers)
         return papers
 
     def _search_uncached(
@@ -15879,6 +16027,8 @@ class ScopusProvider:
                 results = data.get("search-results", {})
                 declared = results.get("opensearch:totalResults")
                 total = int(declared or 0)
+                if declared is not None and self.last_total is None:
+                    self.last_total = total
                 entries = scopus_result_entries(results)
                 if (declared is not None and total == 0) or not entries:
                     break
@@ -16006,10 +16156,10 @@ logger.info(
 )
 <<return cached scopus results the view allows>>=
 if self.view_mode != "standard" and complete_key in self._cache:
-    return self._cache[complete_key]
+    return answer_from_cache(self, complete_key)
 if standard_key in self._cache and not self._complete_confirmed():
     <<warn once that the cached standard view may be outdated>>
-    return self._cache[standard_key]
+    return answer_from_cache(self, standard_key)
 @
 
 Serving on after an inconclusive probe is silent no longer: the
@@ -16847,7 +16997,11 @@ class TestScopusInconclusiveProbe:
     cache = {}
     with patch("requests.get", TestScopusView.service(False, [])):
       TestScopusView.process(cache).search("q", limit=5)
-    assert len(cache) == 1
+    from scholar.cache import is_fetch_meta_key
+    # one answer; the side entry of its fetch facts is not one (#167)
+    assert [key for key in cache if not is_fetch_meta_key(key)] == [
+      ("q", 5, ""),
+    ]
     return cache
 
   @staticmethod
@@ -17300,6 +17454,182 @@ class TestScopusIntegration:
 @
 
 
+\section{Reported totals}
+
+Each provider sets [[last_total]] from the response field it already
+reads to stop paging (\cref{sec:reported-total}).  Let's verify it for
+each, with a search limited to one record from a service that reports
+many, and that a total the response leaves out is unknown rather than
+0.  The responses have the shapes of this chapter's paging tests,
+reduced to the fields the code reads; the fields themselves were not
+newly assumed, since the paging already depends on each of them.
+
+<<test functions>>=
+class TestReportedTotals:
+  """Every provider reports the total its service gave (#166)."""
+
+  @staticmethod
+  def _json(data):
+    response = Mock(status_code=200, ok=True, headers={})
+    response.json.return_value = data
+    response.raise_for_status = Mock()
+    return response
+
+  def test_openalex(self):
+    provider = OpenAlexProvider(api_key=None)
+
+    class Page(list):
+      meta = {"count": 2130}
+
+    def pages(per_page):
+      yield Page([{"id": "W1"}])
+
+    with patch("pyalex.Works") as works:
+      works.return_value.search.return_value.paginate = pages
+      provider.search("total query", limit=1)
+    assert provider.last_total == 2130
+
+  def test_dblp(self):
+    provider = DBLPProvider()
+    hits = {"@total": "1500", "hit": [{"info": {"title": "Paper"}}]}
+    with patch("requests.get",
+               return_value=self._json({"result": {"hits": hits}})):
+      provider.search("total", limit=1)
+    assert provider.last_total == 1500
+    del hits["@total"]
+    with patch("requests.get",
+               return_value=self._json({"result": {"hits": hits}})):
+      provider.search("no total", limit=1)
+    assert provider.last_total is None
+
+  def test_wos_starter(self):
+    provider = WebOfScienceProvider(
+      starter_api_key="test_key", expanded_api_key=None
+    )
+    data = {"metadata": {"total": 75}, "hits": [{"title": "Paper"}]}
+    with patch("requests.get", return_value=self._json(data)):
+      provider.search("total", limit=1)
+    assert provider.last_total == 75
+
+  def test_ieee(self):
+    provider = IEEEXploreProvider(api_key="test_key")
+    data = {"total_records": 350, "articles": [
+      {"title": "Paper", "authors": {"authors": []}},
+    ]}
+    with patch("requests.get", return_value=self._json(data)):
+      provider.search("total", limit=1)
+    assert provider.last_total == 350
+
+  def test_hal(self):
+    provider = HALProvider()
+    data = {"response": {"numFound": 42, "docs": [{"title_s": ["P"]}]}}
+    with patch("requests.get", return_value=self._json(data)):
+      provider.search("total", limit=1)
+    assert provider.last_total == 42
+
+  def test_scopus(self, monkeypatch):
+    monkeypatch.setenv("SCOPUS_VIEW", "standard")
+    provider = ScopusProvider(api_key="test_key")
+    data = {"search-results": {
+      "opensearch:totalResults": "30",
+      "entry": [{"@_fa": "true", "dc:title": "Paper"}],
+    }}
+    with patch("requests.get", return_value=self._json(data)):
+      provider.search("total", limit=1)
+    assert provider.last_total == 30
+
+  def test_arxiv_client_and_provider(self, monkeypatch):
+    from types import SimpleNamespace
+    provider = ArxivProvider()
+    feed = SimpleNamespace(header=SimpleNamespace(total_results=77))
+    monkeypatch.setattr(
+      arxiv.Client, "_Client__try_parse_feed",
+      lambda self, url, first_page, try_index: feed,
+    )
+    provider._client._parse_feed("https://export.arxiv.org/x")
+    assert provider._client.last_total == 77
+    provider._client.results(arxiv.Search(query="next"))
+    assert provider._client.last_total is None
+
+    provider._client = Mock(last_total=77)
+    provider._client.results.return_value = iter([])
+    provider.search("total", limit=1)
+    assert provider.last_total == 77
+    provider._client.results.return_value = iter([])
+    provider.search("total, years", limit=1,
+                    filters=SearchFilters(year="2020"))
+    assert provider.last_total is None
+@
+
+A cached answer must come back with the time it was fetched and the
+total it was fetched with (\cref{sec:fetch-time}), and an answer cached
+before those were kept must come back with the fetch time unknown and
+nothing else changed.  HAL stands in for all providers here, since all
+of them go through the same four functions; Scopus, whose cache lookup
+is its own chunk, gets the same check.
+
+<<test functions>>=
+class TestFetchTimes:
+  """Cached answers keep their fetch time and total (#167)."""
+
+  @staticmethod
+  def _hal_response():
+    response = Mock(status_code=200, ok=True, headers={})
+    response.json.return_value = {
+      "response": {"numFound": 42, "docs": [{"title_s": ["P"]}]},
+    }
+    response.raise_for_status = Mock()
+    return response
+
+  def test_fresh_then_cached(self):
+    provider = HALProvider()
+    with patch("requests.get", return_value=self._hal_response()) as get:
+      provider.search("dated", limit=1)
+      fetched = provider.last_fetched_at
+      assert provider.last_from_cache is False
+      assert fetched.endswith("+00:00")
+      assert provider._cache.changed is True
+      provider._cache.changed = False  # as after a save
+      provider.search("dated", limit=1)
+      assert get.call_count == 1
+    assert provider._cache.changed is False  # a hit only reads
+    assert provider.last_from_cache is True
+    assert provider.last_fetched_at == fetched
+    assert provider.last_total == 42
+
+  def test_entry_cached_before_dates_were_kept(self):
+    provider = HALProvider()
+    old = [Paper(title="Old", authors=["A"])]
+    provider._cache[("undated", 1, "")] = old
+    provider._cache.changed = False  # as loaded from disk
+    with patch("requests.get") as get:
+      assert provider.search("undated", limit=1) is old
+      get.assert_not_called()
+    assert provider._cache.changed is False
+    assert provider.last_from_cache is True
+    assert provider.last_fetched_at is None
+    assert provider.last_total is None
+
+  def test_scopus_cache_hit(self, monkeypatch):
+    monkeypatch.setenv("SCOPUS_VIEW", "standard")
+    provider = ScopusProvider(api_key="test_key")
+    response = Mock(status_code=200, ok=True, headers={})
+    response.json.return_value = {"search-results": {
+      "opensearch:totalResults": "30",
+      "entry": [{"@_fa": "true", "dc:title": "Paper"}],
+    }}
+    response.raise_for_status = Mock()
+    with patch("requests.get", return_value=response) as get:
+      provider.search("dated", limit=1)
+      fetched = provider.last_fetched_at
+      provider.search("dated", limit=1)
+      assert get.call_count == 1
+    assert (provider.last_from_cache, provider.last_fetched_at) == (
+      True, fetched,
+    )
+    assert provider.last_total == 30
+@
+
 \section{Dependencies}
 
 We organize imports so each provider's dependencies are co-located with
@@ -17315,7 +17645,10 @@ from cachetools import cachedmethod
 
 from scholar import Paper, SearchFilters, network
 from scholar.scholar import SEARCH_IN_TITLE_ABSTRACT, without_search_in
-from scholar.cache import load_cache, register_cache
+from scholar.cache import (
+    load_cache, register_cache, fetch_meta, remember_fetch,
+)
+from scholar.utils import utc_now_iso
 from scholar.ratelimit import (
     Limits,
     RateLimited,
