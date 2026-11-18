@@ -2619,9 +2619,14 @@ which the reports below use.
 <<enrich and save chunk by chunk>>=
 from rich.progress import Progress
 from scholar.notes import get_paper_id, migrate_paper_id
+from scholar.review import keep_copy_before_run
 
 originals: list = []
 processed: list = []
+adopted_any = False
+pre_run_copy = (
+    keep_copy_before_run(session_data, "pre-enrich") if selected else None
+)
 try:
     with sigterm_as_keyboard_interrupt(), Progress() as progress:
         task = progress.add_task("[cyan]Enriching...", total=len(selected))
@@ -2633,7 +2638,38 @@ except KeyboardInterrupt:
         f"[yellow]Interrupted: saved {len(processed)} of {len(selected)} "
         f"{scope}; run again to continue.[/yellow]"
     )
+    <<say where the pre-run copy is>>
     raise typer.Exit(130)
+@
+
+Since [[.bak]] ends up holding only the state before the last chunk, we
+first keep a copy of the session as it was before the run
+([[keep_copy_before_run]], \cref{sec:session-integrity}), unless there is
+nothing to enrich and so no save to follow.
+It is the way back from the whole run, which matters because enrichment
+replaces metadata, and, when it adopts a preprint, a paper's id.
+Each run makes a new timestamped copy and the newest three are kept
+([[RUN_COPIES_KEPT]]), so that continuing an interrupted run does not
+overwrite the original.
+The copy covers the session file only: an adoption also moves the notes
+and decision records to the new id ([[migrate_paper_id]]), so the report
+adds a line saying that restoring does not undo that, when the run
+adopted a preprint.
+The final report and the interrupt message both name it, with the path
+written out so that it can be pasted into a [[cp]] command.
+
+<<say where the pre-run copy is>>=
+if pre_run_copy is not None:
+    console.print(
+        "[dim]Session as it was before this run: "
+        f"{escape(str(pre_run_copy))}[/dim]",
+        soft_wrap=True,
+    )
+    if adopted_any:
+        console.print(
+            "[dim]Restoring it does not undo the notes and decision "
+            "records moved to the adopted ids.[/dim]"
+        )
 @
 
 Within a chunk the order matters: the Crossref check reads the DOI the
@@ -2706,6 +2742,7 @@ for orig, new in zip(before, after):
     if get_paper_id(orig) == get_paper_id(new):
         continue
     migrate_paper_id(get_paper_id(orig), get_paper_id(new))
+    adopted_any = True
     console.print(
         f"[cyan]Adopted preprint {new.doi} for "
         f"\N{LEFT DOUBLE QUOTATION MARK}{escape(new.title_preview())}"
@@ -2782,6 +2819,7 @@ enriched_count = sum(
     or (new.pdf_url and orig.pdf_url != new.pdf_url)
 )
 console.print(f"[green]Enriched {enriched_count} papers.[/green]")
+<<say where the pre-run copy is>>
 @
 
 
@@ -3323,6 +3361,148 @@ def test_interrupt_keeps_finished_chunks(self, tmp_path, monkeypatch):
   saved = self._saved(name)
   assert saved["10.1/c137-0"].paper.abstract == "Enriched."
   assert saved["10.1/c137-1"].paper.abstract is None
+@
+
+\subsection{The copy from before the run}
+
+[[.bak]] cannot serve as the way back from a whole run
+(\cref{sec:enrich-chunks}), so the command keeps its own copy.
+The tests run the real command with chunks of one paper, so that the
+[[.bak]] differs from the pre-run copy, and check that the copy is the
+file as it was, that the next run replaces it, that no copy is made
+when there is nothing to enrich, that both the final and the interrupt
+message name it, and that the commands which read every session file
+do not mistake it for a session.
+
+<<test functions>>=
+class TestEnrichPreRunBackup:
+  """A copy of the session from before the run (#153)."""
+
+  @staticmethod
+  def _prepare(tmp_path, monkeypatch, count=2):
+    monkeypatch.setattr("scholar.cli.ENRICH_SAVE_EVERY", 1)
+    name = TestEnrichSelectionAndSaving._session(
+      tmp_path, monkeypatch, count, name="prerun"
+    )
+    return name, tmp_path / "review_sessions" / f"{name}.json"
+
+  @staticmethod
+  def _enrich(papers, **kwargs):
+    return TestEnrichSelectionAndSaving._enriched(papers)
+
+  def test_copy_is_the_session_as_it_was(self, tmp_path, monkeypatch):
+    name, path = self._prepare(tmp_path, monkeypatch)
+    before = path.read_bytes()
+
+    result = TestEnrichSelectionAndSaving._invoke([name], self._enrich)
+    assert result.exit_code == 0, result.stdout
+
+    (copy,) = self._copies(path)
+    assert copy.read_bytes() == before
+    assert path.read_bytes() != before
+    # one chunk per paper: .bak holds the state before the last chunk
+    assert path.with_name(f"{name}.json.bak").read_bytes() != before
+    assert "pre-enrich-" in "".join(result.stdout.split())
+
+  @staticmethod
+  def _copies(path):
+    return sorted(path.parent.glob(f"{path.name}.pre-enrich-*.bak"))
+
+  @staticmethod
+  def _at(monkeypatch, *stamps):
+    """Make the successive runs happen at the given UTC times."""
+    from datetime import datetime, timezone
+
+    times = iter(datetime.strptime(t, "%Y%m%dT%H%M%S").replace(
+      tzinfo=timezone.utc) for t in stamps)
+    monkeypatch.setattr("scholar.review._utcnow", lambda: next(times))
+
+  def test_second_run_keeps_the_first_copy(self, tmp_path, monkeypatch):
+    name, path = self._prepare(tmp_path, monkeypatch)
+    self._at(monkeypatch, "20261118T100000", "20261118T110000")
+    original = path.read_bytes()
+
+    for _ in range(2):
+      result = TestEnrichSelectionAndSaving._invoke([name], self._enrich)
+      assert result.exit_code == 0, result.stdout
+
+    first, second = self._copies(path)
+    assert first.name.endswith("pre-enrich-20261118T100000Z.bak")
+    assert first.read_bytes() == original
+    assert second.name.endswith("pre-enrich-20261118T110000Z.bak")
+    assert second.read_bytes() != original
+
+  def test_fourth_run_prunes_the_oldest(self, tmp_path, monkeypatch):
+    name, path = self._prepare(tmp_path, monkeypatch)
+    self._at(monkeypatch, *[f"20261118T1{i}0000" for i in range(4)])
+
+    for _ in range(4):
+      result = TestEnrichSelectionAndSaving._invoke([name], self._enrich)
+      assert result.exit_code == 0, result.stdout
+
+    assert [c.name.split("pre-enrich-")[1] for c in self._copies(path)] == [
+      "20261118T110000Z.bak", "20261118T120000Z.bak",
+      "20261118T130000Z.bak",
+    ]
+    assert result.stdout.count("pre-enrich-") == 1  # names the newest
+
+  def test_adoption_is_mentioned(self, tmp_path, monkeypatch):
+    from dataclasses import replace
+
+    name, path = self._prepare(tmp_path, monkeypatch, count=1)
+
+    def adopt(papers, **kwargs):
+      return [replace(p, doi="10.1/adopted-153") for p in papers]
+
+    result = TestEnrichSelectionAndSaving._invoke([name], adopt)
+    assert result.exit_code == 0, result.stdout
+    assert "does not undo the notes" in " ".join(result.stdout.split())
+    plain = TestEnrichSelectionAndSaving._invoke([name], self._enrich)
+    assert "does not undo" not in plain.stdout
+
+  def test_nothing_to_enrich_makes_no_copy(self, tmp_path, monkeypatch):
+    from scholar.review import DecisionStatus, load_session, save_session
+
+    name, path = self._prepare(tmp_path, monkeypatch)
+    session = load_session(name)
+    for decision in session.decisions:
+      decision.status = DecisionStatus.KEPT
+      decision.tags = ["t"]
+    save_session(session)
+
+    result = TestEnrichSelectionAndSaving._invoke(
+      [name, "--pending-only"], self._enrich
+    )
+    assert result.exit_code == 0, result.stdout
+    assert self._copies(path) == []
+
+  def test_interrupt_names_the_copy(self, tmp_path, monkeypatch):
+    name, path = self._prepare(tmp_path, monkeypatch)
+    calls = []
+
+    def enrich(papers, **kwargs):
+      calls.append(papers)
+      if len(calls) == 2:
+        raise KeyboardInterrupt
+      return TestEnrichSelectionAndSaving._enriched(papers)
+
+    before = path.read_bytes()
+    result = TestEnrichSelectionAndSaving._invoke([name], enrich)
+    assert result.exit_code == 130
+    assert "pre-enrich-" in "".join(result.stdout.split())
+    (copy,) = self._copies(path)
+    assert copy.read_bytes() == before
+
+  def test_the_copy_is_not_a_session(self, tmp_path, monkeypatch):
+    from scholar.review import list_sessions, sessions_mentioning
+
+    name, path = self._prepare(tmp_path, monkeypatch)
+    result = TestEnrichSelectionAndSaving._invoke([name], self._enrich)
+    assert result.exit_code == 0, result.stdout
+    assert len(self._copies(path)) == 1
+
+    assert [s["name"] for s in list_sessions()] == [name]
+    assert [s.name for s in sessions_mentioning("10.1/c137-0")] == [name]
 @
 
 A time limit ends a process with SIGTERM, whose default action ends
