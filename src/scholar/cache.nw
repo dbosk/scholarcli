@@ -828,6 +828,138 @@ def test_processes_saving_at_once_keep_each_others_entries():
 @
 
 
+\section{When a cached answer was fetched}
+\label{sec:fetch-meta}
+
+A cache entry is an answer without a date.  A search served from it
+used to be stamped with the time of the run, so a session, the report
+and the [[DATE]] of a [[bibtex+prov]] block claimed that the database
+had been searched today when the answer was months old
+(\url{https://github.com/dbosk/scholar/issues/167}).  PRISMA asks for
+the date each source was last searched, and the cache is the one place
+that can know it.
+
+So a provider that stores an answer also stores when it fetched it,
+and the total the service reported with it, since a cached answer
+should not lose that either (\cref{sec:reported-total} in the providers
+chapter).  The facts go into a side table kept in the same cache
+dictionary: beside the answer at [[key]], an entry at
+[[(FETCH_META_KEY, key)]] holds its facts.  Wrapping the cached answers
+themselves would have changed the shape of every entry, so every entry
+already on disk would have to be read through a fallback or thrown
+away; throwing them away would mean re-fetching them, against the
+provider's quota.  With a side table nothing that exists changes: an
+entry stored before has no facts, and [[fetch_meta]] answers an empty
+dictionary for it, which callers read as \enquote{fetch date unknown}.
+The side entries go wherever their cache goes: saved and loaded with
+it, and emptied with it by [[clear_cache]].  Their keys begin with a
+string no provider uses, so they cannot collide with an answer, and
+[[is_fetch_meta_key]] tells them apart where entries are counted.
+
+Each fact is an entry of its own, not a value inside one shared
+table, for the sake of the [[PersistentCache]] (\cref{sec:cache-concurrency}):
+only an assignment through [[__setitem__]] marks the cache changed, so
+a fact written into a nested table after the table existed would never
+be saved; and [[save_cache]] merges with what other processes saved by
+top-level key, so one shared table would let the last process to save
+erase the facts the others stored.  Reading the facts assigns nothing,
+so a search served from the cache leaves the cache unchanged and
+unsaved, as before.
+
+<<constants>>=
+FETCH_META_KEY = "__fetch_meta__"
+<<cache load and save functions>>=
+def is_fetch_meta_key(key: Any) -> bool:
+    """Whether `key` is that of a side entry of fetch facts."""
+    return (
+        isinstance(key, tuple) and len(key) == 2
+        and key[0] == FETCH_META_KEY
+    )
+
+
+def fetch_meta(cache: dict[Any, Any], key: Any) -> dict[str, Any]:
+    """The facts stored about the cached answer at `key`, or `{}`.
+
+    The facts are `fetched_at` (UTC ISO time of the fetch), `total`
+    and `total_estimated` (what the service reported). Answers cached
+    before facts were stored have none. Reading changes nothing.
+    """
+    facts = cache.get((FETCH_META_KEY, key))
+    return dict(facts) if isinstance(facts, dict) else {}
+
+
+def remember_fetch(
+    cache: dict[Any, Any], key: Any, **facts: Any
+) -> None:
+    """Store `facts` about the cached answer at `key` in its side entry."""
+    cache[(FETCH_META_KEY, key)] = facts
+@
+
+Let's verify that the facts survive a save and a load with the answer
+they describe, and that an answer cached without them, as every answer
+on disk today was, reads as having none:
+
+<<test functions>>=
+class TestFetchMeta:
+    """Facts about cached answers live in a side table (#167)."""
+
+    def test_round_trip(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path))
+        cache = {("q", 100, ""): []}
+        remember_fetch(cache, ("q", 100, ""),
+                       fetched_at="2026-10-02T08:00:00+00:00", total=7)
+        save_cache("meta_provider", cache)
+        loaded = load_cache("meta_provider")
+        assert loaded[("q", 100, "")] == []
+        assert fetch_meta(loaded, ("q", 100, "")) == {
+            "fetched_at": "2026-10-02T08:00:00+00:00", "total": 7,
+        }
+
+    def test_old_entries_have_no_facts(self):
+        cache = {("q", 100, ""): []}
+        assert fetch_meta(cache, ("q", 100, "")) == {}
+        remember_fetch(cache, ("other", 5, ""), fetched_at="x")
+        assert fetch_meta(cache, ("q", 100, "")) == {}
+
+    def test_reading_leaves_the_cache_unchanged(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path))
+        cache = load_cache("meta_read")
+        cache[("q", 100, "")] = []
+        remember_fetch(cache, ("q", 100, ""), fetched_at="x")
+        save_cache("meta_read", cache)
+        loaded = load_cache("meta_read")
+        assert fetch_meta(loaded, ("q", 100, "")) == {"fetched_at": "x"}
+        assert loaded.changed is False
+
+    def test_a_second_answer_marks_and_persists(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path))
+        cache = load_cache("meta_add")
+        cache[("q", 100, "")] = []
+        remember_fetch(cache, ("q", 100, ""), fetched_at="first")
+        save_cache("meta_add", cache)
+        assert cache.changed is False
+        remember_fetch(cache, ("r", 5, ""), fetched_at="second")
+        assert cache.changed is True
+        save_cache("meta_add", cache)
+        loaded = load_cache("meta_add")
+        assert fetch_meta(loaded, ("q", 100, "")) == {"fetched_at": "first"}
+        assert fetch_meta(loaded, ("r", 5, "")) == {"fetched_at": "second"}
+
+    def test_two_processes_keep_each_others_facts(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path))
+        first, second = load_cache("meta_two"), load_cache("meta_two")
+        remember_fetch(first, ("a", 1, ""), fetched_at="by first")
+        remember_fetch(second, ("b", 1, ""), fetched_at="by second")
+        save_cache("meta_two", first)
+        save_cache("meta_two", second)
+        loaded = load_cache("meta_two")
+        assert fetch_meta(loaded, ("a", 1, "")) == {"fetched_at": "by first"}
+        assert fetch_meta(loaded, ("b", 1, "")) == {"fetched_at": "by second"}
+@
+
+
 \section{Cache management}
 
 Users need ways to inspect and clear the cache.
@@ -1077,6 +1209,8 @@ The files saved beside unreadable caches are listed by path instead
 (\cref{sec:cache-unmerged-files}): their entries are not in use, so
 counting them would overstate what the cache serves, and the user who
 has to look at them needs to know where they are.
+The side entries of fetch facts (\cref{sec:fetch-meta}) are not entries
+a user cached, so they are not counted.
 
 <<cache management functions>>=
 def get_cache_stats() -> dict[str, Any]:
@@ -1104,7 +1238,10 @@ def get_cache_stats() -> dict[str, Any]:
         total_size += cache_file.stat().st_size
         counts = llm_caches if is_llm_cache(name) else providers
         try:
-            counts[name] = len(load_cache(name))
+            cache = load_cache(name)
+            counts[name] = sum(
+                1 for key in cache if not is_fetch_meta_key(key)
+            )
         except Exception:
             counts[name] = 0
 

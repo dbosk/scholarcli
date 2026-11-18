@@ -110,6 +110,7 @@ from cachetools import cachedmethod
 from scholar.scholar import Paper, SearchFilters, merge_version_of
 from scholar.scholar import filters_key, filter_flags
 from scholar.scholar import hits_label, result_outcome
+from scholar.scholar import parts_returning, result_total, result_dates
 from scholar.scholar import RANKED_PROVIDERS, is_ranked_provider
 from scholar.notes import (
     get_paper_id, get_query_hash, get_data_dir,
@@ -1189,7 +1190,16 @@ repeated before the answer was accepted.  Records written before these
 fields existed load with [[hits]] unknown ([[None]]), no error and no
 retries: we cannot reconstruct what an old search returned, and claiming
 \enquote{answered} for it is no worse than what such a record has always
-claimed.
+claimed.  The record also keeps the [[total]] the service reported, and
+whether it was an estimate, so that a count cut at the limit reads as
+one (\url{https://github.com/dbosk/scholar/issues/166}); older records
+load with the total unknown.  And it keeps when the search ran and when
+its answer was fetched (\cref{sec:search-dates} in the [[scholar]]
+module), which differ for an answer served from the cache, so that a
+report can state the date each source was searched
+(\url{https://github.com/dbosk/scholar/issues/167}).  Older records
+load with both dates unknown, and the session's own [[timestamp]],
+reset at every append, is no stand-in for them.
 
 \label{sec:search-record-key}
 A search is identified by its query, its provider \emph{and} its
@@ -1218,6 +1228,12 @@ class SearchRecord:
     the number of papers the search produced (``None`` for records that
     predate it), ``error`` why the provider failed (``None`` when it
     answered), and ``retries`` how often the search was repeated.
+    ``total`` is the number of matching records the service reported
+    (``None`` when unknown), ``total_estimated`` whether it called that
+    an estimate. ``searched_at`` is when the search ran, ``fetched_at``
+    when its answer was fetched from the service (UTC ISO times;
+    ``None`` when unknown) and ``from_cache`` whether the answer came
+    from the cache (``None`` when unknown).
     """
     query: str
     provider: str
@@ -1226,6 +1242,11 @@ class SearchRecord:
     hits: int | None = None
     error: str | None = None
     retries: int = 0
+    total: int | None = None
+    total_estimated: bool = False
+    searched_at: str | None = None
+    fetched_at: str | None = None
+    from_cache: bool | None = None
 
     @property
     def key(self) -> tuple[str, str, str]:
@@ -1240,6 +1261,8 @@ class SearchRecord:
         recorded since stores its limit.
         """
         return self.filters is None and self.limit is None
+
+    <<search record properties>>
 @
 
 One kind of record cannot take part in that key.  Sessions written
@@ -1264,6 +1287,506 @@ of its query on its provider replaces it, whatever the new run's
 filters (\cref{sec:legacy-records}).  Keeping it beside the new record
 would make [[found-via]] print, for it, a command without filters that
 may never have been run.
+
+\label{sec:merged-records}
+A second kind of old record cannot be split either.  Until
+\url{https://github.com/dbosk/scholar/issues/164} a multi-provider
+[[search -n]] stored its merged result as one record: provider
+[[openalex, dblp]], query [[q | q]], the deduplicated count of all
+providers together and their errors joined, each prefixed with its
+provider.  Searches now record one record per provider
+(\cref{sec:review-found-by}), but sessions hold hundreds of the old
+ones, and their papers link to them.  They load unchanged, since
+rewriting them would invent per-provider counts that were never
+stored.  What changes is how they are read: [[is_merged]] recognises
+them by the comma that no provider name contains, and
+[[search_outcome_label]] says what such a record is---\enquote{merged
+record (providers openalex, dblp): outcome cannot be split}, with the
+total and the provider-labelled errors after it---instead of a count
+that a reader would take for each provider's.
+
+<<search record properties>>=
+@property
+def merged_providers(self) -> list[str]:
+    """The providers of a merged record, or `[provider]` for one search."""
+    return [p.strip() for p in self.provider.split(",") if p.strip()]
+
+@property
+def is_merged(self) -> bool:
+    """Whether the record is a merged one from before #164."""
+    return len(self.merged_providers) > 1
+@
+
+The label is the one place that decides how a record's outcome reads,
+for [[sessions show]] and the report alike; for a record of one search
+it is [[hits_label]] (\cref{sec:search-result-error} in the
+[[scholar]] module).
+
+<<review data structures>>=
+def search_outcome_label(record: SearchRecord) -> str:
+    """Describe a search record's outcome; "" when nothing is known.
+
+    A merged record (see `SearchRecord.is_merged`) is labelled as such,
+    since its count and errors cannot be attributed to its providers.
+    """
+    if record.is_merged:
+        details = []
+        if record.hits is not None:
+            details.append(f"{record.hits} papers in total")
+        if record.error:
+            details.append(f"errors: {record.error}")
+        label = (
+            f"merged record (providers {', '.join(record.merged_providers)})"
+            ": outcome cannot be split"
+        )
+        return label + (f" ({'; '.join(details)})" if details else "")
+    return hits_label(
+        record.hits, record.error, record.retries,
+        ranked=is_ranked_provider(record.provider),
+        total=record.total, limit=record.limit,
+        estimated=record.total_estimated,
+    )
+@
+
+A record's dates are described in words for the same views.  An
+answer fetched during the run needs only the run's date; a cached one
+names the date it was fetched, or says that the cache does not know it
+(an answer cached before fetch dates were kept), never the run's date
+in its place (\url{https://github.com/dbosk/scholar/issues/167}).
+[[search_source_date]] is the one date a coverage statement can use,
+the date the database itself was asked: the fetch date when known,
+otherwise the run's date unless the answer came from the cache.  A
+provider that does not say whether it answered from a cache (one from
+outside scholar) is taken to have been asked when the search ran, the
+only date there is.  A search that failed outright, or was skipped,
+has no such date: the database answered nothing, and a date would let
+the coverage statement count it as searched.  The caption and the
+report leave such records out of their period
+([[answered_records]]).
+
+<<review data structures>>=
+def search_dates_label(record: SearchRecord) -> str:
+    """Describe when a search ran and its answer was fetched; "" if unknown."""
+    searched = (record.searched_at or "")[:10]
+    fetched = (record.fetched_at or "")[:10]
+    if not searched and not fetched:
+        return ""
+    if record.from_cache:
+        cached = (
+            f"cached answer fetched {fetched}" if fetched
+            else "cached answer, fetch date unknown"
+        )
+        return f"searched {searched}, {cached}" if searched else cached
+    if not searched:
+        return f"fetched {fetched}"
+    if fetched and fetched != searched:
+        return f"searched {searched}, fetched {fetched}"
+    return f"searched {searched}"
+
+
+def search_source_date(record: SearchRecord) -> str | None:
+    """The date (YYYY-MM-DD) the database answered the search, if known.
+
+    None for a search that failed outright or was skipped, since the
+    database answered nothing.
+    """
+    if record.error and not record.hits:
+        return None
+    if record.fetched_at:
+        return record.fetched_at[:10]
+    if record.from_cache or not record.searched_at:
+        return None
+    return record.searched_at[:10]
+
+
+def answered_records(records: list[SearchRecord]) -> list[SearchRecord]:
+    """The records whose search did not fail outright (or was skipped)."""
+    return [r for r in records if not (r.error and not r.hits)]
+@
+
+<<test functions>>=
+class TestSearchDatesLabel:
+    """Dates of a search, worded for display (#167)."""
+
+    def test_labels(self):
+        def record(**dates):
+            return SearchRecord("q", "openalex", None, 100, hits=1, **dates)
+
+        run = "2026-11-18T09:00:00+00:00"
+        october = "2026-10-02T08:00:00+00:00"
+        assert search_dates_label(record()) == ""
+        assert search_dates_label(record(
+            searched_at=run, fetched_at=run, from_cache=False,
+        )) == "searched 2026-11-18"
+        assert search_dates_label(record(
+            searched_at=run, fetched_at=october, from_cache=True,
+        )) == "searched 2026-11-18, cached answer fetched 2026-10-02"
+        assert search_dates_label(record(
+            searched_at=run, from_cache=True,
+        )) == "searched 2026-11-18, cached answer, fetch date unknown"
+
+    def test_source_date(self):
+        run = "2026-11-18T09:00:00+00:00"
+        october = "2026-10-02T08:00:00+00:00"
+        assert search_source_date(SearchRecord(
+            "q", "p", searched_at=run, fetched_at=october, from_cache=True,
+        )) == "2026-10-02"
+        assert search_source_date(SearchRecord(
+            "q", "p", searched_at=run, from_cache=True,
+        )) is None
+        assert search_source_date(SearchRecord(
+            "q", "p", searched_at=run,
+        )) == "2026-11-18"
+        assert search_source_date(SearchRecord("q", "p")) is None
+
+    def test_failed_or_skipped_search_has_no_date(self):
+        run = "2026-11-18T09:00:00+00:00"
+        skipped = SearchRecord(
+            "q", "ieee", hits=0, searched_at=run,
+            error="skipped: daily quota spent; resets 01:00",
+        )
+        assert search_source_date(skipped) is None
+        partial = SearchRecord("q", "dblp", hits=3, error="cut short",
+                               searched_at=run, fetched_at=run,
+                               from_cache=False)
+        assert search_source_date(partial) == "2026-11-18"
+        answered = SearchRecord("q", "openalex", hits=2,
+                                fetched_at="2026-10-02T08:00:00+00:00")
+        assert audit_dates_sentence(
+            AUDIT_STRINGS["en"], [skipped, answered]
+        ) == "Searched 2026-10-02."
+@
+
+The dates must reach the session file from a search result and come
+back, and a record saved before they existed must load with them
+unknown:
+
+<<test functions>>=
+class TestRecordDates:
+    """Search records keep their dates through a save (#167)."""
+
+    def test_round_trip_and_old_records(self):
+        import json
+        from scholar.review import _get_sessions_dir
+        from scholar.scholar import SearchResult
+        result = SearchResult(
+            query="q", provider="openalex", timestamp="t", papers=[],
+            limit=5, searched_at="2026-11-18T09:00:00+00:00",
+            fetched_at="2026-10-02T08:00:00+00:00", from_cache=True,
+        )
+        save_session(create_review_session([result], "q",
+                                           session_name="dated"))
+        record = load_session("dated").search_records[0]
+        assert (record.searched_at, record.fetched_at, record.from_cache) \
+            == ("2026-11-18T09:00:00+00:00", "2026-10-02T08:00:00+00:00",
+                True)
+        path = _get_sessions_dir() / "dated.json"
+        data = json.loads(path.read_text())
+        for rec in data["search_records"]:
+            for field_name in ("searched_at", "fetched_at", "from_cache"):
+                del rec[field_name]
+        path.write_text(json.dumps(data))
+        record = load_session("dated").search_records[0]
+        assert (record.searched_at, record.fetched_at, record.from_cache) \
+            == (None, None, None)
+        assert search_dates_label(record) == ""
+@
+
+<<test functions>>=
+class TestMergedRecords:
+    """Merged records from before #164 are labelled, never split."""
+
+    def test_merged_record_is_recognised(self):
+        record = SearchRecord("q | q", "openalex, dblp", None, 100,
+                              hits=25, error="dblp: non-JSON response")
+        assert record.is_merged
+        assert record.merged_providers == ["openalex", "dblp"]
+        assert not SearchRecord("q", "dblp", None, 100).is_merged
+
+    def test_label_does_not_split_the_outcome(self):
+        record = SearchRecord("q | q", "openalex, dblp", None, 100,
+                              hits=25, error="dblp: non-JSON response")
+        assert search_outcome_label(record) == (
+            "merged record (providers openalex, dblp): outcome cannot be "
+            "split (25 papers in total; errors: dblp: non-JSON response)"
+        )
+
+    def test_single_search_label_is_hits_label(self):
+        record = SearchRecord("q", "dblp", None, 100, hits=0,
+                              error="HTTP 503")
+        assert search_outcome_label(record) == "failed (HTTP 503)"
+@
+
+\label{sec:superseded-merged}
+A merged record cannot be split, but it can be superseded.  When the
+user re-runs its query with the current code, the new run records one
+search per provider, and those records stood beside the old merged one
+(a copy of a real session went from 4 to 6 records for one re-run):
+the caption's \enquote{for k of n queries} and the report then counted
+that query twice for each of its providers.  Once there is a record of
+the same query and filters for \emph{every} provider the merged record
+names ([[merged_record_cover]]), the merged record says nothing those
+records do not, except a count that could never be attributed, so it is
+dropped ([[supersede_merged_records]]).  A merged record that only some
+providers have re-run stays: dropping it would lose the only record of
+the others.
+
+A record covers only if it can stand in for the provider's part of the
+merged search.  It must have answered: a skipped search or an HTTP~500
+says nothing about what the provider holds, and dropping the merged
+record for it would turn an answered search into a failed one.  And it
+must have asked for at least as much: a re-run with [[-l 5]] cannot
+stand in for a merged search with [[-l 100]], whose papers it may not
+include.  A merged record whose limit is unknown (the merge of two
+different limits stores none) is covered by any answered record, since
+nothing is known to compare with.  Without these two conditions a plain
+load and save of real sessions dropped merged records that no answered
+search covered; with them, a merged record is dropped only where it
+really counted a search twice.
+
+The papers linked to the merged record keep a link to the search, now
+per provider.  A paper that the new run returned already has links to
+the records of the providers that returned it ([[found_in]],
+\cref{sec:review-found-by}), which is more precise than the old link,
+so the old link is simply dropped.  A paper that the new run did not
+return is linked to the records of all the merged providers, which is
+what the old link said: one of them returned it.
+
+The positions of the query parts and the providers correspond, since
+the merge joined both in the same order ([[q1 | q2]] with
+[[openalex, dblp]]); a query whose parts are all equal, the usual case,
+covers every provider.  The rule runs wherever records come together:
+at the end of [[create_review_session]], and at the end of a save's
+merge with the file (\cref{sec:session-integrity}), since another
+process may have re-run the query, or may still hold the merged record
+this process dropped.
+
+<<review session functions>>=
+def merged_record_cover(
+    record: SearchRecord, records: list[SearchRecord]
+) -> list[SearchRecord] | None:
+    """The per-provider records that supersede a merged `record`, or None.
+
+    One record of the same query and filters is needed for each
+    provider the merged record names, one that answered and asked for
+    at least the merged record's limit (any limit when that is
+    unknown); None if any is missing.
+    """
+    if not record.is_merged:
+        return None
+    providers = record.merged_providers
+    queries = record.query.split(" | ")
+    if len(queries) != len(providers):
+        if len(set(queries)) != 1:
+            return None
+        queries = queries[:1] * len(providers)
+    key = filters_key(record.filters)
+
+    def wide_enough(other: SearchRecord) -> bool:
+        if record.limit is None:
+            return True
+        return other.limit is not None and (
+            search_width(other.limit) >= search_width(record.limit)
+        )
+
+    cover = []
+    for provider, query in zip(providers, queries):
+        match = next((
+            r for r in records
+            if not r.is_merged and r.provider == provider
+            and r.query == query and filters_key(r.filters) == key
+            and not failed_outright(r) and wide_enough(r)
+        ), None)
+        if match is None:
+            return None
+        cover.append(match)
+    return cover
+
+
+def supersede_merged_records(session: "ReviewSession") -> None:
+    """Drop each merged record that per-provider records fully cover.
+
+    Links to it are dropped where the paper links to a covering record
+    already, and otherwise replaced by links to all covering records.
+    """
+    for record in list(session.search_records):
+        cover = merged_record_cover(record, session.search_records)
+        if cover is None:
+            continue
+        session.search_records.remove(record)
+        cover_keys = [r.key for r in cover]
+        for decision in session.decisions:
+            old = [
+                link for link in decision.found_by
+                if link[:2] == (record.query, record.provider)
+                and link[2] in (None, record.key[2])
+            ]
+            if not old:
+                continue
+            links = [link for link in decision.found_by if link not in old]
+            if not any(link in cover_keys for link in links):
+                links += cover_keys
+            decision.found_by = without_superseded_links(
+                list(dict.fromkeys(links))
+            )
+@
+
+Let's verify the three cases with sessions written as old files are:
+a re-run on every provider replaces the merged record and repoints its
+links (a paper the re-run returned to its own provider, a paper it did
+not return to both); a re-run on one of the two providers leaves the
+merged record; and a save that meets the merged record in the file
+drops it again.
+
+<<test functions>>=
+class TestSupersededMergedRecords:
+    """Per-provider re-runs supersede an old merged record."""
+
+    MERGED = SearchRecord("q | q", "openalex, dblp", None, 100, hits=7)
+
+    def _covered(self, dblp, merged=None):
+        openalex = SearchRecord("q", "openalex", None, 100, hits=4)
+        return merged_record_cover(merged or self.MERGED, [openalex, dblp])
+
+    def test_answered_cover(self):
+        dblp = SearchRecord("q", "dblp", None, 100, hits=3)
+        assert self._covered(dblp) is not None
+        assert self._covered(SearchRecord("q", "dblp", None, 1000, hits=3))
+
+    def test_failed_or_skipped_cover_does_not_count(self):
+        for error in ("HTTP 500", "skipped: daily quota spent; resets 01:00"):
+            dblp = SearchRecord("q", "dblp", None, 100, hits=0, error=error)
+            assert self._covered(dblp) is None
+        partial = SearchRecord("q", "dblp", None, 100, hits=2, error="cut")
+        assert self._covered(partial) is not None
+
+    def test_narrower_cover_does_not_count(self):
+        dblp = SearchRecord("q", "dblp", None, 5, hits=3)
+        assert self._covered(dblp) is None
+        unknown = SearchRecord("q | q", "openalex, dblp", {"year": "2020"},
+                               None, hits=7)
+        assert merged_record_cover(unknown, [
+            SearchRecord("q", "openalex", {"year": "2020"}, 5, hits=4),
+            SearchRecord("q", "dblp", {"year": "2020"}, 5, hits=3),
+        ]) is not None
+
+    def test_other_filters_or_query_do_not_count(self):
+        dblp = SearchRecord("q", "dblp", {"year": "2020"}, 100, hits=3)
+        assert self._covered(dblp) is None
+        merged = SearchRecord("q | r", "openalex, dblp", None, 100, hits=7)
+        dblp = SearchRecord("q", "dblp", None, 100, hits=3)
+        assert self._covered(dblp, merged) is None
+        assert self._covered(SearchRecord("r", "dblp", None, 100, hits=3),
+                             merged) is not None
+
+    @staticmethod
+    def _old_session(name):
+        import json
+        from scholar.review import _get_sessions_dir
+        merged_link = {"query": "q | q", "provider": "openalex, dblp",
+                       "filters": ""}
+
+        def decision(doi):
+            return {
+                "paper_id": f"doi:{doi}", "provider": "openalex, dblp",
+                "status": "kept", "tags": [], "source": "human",
+                "found_by": [merged_link],
+                "paper": {"title": doi, "authors": ["A"], "doi": doi,
+                          "sources": ["openalex"]},
+            }
+
+        path = _get_sessions_dir() / f"{name}.json"
+        path.write_text(json.dumps({
+            "query": "q", "name": name, "providers": ["openalex, dblp"],
+            "timestamp": datetime.now().isoformat(),
+            "search_records": [{
+                "query": "q | q", "provider": "openalex, dblp",
+                "filters": None, "limit": 100, "hits": 2, "error": None,
+                "retries": 0,
+            }],
+            "decisions": [decision("10.1/sm-again"), decision("10.1/sm-old")],
+        }))
+        return path
+
+    @staticmethod
+    def _result(provider, dois):
+        from scholar.scholar import SearchResult
+        return SearchResult(
+            query="q", provider=provider, timestamp="t", limit=100,
+            papers=[Paper(title=d, authors=["A"], doi=d) for d in dois],
+        )
+
+    def test_full_cover_replaces_and_repoints(self):
+        self._old_session("sm-full")
+        merged = self._result("openalex", ["10.1/sm-again"]).merge(
+            self._result("dblp", [])
+        )
+        created = create_review_session([merged], "q",
+                                        session_name="sm-full")
+        assert [r.provider for r in created.search_records] == [
+            "openalex", "dblp",
+        ]
+        save_session(created)
+        session = load_session("sm-full")
+        assert [r.provider for r in session.search_records] == [
+            "openalex", "dblp",
+        ]
+        links = {d.paper.doi: d.found_by for d in session.decisions}
+        assert links["10.1/sm-again"] == [("q", "openalex", "")]
+        assert links["10.1/sm-old"] == [
+            ("q", "openalex", ""), ("q", "dblp", ""),
+        ]
+
+    def test_failed_cover_keeps_record_and_links(self):
+        self._old_session("sm-failed")
+        merged = self._result("openalex", ["10.1/sm-again"]).merge(
+            self._result("dblp", [])
+        )
+        merged.parts[1].error = "HTTP 500"
+        save_session(create_review_session([merged], "q",
+                                           session_name="sm-failed"))
+        session = load_session("sm-failed")
+        assert sorted(r.provider for r in session.search_records) == [
+            "dblp", "openalex", "openalex, dblp",
+        ]
+        old = next(d for d in session.decisions
+                   if d.paper.doi == "10.1/sm-old")
+        assert old.found_by == [("q | q", "openalex, dblp", "")]
+
+    def test_partial_cover_keeps_the_merged_record(self):
+        self._old_session("sm-part")
+        save_session(create_review_session(
+            [self._result("openalex", ["10.1/sm-again"])], "q",
+            session_name="sm-part",
+        ))
+        session = load_session("sm-part")
+        assert sorted(r.provider for r in session.search_records) == [
+            "openalex", "openalex, dblp",
+        ]
+        old = next(d for d in session.decisions
+                   if d.paper.doi == "10.1/sm-old")
+        assert old.found_by == [("q | q", "openalex, dblp", "")]
+
+    def test_a_save_drops_it_from_the_file_too(self):
+        self._old_session("sm-save")
+        stale = load_session("sm-save")
+        merged = self._result("openalex", ["10.1/sm-again"]).merge(
+            self._result("dblp", [])
+        )
+        save_session(create_review_session([merged], "q",
+                                           session_name="sm-save"))
+        stale.decisions[0].status = DecisionStatus.DISCARDED
+        stale.decisions[0].tags = ["off-topic"]
+        save_session(stale)
+        session = load_session("sm-save")
+        assert [r.provider for r in session.search_records] == [
+            "openalex", "dblp",
+        ]
+        assert all(
+            link[1] != "openalex, dblp"
+            for d in session.decisions for link in d.found_by
+        )
+@
 
 
 \subsection{Review Session}
@@ -1491,7 +2014,11 @@ with its key (query, provider and filters, \cref{sec:search-record-key})
 is present yet, preventing duplicates when
 appending results to an existing session; its [[filters]] and [[limit]]
 arguments default to [[None]] so older callers that only know the query and
-provider keep working. The [[query_provider_pairs]] property derives the
+provider keep working.  [[add_search_record]] does the same for a record
+that already exists, such as one from the previous session: adding the
+record itself, rather than rebuilding it from its fields, keeps every
+field of it, also those added after this code was written.
+The [[query_provider_pairs]] property derives the
 [[(query, provider)]] pairs from the records, so every reader written against
 the old field is unaffected; a pair may now occur twice, once per set of
 filters, as it is two searches. The [[queries_for_provider]] method retrieves all
@@ -1521,6 +2048,11 @@ def add_query_provider_pair(
     hits: int | None = None,
     error: str | None = None,
     retries: int = 0,
+    total: int | None = None,
+    total_estimated: bool = False,
+    searched_at: str | None = None,
+    fetched_at: str | None = None,
+    from_cache: bool | None = None,
 ) -> None:
     """
     Record a search unless a record with its key is already present.
@@ -1535,10 +2067,16 @@ def add_query_provider_pair(
     filters and limit applied so the search can be reproduced exactly,
     and its outcome (hits, error, retries).
     """
-    record = SearchRecord(
+    self.add_search_record(SearchRecord(
         query, provider, filters, limit,
         hits=hits, error=error, retries=retries,
-    )
+        total=total, total_estimated=total_estimated,
+        searched_at=searched_at, fetched_at=fetched_at,
+        from_cache=from_cache,
+    ))
+
+def add_search_record(self, record: SearchRecord) -> None:
+    """Add `record` unless a record with its key is already present."""
     if record.key not in {r.key for r in self.search_records}:
         self.search_records.append(record)
 
@@ -2138,7 +2676,9 @@ def create_review_session(
                         len(previous_decisions.decisions))
     
     # Create review session
-    providers = list(dict.fromkeys(r.provider for r in results))
+    providers = list(dict.fromkeys(
+        part.provider for r in results for part in search_parts_of(r)
+    ))
     logger.debug("Session includes providers: %s", providers)
     session = ReviewSession(
         query=query,
@@ -2153,25 +2693,29 @@ def create_review_session(
     if previous_session:
         session._baseline = previous_session._baseline
 
-    # Build search records (query, provider, filters, limit, outcome)
+    # Build search records (query, provider, filters, limit, outcome),
+    # one per provider search, also inside a merged result
     for result in results:
-        error, retries = result_outcome(result)
-        session.add_query_provider_pair(
-            result.query, result.provider, result.filters, result.limit,
-            hits=len(result.papers), error=error, retries=retries,
-        )
+        for part in search_parts_of(result):
+            error, retries = result_outcome(part)
+            total, estimated = result_total(part)
+            searched_at, fetched_at, from_cache = result_dates(part)
+            session.add_query_provider_pair(
+                part.query, part.provider, part.filters, part.limit,
+                hits=len(part.papers), error=error, retries=retries,
+                total=total, total_estimated=estimated,
+                searched_at=searched_at, fetched_at=fetched_at,
+                from_cache=from_cache,
+            )
 
     # Merge with previous session's searches (if any), preserving their filters
     replaced_links: dict[tuple, tuple] = {}
     if previous_session:
         current_run = list(session.search_records)
         for record in previous_session.search_records:
-            <<keep an earlier answer over a failed re-run>>
+            <<keep the preferred record of each search>>
             <<let a re-run replace a legacy record>>
-            session.add_query_provider_pair(
-                record.query, record.provider, record.filters, record.limit,
-                hits=record.hits, error=record.error, retries=record.retries,
-            )
+            session.add_search_record(record)
     
     # Collect paper IDs from current search results
     current_paper_ids = set()
@@ -2186,6 +2730,7 @@ def create_review_session(
     # Convert search results to review decisions, merging with previous
     <<convert search results to decisions>>
     <<point links at the records that replaced theirs>>
+    supersede_merged_records(session)
     
     logger.info("Created session with %d papers (%d kept, %d discarded, %d pending)",
                len(session.decisions), len(session.kept_papers()),
@@ -2206,7 +2751,82 @@ earlier record that answered replaces a failed re-run of the same pair.
 The failure itself is not lost from view: it was reported when it
 happened, and the session keeps the answer that its papers came from.
 
-<<keep an earlier answer over a failed re-run>>=
+That holds for a re-run that failed \emph{outright}, with no papers.
+A re-run that failed part-way, \enquote{incomplete}, did answer, in
+part, and its papers are added to the session; it is the latest answer
+of the search, and it replaces the earlier record with its own outcome,
+marked incomplete.  Keeping the earlier record would have been wrong
+twice: a Boolean query that the old relevance search answered with 0
+and the bulk search now answers with five papers before it is cut
+short would keep \enquote{0} beside five new decisions, and the date
+the source was last searched would be the old one.  A wider earlier
+record still wins over a narrower re-run (\cref{sec:wider-record}).
+
+These rules, and the one for limits below (\cref{sec:wider-record}),
+decide between two records of one search, and they are needed in two
+places: here, between this run's record and the session's, and when a
+save meets a record of the same search that another process saved
+meanwhile (\cref{sec:session-integrity}).  Applied in one place only,
+the other undid them: a process still holding the narrow record of
+[[-l 5]] saved it over the [[-l 0]] record another process had just
+saved, with fifty papers linked to it.  So the rules are one function,
+[[preferred_record]], which both places call.
+
+What the rules make of a session is this: the record of a search, its
+query, provider and filters, is its \emph{latest answered search of the
+widest scope}, and the record reports that search's own outcome, its
+count, its error and its dates.
+
+The function compares one sort key per record, [[record_rank]], rather
+than going through cases.  A first version went through cases (an
+answer over a failure, then the wider limit, then a partial answer
+with more hits over an answer with fewer, then the later run), and
+cases interact: an undated record tied with a dated one, so which
+survived a concurrent save depended on which process saved last, and
+three records could beat each other in a circle (ten hits on 18
+November over a partial twenty on 10 November over thirty on
+1 November over the first).  A key compared lexicographically cannot
+do either: it orders all records, a total preorder, and the outcome of
+a comparison does not depend on the order of the arguments, except
+between records whose keys are equal.  The key is, in order of weight:
+\begin{description}
+\item[Answered] An answer, also a partial one, beats a failure
+  outright ([[failed_outright]]).
+\item[Width] The wider limit wins, no limit ([[None]] or 0) the widest
+  (\cref{sec:wider-record}).  A legacy record's limit is unknown, not
+  unlimited, so it ranks below every known limit: a re-run that
+  answered replaces it, as the legacy rule says
+  (\cref{sec:legacy-records}).
+\item[Run] The later run wins, and a dated record beats an undated one.
+\item[Hits] Of runs of the same date, or of undated records such as
+  legacy ones, the one with more hits wins; an unknown count ranks
+  lowest.
+\item[Complete] Of equal counts, the one without an error wins.
+\end{description}
+The date ranks above the count because the session must say when each
+source was last searched, which PRISMA asks for: an older complete
+answer of thirty hits must not displace a newer complete one of ten,
+or the session would date the search to the older run although it was
+run again since.  The count cannot rank above the date for partial
+answers and below it for complete ones either: any such mix makes the
+circle above possible again, which no key can express.  So a newer
+answer always replaces an older one of the same scope, complete or not,
+and shows its own outcome; a newer partial answer reads
+\enquote{incomplete}, which is what the latest search was.
+
+The papers that older runs of the same search returned keep their
+links: a link names the search by its key, query, provider and
+filters (\cref{sec:search-record-key}), which the replacing record has
+too, so they stay attached to the search's one record.  That record
+may then count fewer hits than it has linked papers, when the older run
+returned more; the papers were found by that search, and the count says
+what its latest run returned.
+
+Two records with equal keys are a true tie, and the first argument
+wins, so the caller decides: the new run here, the process's own record
+in a save.
+
+<<keep the preferred record of each search>>=
 for i, current in enumerate(session.search_records):
     same_search = current.key == record.key or (
         record.is_legacy
@@ -2214,10 +2834,126 @@ for i, current in enumerate(session.search_records):
         and (current.query, current.provider)
         == (record.query, record.provider)
     )
-    if same_search and current.error and not record.error:
+    if same_search and preferred_record(current, record) is record:
         session.search_records[i] = record
         if current.key != record.key:
             replaced_links[current.key] = record.key
+<<review session functions>>=
+def failed_outright(record: SearchRecord) -> bool:
+    """Whether the search failed without a single paper."""
+    return bool(record.error) and not record.hits
+
+
+def record_rank(record: SearchRecord) -> tuple:
+    """The sort key by which a session keeps one of two records.
+
+    `(answered, width, searched_at, hits, complete)`: higher is better;
+    a legacy record's width, an unknown run time and an unknown hit
+    count rank lowest.
+    """
+    width = (
+        float("-inf") if record.is_legacy else search_width(record.limit)
+    )
+    return (
+        0 if failed_outright(record) else 1,
+        width,
+        record.searched_at or "",
+        -1 if record.hits is None else record.hits,
+        0 if record.error else 1,
+    )
+
+
+def preferred_record(a: SearchRecord, b: SearchRecord) -> SearchRecord:
+    """Of two records of one search, the one a session keeps.
+
+    The one with the higher `record_rank`; on equal ranks, `a`.
+    """
+    return a if record_rank(a) >= record_rank(b) else b
+@
+
+<<test functions>>=
+class TestPreferredRecord:
+    """The one order of two records of a search."""
+
+    @staticmethod
+    def _r(limit=100, hits=None, error=None, searched_at=None, **kw):
+        return SearchRecord("q", "p", None, limit, hits=hits, error=error,
+                            searched_at=searched_at, **kw)
+
+    def test_order(self):
+        answer = self._r(hits=12)
+        failed = self._r(hits=0, error="HTTP 503")
+        assert preferred_record(failed, answer) is answer
+        assert preferred_record(answer, failed) is answer
+        wide = self._r(limit=10_000, hits=50)
+        narrow = self._r(limit=5, hits=5)
+        assert preferred_record(narrow, wide) is wide
+        assert preferred_record(wide, narrow) is wide
+        partial = self._r(hits=20, error="cut short")
+        assert preferred_record(answer, partial) is partial
+        assert preferred_record(partial, self._r(hits=30)).hits == 30
+        old = self._r(hits=3, searched_at="2026-10-01T00:00:00+00:00")
+        new = self._r(hits=3, searched_at="2026-11-01T00:00:00+00:00")
+        assert preferred_record(old, new) is new
+        assert preferred_record(new, old) is new
+        tie, same = self._r(hits=1), self._r(hits=1)
+        assert preferred_record(tie, same) is tie
+        assert preferred_record(same, tie) is same
+
+    def test_dated_beats_undated_in_both_orders(self):
+        undated = self._r(hits=5)
+        dated = self._r(hits=5, searched_at="2026-11-18T09:00:00+00:00")
+        assert preferred_record(undated, dated) is dated
+        assert preferred_record(dated, undated) is dated
+
+    def test_former_cycle_is_ordered(self):
+        ten = self._r(hits=10, searched_at="2026-11-18T00:00:00+00:00")
+        twenty = self._r(hits=20, error="cut short",
+                         searched_at="2026-11-10T00:00:00+00:00")
+        thirty = self._r(hits=30, searched_at="2026-11-01T00:00:00+00:00")
+        for a, b in [(ten, twenty), (twenty, thirty), (thirty, ten)]:
+            assert preferred_record(a, b) is preferred_record(b, a)
+        import functools
+        import itertools
+        winners = {
+            id(functools.reduce(preferred_record, order))
+            for order in itertools.permutations([ten, twenty, thirty])
+        }
+        assert winners == {id(ten)}
+
+    def test_newer_complete_answer_beats_older_with_more_hits(self):
+        older = self._r(hits=30, searched_at="2026-11-01T00:00:00+00:00")
+        newer = self._r(hits=10, searched_at="2026-11-18T00:00:00+00:00")
+        assert preferred_record(older, newer) is newer
+        assert preferred_record(newer, older) is newer
+        partial = self._r(hits=3, error="cut short",
+                          searched_at="2026-11-18T00:00:00+00:00")
+        assert preferred_record(older, partial) is partial
+
+    def test_symmetric_and_transitive_on_a_generated_set(self):
+        import itertools
+        records = [
+            self._r(limit=limit, hits=hits, error=error, searched_at=when)
+            for limit in (5, 100, None)
+            for hits, error in ((None, None), (0, None), (0, "HTTP 503"),
+                                (5, None), (5, "cut"), (20, "cut"))
+            for when in (None, "2026-10-01T00:00:00+00:00",
+                         "2026-11-01T00:00:00+00:00")
+        ] + [SearchRecord("q", "p", hits=None)]
+        for a, b in itertools.product(records, repeat=2):
+            if record_rank(a) != record_rank(b):
+                assert preferred_record(a, b) is preferred_record(b, a)
+        for a, b, c in itertools.product(records[::3], repeat=3):
+            if (preferred_record(a, b) is a
+                    and preferred_record(b, c) is b):
+                assert record_rank(a) >= record_rank(c)
+
+    def test_legacy_limit_is_unknown(self):
+        legacy = SearchRecord("q", "p", hits=None)
+        current = self._r(limit=5, hits=5)
+        assert preferred_record(current, legacy) is current
+        failed = self._r(limit=5, hits=0, error="HTTP 503")
+        assert preferred_record(failed, legacy) is legacy
 @
 
 \label{sec:legacy-records}
@@ -2237,6 +2973,206 @@ of it.  [[replaced_links]] maps each replaced key to its successor, and
 once all decisions are built every link is moved
 ([[<<point links at the records that replaced theirs>>]]); duplicates
 that the move creates are merged, keeping the first.
+
+\label{sec:wider-record}
+A re-run with a smaller limit is the opposite case: it answered, but
+asked for less.  The limit is not part of the key
+(\cref{sec:search-record-key}), so a run with [[-l 5]] after one with
+[[-l 0]] is the same search, and the newer record used to win.  The
+session then said \enquote{limit 5, hits 5} for fifty linked papers,
+and [[found-via]] built its command from that record, a command that
+returns five of them (\url{https://github.com/dbosk/scholar/issues/166}).
+A narrower run of the same query, provider and filters fetches the
+first part of what the wider one fetched, so the wider record already
+accounts for its papers: we keep the wider record and record nothing
+new.  The narrower run's papers link to the key they share with it, so
+their links name the wider record without being moved.  (Should the
+service have reordered its ranking in between, a paper of the narrower
+run may not have been among the wider run's; re-run today, the wider
+search returns it, which is what the link claims.)
+
+\enquote{Wider} compares the limits, with no limit ([[None]], or 0)
+the widest; [[-l 0]] is stored as the large internal cap and so is
+wide already.  A legacy record's missing limit means \emph{unknown},
+not unlimited, so a legacy record is never wider; it has its own rule
+below.  A wider record that failed outright does not stand in for a
+narrower answer; otherwise the wider record wins, also over a narrower
+re-run that failed part-way with more papers than it counts (the wider
+record then shows fewer hits than the papers linked to it, a known and
+accepted case).  [[preferred_record]] above applies the rule.
+
+<<review session functions>>=
+def search_width(limit: int | None) -> float:
+    """How many results a search with `limit` may fetch; no limit is all."""
+    return float("inf") if not limit else float(limit)
+@
+
+Let's verify the run of \url{https://github.com/dbosk/scholar/issues/166}:
+fifty papers with the internal cap of [[-l 0]], then five with [[-l 5]].
+The session keeps the wide record, every paper links to it, and the
+report labels it with its total.  The other direction, a wider run
+after a narrower one, replaces the narrow record as before; a failed
+wide run does not displace a narrow answer; and the total survives a
+save, while a record saved before it existed loads with the total
+unknown.
+
+<<test functions>>=
+class TestWiderRecordKept:
+    """A narrower re-run never replaces a wider record (#166)."""
+
+    WIDE = 10_000
+
+    @staticmethod
+    def _result(papers, limit, total=None, error=None):
+        from scholar.scholar import SearchResult
+        return SearchResult(
+            query="q", provider="openalex", timestamp="t", papers=papers,
+            limit=limit, total=total, error=error,
+        )
+
+    @staticmethod
+    def _papers(n):
+        return [Paper(title=f"P{i}", authors=["A"], doi=f"10.1/wide-{i}")
+                for i in range(n)]
+
+    def test_narrow_rerun_keeps_wide_record(self):
+        papers = self._papers(50)
+        save_session(create_review_session(
+            [self._result(papers, self.WIDE, total=50)], "q",
+            session_name="wide",
+        ))
+        save_session(create_review_session(
+            [self._result(papers[:5], 5, total=50)], "q",
+            session_name="wide",
+        ))
+        session = load_session("wide")
+        assert [(r.limit, r.hits, r.total)
+                for r in session.search_records] == [(self.WIDE, 50, 50)]
+        record = session.search_records[0]
+        assert all(
+            session.search_record(*link) is record
+            for d in session.decisions for link in d.found_by
+        )
+
+    def test_wider_rerun_replaces_narrow_record(self):
+        papers = self._papers(6)
+        save_session(create_review_session(
+            [self._result(papers[:5], 5, total=6)], "q",
+            session_name="widen",
+        ))
+        session = create_review_session(
+            [self._result(papers, self.WIDE, total=6)], "q",
+            session_name="widen",
+        )
+        assert [(r.limit, r.hits) for r in session.search_records] == [
+            (self.WIDE, 6),
+        ]
+
+    def test_failed_wide_record_does_not_displace_answer(self):
+        papers = self._papers(3)
+        save_session(create_review_session(
+            [self._result([], self.WIDE, error="HTTP 503")], "q",
+            session_name="failed-wide",
+        ))
+        session = create_review_session(
+            [self._result(papers, 5, total=3)], "q",
+            session_name="failed-wide",
+        )
+        assert [(r.limit, r.hits, r.error)
+                for r in session.search_records] == [(5, 3, None)]
+
+    def test_total_round_trip_and_old_records(self):
+        import json
+        from scholar.review import _get_sessions_dir
+        save_session(create_review_session(
+            [self._result(self._papers(5), 5, total=2130)], "q",
+            session_name="totals",
+        ))
+        session = load_session("totals")
+        record = session.search_records[0]
+        assert (record.total, record.total_estimated) == (2130, False)
+        assert search_outcome_label(record) == (
+            "5 of 2,130 (capped at 5)"
+        )
+        path = _get_sessions_dir() / "totals.json"
+        data = json.loads(path.read_text())
+        for rec in data["search_records"]:
+            del rec["total"], rec["total_estimated"]
+        path.write_text(json.dumps(data))
+        record = load_session("totals").search_records[0]
+        assert (record.total, record.total_estimated) == (None, False)
+        assert search_outcome_label(record) == "5 (capped at 5)"
+@
+
+The same order must hold when a save meets the other process's record
+of the same search (\cref{sec:session-integrity}).  The reviewer's
+case: the session is at [[-l 5]]; process~B re-runs with [[-l 0]] and
+saves fifty hits; process~A, still holding the [[-l 5]] record, saves
+a decision.  The file must keep B's wide record with its dates.  And the
+mirror: A holds the wide re-run when B saves its narrow copy, and A's
+wide record must survive A's save.
+
+<<test functions>>=
+class TestConcurrentRecordOrder:
+    """A save keeps the preferred record of a shared search."""
+
+    WIDE = 10_000
+
+    @staticmethod
+    def _result(papers, limit, when):
+        from scholar.scholar import SearchResult
+        return SearchResult(
+            query="q", provider="openalex", timestamp="t", papers=papers,
+            limit=limit, total=50, searched_at=when, fetched_at=when,
+            from_cache=False,
+        )
+
+    @staticmethod
+    def _papers(n):
+        return [Paper(title=f"P{i}", authors=["A"], doi=f"10.1/cro-{i}")
+                for i in range(n)]
+
+    def _narrow_session(self, name):
+        save_session(create_review_session(
+            [self._result(self._papers(5), 5, "2026-10-01T00:00:00+00:00")],
+            "q", session_name=name,
+        ))
+
+    def test_stale_narrow_save_keeps_the_wide_record(self):
+        self._narrow_session("cro")
+        stale = load_session("cro")
+        save_session(create_review_session(
+            [self._result(self._papers(50), self.WIDE,
+                          "2026-11-18T09:00:00+00:00")],
+            "q", session_name="cro",
+        ))
+        stale.decisions[0].status = DecisionStatus.KEPT
+        save_session(stale)
+        session = load_session("cro")
+        assert [(r.limit, r.hits, r.searched_at)
+                for r in session.search_records] == [
+            (self.WIDE, 50, "2026-11-18T09:00:00+00:00"),
+        ]
+        assert len(session.decisions) == 50
+        assert session.decisions[0].status == DecisionStatus.KEPT
+
+    def test_own_wide_record_survives_a_narrow_file(self):
+        self._narrow_session("cro-mirror")
+        wide = create_review_session(
+            [self._result(self._papers(50), self.WIDE,
+                          "2026-11-18T09:00:00+00:00")],
+            "q", session_name="cro-mirror",
+        )
+        other = load_session("cro-mirror")
+        other.decisions[0].status = DecisionStatus.KEPT
+        save_session(other)
+        save_session(wide)
+        session = load_session("cro-mirror")
+        assert [(r.limit, r.hits) for r in session.search_records] == [
+            (self.WIDE, 50),
+        ]
+        assert session.decisions[0].status == DecisionStatus.KEPT
+@
 
 <<let a re-run replace a legacy record>>=
 if record.is_legacy:
@@ -2310,6 +3246,91 @@ class TestSearchRecordOutcome:
         )
         record = session.search_record_for("dblp")
         assert (record.hits, record.error) == (1, None)
+@
+
+A partial re-run is not a failed one.  The case found in the review of
+the S2 bulk search: an old relevance answer of 0 for [[a AND b]], then
+a newer bulk re-run with five papers, cut short.  The record must show
+the five, marked incomplete.  A newer partial re-run with fewer papers
+than the earlier answer replaces it too, since it is the latest search,
+and the papers of the earlier run stay; only between undated records
+does the count decide; and a wider earlier answer still wins over a
+narrower partial one.
+
+<<test functions>>=
+class TestPartialRerun:
+    """A partial re-run with more hits replaces an earlier answer."""
+
+    @staticmethod
+    def _result(papers, error=None, limit=100, when=None):
+        from scholar.scholar import SearchResult
+        return SearchResult(
+            query="a AND b", provider="s2", timestamp="t", papers=papers,
+            limit=limit, error=error, searched_at=when,
+        )
+
+    @staticmethod
+    def _papers(n):
+        return [Paper(title=f"P{i}", authors=["A"], doi=f"10.1/pr-{i}")
+                for i in range(n)]
+
+    def test_partial_with_more_hits_replaces_zero(self):
+        save_session(create_review_session(
+            [self._result([], when="2026-10-01T00:00:00+00:00")],
+            "a AND b", session_name="partial",
+        ))
+        session = create_review_session(
+            [self._result(self._papers(5), error="search cut short",
+                          when="2026-11-18T00:00:00+00:00")],
+            "a AND b", session_name="partial",
+        )
+        record = session.search_record_for("s2")
+        assert (record.hits, record.error) == (5, "search cut short")
+        assert len(session.decisions) == 5
+
+    def test_newer_partial_with_fewer_hits_replaces_answer(self):
+        save_session(create_review_session(
+            [self._result(self._papers(12),
+                          when="2026-10-01T00:00:00+00:00")], "a AND b",
+            session_name="partial-less",
+        ))
+        session = create_review_session(
+            [self._result(self._papers(3), error="search cut short",
+                          when="2026-11-18T00:00:00+00:00")],
+            "a AND b", session_name="partial-less",
+        )
+        record = session.search_record_for("s2")
+        assert (record.hits, record.error, record.searched_at) == (
+            3, "search cut short", "2026-11-18T00:00:00+00:00",
+        )
+        assert search_outcome_label(record) == (
+            "3, incomplete (search cut short)"
+        )
+        assert len(session.decisions) == 12
+
+    def test_undated_partial_with_fewer_hits_keeps_answer(self):
+        save_session(create_review_session(
+            [self._result(self._papers(12))], "a AND b",
+            session_name="partial-undated",
+        ))
+        session = create_review_session(
+            [self._result(self._papers(3), error="search cut short")],
+            "a AND b", session_name="partial-undated",
+        )
+        record = session.search_record_for("s2")
+        assert (record.hits, record.error) == (12, None)
+
+    def test_wider_answer_beats_narrower_partial(self):
+        save_session(create_review_session(
+            [self._result(self._papers(2), limit=10_000)], "a AND b",
+            session_name="partial-wide",
+        ))
+        session = create_review_session(
+            [self._result(self._papers(5), error="cut", limit=5)],
+            "a AND b", session_name="partial-wide",
+        )
+        record = session.search_record_for("s2")
+        assert (record.limit, record.hits, record.error) == (10_000, 2, None)
 @
 
 Filters are part of a search's key (\cref{sec:search-record-key}).
@@ -2806,13 +3827,55 @@ this run, a renamed or adopted entry, a previous decision, or a new one),
 the decision records the search that returned it ([[record_search]]).  The
 link has to be made here: this loop is the only place that still knows
 which [[SearchResult]], and so which search record, a paper came from.
-The result's query, provider and [[filters_key]] of its filters are
-exactly the key [[add_query_provider_pair]] recorded above, merged
-results included ([[q | q]], [[openalex, dblp]]), so the link always
-names a stored record.
+A link is a part's query, provider and [[filters_key]] of its filters,
+exactly the key [[add_query_provider_pair]] recorded above, so the link
+always names a stored record.
 A decision rebuilt from the previous session copies that session's links,
-and the new one is added to them: a paper returned by three queries keeps
-all three.
+and the new ones are added to them: a paper returned by three queries
+keeps all three.
+
+A merged result (the default [[search -n]] over several providers) is
+recorded part by part (\cref{sec:search-result-parts} in the [[scholar]]
+module): one record per provider, with that provider's own count and
+error, never one record [[openalex, dblp]] whose failure would be
+charged to every provider in it
+(\url{https://github.com/dbosk/scholar/issues/164}).  Its papers are
+still the deduplicated ones, so deduplication stays a matter of papers,
+and each paper is linked to the parts that returned it
+([[paper_search_links]]).  The decision's [[provider]] names the same
+providers, so a paper only OpenAlex returned no longer reads as found
+by DBLP as well.  Results built without parts (by [[rq]], by
+[[--no-dedup]], in tests, by code outside scholar) are their own one
+part; a [[Mock]] standing in for a result has no list of parts and is
+treated so too.  Should a merged result's [[found_in]] not fit its
+papers---code that filtered the papers after merging---the links are
+computed again from the papers themselves.
+
+<<review session functions>>=
+def search_parts_of(result) -> list:
+    """The single-provider searches of a `SearchResult`-like object."""
+    parts = getattr(result, "parts", None)
+    if isinstance(parts, list) and parts:
+        return list(parts)
+    return [result]
+
+
+def paper_search_links(result) -> list[list[tuple[str, str, str]]]:
+    """For each paper of `result`, the keys of the searches that returned it.
+
+    A key is `(query, provider, filters key)` of one part of the result
+    (see `search_parts_of`); a result that is not a merge links every
+    paper to itself.
+    """
+    parts = search_parts_of(result)
+    keys = [(p.query, p.provider, filters_key(p.filters)) for p in parts]
+    if len(parts) == 1:
+        return [[keys[0]] for _ in result.papers]
+    found_in = getattr(result, "found_in", None)
+    if not isinstance(found_in, list) or len(found_in) != len(result.papers):
+        found_in = parts_returning(result.papers, parts)
+    return [[keys[i] for i in indices] for indices in found_in]
+@
 
 <<convert search results to decisions>>=
 decision_lookup: dict[str, ReviewDecision] = {
@@ -2832,8 +3895,10 @@ for d in session.decisions:
             provenance_lookup[key] = d
 
 for result in results:
-    link = (result.query, result.provider, filters_key(result.filters))
-    for paper in result.papers:
+    for paper, links in zip(result.papers, paper_search_links(result)):
+        found_by_provider = ", ".join(
+            dict.fromkeys(provider for _, provider, _ in links)
+        ) or result.provider
         paper = without_homonym_numbers(
             _normalize_paper_identifiers(paper)
         )
@@ -2845,7 +3910,8 @@ for result in results:
                 existing.paper = existing.paper.merge_with(paper)
             except ValueError:
                 pass
-            existing.record_search(*link)
+            for link in links:
+                existing.record_search(*link)
             continue
 
         renamed = renamed_lookup.pop(paper_id, None)
@@ -2857,13 +3923,15 @@ for result in results:
             ).merge_with(paper)
             decision_lookup.pop(old_id, None)
             decision_lookup[paper_id] = renamed
-            renamed.record_search(*link)
+            for link in links:
+                renamed.record_search(*link)
             continue
 
         adopted = provenance_lookup.get(paper_id)
         if adopted is not None:
             adopted.paper = merge_version_of(adopted.paper, paper)
-            adopted.record_search(*link)
+            for link in links:
+                adopted.record_search(*link)
             continue
 
         replaced = None
@@ -2880,7 +3948,8 @@ for result in results:
             replaced.paper = merge_version_of(paper, replaced.paper)
             decision_lookup[paper_id] = replaced
             provenance_lookup[old_id] = replaced
-            replaced.record_search(*link)
+            for link in links:
+                replaced.record_search(*link)
             continue
 
         # Check for previous decision (prefer session data over notes)
@@ -2902,7 +3971,7 @@ for result in results:
             # Use previous decision but with fresh paper data
             decision = ReviewDecision(
                 paper=paper,  # Fresh paper data from search
-                provider=result.provider,
+                provider=found_by_provider,
                 status=prev_dec.status,
                 tags=prev_dec.tags,
                 source=prev_dec.source,
@@ -2930,7 +3999,7 @@ for result in results:
 
             decision = ReviewDecision(
                 paper=paper,
-                provider=result.provider,
+                provider=found_by_provider,
                 status=status,
                 tags=tags,
                 source=source,
@@ -2941,11 +4010,13 @@ for result in results:
             # New paper, no previous decision
             decision = ReviewDecision(
                 paper=paper,
-                provider=result.provider,
+                provider=found_by_provider,
                 status=DecisionStatus.PENDING,
             )
 
-        decision.record_search(*link)
+
+        for link in links:
+            decision.record_search(*link)
         session.decisions.append(decision)
         decision_lookup[paper_id] = decision
 @
@@ -3026,6 +4097,90 @@ class TestFoundByLinks:
         assert set(links["10.1/fb-first"]) == {
             ("q1", "openalex", ""), ("q2", "openalex", ""),
         }
+@
+
+The case of \url{https://github.com/dbosk/scholar/issues/164}: the
+default search merges OpenAlex, which answered, with DBLP, which
+failed.  The session must hold two records with their own outcomes, the
+paper only OpenAlex returned must link to OpenAlex alone, and a merged
+record already in the session from before, of providers this run does
+not all cover, must load and stay as it was (one that the run covers is
+superseded, \cref{sec:superseded-merged}; this test used OpenAlex and
+DBLP before that rule existed).
+The merge is the real [[SearchResult.merge]] that the search command
+runs.
+
+<<test functions>>=
+class TestRecordsPerProvider:
+    """A merged result is recorded as one search per provider (#164)."""
+
+    @staticmethod
+    def _merged():
+        from scholar.scholar import SearchResult
+        both = Paper(title="Both", authors=["A"], doi="10.1/pp-both")
+        only = Paper(title="Only OA", authors=["B"], doi="10.1/pp-oa")
+        openalex = SearchResult(
+            query="q", provider="openalex", timestamp="t",
+            papers=[both, only], limit=100,
+        )
+        dblp = SearchResult(
+            query="q", provider="dblp", timestamp="t", papers=[both],
+            limit=100, error="non-JSON response",
+        )
+        return openalex.merge(dblp)
+
+    def test_one_record_per_provider(self):
+        session = create_review_session(
+            [self._merged()], "q", session_name="per-provider",
+        )
+        outcomes = {
+            r.provider: (r.query, r.hits, r.error)
+            for r in session.search_records
+        }
+        assert outcomes == {
+            "openalex": ("q", 2, None),
+            "dblp": ("q", 1, "non-JSON response"),
+        }
+        assert session.providers == ["openalex", "dblp"]
+
+    def test_papers_link_to_the_providers_that_returned_them(self):
+        session = create_review_session(
+            [self._merged()], "q", session_name="per-provider",
+        )
+        found = {
+            d.paper.doi: (d.provider, d.found_by) for d in session.decisions
+        }
+        assert found["10.1/pp-oa"] == ("openalex", [("q", "openalex", "")])
+        assert found["10.1/pp-both"] == (
+            "openalex, dblp", [("q", "openalex", ""), ("q", "dblp", "")],
+        )
+
+    def test_old_merged_record_loads_unchanged(self):
+        # A merged record of providers this run does not all cover
+        # (scopus was not re-run), so it is not superseded
+        # (sec:superseded-merged) and must stay as it was.
+        import json
+        from scholar.review import _get_sessions_dir
+        old = {"query": "q | q", "provider": "openalex, scopus",
+               "filters": None, "limit": 100, "hits": 25,
+               "error": "scopus: HTTP 500", "retries": 0}
+        path = _get_sessions_dir() / "merged-old.json"
+        path.write_text(json.dumps({
+            "query": "q", "name": "merged-old",
+            "providers": ["openalex, scopus"],
+            "timestamp": datetime.now().isoformat(),
+            "search_records": [old], "decisions": [],
+        }))
+        session = create_review_session(
+            [self._merged()], "q", session_name="merged-old",
+        )
+        save_session(session)
+        records = json.loads(path.read_text())["search_records"]
+        assert [r["provider"] for r in records] == [
+            "openalex", "dblp", "openalex, scopus",
+        ]
+        merged = records[2]
+        assert {k: merged[k] for k in old} == old
 @
 
 Extracting tags from a [[ReviewDecisionRecord]] is useful for backward compatibility
@@ -3325,6 +4480,11 @@ def read_session_file(session_path: Path) -> ReviewSession:
                     hits=rec.get("hits"),
                     error=rec.get("error"),
                     retries=rec.get("retries") or 0,
+                    total=rec.get("total"),
+                    total_estimated=rec.get("total_estimated") is True,
+                    searched_at=rec.get("searched_at"),
+                    fetched_at=rec.get("fetched_at"),
+                    from_cache=rec.get("from_cache"),
                 )
                 for rec in data["search_records"]
             ]
@@ -3445,6 +4605,11 @@ data = {
             "hits": r.hits,
             "error": r.error,
             "retries": r.retries,
+            "total": r.total,
+            "total_estimated": r.total_estimated,
+            "searched_at": r.searched_at,
+            "fetched_at": r.fetched_at,
+            "from_cache": r.from_cache,
         }
         for r in session.search_records
     ],
@@ -3625,7 +4790,16 @@ the same ids.)  Search records and snowball rounds only
 ever accumulate, so we add any that only the file has; a record is the
 file's own when no record here has its key (query, provider and
 filters, \cref{sec:search-record-key}), so a run of the same query with
-other filters in another process is kept beside ours.  So do a paper's
+other filters in another process is kept beside ours.  When both hold a
+record of the same search, the two are not merged field by field but
+one is kept, by the same rules as when a search is re-run
+([[preferred_record]], \cref{sec:wider-record}): without that, a
+process still holding the narrow record of a [[-l 5]] run saved it over
+the [[-l 0]] record another process had saved meanwhile, and fifty
+papers linked to a search that returns five.  This needs no baseline,
+since the rules judge the records themselves; when they cannot tell the
+two apart, ours is kept, as before.  The links need no repointing,
+since both records have the same key.  So do a paper's
 links to the searches that returned it ([[found_by]],
 \cref{sec:review-found-by}): each is a fact about a search that ran, not
 a judgement, so the links the file holds for a paper are added to the
@@ -3735,15 +4909,21 @@ def merge_concurrent_changes(
 
     <<merge research context from disk>>
 
-    own_keys = {r.key for r in session.search_records}
+    own_index = {r.key: i for i, r in enumerate(session.search_records)}
     for record in on_disk.search_records:
-        if record.key not in own_keys and record.key not in replaced:
+        if record.key in own_index:
+            i = own_index[record.key]
+            session.search_records[i] = preferred_record(
+                session.search_records[i], record
+            )
+        elif record.key not in replaced:
             session.search_records.append(record)
     own_rounds = {r.timestamp for r in session.snowball_rounds}
     for snowball_round in on_disk.snowball_rounds:
         if snowball_round.timestamp not in own_rounds:
             session.snowball_rounds.append(snowball_round)
     <<merge the LLM review samples from disk>>
+    supersede_merged_records(session)
 
     session._invalidate_cache()
 @
@@ -3851,6 +5031,77 @@ if on_disk is not None:
 The window that remains, between reading the file and replacing it, is
 milliseconds instead of hours, and [[save_session]] closes it by holding
 [[file_lock]] across both.
+
+A save can also fail for want of space.  A review that ran with a full
+temporary volume left three copied sessions with more search records
+than before (73 became 85 in one), which did not happen again on a
+clean run.  Let's verify what a full disk does to a save: the write
+fails part-way (the temporary file is written, its [[fsync]] reports
+[[ENOSPC]]), the error reaches the caller, the session file is
+byte for byte what it was, no temporary file is left, and neither a
+second save of the same session object nor a fresh append of the same
+search adds a record or a paper that a clean run would not.  The
+records are compared with what a clean run produces.
+
+<<test functions>>=
+class TestSaveOnAFullDisk:
+    """A save that runs out of space changes nothing."""
+
+    @staticmethod
+    def _result(query, n, prefix):
+        from scholar.scholar import SearchResult
+        return SearchResult(
+            query=query, provider="openalex", timestamp="t", limit=100,
+            papers=[Paper(title=f"{prefix}{i}", authors=["A"],
+                          doi=f"10.1/full-{prefix}-{i}") for i in range(n)],
+        )
+
+    @staticmethod
+    def _full_disk(monkeypatch):
+        import errno
+        import os
+
+        def fsync(fd):
+            raise OSError(errno.ENOSPC, "No space left on device")
+
+        monkeypatch.setattr(os, "fsync", fsync)
+
+    def _records(self, name):
+        session = load_session(name)
+        return sorted((r.query, r.provider, r.hits)
+                      for r in session.search_records), len(session.decisions)
+
+    def test_failed_save_changes_nothing(self, monkeypatch):
+        import errno
+        from scholar.review import _get_sessions_dir
+
+        for name in ("full", "clean"):
+            save_session(create_review_session(
+                [self._result("q1", 3, "a")], "q1", session_name=name,
+            ))
+        save_session(create_review_session(
+            [self._result("q2", 2, "b")], "q2", session_name="clean",
+        ))
+
+        path = _get_sessions_dir() / "full.json"
+        before = path.read_bytes()
+        appended = create_review_session(
+            [self._result("q2", 2, "b")], "q2", session_name="full",
+        )
+        with monkeypatch.context() as patched:
+            self._full_disk(patched)
+            with pytest.raises(OSError) as raised:
+                save_session(appended)
+        assert raised.value.errno == errno.ENOSPC
+        assert path.read_bytes() == before
+        assert not list(path.parent.glob(".full.json.*.tmp"))
+
+        save_session(appended)
+        save_session(create_review_session(
+            [self._result("q2", 2, "b")], "q2", session_name="full",
+        ))
+        assert self._records("full") == self._records("clean")
+@
 
 Now the regression test for the incident.  Process~A (the enrichment)
 loads the session; process~B sets the research context and classifies,
@@ -5855,13 +7106,17 @@ def search_outcomes(
     return [
         (
             r.query, r.provider, " ".join(filter_flags(r.filters)),
-            hits_label(
-                r.hits, r.error, r.retries,
-                ranked=is_ranked_provider(r.provider),
-            ),
+            search_outcome_label(r),
         )
         for r in session.search_records
     ]
+
+
+def search_dates(session: ReviewSession) -> list[str]:
+    """The dates label of each search, parallel to `search_outcomes`."""
+    if not session.search_records:
+        return ["" for _ in get_query_provider_pairs(session)]
+    return [search_dates_label(r) for r in session.search_records]
 
 
 def searches_share_query(session: ReviewSession) -> bool:
@@ -5876,12 +7131,244 @@ def search_table_needed(session: ReviewSession) -> bool:
         provider_queries_differ(session)
         or any_search_failed(session)
         or searches_share_query(session)
+        or len(searched_queries(session)) > 1
+        or any(
+            r.hits is not None or r.searched_at or r.fetched_at
+            for r in session.search_records
+        )
     )
 
 
 def any_search_failed(session: ReviewSession) -> bool:
     """Whether any recorded search failed."""
     return any(r.error for r in session.search_records)
+@
+
+The parameters above the table used to be the session's [[query]] and
+[[providers]], which each append overwrites: a session of six searches
+on six providers reported \enquote{The search covered scopus}, the
+provider of the last append
+(\url{https://github.com/dbosk/scholar/issues/163}).  They are now
+derived from all search records: every provider any record names (the
+providers of a merged record each count, \cref{sec:merged-records}),
+the one query if all records share it and otherwise their number, and
+the period in which the databases answered ([[search_source_date]]),
+with the number of searches whose date is unknown.  A provider is
+listed among those searched only if it answered at least one search,
+as in the caption of the audit table: one that was skipped or failed
+outright every time was not searched, and the report says so, with the
+reason, under \enquote{Not searched}, so that a reader sees the gap
+instead of a database the review never reached.  A provider that an
+old merged record with papers names as failed may have answered part
+of that search or nothing of it, which the record cannot tell; it is
+listed among the providers searched, with the note the caption gives
+it, \enquote{failed or incomplete in a merged record}
+([[searched_providers_text]]), so the report and the caption say the
+same.  The table itself
+appears whenever a record knows its outcome or its dates, so that each
+search is described with them, in a Date column when any date is
+known; only a session whose records know neither, from before outcomes
+were kept, still gets the table under the old conditions alone, and
+its report looks as it did.  Sessions without any records fall back to
+the session's own fields.
+
+<<review report generation>>=
+def provider_failure(record: SearchRecord, name: str) -> str | None:
+    """Why provider `name` answered nothing in `record`, or None.
+
+    A merged record's error is split at its provider prefixes; a
+    provider it names failed outright only if the record has no papers.
+    """
+    if not record.is_merged:
+        return record.error if failed_outright(record) else None
+    if record.hits or name not in merged_record_failures(record):
+        return None
+    for segment in (record.error or "").split("; "):
+        prefix, _, reason = segment.partition(":")
+        if prefix.strip() == name:
+            return reason.strip()
+    return record.error
+
+
+def searched_providers(session: ReviewSession) -> list[str]:
+    """The providers that answered at least one search, in order."""
+    if not session.search_records:
+        return list(session.providers)
+    names: list[str] = []
+    for record in session.search_records:
+        for name in record.merged_providers:
+            if name not in names and provider_failure(record, name) is None:
+                names.append(name)
+    return names
+
+
+def unsearched_providers(session: ReviewSession) -> list[tuple[str, str]]:
+    """`(provider, reason)` for each provider that answered no search."""
+    answered = set(searched_providers(session))
+    reasons: dict[str, str] = {}
+    for record in session.search_records:
+        for name in record.merged_providers:
+            if name not in answered and name not in reasons:
+                reasons[name] = provider_failure(record, name) or ""
+    return list(reasons.items())
+
+
+def searched_providers_text(session: ReviewSession) -> str:
+    """The providers searched, each failure in a merged record noted.
+
+    A provider that a merged record with papers names as failed
+    answered in part or not at all, which the record cannot tell;
+    it is noted as the audit caption notes it.
+    """
+    noted = {
+        name for record in session.search_records
+        if record.hits for name in merged_record_failures(record)
+    }
+    return ", ".join(
+        f"{name} (failed or incomplete in a merged record)"
+        if name in noted else name
+        for name in searched_providers(session)
+    )
+
+
+def unsearched_text(session: ReviewSession) -> str:
+    """The providers that answered no search, each with its reason."""
+    return ", ".join(
+        f"{name} ({reason})" if reason else name
+        for name, reason in unsearched_providers(session)
+    )
+
+
+def searched_queries(session: ReviewSession) -> list[str]:
+    """The distinct queries of the session's search records, in order."""
+    if not session.search_records:
+        return [session.query]
+    return list(dict.fromkeys(r.query for r in session.search_records))
+
+
+def search_period(session: ReviewSession) -> str:
+    """When the databases answered, "A to B", with unknown dates counted.
+
+    "" when no record knows its date.
+    """
+    dates = [
+        search_source_date(r)
+        for r in answered_records(session.search_records)
+    ]
+    known = sorted(d for d in dates if d)
+    if not known:
+        return ""
+    if known[0] == known[-1]:
+        period = known[0]
+    else:
+        period = f"{known[0]} to {known[-1]}"
+    unknown = len(dates) - len(known)
+    if unknown:
+        period += f" (date unknown for {unknown} of {len(dates)} searches)"
+    return period
+
+
+def search_parameter_items(session: ReviewSession) -> list[tuple[str, str]]:
+    """The `(label, value)` items describing all of the session's searches."""
+    queries = searched_queries(session)
+    if len(queries) == 1:
+        items = [("Query", queries[0])]
+    else:
+        items = [("Queries", f"{len(queries)}, see the table of searches")]
+    items.append(
+        ("Providers", searched_providers_text(session) or "none")
+    )
+    not_searched = unsearched_text(session)
+    if not_searched:
+        items.append(("Not searched", not_searched))
+    period = search_period(session)
+    if period:
+        items.append(("Searched", period))
+    return items
+@
+
+<<test functions>>=
+class TestReportDescribesAllSearches:
+    """The report's search parameters cover every record (#163)."""
+
+    @staticmethod
+    def _session():
+        session = ReviewSession(
+            query="last", providers=["scopus"], timestamp=datetime.now(),
+        )
+        session.search_records = [
+            SearchRecord("first", "openalex", None, 100, hits=12,
+                         fetched_at="2026-10-02T08:00:00+00:00"),
+            SearchRecord("first | first", "dblp, hal", None, 100, hits=3),
+            SearchRecord("last", "scopus", None, 25, hits=25, total=93,
+                         searched_at="2026-11-18T09:00:00+00:00",
+                         fetched_at="2026-11-18T09:00:00+00:00",
+                         from_cache=False),
+        ]
+        return session
+
+    def test_items(self):
+        assert searched_providers(self._session()) == [
+            "openalex", "dblp", "hal", "scopus",
+        ]
+        assert search_parameter_items(self._session()) == [
+            ("Queries", "3, see the table of searches"),
+            ("Providers", "openalex, dblp, hal, scopus"),
+            ("Searched", "2026-10-02 to 2026-11-18 "
+                         "(date unknown for 1 of 3 searches)"),
+        ]
+
+    def test_markdown_lists_every_search(self):
+        lines = build_search_parameters_markdown(self._session())
+        assert "- Providers: openalex, dblp, hal, scopus" in lines
+        assert "| Provider | Query | Hits | Date |" in lines
+        assert ("| scopus | last | 25 of 93 (capped at 25) | "
+                "searched 2026-11-18 |") in lines
+        assert any("merged record (providers dblp, hal)" in line
+                   for line in lines)
+
+    def test_skipped_and_failed_providers_are_not_searched(self):
+        session = self._session()
+        session.search_records += [
+            SearchRecord("first", "ieee", None, 100, hits=0,
+                         error="skipped: daily quota spent; resets 01:00"),
+            SearchRecord("first | first", "wos, arxiv", None, 100, hits=0,
+                         error="wos: HTTP 401; arxiv: HTTP 503"),
+            SearchRecord("last", "hal", None, 100, hits=0,
+                         error="HTTP 500"),
+            SearchRecord("first", "hal", None, 100, hits=4),
+        ]
+        assert searched_providers(session) == [
+            "openalex", "dblp", "hal", "scopus",
+        ]
+        items = dict(search_parameter_items(session))
+        assert items["Not searched"] == (
+            "ieee (skipped: daily quota spent; resets 01:00), "
+            "wos (HTTP 401), arxiv (HTTP 503)"
+        )
+        assert "Not searched: ieee (skipped: daily quota spent" in (
+            build_review_report_abstract(session)
+        )
+
+    def test_failure_in_a_merged_record_is_noted(self):
+        session = self._session()
+        session.search_records[1].error = "dblp: non-JSON response"
+        expected = (
+            "openalex, dblp (failed or incomplete in a merged record), "
+            "hal, scopus"
+        )
+        assert dict(search_parameter_items(session))["Providers"] == expected
+        assert f"The search covered {expected}" in (
+            build_review_report_abstract(session)
+        )
+
+    def test_latex_and_abstract(self):
+        text = "\n".join(build_search_parameters_latex(self._session()))
+        assert r"\item[Providers] openalex, dblp, hal, scopus" in text
+        assert "Base query" not in text
+        assert "The search covered openalex, dblp, hal, scopus" in (
+            build_review_report_abstract(self._session())
+        )
 @
 
 The research context and the search parameters exist in a Markdown and a
@@ -5892,7 +7379,8 @@ ran a query different from the base query, since otherwise it would
 repeat the base query once per provider---or when a search failed,
 since the failure must be visible either way, or when two searches
 share their query and provider, since only the table's filters column
-tells them apart.
+tells them apart, or when any record knows its outcome or dates (see
+above).
 
 <<review report generation>>=
 def build_research_context_markdown(
@@ -5918,34 +7406,36 @@ def build_search_parameters_markdown(
 ) -> list[str]:
     """Build search parameters (including executed queries) as Markdown lines."""
     heading = "#" * heading_level
-    providers = ", ".join(session.providers)
 
-    lines: list[str] = [
-        f"{heading} Search Parameters",
-        "",
-        f"- Base query: {session.query}",
-        f"- Providers: {providers}",
-        "",
-    ]
+    lines: list[str] = [f"{heading} Search Parameters", ""]
+    lines.extend(
+        f"- {label}: {value}"
+        for label, value in search_parameter_items(session)
+    )
+    lines.append("")
 
     if search_table_needed(session):
         heading2 = "#" * (heading_level + 1)
         outcomes = search_outcomes(session)
+        dates = search_dates(session)
         with_hits = any(label for *_, label in outcomes)
         with_flags = any(flags for _, _, flags, _ in outcomes)
+        with_dates = any(dates)
         columns = ["Provider", "Query"]
         columns += ["Filters"] if with_flags else []
         columns += ["Hits"] if with_hits else []
+        columns += ["Date"] if with_dates else []
         lines.extend([
             f"{heading2} Provider-specific queries",
             "",
             "| " + " | ".join(columns) + " |",
             "|" + " --- |" * len(columns),
         ])
-        for query, provider, flags, label in outcomes:
+        for (query, provider, flags, label), date in zip(outcomes, dates):
             cells = [provider, query]
             cells += [f"`{flags}`" if flags else ""] if with_flags else []
             cells += [label] if with_hits else []
+            cells += [date] if with_dates else []
             lines.append("| " + " | ".join(cells) + " |")
         lines.append("")
 
@@ -5978,23 +7468,20 @@ def build_search_parameters_latex(
     heading_command: str = r"\section",
 ) -> list[str]:
     """Build search parameters (including executed queries) as LaTeX lines."""
-    providers = ", ".join(session.providers)
-
     lines: list[str] = [f"{heading_command}{{Search Parameters}}", ""]
+    lines.append(r"\begin{description}")
     lines.extend(
-        [
-            r"\begin{description}",
-            f"\\item[Base query] {escape_latex(session.query)}",
-            f"\\item[Providers] {escape_latex(providers)}",
-            r"\end{description}",
-            "",
-        ]
+        f"\\item[{label}] {escape_latex(value)}"
+        for label, value in search_parameter_items(session)
     )
+    lines.extend([r"\end{description}", ""])
 
     if search_table_needed(session):
         outcomes = search_outcomes(session)
+        dates = search_dates(session)
         with_hits = any(label for *_, label in outcomes)
         with_flags = any(flags for _, _, flags, _ in outcomes)
+        with_dates = any(dates)
         spec = "lp{8cm}" if with_hits else "lp{10cm}"
         header = ["Provider", "Query"]
         if with_flags:
@@ -6003,6 +7490,11 @@ def build_search_parameters_latex(
         if with_hits:
             spec += "p{3.5cm}"
             header.append("Hits")
+        if with_dates:
+            spec = spec.replace("p{8cm}", "p{5cm}").replace(
+                "p{6cm}", "p{4cm}"
+            ) + "p{3.5cm}"
+            header.append("Date")
         lines.extend(
             [
                 f"{sub_heading(heading_command)}{{Provider-specific queries}}",
@@ -6012,12 +7504,14 @@ def build_search_parameters_latex(
                 r"\midrule",
             ]
         )
-        for query, provider, flags, label in outcomes:
+        for (query, provider, flags, label), date in zip(outcomes, dates):
             cells = [escape_latex(provider), escape_latex(query)]
             if with_flags:
                 cells.append(latex_flags(flags))
             if with_hits:
                 cells.append(escape_latex(label))
+            if with_dates:
+                cells.append(escape_latex(date))
             lines.append(" & ".join(cells) + r" \\")
         lines.extend(
             [
@@ -6029,6 +7523,12 @@ def build_search_parameters_latex(
 
     return lines
 @
+
+Until \url{https://github.com/dbosk/scholar/issues/163} one plain search
+that answered got no table, and so its count appeared nowhere in the
+report; the last test below asserted that.  It now asserts the opposite
+for such a search, and keeps the old expectation for a record that
+knows no outcome, whose report looks as it did.
 
 Let's verify the table for one query run twice on OpenAlex, over the
 full text and with [[--in title-abstract]] (the counts are those of the
@@ -6067,12 +7567,19 @@ class TestReportShowsSearchFilters:
             r"openalex & Q & \texttt{-{}-in title-abstract} & 192 \\"
         ) in text
 
-    def test_no_table_for_one_plain_search(self):
+    def test_no_table_for_one_plain_search_without_outcome(self):
         session = self._session()
-        session.search_records = session.search_records[:1]
+        session.search_records = [SearchRecord("Q", "openalex", None, 1000)]
         assert not any(
             "Provider-specific" in line
             for line in build_search_parameters_markdown(session)
+        )
+
+    def test_one_plain_search_with_outcome_is_described(self):
+        session = self._session()
+        session.search_records = session.search_records[:1]
+        assert "| openalex | Q | 2130 |" in (
+            build_search_parameters_markdown(session)
         )
 @
 
@@ -7034,11 +8541,14 @@ def build_review_report_abstract(session: ReviewSession) -> str:
     else:
         lead = "This report documents a systematic literature review session."
 
-    providers = ", ".join(session.providers)
+    providers = searched_providers_text(session) or "no database"
     summary = (
         f"{lead} The search covered {providers} and yielded {total} papers "
         f"({kept} kept, {discarded} discarded, {pending} pending)."
     )
+    not_searched = unsearched_text(session)
+    if not_searched:
+        summary += f" Not searched: {not_searched}."
 
     sources = decision_sources_sentence(session.decisions)
     if sources:
@@ -7299,6 +8809,18 @@ AUDIT_STRINGS: dict[str, dict] = {
         "openalex_note": "not open access",
         "search_failed": "failed for {n} of {total} {queries}",
         "search_incomplete": "incomplete for {n} of {total} {queries}",
+        "search_failed_merged": (
+            "failed or incomplete for {n} of {total} {queries},"
+            " in a merged record"
+        ),
+        "search_capped": "capped at the limit for {n} of {total} {queries}",
+        "searched_range": "Searched {start} to {end}.",
+        "searched_on": "Searched {start}.",
+        "dates_unknown": (
+            "Search date unknown for {n} of {total} {searches}."
+        ),
+        "search": "search",
+        "searches": "searches",
         "query": "query",
         "queries": "queries",
         "title": "Title",
@@ -7370,6 +8892,18 @@ AUDIT_STRINGS: dict[str, dict] = {
         "openalex_note": "inte open access",
         "search_failed": "misslyckades för {n} av {total} {queries}",
         "search_incomplete": "ofullständig för {n} av {total} {queries}",
+        "search_failed_merged": (
+            "misslyckades eller ofullständig för {n} av {total}"
+            " {queries}, i en sammanslagen post"
+        ),
+        "search_capped": "nådde träffgränsen för {n} av {total} {queries}",
+        "searched_range": "Sökt {start} till {end}.",
+        "searched_on": "Sökt {start}.",
+        "dates_unknown": (
+            "Sökdatum okänt för {n} av {total} {searches}."
+        ),
+        "search": "sökning",
+        "searches": "sökningar",
         "query": "sökfråga",
         "queries": "sökfrågor",
         "title": "Titel",
@@ -8116,8 +9650,9 @@ def audit_databases_sentence(
         for provider in row.providers:
             if provider not in used and provider not in RANKED_SHORT_NAMES:
                 used.append(provider)
-    for short, (failed, _, total) in shortfalls.items():
-        if failed < total and short not in used:
+    for short, tally in shortfalls.items():
+        failed, total, merged_outright = tally[0], tally[2], tally[5]
+        if failed + merged_outright < total and short not in used:
             used.append(short)
     names: list[str] = []
     for key, short in PROVIDER_SHORT_NAMES.items():
@@ -8172,37 +9707,108 @@ queries} is exactly true when one year range failed and the other
 answered.  Counting the words once would hide either the failure or
 the answer, so the wording stays as it is.
 
+A merged record from before searches were recorded per provider
+(\cref{sec:merged-records}) counts as one query for each of its
+providers.  Its count cannot be split, but its error can be read: the
+merge prefixed each provider's error with the provider
+([[dblp: non-JSON response]]), so the error names the providers that
+failed (\cref{sec:search-result-error} in the [[scholar]] module).
+Before \url{https://github.com/dbosk/scholar/issues/164} the caption
+charged every provider of the record with its failure, and OpenAlex,
+IEEE and arXiv read \enquote{incomplete} when only DBLP had failed;
+a first repair marked none of them unless all had failed, which hid
+the failure in 61 of the 62 merged records with errors in real
+sessions.  So each provider the error names is marked, and only it
+([[merged_record_failures]]).  Whether it failed outright or part-way
+is not recorded per provider, so the note says \enquote{failed or
+incomplete \dots, in a merged record}.  A record with no papers at all
+tells more: every provider it names failed outright, and such a
+provider counts as not searched for that query when the caption
+decides whether to name it.
+
+A search that answered can still have stopped at its limit, and the
+coverage statement should not let a reader take it for the whole
+answer (\url{https://github.com/dbosk/scholar/issues/166}).  So a
+fifth count is of the searches that reached their limit while the
+service reported more, or reported no total at all: \enquote{capped at
+the limit for 2 of 5 queries}.  It is the same test as the
+\enquote{capped at} of [[count_label]] in the [[scholar]] module.
+
 <<review report generation>>=
+def merged_record_failures(record: SearchRecord) -> list[str]:
+    """The providers of a merged record that its error names as failed.
+
+    The merge prefixes each provider's error with the provider, as in
+    "dblp: non-JSON response; scopus: HTTP 500".
+    """
+    if not record.is_merged or not record.error:
+        return []
+    named = {
+        segment.split(":", 1)[0].strip()
+        for segment in record.error.split("; ") if ":" in segment
+    }
+    return [p for p in record.merged_providers if p in named]
+
+
+def search_was_capped(record: SearchRecord) -> bool:
+    """Whether an answered search stopped at its limit with more left.
+
+    True when the hits reached a positive limit and the service
+    reported more, or reported no total; see `count_label`.
+    """
+    if record.error or record.is_merged or not record.limit:
+        return False
+    if record.hits is None or record.hits != record.limit:
+        return False
+    return record.total is None or record.total > record.hits
+
+
 def audit_search_shortfalls(
     records: list[SearchRecord],
-) -> dict[str, tuple[int, int, int]]:
-    """Count failed, incomplete and all searches per provider code."""
+) -> dict[str, tuple[int, int, int, int, int, int]]:
+    """Count searches per provider code: failed, incomplete, all, failed
+    or incomplete inside a merged record, capped, and failed outright
+    inside a merged record without papers."""
     counts: dict[str, list[int]] = {}
     for record in records:
         if is_ranked_provider(record.provider):
             continue
+        failed_here = {
+            short for name in merged_record_failures(record)
+            for short in provider_short_names(name)
+        }
         for short in provider_short_names(record.provider):
-            tally = counts.setdefault(short, [0, 0, 0])
+            tally = counts.setdefault(short, [0, 0, 0, 0, 0, 0])
             tally[2] += 1
-            if record.error and record.hits:
+            if record.is_merged:
+                if short in failed_here:
+                    tally[3] += 1
+                    if not record.hits:
+                        tally[5] += 1
+            elif record.error and record.hits:
                 tally[1] += 1
             elif record.error:
                 tally[0] += 1
+            elif search_was_capped(record):
+                tally[4] += 1
     return {short: tuple(tally) for short, tally in counts.items()}
 
 
 def audit_search_notes(
-    shortfall: tuple[int, int, int] | None, strings: dict
+    shortfall: tuple[int, int, int, int, int, int] | None, strings: dict
 ) -> list[str]:
-    """Localised notes on a database's failed and incomplete searches."""
+    """Localised notes on a database's failed, incomplete and capped
+    searches."""
     if not shortfall:
         return []
-    failed, incomplete, total = shortfall
+    failed, incomplete, total, merged_failed, capped, _ = shortfall
     queries = strings["query"] if total == 1 else strings["queries"]
     notes = []
     for count, template in (
         (failed, strings["search_failed"]),
         (incomplete, strings["search_incomplete"]),
+        (merged_failed, strings["search_failed_merged"]),
+        (capped, strings["search_capped"]),
     ):
         if count:
             notes.append(
@@ -8310,6 +9916,154 @@ class TestAuditDatabasesFailures:
                 build_audit_table_latex(session, label="x", lang=lang)
             )
             assert expected in text
+@
+
+A merged record charges only the providers its error names, and says
+that the failure comes from a merged record, in both languages; a
+provider whose every query failed in a merged record without papers is
+not named.  (The first test asserted, before this was repaired, that a
+DBLP failure in a merged record marked no provider at all.)
+
+<<test functions>>=
+class TestAuditMergedRecords:
+    """Merged records from before #164 in the databases sentence."""
+
+    ROWS = [AuditRow("t", "2020", ["OA", "DBLP"], DecisionStatus.KEPT,
+                     "r", 0)]
+
+    def test_one_failure_marks_only_its_provider(self):
+        records = [SearchRecord("q | q", "openalex, dblp", None, 100,
+                                hits=25, error="dblp: non-JSON response")]
+        assert audit_databases_sentence(
+            self.ROWS, AUDIT_STRINGS["en"], records
+        ) == (
+            "Databases: OpenAlex (OA; not open access), DBLP (failed or "
+            "incomplete for 1 of 1 query, in a merged record)."
+        )
+
+    def test_all_failed_says_merged(self):
+        records = [
+            SearchRecord("q | q", "openalex, dblp", None, 100, hits=0,
+                         error="openalex: HTTP 503; dblp: HTTP 503"),
+            SearchRecord("r", "dblp", None, 100, hits=4),
+        ]
+        rows = [AuditRow("t", "2020", ["DBLP"], DecisionStatus.KEPT,
+                         "r", 0)]
+        assert audit_databases_sentence(
+            rows, AUDIT_STRINGS["en"], records
+        ) == (
+            "Databases: DBLP (failed or incomplete for 1 of 2 queries, "
+            "in a merged record)."
+        )
+        assert "i en sammanslagen post" in audit_databases_sentence(
+            rows, AUDIT_STRINGS["sv"], records
+        )
+@
+
+A search that reached its limit with more left is named as capped, in
+both languages; one that reached it with nothing left, or did not
+reach it, is not:
+
+<<test functions>>=
+class TestAuditCapped:
+    """Searches stopped at their limit are noted (#166)."""
+
+    def test_capped_note(self):
+        records = [
+            SearchRecord("q1", "dblp", None, 100, hits=100, total=2130),
+            SearchRecord("q2", "dblp", None, 100, hits=100),
+            SearchRecord("q3", "dblp", None, 100, hits=100, total=100),
+            SearchRecord("q4", "dblp", None, 100, hits=12, total=12),
+        ]
+        rows = [AuditRow("t", "2020", ["DBLP"], DecisionStatus.KEPT,
+                         "r", 0)]
+        assert audit_databases_sentence(
+            rows, AUDIT_STRINGS["en"], records
+        ) == "Databases: DBLP (capped at the limit for 2 of 4 queries)."
+        assert "nådde träffgränsen för 2 av 4 sökfrågor" in (
+            audit_databases_sentence(rows, AUDIT_STRINGS["sv"], records)
+        )
+@
+
+The caption also says when the databases were searched: the range of
+the dates on which they answered ([[search_source_date]]), as PRISMA
+asks for the date each source was last searched
+(\url{https://github.com/dbosk/scholar/issues/167}).  A cached answer
+counts on the date it was fetched, not on the day of the run that
+served it.  Searches whose date is unknown---records from before dates
+were kept, cached answers whose fetch date the cache does not know---are
+counted in a sentence of their own rather than silently left out of
+the range, and a session with no dates at all gets no sentence, as
+before.
+
+<<review report generation>>=
+def audit_dates_sentence(
+    strings: dict, records: list[SearchRecord] | None
+) -> str:
+    """Say when the searches of `records` were answered; "" if never known."""
+    records = records or []
+    dates = [search_source_date(r) for r in answered_records(records)]
+    known = sorted(d for d in dates if d)
+    if not known:
+        return ""
+    if known[0] == known[-1]:
+        sentence = strings["searched_on"].format(start=known[0])
+    else:
+        sentence = strings["searched_range"].format(
+            start=known[0], end=known[-1]
+        )
+    unknown = len(dates) - len(known)
+    if unknown:
+        noun = strings["search"] if len(dates) == 1 else strings["searches"]
+        sentence += " " + strings["dates_unknown"].format(
+            n=unknown, total=len(dates), searches=noun
+        )
+    return sentence
+@
+
+<<test functions>>=
+class TestAuditDates:
+    """The caption says when the databases answered (#167)."""
+
+    def test_range_and_unknown(self):
+        records = [
+            SearchRecord("q1", "openalex", searched_at="2026-11-18T09:00:00"
+                         "+00:00", fetched_at="2026-10-02T08:00:00+00:00",
+                         from_cache=True),
+            SearchRecord("q2", "dblp", searched_at="2026-11-18T09:00:00"
+                         "+00:00", fetched_at="2026-11-18T09:00:00+00:00",
+                         from_cache=False),
+            SearchRecord("q3", "hal", searched_at="2026-11-18T09:00:00"
+                         "+00:00", from_cache=True),
+            SearchRecord("q4", "hal"),
+        ]
+        assert audit_dates_sentence(AUDIT_STRINGS["en"], records) == (
+            "Searched 2026-10-02 to 2026-11-18. "
+            "Search date unknown for 2 of 4 searches."
+        )
+        assert audit_dates_sentence(AUDIT_STRINGS["sv"], records) == (
+            "Sökt 2026-10-02 till 2026-11-18. "
+            "Sökdatum okänt för 2 av 4 sökningar."
+        )
+
+    def test_one_day_and_none(self):
+        one = [SearchRecord("q", "dblp", fetched_at="2026-11-18T09:00:00"
+                            "+00:00")]
+        assert audit_dates_sentence(AUDIT_STRINGS["en"], one) == (
+            "Searched 2026-11-18."
+        )
+        assert audit_dates_sentence(
+            AUDIT_STRINGS["en"], [SearchRecord("q", "dblp")]
+        ) == ""
+
+    def test_caption_carries_the_dates(self):
+        session = _audit_session()
+        session.search_records = [
+            SearchRecord("q", "dblp", hits=2,
+                         fetched_at="2026-10-02T08:00:00+00:00"),
+        ]
+        text = "\n".join(build_audit_table_latex(session, label="x"))
+        assert "Searched 2026-10-02." in text
 @
 
 A query run with two filter sets counts as two queries, as argued above:
@@ -8507,6 +10261,7 @@ def build_audit_table_latex(
     databases = " ".join(filter(None, [
         audit_databases_sentence(rows, strings, session.search_records),
         audit_semantic_sentence(rows, strings, session.search_records),
+        audit_dates_sentence(strings, session.search_records),
     ]))
     if bearing_only:
         template = strings["bearing"]
