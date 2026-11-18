@@ -1619,6 +1619,9 @@ class SemanticScholarProvider:
         self._limiter.limits = self._current_limits()
         self.last_error: str | None = None
         self.last_retries = 0
+        self.last_via: str | None = None
+        self.last_total: int | None = None
+        self.last_total_estimated = False
 
     def is_available(self) -> bool:
         """Semantic Scholar is always available (API key is optional)."""
@@ -2312,27 +2315,250 @@ def check(self) -> tuple[str, str]:
     )
 @
 
-\subsubsection{Search method}
+\subsubsection{Two search endpoints}
+\label{sec:s2-two-searches}
 
-The search method calls the API with rate limiting and handles errors.
-When the user requests more results than a single API call can return (the
-Semantic Scholar API caps at 100 results per request), we automatically fetch
-multiple pages using the [[offset]] parameter.
+Semantic Scholar has two keyword searches, and they answer different
+questions.
+Their API description
+(\url{https://api.semanticscholar.org/graph/v1/swagger.json}, read
+18~November 2026) says this of them:
+\begin{description}
+\item[The relevance search] ([[/graph/v1/paper/search]]) takes
+  \enquote{A plain-text search query string}, for which \enquote{No
+  special query syntax is supported}.
+  It \enquote{Can only return up to 1,000 relevance-ranked results},
+  and a page holds at most a hundred (its [[limit]] \enquote{Must be
+  <= 100}).
+\item[The bulk search] ([[/graph/v1/paper/search/bulk]]) is
+  \enquote{intended for bulk retrieval of basic paper data without
+  search relevance}.
+  Its \enquote{Text query is optional and supports boolean logic for
+  document matching}; it is \enquote{matched against the paper's title
+  and abstract}, and \enquote{All terms are stemmed in English}.
+  \enquote{Up to 1,000 papers will be returned in each call}, and
+  \enquote{If there are more matching papers, a continuation "token"
+  will be present}; \enquote{Up to 10,000,000 papers can be fetched
+  via this method}.
+  Its results come in the order of their paper ids, not of relevance:
+  \enquote{The default field is paperId and the default order is
+  asc}.
+\end{description}
 
-This pagination is transparent to the caller: they simply request the number of
-results they want, and the provider handles the underlying paging.
-The loop terminates when we have fetched enough results, when the API returns
-no more data, or when we reach the total number of available results.
+The provider used to call the relevance search only.
+A Boolean query, as a review protocol sends to every database, then
+came back with a total of 0 and no error, and a session recorded it as
+\enquote{this database holds no matching record}
+(\url{https://github.com/dbosk/scholar/issues/161}, which measured 0
+there and 780 on the bulk search for the same query).
+And [[--limit 0]] could not mean \enquote{everything}, since the
+relevance search stops at a thousand.
 
-\label{sec:s2-search-cacheable}
-As with DBLP, [[search]] caches only \emph{trustworthy} results.  A rate
-limit, a rejected key, or an HTTP/parse error can cut a search short, and the
-persistent pickle cache would otherwise freeze that partial or empty result for
-every later call with the same arguments.  We therefore split the work: the
-inner [[_search_uncached]] reports a [[cacheable]] flag alongside its papers,
-and the thin [[search]] wrapper writes to the cache only when that flag is
-true.  Partial results are still \emph{returned} to the caller---the user sees
-what we managed to fetch---they are just not cached.
+So the provider now picks the endpoint for each search:
+\begin{description}
+\item[The bulk search] for a query that uses operators
+  (\cref{sec:s2-operators}), and for any query searched without a
+  limit ([[--limit 0]]).
+  It is the only endpoint that reads the operators, and the only one
+  without a ceiling that a review reaches.
+\item[The relevance search] for a plain-word query with a limit, as
+  before.
+  A limit is where its ranking pays: the first hundred of a ranked
+  list are the hundred most relevant works, while the bulk search's
+  first hundred would be the hundred lowest paper ids.
+\end{description}
+The choice depends on the query and the limit only, so the command
+that [[prov found-via]] rebuilds from a session record reaches the same
+endpoint again.
+The record still says which endpoint answered
+(\cref{sec:s2-via}): a reader should not need to know this rule to
+read the record.
+
+What the bulk search does differently is the user's to know, and
+[[scholar syntax]] says it (\cref{ch:syntax-cli}).
+It stems its terms, so its counts are not comparable word for word
+with those of a provider that does not.
+It matches title and abstract only, which is also what the warning
+for [[--in title-abstract]] (\cref{sec:providers-search-in}) leads to
+there: it says that the provider's default fields are searched, and
+for the bulk search those are title and abstract.
+
+\paragraph{Telling a Boolean query from plain words.}
+\label{sec:s2-operators}
+A query goes to the bulk search when it contains scholar's Boolean
+words in upper case ([[AND]], [[OR]], [[NOT]]), as every provider with
+Boolean operators requires (\cref{ch:syntax-cli}), or anything else
+the relevance search would read as plain text but the bulk search reads
+as syntax: a quoted phrase, parentheses, or the bulk search's own
+operators ([[|]], a leading [[+]] or [[-]], a trailing [[*]]).
+Lower-case [[and]] and [[or]] stay words, as on the other providers.
+A hyphen inside a word ([[multi-factor]]) is not an operator here:
+only a [[-]] at the start of a word is.
+
+<<semantic scholar constants>>=
+S2_OPERATOR_PATTERN = re.compile(
+    r'\b(?:AND|OR|NOT)\b'
+    r'|["()|*]'
+    r'|(?:^|\s)[+-](?=\S)'
+)
+<<semantic scholar helpers>>=
+def s2_has_operators(query: str) -> bool:
+    """Whether `query` uses syntax the relevance search reads as words."""
+    return bool(S2_OPERATOR_PATTERN.search(query))
+
+
+def s2_uses_bulk(query: str, limit: int | None) -> bool:
+    """Whether a search goes to the bulk search, not the relevance one.
+
+    Queries with operators and searches without a limit (`None`, `0`,
+    or the CLI's `UNLIMITED_PROVIDER_LIMIT`) go to the bulk search.
+    """
+    unlimited = (
+        not limit or limit <= 0 or limit >= UNLIMITED_PROVIDER_LIMIT
+    )
+    return unlimited or s2_has_operators(query)
+@
+
+Let's pin the rule down, with the cases that differ in one thing:
+
+<<test functions>>=
+class TestS2EndpointChoice:
+  """Which Semantic Scholar search a query and a limit go to."""
+
+  @pytest.mark.parametrize("query", [
+    "machine learning privacy",
+    "multi-factor authentication",
+    "research and development or not",
+  ])
+  def test_plain_words_with_a_limit_stay_on_relevance(self, query):
+    assert not s2_uses_bulk(query, 100)
+
+  @pytest.mark.parametrize("query", [
+    "phishing AND mfa",
+    "phishing OR mfa",
+    "phishing NOT mfa",
+    '"two-factor authentication"',
+    "(phishing mfa)",
+    "phishing | mfa",
+    "phishing -mfa",
+    "+phishing mfa",
+    "authenticat*",
+  ])
+  def test_operators_go_to_bulk(self, query):
+    assert s2_uses_bulk(query, 100)
+
+  @pytest.mark.parametrize("limit", [0, None, -1, UNLIMITED_PROVIDER_LIMIT])
+  def test_no_limit_goes_to_bulk(self, limit):
+    assert s2_uses_bulk("machine learning privacy", limit)
+@
+
+\paragraph{Translating the operators.}
+The bulk search's syntax is not scholar's: \enquote{[[+]] for AND
+operation}, \enquote{[[|]] for OR operation}, \enquote{[[-]] negates a
+term}, \enquote{[["]] collects terms into a phrase}, and
+\enquote{[[(]] and [[)]] for precedence} (the [[query]] parameter of
+the bulk search in the API description cited above).
+[[s2_bulk_query]] translates the three words and leaves everything
+else as the user wrote it: the same terms, phrases and parentheses are
+sent, only the operators are spelt the bulk search's way.
+[[NOT]] becomes a [[-]] on whatever follows it, and [[AND NOT]] the
+same, since \enquote{By default all terms in the query must be
+present}: the [[AND]] adds nothing there.
+The description shows [[-]] negating a word only
+(\enquote{[[fish -ladder]]}); what it does before a parenthesis or a
+phrase is not documented, so a query that relies on [[NOT (...)]]
+should be checked by hand.
+Nor does the description state a precedence between [[+]] and [[|]],
+so a query that mixes [[AND]] and [[OR]] should group them in
+parentheses, as the issue's queries did.
+
+Quoted phrases are left alone, operators and all: an upper-case
+[[AND]] inside quotes is a word of the phrase.
+Splitting on the phrases first, with a capturing group, puts them at
+the odd positions of the list and the text between them at the even
+ones, so only the even parts are translated.
+
+<<semantic scholar constants>>=
+S2_PHRASE = re.compile(r'("[^"]*")')
+S2_BULK_TRANSLATION = (
+    (re.compile(r"\s+AND\s+NOT\s+"), " -"),
+    (re.compile(r"(?<![^\s(])NOT\s+"), "-"),
+    (re.compile(r"\s+AND\s+"), " + "),
+    (re.compile(r"\s+OR\s+"), " | "),
+)
+<<semantic scholar helpers>>=
+def s2_bulk_query(query: str) -> str:
+    """Translate scholar's Boolean words into the bulk search's syntax.
+
+    `AND` becomes `+`, `OR` becomes `|` and `NOT` a `-` on what
+    follows it; quoted phrases and everything else are kept as written.
+    """
+    parts = S2_PHRASE.split(query)
+    for i in range(0, len(parts), 2):
+        for pattern, replacement in S2_BULK_TRANSLATION:
+            parts[i] = pattern.sub(replacement, parts[i])
+    return "".join(parts)
+@
+
+<<test functions>>=
+class TestS2BulkQuery:
+  """scholar's Boolean words in the bulk search's syntax."""
+
+  @pytest.mark.parametrize("query, sent", [
+    ("a AND b", "a + b"),
+    ("a OR b", "a | b"),
+    ("a NOT b", "a -b"),
+    ("a AND NOT b", "a -b"),
+    ("NOT a", "-a"),
+    ("(a OR b) AND NOT (c)", "(a | b) -(c)"),
+    ('"a AND b" OR c', '"a AND b" | c'),
+    ('x AND NOT "y z"', 'x -"y z"'),
+    ("research and development", "research and development"),
+  ])
+  def test_translation(self, query, sent):
+    assert s2_bulk_query(query) == sent
+
+  def test_the_issues_query(self):
+    """The query of issue #161, as the review sent it to S2 by hand."""
+    query = (
+      '("multi-factor authentication" OR "2FA") AND '
+      '(bypass OR "man-in-the-middle")'
+    )
+    assert s2_bulk_query(query) == (
+      '("multi-factor authentication" | "2FA") + '
+      '(bypass | "man-in-the-middle")'
+    )
+@
+
+\subsubsection{The search method}
+
+[[search]] picks the endpoint, serves the cache, and reads off what a
+session needs to record besides the papers.
+As with DBLP, it caches only \emph{trustworthy} results
+\label{sec:s2-search-cacheable}%
+(\cref{sec:cache-successful-only}).
+A rate limit, a rejected key, or an HTTP or parse error can cut a
+search short, and the persistent pickle cache would otherwise freeze
+that partial or empty result for every later call with the same
+arguments.
+So the two paged searches, [[_search_uncached]] (relevance) and
+[[_search_bulk]], each report a [[cacheable]] flag alongside their
+papers, and the wrapper writes to the cache only when that flag is
+true.
+Partial results are still \emph{returned}: the user sees what we
+managed to fetch, and [[last_error]] marks them incomplete.
+
+A bulk result is cached under its own key, the relevance key with
+[[S2_VIA_BULK]] added as a fourth part, as Scopus keys its complete
+view (\cref{sec:scopus-cache-view}).
+This is what makes the change safe for caches filled before it.
+The cache never expires, and it holds what the relevance search
+answered to Boolean queries and to [[--limit 0]]: for a Boolean query
+that is the zero this section began with.
+Under the old key, the bulk search would serve that zero again; under
+a new one it asks.
+A plain-word query with a limit keeps the old key and its cached
+relevance answers, so nothing that was right is fetched again.
 
 <<semantic scholar search method>>=
 def search(
@@ -2344,97 +2570,528 @@ def search(
     """
     Search Semantic Scholar for papers matching the query.
 
-    Automatically fetches multiple pages if the requested limit exceeds
-    the API's per-request maximum (100 results per page).
+    A query with operators, or a search without a limit, goes to the
+    bulk search; plain words with a limit to the relevance search.
+    Both are paged automatically.
     """
     self.last_error = None
     self.last_retries = 0
+    bulk = s2_uses_bulk(query, limit)
+    self.last_via = S2_VIA_BULK if bulk else None
     cache_key = (query, limit, filters.cache_key() if filters else "")
+    if bulk:
+        cache_key += (S2_VIA_BULK,)
     if cache_key in self._cache:
-        return self._cache[cache_key]
-
-    papers, cacheable = self._search_uncached(query, limit, filters)
-    if cacheable:
-        self._cache[cache_key] = papers
+        papers = self._cache[cache_key]
     else:
-        self.last_error = SEARCH_CUT_SHORT
+        fetch = self._search_bulk if bulk else self._search_uncached
+        papers, cacheable = fetch(query, limit, filters)
+        if cacheable:
+            self._cache[cache_key] = papers
+        else:
+            self.last_error = SEARCH_CUT_SHORT
+    <<note the total the answer reported>>
+    if not bulk and self.last_error is None:
+        self.last_error = s2_relevance_ceiling_error(papers, limit)
     return papers
+<<semantic scholar constants>>=
+S2_VIA_BULK = "bulk"
+@
 
+\paragraph{The total and the endpoint.}
+\label{sec:s2-via}
+A session record says how many papers a search returned; what the
+database holds is a second number, and a reader needs both to tell a
+complete answer from a capped one.
+Both searches report it as [[total]], and the API description says the
+same of both: \enquote{Approximate number of matching search results}
+(the [[PaperRelevanceSearchBatch]] and [[PaperBulkSearchBatch]]
+schemas), so the provider marks it as an estimate for both
+([[last_total_estimated]]).
+The two attributes follow the protocol of [[last_error]]: reset on
+every search, set from the answer, read by [[Search.execute]].
+[[last_via]] names the endpoint: [[S2_VIA_BULK]] for the bulk search,
+[[None]] for the provider's default, the relevance search.
+[[Search.execute]] copies it onto the result as [[via]], and the
+session record keeps it (\cref{sec:search-result-via} in the scholar
+module).
+
+A cache hit has to report the total too, or a search run again from
+the cache would read as \enquote{total unknown} although it was known.
+So the paged searches return a [[PapersWithTotal]]: a list of the
+papers that also carries the total, as [[RankedPapers]] carries the
+scores of a semantic search (\cref{sec:openalex-semantic}).
+Being a list, it passes through every caller unchanged; being what is
+cached, it brings the total back from the cache.
+An entry cached before this change is a plain list, and its total
+reads as unknown, never as a wrong number.
+The class is pickled into the cache by name, so renaming it would make
+those entries unreadable: it keeps its name.
+
+<<note the total the answer reported>>=
+self.last_total = getattr(papers, "total", None)
+self.last_total_estimated = self.last_total is not None
+<<semantic scholar helpers>>=
+class PapersWithTotal(list):
+    """Papers with the total that the service reported for the search.
+
+    `total` is None when the answer gave none or was never read.
+    """
+
+    def __init__(self, papers=(), total=None):
+        super().__init__(papers)
+        self.total = total
+
+
+def s2_total(data) -> int | None:
+    """The `total` of a Semantic Scholar answer, or None if it has none.
+
+    The API description types it as a string; the live service sent
+    an integer (2026-11-18).  Both are read.
+    """
+    total = data.get("total") if isinstance(data, dict) else None
+    if isinstance(total, bool):
+        return None
+    try:
+        return int(total)
+    except (TypeError, ValueError):
+        return None
+@
+
+A page can be refused in two ways that both searches handle alike: a
+429 that outlasted the retries of [[_send]] (\cref{sec:s2-retrying}),
+with a hint about the key, and a 403 that [[_request]] has already
+logged.
+Neither is an answer, so either ends the search as not cacheable.
+
+<<semantic scholar search method>>=
+def _page_refused(self, response: requests.Response) -> bool:
+    """Whether a page was refused (429 or 403); a 429 gets a key hint."""
+    if response.status_code == 429:
+        logger.warning(
+            "s2: Rate limited (429). "
+            "Get a free API key at "
+            "https://www.semanticscholar.org/product/api#api-key-form "
+            "and set S2_API_KEY environment variable."
+        )
+        return True
+    return response.status_code == 403
+@
+
+\paragraph{The relevance search.}
+When the user requests more results than one call returns, the
+relevance search fetches page after page with the [[offset]]
+parameter, until it has enough, until the service has no more, or
+until it reaches the total the service reported.
+It also stops at the thousandth result, the most this endpoint returns
+(\cref{sec:s2-two-searches}), rather than asking for a page beyond it.
+
+<<semantic scholar search method>>=
 def _search_uncached(
     self,
     query: str,
     limit: int,
     filters: SearchFilters | None,
 ) -> tuple[list[Paper], bool]:
-    """Run the paged search, returning ``(papers, cacheable)``.
+    """Run the paged relevance search, returning ``(papers, cacheable)``.
 
     ``cacheable`` is False when a transient failure (rate limit, rejected
     key, HTTP or parse error) truncated the search, so the caller can avoid
     freezing a partial or empty result into the cache.
     """
-    all_papers: list[Paper] = []
+    papers = PapersWithTotal()
     offset = 0
-    page_size = min(limit, 100)  # S2 API returns max 100 per request
+    page_size = min(limit, S2_RELEVANCE_PAGE)
 
     try:
-        while len(all_papers) < limit:
-            # Calculate how many results we still need
-            remaining = limit - len(all_papers)
-            current_page_size = min(page_size, remaining)
-
+        while len(papers) < limit and offset < S2_RELEVANCE_MAX:
+            current_page_size = min(
+                page_size, limit - len(papers), S2_RELEVANCE_MAX - offset
+            )
             params = {
                 "query": query,
                 "limit": current_page_size,
                 "offset": offset,
-                "fields": "title,authors,year,abstract,venue,externalIds,url,openAccessPdf,citationCount,publicationTypes,fieldsOfStudy",
+                "fields": S2_SEARCH_FIELDS,
             }
 
             # Apply filters (Semantic Scholar supports most filters natively)
             <<semantic scholar apply filters>>
 
             response = self._request(self.API_URL, params)
-
-            if response.status_code == 429:
-                logger.warning(
-                    "s2: Rate limited (429). "
-                    "Get a free API key at "
-                    "https://www.semanticscholar.org/product/api#api-key-form "
-                    "and set S2_API_KEY environment variable."
-                )
-                return all_papers, False
-
-            if response.status_code == 403:
-                # Key rejected and anonymous access also forbidden; the
-                # helper already logged the error. Don't cache the empty.
-                return all_papers, False
+            if self._page_refused(response):
+                return papers, False
 
             response.raise_for_status()
             data = response.json()
+            papers.total = s2_total(data)
 
-            papers = data.get("data", [])
-            if not papers:
-                # No more results available
+            page = data.get("data", [])
+            if not page:
                 break
 
-            all_papers.extend(self._convert_paper(p) for p in papers)
-            offset += len(papers)
-
-            # Check if we've fetched all available results
-            total = data.get("total", 0)
-            if offset >= total:
+            papers.extend(self._convert_paper(p) for p in page)
+            offset += len(page)
+            if offset >= (papers.total or 0):
                 break
 
-        logger.debug(f"semantic_scholar: Retrieved {len(all_papers)} papers")
-        return all_papers, True
+        logger.debug(f"semantic_scholar: Retrieved {len(papers)} papers")
+        return papers, True
     except RateLimited:
         # The limiter already logged the reason once
-        return all_papers, False
+        return papers, False
     except requests.exceptions.HTTPError as e:
         logger.warning("s2: HTTP error: %s", e)
-        return all_papers, False
+        return papers, False
     except Exception as e:
         logger.warning("s2: %s", e)
-        return all_papers, False
+        return papers, False
+<<semantic scholar constants>>=
+S2_RELEVANCE_MAX = 1000   # "Can only return up to 1,000 relevance-ranked"
+S2_RELEVANCE_PAGE = 100   # its limit "Must be <= 100"
+S2_SEARCH_FIELDS = (
+    "title,authors,year,abstract,venue,externalIds,url,openAccessPdf,"
+    "citationCount,publicationTypes,fieldsOfStudy"
+)
+@
+
+A relevance search that stops at the thousandth result while the user
+asked for more and the service reported more is not a complete answer,
+and the record must not read as one.
+[[s2_relevance_ceiling_error]] gives the reason it is incomplete, and
+[[search]] sets it as [[last_error]], so the views show
+\enquote{1000, incomplete (relevance search stops at 1000)}
+([[hits_label]], \cref{sec:search-result-error}).
+The answer is still cached: it is what the endpoint returns, every
+time, and the reason is derived from it again on a cache hit.
+With [[--limit 0]] the search never gets here, since it goes to the
+bulk search; a limit above a thousand on plain words does.
+For an entry cached without its total, a thousand results with a
+larger limit are taken to be incomplete: the endpoint cannot say
+otherwise.
+
+<<semantic scholar helpers>>=
+def s2_relevance_ceiling_error(papers: list, limit: int) -> str | None:
+    """Why a relevance search is incomplete at its ceiling, else None."""
+    total = getattr(papers, "total", None)
+    if (len(papers) >= S2_RELEVANCE_MAX and limit > len(papers)
+            and (total is None or total > len(papers))):
+        return S2_RELEVANCE_CEILING
+    return None
+<<semantic scholar constants>>=
+S2_RELEVANCE_CEILING = f"relevance search stops at {S2_RELEVANCE_MAX}"
+@
+
+\paragraph{The bulk search.}
+The bulk search pages with a token instead of an offset: each answer
+carries the token for the next page, and \enquote{The query can be
+repeated with the token param added to efficiently continue fetching
+matching papers}.
+[[_search_bulk]] repeats the same parameters with the latest token
+until an answer comes without one, or with no papers (so that a
+service that kept sending tokens could not keep us asking for nothing),
+or until it has as many papers as the limit asked for; it then cuts
+the last page down to the limit.
+The last page of the issue's query had the [[token]] key with an empty
+value (recorded on 2026-11-18), so an empty token counts as none.
+Every page goes through [[_request]], so the limiter paces each one
+and retries are counted (\cref{sec:s2-retrying}); a search without a
+limit on a broad query can take many pages, each a second apart, and
+each page is logged.
+
+The fields are those of the relevance search.
+The issue found that the bulk search refuses the field [[tldr]]; the
+provider asks for none it does not convert.
+The filters are translated as for the relevance search: the bulk
+search's parameter list has the same [[year]], [[venue]],
+[[minCitationCount]], [[publicationTypes]] and [[openAccessPdf]].
+
+<<semantic scholar search method>>=
+def _search_bulk(
+    self,
+    query: str,
+    limit: int | None,
+    filters: SearchFilters | None,
+) -> tuple[list[Paper], bool]:
+    """Run the bulk search, paging by token: ``(papers, cacheable)``."""
+    papers = PapersWithTotal()
+    wanted = (
+        limit if limit and 0 < limit < UNLIMITED_PROVIDER_LIMIT else None
+    )
+    params = {"query": s2_bulk_query(query), "fields": S2_SEARCH_FIELDS}
+    <<semantic scholar apply filters>>
+
+    try:
+        while True:
+            response = self._request(S2_BULK_URL, params)
+            if self._page_refused(response):
+                return papers, False
+            response.raise_for_status()
+            data = response.json()
+            papers.total = s2_total(data)
+            page = data.get("data") or []
+            papers.extend(self._convert_paper(p) for p in page)
+            logger.info(
+                "s2: bulk search, %d of about %s papers fetched",
+                len(papers), papers.total,
+            )
+            if wanted is not None and len(papers) >= wanted:
+                del papers[wanted:]
+                break
+            token = data.get("token")
+            if not token or not page:
+                break
+            params["token"] = token
+        return papers, True
+    except RateLimited:
+        return papers, False
+    except requests.exceptions.HTTPError as e:
+        logger.warning("s2: bulk search HTTP error: %s", e)
+        return papers, False
+    except Exception as e:
+        logger.warning("s2: bulk search: %s", e)
+        return papers, False
+<<semantic scholar constants>>=
+S2_BULK_URL = "https://api.semanticscholar.org/graph/v1/paper/search/bulk"
+@
+
+\paragraph{Testing the two searches.}
+The bulk search is tested against recorded answers.
+Three requests were made on 2026-11-18 with an API key, to
+[[https://api.semanticscholar.org/graph/v1/paper/search/bulk]] with
+[[fields]] set to [[S2_SEARCH_FIELDS]]: the issue's query, translated
+as above, and a broader query,
+\enquote{[["two-factor authentication" | "multi-factor authentication"]]},
+twice, the second time with the token
+of the first answer.
+The first answered 784 papers in one page; the broader one reported
+4903 and sent a token with each of its two pages, a different one each
+time.
+The recordings keep three papers per page, the total and the token.
+The author names are replaced by placeholders and the abstracts by a
+note, since no test reads them; the titles, identifiers and venues are
+public bibliographic data and stay.
+
+The replay sits at the HTTP adapter, as for the OpenAlex semantic
+search (\cref{sec:openalex-semantic}), so the provider's session, the
+retries of [[_send]] and the limiter run for real, and the test can
+assert the requests that would have gone out.
+
+<<test functions>>=
+S2_BULK_SINGLE_PAGE = {
+  "total": 784,
+  "token": None,
+  "data": [
+    <<recorded bulk search, the issue's query>>
+  ],
+}
+S2_BULK_PAGE_1 = {
+  "total": 4903,
+  "token": (
+    "PCOKWVSKJJGM4TWNJNI3EUSQJIWVNUSRKBFEYK2JFUBHFI4VRRGZGLMB2KTKMB"
+    "RGS2TCTKNJS3DCTCLGY2LOM2IWEYUWTKPGRGUZNCLJY2TESBSKWG2QAAHLCUEQ"
+  ),
+  "data": [
+    <<recorded bulk search, broad query, page 1>>
+  ],
+}
+S2_BULK_PAGE_2 = {
+  "total": 4903,
+  "token": (
+    "PCOKWVSKJJGM4TWNJNI3EUSQJIWVNUSRKBFEYK2JFUBHFI4VZQJE3DKTZSGC2E"
+    "WNZVJC3TESSPGQ2UQTSOJZGTIMKIWFFDMT2JJFELENFQWE2U6NSVRGWAIB5QKQS"
+  ),
+  "data": [
+    <<recorded bulk search, broad query, page 2>>
+  ],
+}
+
+
+def _replay_s2(monkeypatch, answers):
+  """Answer Semantic Scholar requests from `answers`, in order.
+
+  Each answer is a JSON payload, or a `(status, payload)` pair.
+  Returns the list of the requests' `(url, params)`, appended as they
+  are sent.
+  """
+  import urllib.parse
+
+  import requests.adapters
+
+  sent = []
+  queue = list(answers)
+
+  def send(adapter, request, **kwargs):
+    url = urllib.parse.urlsplit(request.url)
+    sent.append((
+      f"{url.scheme}://{url.netloc}{url.path}",
+      dict(urllib.parse.parse_qsl(url.query, keep_blank_values=True)),
+    ))
+    answer = queue.pop(0)
+    status, payload = answer if isinstance(answer, tuple) else (200, answer)
+    response = requests.Response()
+    response.status_code = status
+    response.headers["Content-Type"] = "application/json"
+    response._content = json.dumps(payload).encode()
+    response.url = request.url
+    response.request = request
+    return response
+
+  monkeypatch.setattr(requests.adapters.HTTPAdapter, "send", send)
+  return sent
+
+
+class TestS2BulkSearch:
+  """Boolean and unlimited searches go to the bulk search."""
+
+  BOOLEAN = '("multi-factor authentication" OR "2FA") AND phishing'
+
+  <<s2 bulk search test methods>>
+<<s2 bulk search test methods>>=
+def test_boolean_query_is_sent_to_bulk_translated(self, monkeypatch):
+  sent = _replay_s2(monkeypatch, [S2_BULK_SINGLE_PAGE])
+  provider = SemanticScholarProvider(api_key=None)
+
+  papers = provider.search(self.BOOLEAN, limit=UNLIMITED_PROVIDER_LIMIT)
+
+  [(url, params)] = sent
+  assert url == S2_BULK_URL
+  assert params["query"] == (
+    '("multi-factor authentication" | "2FA") + phishing'
+  )
+  assert "tldr" not in params["fields"].split(",")
+  assert "token" not in params and "offset" not in params
+  assert [p.doi for p in papers] == [
+    (p["externalIds"] or {}).get("DOI")
+    for p in S2_BULK_SINGLE_PAGE["data"]
+  ]
+  assert all(p.sources == ["s2"] for p in papers)
+  assert provider.last_error is None
+  assert provider.last_via == "bulk"
+  assert (provider.last_total, provider.last_total_estimated) == (784, True)
+
+def test_pages_follow_the_token_up_to_the_limit(self, monkeypatch):
+  sent = _replay_s2(monkeypatch, [S2_BULK_PAGE_1, S2_BULK_PAGE_2])
+  provider = SemanticScholarProvider(api_key=None)
+
+  papers = provider.search(self.BOOLEAN, limit=5)
+
+  assert [params.get("token") for _, params in sent] \
+    == [None, S2_BULK_PAGE_1["token"]]
+  assert sent[0][1]["query"] == sent[1][1]["query"]
+  assert len(papers) == 5
+  assert provider.last_total == 4903
+
+def test_plain_words_without_a_limit_go_to_bulk(self, monkeypatch):
+  sent = _replay_s2(monkeypatch, [S2_BULK_SINGLE_PAGE])
+  provider = SemanticScholarProvider(api_key=None)
+  provider.search("account recovery", limit=UNLIMITED_PROVIDER_LIMIT)
+  assert sent[0][0] == S2_BULK_URL
+  assert sent[0][1]["query"] == "account recovery"
+
+def test_plain_words_with_a_limit_stay_on_relevance(self, monkeypatch):
+  sent = _replay_s2(monkeypatch, [{"total": 0, "offset": 0, "data": []}])
+  provider = SemanticScholarProvider(api_key=None)
+  provider.search("account recovery", limit=100)
+  assert sent[0][0] == SemanticScholarProvider.API_URL
+  assert provider.last_via is None
+  assert (provider.last_total, provider.last_total_estimated) == (0, True)
+
+def test_a_cached_relevance_zero_is_not_served(self, monkeypatch):
+  """A Boolean query's cached relevance answer (the wrong zero) is
+  ignored: the bulk search has a key of its own."""
+  sent = _replay_s2(monkeypatch, [S2_BULK_SINGLE_PAGE])
+  provider = SemanticScholarProvider(api_key=None)
+  provider._cache[(self.BOOLEAN, UNLIMITED_PROVIDER_LIMIT, "")] = []
+
+  papers = provider.search(self.BOOLEAN, limit=UNLIMITED_PROVIDER_LIMIT)
+
+  assert len(sent) == 1 and len(papers) == 3
+  assert provider._cache[(self.BOOLEAN, UNLIMITED_PROVIDER_LIMIT, "")] == []
+
+def test_a_cache_hit_reports_total_and_endpoint(self, monkeypatch):
+  sent = _replay_s2(monkeypatch, [S2_BULK_SINGLE_PAGE])
+  provider = SemanticScholarProvider(api_key=None)
+  first = provider.search(self.BOOLEAN, limit=0)
+  provider.last_total = provider.last_via = None
+
+  again = pickle.loads(pickle.dumps(provider._cache))
+  provider._cache.clear()
+  provider._cache.update(again)
+  second = provider.search(self.BOOLEAN, limit=0)
+
+  assert len(sent) == 1
+  assert [p.title for p in second] == [p.title for p in first]
+  assert (provider.last_total, provider.last_via) == (784, "bulk")
+
+def test_an_old_cache_entry_has_no_total(self, monkeypatch):
+  _replay_s2(monkeypatch, [])
+  provider = SemanticScholarProvider(api_key=None)
+  provider._cache[("old words", 100, "")] = [Paper(title="Old", authors=[])]
+  assert len(provider.search("old words", limit=100)) == 1
+  assert (provider.last_total, provider.last_total_estimated) \
+    == (None, False)
+
+def test_a_page_refused_midway_is_not_cached(self, monkeypatch):
+  _replay_s2(monkeypatch, [
+    S2_BULK_PAGE_1, (400, {"error": "Unrecognized or unsupported fields"}),
+  ])
+  provider = SemanticScholarProvider(api_key=None)
+
+  papers = provider.search(self.BOOLEAN, limit=0)
+
+  assert len(papers) == 3
+  assert provider.last_error == SEARCH_CUT_SHORT
+  assert not any(
+    key[-1] == "bulk" for key in provider._cache if isinstance(key, tuple)
+  )
+@
+
+The thousand-result ceiling of the relevance search cannot be
+recorded without fetching a thousand results, so its test answers
+with pages built by hand, in the shape of the recordings above: ten
+pages of a hundred, and a total of 5000.
+
+<<test functions>>=
+class TestS2RelevanceCeiling:
+  """A relevance search stops at 1000 and says it is incomplete."""
+
+  @staticmethod
+  def _pages(total):
+    return [
+      {"total": total, "offset": offset, "data": [
+        {"title": f"Paper {offset + i}", "authors": []} for i in range(100)
+      ]}
+      for offset in range(0, 1000, 100)
+    ]
+
+  def test_stops_at_the_thousandth_and_says_so(self, monkeypatch):
+    sent = _replay_s2(monkeypatch, self._pages(5000))
+    provider = SemanticScholarProvider(api_key=None)
+
+    papers = provider.search("plain words", limit=2000)
+
+    assert len(sent) == 10
+    assert sent[-1][1]["offset"] == "900"
+    assert len(papers) == 1000
+    assert provider.last_error == S2_RELEVANCE_CEILING
+    assert hits_label(len(papers), provider.last_error) \
+      == "1000, incomplete (relevance search stops at 1000)"
+    provider.search("plain words", limit=2000)
+    assert len(sent) == 10
+    assert provider.last_error == S2_RELEVANCE_CEILING
+
+  def test_a_limit_of_a_thousand_is_complete(self, monkeypatch):
+    _replay_s2(monkeypatch, self._pages(5000))
+    provider = SemanticScholarProvider(api_key=None)
+    provider.search("plain words", limit=1000)
+    assert provider.last_error is None
+
+  def test_exactly_a_thousand_matches_is_complete(self, monkeypatch):
+    _replay_s2(monkeypatch, self._pages(1000))
+    provider = SemanticScholarProvider(api_key=None)
+    provider.search("plain words", limit=2000)
+    assert provider.last_error is None
 @
 
 \subsubsection{Applying filters}
@@ -2857,6 +3514,154 @@ def _convert_paper(self, paper_data: dict) -> Paper:
     )
 @
 
+The recorded answers, in the order the tests above name them:
+
+<<recorded bulk search, the issue's query>>=
+{'paperId': '00a055e6b152871b87e4d05392e8e0a418f07c36',
+ 'externalIds': {'CorpusId': 195349512},
+ 'url': 'https://www.semanticscholar.org/paper/00a055e6b152871b87e4d05392e8e0a418f07c36',
+ 'title': '3CAuth - A Novel Multi-Factor Authentication Scheme Using '
+          'QR-Code',
+ 'venue': 'International Journal of Network Security',
+ 'year': 2016,
+ 'citationCount': 2,
+ 'openAccessPdf': {'url': '', 'status': None},
+ 'fieldsOfStudy': ['Computer Science'],
+ 'publicationTypes': ['JournalArticle'],
+ 'authors': [{'authorId': None, 'name': 'Author 1-1'},
+             {'authorId': None, 'name': 'Author 1-2'}],
+ 'abstract': None},
+{'paperId': '0120bcd1b52bdb0f4e7b192a4631e48dd844eae3',
+ 'externalIds': {'DOI': '10.1109/ICASS69550.2026.11547780',
+                 'CorpusId': 289119041},
+ 'url': 'https://www.semanticscholar.org/paper/0120bcd1b52bdb0f4e7b192a4631e48dd844eae3',
+ 'title': 'Developing Enhanced Security Protocols For Mobile Banking '
+          'Applications Using MFA In Blockchain',
+ 'venue': 'International Conference on Independent Component Analysis '
+          'and Signal Separation',
+ 'year': 2026,
+ 'citationCount': 0,
+ 'openAccessPdf': {'url': '', 'status': 'CLOSED'},
+ 'fieldsOfStudy': None,
+ 'publicationTypes': ['Conference'],
+ 'authors': [{'authorId': None, 'name': 'Author 2-1'},
+             {'authorId': None, 'name': 'Author 2-2'},
+             {'authorId': None, 'name': 'Author 2-3'}],
+ 'abstract': 'Abstract replaced by the recording.'},
+{'paperId': '0137294c4d761b1310b504d36ed7630547cf046d',
+ 'externalIds': {'DOI': '10.1109/ICDCS60910.2024.00127',
+                 'CorpusId': 271936106},
+ 'url': 'https://www.semanticscholar.org/paper/0137294c4d761b1310b504d36ed7630547cf046d',
+ 'title': 'Dual Study of Canvas Fingerprinting Based Authentication: A '
+          'Novel Spoofing Attack and the Countermeasure',
+ 'venue': 'IEEE International Conference on Distributed Computing '
+          'Systems',
+ 'year': 2024,
+ 'citationCount': 2,
+ 'openAccessPdf': {'url': '', 'status': 'CLOSED'},
+ 'fieldsOfStudy': ['Computer Science'],
+ 'publicationTypes': ['JournalArticle', 'Conference'],
+ 'authors': [{'authorId': None, 'name': 'Author 3-1'},
+             {'authorId': None, 'name': 'Author 3-2'}],
+ 'abstract': 'Abstract replaced by the recording.'},
+<<recorded bulk search, broad query, page 1>>=
+{'paperId': '000071a75d62b1c1cf0ffdf206143a72bc36169c',
+ 'externalIds': {'DOI': '10.9790/0661-16164752', 'CorpusId': 8855276},
+ 'url': 'https://www.semanticscholar.org/paper/000071a75d62b1c1cf0ffdf206143a72bc36169c',
+ 'title': 'A Comparative Study of Facial, Retinal, Iris and Sclera '
+          'Recognition Techniques',
+ 'venue': '',
+ 'year': 2014,
+ 'citationCount': 3,
+ 'openAccessPdf': {'url': 'https://doi.org/10.9790/0661-16164752',
+                   'status': 'BRONZE'},
+ 'fieldsOfStudy': ['Computer Science'],
+ 'publicationTypes': None,
+ 'authors': [{'authorId': None, 'name': 'Author 1-1'},
+             {'authorId': None, 'name': 'Author 1-2'},
+             {'authorId': None, 'name': 'Author 1-3'}],
+ 'abstract': None},
+{'paperId': '00095148c10f0968a03ae61cfc754bbdf9c6ca16',
+ 'externalIds': {'DOI': '10.1109/ICSSIT55814.2023.10061113',
+                 'CorpusId': 257536334},
+ 'url': 'https://www.semanticscholar.org/paper/00095148c10f0968a03ae61cfc754bbdf9c6ca16',
+ 'title': 'Multifactor Mutual Authentication of IoT Devices and Server',
+ 'venue': '2023 5th International Conference on Smart Systems and '
+          'Inventive Technology (ICSSIT)',
+ 'year': 2023,
+ 'citationCount': 8,
+ 'openAccessPdf': {'url': '', 'status': 'CLOSED'},
+ 'fieldsOfStudy': None,
+ 'publicationTypes': ['Conference'],
+ 'authors': [{'authorId': None, 'name': 'Author 2-1'},
+             {'authorId': None, 'name': 'Author 2-2'},
+             {'authorId': None, 'name': 'Author 2-3'}],
+ 'abstract': 'Abstract replaced by the recording.'},
+{'paperId': '001432873e8163a12cb8905c1b4ead0b0678d310',
+ 'externalIds': {'DOI': '10.1007/978-3-030-60700-5_15',
+                 'CorpusId': 227034890},
+ 'url': 'https://www.semanticscholar.org/paper/001432873e8163a12cb8905c1b4ead0b0678d310',
+ 'title': 'Sequence Based Two-Factor Authentication (2FA) Method',
+ 'venue': 'Interacción',
+ 'year': 2020,
+ 'citationCount': 1,
+ 'openAccessPdf': {'url': '', 'status': 'CLOSED'},
+ 'fieldsOfStudy': ['Computer Science'],
+ 'publicationTypes': ['JournalArticle'],
+ 'authors': [{'authorId': None, 'name': 'Author 3-1'},
+             {'authorId': None, 'name': 'Author 3-2'}],
+ 'abstract': None},
+<<recorded bulk search, broad query, page 2>>=
+{'paperId': '35d858d6ca3ddd8060969ac09ef308cdb836a25f',
+ 'externalIds': {'DOI': '10.55606/juisik.v5i2.1231',
+                 'CorpusId': 279672675},
+ 'url': 'https://www.semanticscholar.org/paper/35d858d6ca3ddd8060969ac09ef308cdb836a25f',
+ 'title': 'Evaluasi Implementasi Keamanan Informasi pada Sistem '
+          'Perpustakaan SMKN 1 Banyumas',
+ 'venue': 'Jurnal ilmiah Sistem Informasi dan Ilmu Komputer',
+ 'year': 2025,
+ 'citationCount': 0,
+ 'openAccessPdf': {'url': 'https://journal.sinov.id/index.php/juisik/article/download/1231/1008',
+                   'status': 'GOLD'},
+ 'fieldsOfStudy': None,
+ 'publicationTypes': ['JournalArticle'],
+ 'authors': [{'authorId': None, 'name': 'Author 1-1'},
+             {'authorId': None, 'name': 'Author 1-2'},
+             {'authorId': None, 'name': 'Author 1-3'}],
+ 'abstract': 'Abstract replaced by the recording.'},
+{'paperId': '35e260a0cff08f455f73b6c5aa70f22cef61b3f2',
+ 'externalIds': {'DOI': '10.30574/wjaets.2025.15.2.0735',
+                 'CorpusId': 278717303},
+ 'url': 'https://www.semanticscholar.org/paper/35e260a0cff08f455f73b6c5aa70f22cef61b3f2',
+ 'title': 'Azure AD identity and access management: Building the '
+          'foundation for modern enterprise security',
+ 'venue': 'World Journal of Advanced Engineering Technology and Sciences',
+ 'year': 2025,
+ 'citationCount': 0,
+ 'openAccessPdf': {'url': 'https://journalwjaets.com/sites/default/files/fulltext_pdf/WJAETS-2025-0735.pdf',
+                   'status': 'HYBRID'},
+ 'fieldsOfStudy': None,
+ 'publicationTypes': ['JournalArticle'],
+ 'authors': [{'authorId': None, 'name': 'Author 2-1'}],
+ 'abstract': 'Abstract replaced by the recording.'},
+{'paperId': '35ed996fd1356bbae3cc41a4aa9a07faa49ce674',
+ 'externalIds': {'DOI': '10.1109/ICCR67387.2025.11291995',
+                 'CorpusId': 284019986},
+ 'url': 'https://www.semanticscholar.org/paper/35ed996fd1356bbae3cc41a4aa9a07faa49ce674',
+ 'title': 'Towards Securing Smart Homes: A Practical SRAM PUF-Based '
+          'Two-Factor Authentication Framework',
+ 'venue': 'International Conference Control and Robots',
+ 'year': 2025,
+ 'citationCount': 0,
+ 'openAccessPdf': {'url': '', 'status': 'CLOSED'},
+ 'fieldsOfStudy': None,
+ 'publicationTypes': ['Conference'],
+ 'authors': [{'authorId': None, 'name': 'Author 3-1'},
+             {'authorId': None, 'name': 'Author 3-2'},
+             {'authorId': None, 'name': 'Author 3-3'}],
+ 'abstract': 'Abstract replaced by the recording.'},
+@
+
 \subsection{Auto-registration}
 
 We register the provider when this module is imported:
@@ -2869,9 +3674,13 @@ register_provider(SemanticScholarProvider())
 \subsection{Dependencies}
 
 <<semantic scholar imports>>=
+import datetime
+import re
 import time
 
 import requests
+
+from scholar.scholar import UNLIMITED_PROVIDER_LIMIT
 @
 
 \subsection{Testing Semantic Scholar provider}
@@ -14270,6 +15079,7 @@ cached.
 @
 
 \subsection{Caching per view}
+\label{sec:scopus-cache-view}
 
 The cache never expires, which turns the view into a caching problem:
 results fetched off campus lack abstracts, and if they answered for the
@@ -15632,6 +16442,8 @@ logger = logging.getLogger(__name__)
 <<constants>>=
 # Provider constants
 DEFAULT_LIMIT = 100
+<<semantic scholar constants>>
+<<semantic scholar helpers>>
 <<openalex constants>>
 <<openalex helpers>>
 <<dblp constants>>

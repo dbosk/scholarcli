@@ -95,7 +95,7 @@ Providers self-register via `register_provider()` at module load time.
 
 | Provider | Name | API | Auth |
 |----------|------|-----|------|
-| Semantic Scholar | `s2` | REST API (`requests`) | `S2_API_KEY` (optional) |
+| Semantic Scholar | `s2` | REST API (`requests`): relevance search, or bulk search for operators / `-l 0` | `S2_API_KEY` (optional) |
 | OpenAlex | `openalex` | `pyalex` client | `OPENALEX_API_KEY` (optional, 10x daily budget), `SCHOLAR_EMAIL` (optional) |
 | DBLP | `dblp` | REST API | None required |
 | Web of Science | `wos` | REST API | `WOS_API_KEY` (required) |
@@ -122,6 +122,38 @@ environment is the normal key source. Tests wanting no key must
 construction). Exception: `WebOfScienceProvider` uses a sentinel, so an
 explicit `None` disables that tier (the legacy `WOS_API_KEY` still
 fills it).
+
+### Semantic Scholar: relevance vs bulk search (#161)
+
+`SemanticScholarProvider.search` picks the endpoint per search
+(`s2_uses_bulk(query, limit)`, providers.nw `sec:s2-two-searches`, API
+description https://api.semanticscholar.org/graph/v1/swagger.json):
+a query with operators (`s2_has_operators`: UPPERCASE AND/OR/NOT,
+quotes, parentheses, `|`, a word-initial `+`/`-`, `*`) or a search
+without a limit (`None`, `<= 0`, or `UNLIMITED_PROVIDER_LIMIT`, now
+defined in `scholar.scholar` and imported by the CLI) goes to
+`/paper/search/bulk` (`_search_bulk`, pages by `token` until it is
+empty/absent or the limit is reached; `s2_bulk_query` translates
+AND→`+`, OR→`|`, NOT/AND NOT→`-` outside quoted phrases); plain words
+with a limit stay on `/paper/search` (`_search_uncached`), which never
+asks past offset 1000 and sets `last_error = S2_RELEVANCE_CEILING`
+("relevance search stops at 1000", shown as "1000, incomplete (...)")
+when it stops there with more asked for and reported. Bulk results are
+cached under the relevance key plus `"bulk"` (old relevance entries,
+including the wrong zeros of Boolean queries, are never served for a
+bulk search; plain-word entries keep serving). Both return a
+`PapersWithTotal` (list + `total`, pickled into the cache by name: keep
+the name); `search` sets `last_total` (None for old plain-list
+entries) and `last_total_estimated = True` (the description calls both
+totals "Approximate"), and `last_via` (`"bulk"` or None). `via` flows
+`provider_via()` → `SearchResult.via` (kept through `merge` as
+`"s2: bulk"` and `deduplicate`) → `result_via()` →
+`SearchRecord.via` (saved/loaded as `"via"`, old files → None; not part
+of the record key) → `sessions show` ("s2 (bulk search): q", JSON
+`via` when set). Bulk stems terms and matches title+abstract only
+(`scholar syntax` says so). Not verified live: what `-` does before a
+parenthesis or phrase, and whether an unquoted hyphenated word is
+read as a negation.
 
 ### Title-and-Abstract Search (`--in`)
 
