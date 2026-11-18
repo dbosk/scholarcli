@@ -147,6 +147,7 @@ class DecisionStatus(Enum):
 @
 
 \subsection{Review Source}
+\label{sec:review-source}
 
 When using LLM-assisted review, we track where each decision originated.
 This enables:
@@ -159,12 +160,413 @@ This enables:
   prioritized for human review.
 \end{description}
 
+Machines decide in two ways, and a report must keep them apart.  An
+LLM classifies papers through [[scholar llm classify]], one prompt per
+batch, with a confidence per paper.  An AI \emph{agent} (an assistant
+driving Scholar from the command line on the user's behalf) reads the
+hits and records its own verdicts with [[sessions decide --source
+agent]].  Both are machine decisions that no human has looked at, and
+both used to be recorded as something else: an agent had to choose
+between [[human]], which made the audit table cite its keeps as if the
+author had read them, and [[llm]], which credited a classifier run that
+never happened (\url{https://github.com/dbosk/scholar/issues/162}).
+
+So each machine source comes in two states.  The unreviewed one is what
+the machine recorded; the reviewed one is what a human's confirmation
+(or correction) turns it into.  The reviewed state keeps the machine's
+name, because \enquote{a human confirmed what the agent proposed} is a
+different fact from \enquote{a human decided}: the first says the
+screening was delegated and checked, the second that it was not
+delegated at all.  Five values therefore cover every decision Scholar
+records.
+
 <<review data structures>>=
 class ReviewSource(Enum):
     """Source of a review decision."""
     HUMAN = "human"              # User decided directly
     LLM_UNREVIEWED = "llm"       # LLM decided, not yet reviewed by user
     LLM_REVIEWED = "llm_reviewed"  # LLM decided, user confirmed or changed
+    AGENT_UNREVIEWED = "agent"   # AI agent decided, not yet reviewed
+    AGENT_REVIEWED = "agent_reviewed"  # agent decided, user confirmed/changed
+
+    <<unknown review sources>>
+    <<review source properties>>
+@
+
+A session file can hold a source Scholar never wrote.  Real sessions
+contain decisions with the source [[manual]], a value no version of
+Scholar has produced (no commit in the history has it as a string, so
+there is no legacy meaning to map it to), and a hand-edited [[Agent]]
+would be another.  Loading used to turn every such value into
+[[human]], so a decision of unknown origin became a citable human
+decision: the report claimed more than is known about who decided
+(\url{https://github.com/dbosk/scholar/issues/162}).
+
+An unknown value is therefore kept as it is.  [[_missing_]] is the hook
+[[Enum]] calls when a value matches no member; instead of failing it
+returns a pseudo-member that carries the stored value, so the value
+goes back to the file unchanged on save, and the same value always
+gives the same object (it is cached in the enum's own value map, as
+[[enum.Flag]] does for its combinations).  The pseudo-members are not
+listed when the enum is iterated.  The properties below treat them as
+unreviewed: never cited, queued for review, and turned into a human
+decision when a human reviews them, since then a human has decided.
+
+<<unknown review sources>>=
+@classmethod
+def _missing_(cls, value):
+    """Keep an unknown stored value as a pseudo-member (`is_unknown`)."""
+    if not isinstance(value, str):
+        return None
+    pseudo = object.__new__(cls)
+    pseudo._value_ = value
+    pseudo._name_ = "UNKNOWN"
+    return cls._value2member_map_.setdefault(value, pseudo)
+
+@property
+def is_unknown(self) -> bool:
+    """True for a stored value that is none of the known sources."""
+    return self not in type(self).__members__.values()
+@
+
+Most readers of a decision ask one of three questions, and the
+properties answer them so that no caller lists the members itself (a
+list that forgets the agent is how a sixth source would slip into the
+\enquote{cited} column).  [[is_unreviewed]] asks whether the decision
+still waits for a human: such a decision is queued for confirmation in
+the TUI and can never be cited.  [[is_machine]] asks whether a machine
+proposed it, reviewed or not, so that the report can say how much of
+the screening was delegated.  [[reviewed]] is the state a human review
+moves a decision to; a decision that needs no review maps to itself,
+and one of unknown source becomes a human decision.
+
+<<review source properties>>=
+@property
+def is_unreviewed(self) -> bool:
+    """True for a decision that waits for a human: an unreviewed machine
+    decision, or one of unknown source."""
+    return self.is_unknown or self in (
+        ReviewSource.LLM_UNREVIEWED, ReviewSource.AGENT_UNREVIEWED,
+    )
+
+@property
+def is_machine(self) -> bool:
+    """True if an LLM or an agent proposed the decision, reviewed or not."""
+    return self in (
+        ReviewSource.LLM_UNREVIEWED, ReviewSource.LLM_REVIEWED,
+        ReviewSource.AGENT_UNREVIEWED, ReviewSource.AGENT_REVIEWED,
+    )
+
+@property
+def reviewed(self) -> "ReviewSource":
+    """The source of this decision once a human has reviewed it."""
+    if self.is_unknown:
+        return ReviewSource.HUMAN
+    return {
+        ReviewSource.LLM_UNREVIEWED: ReviewSource.LLM_REVIEWED,
+        ReviewSource.AGENT_UNREVIEWED: ReviewSource.AGENT_REVIEWED,
+    }.get(self, self)
+@
+
+Reports count decisions by source (issue~\#163): a review whose 84 of
+93 decisions are unreviewed LLM output reads very differently from one
+a person screened, and the report used to show both as \enquote{93
+papers (9 kept, 84 discarded)}.  The labels below are the single
+wording of the five sources, in the order reports list them: the human
+decisions first, then the machine decisions a human reviewed, then the
+unreviewed ones, which are the ones a reader must discount.  Unknown
+sources come last, each named by its stored value.  Only decided papers
+are counted, since a pending paper carries the default source [[human]]
+without anyone having decided anything.
+
+<<review data structures>>=
+DECISION_SOURCE_LABELS: dict[ReviewSource, str] = {
+    ReviewSource.HUMAN: "human",
+    ReviewSource.LLM_REVIEWED: "LLM, reviewed by a human",
+    ReviewSource.AGENT_REVIEWED: "agent, reviewed by a human",
+    ReviewSource.LLM_UNREVIEWED: "LLM, unreviewed",
+    ReviewSource.AGENT_UNREVIEWED: "agent, unreviewed",
+}
+
+
+def source_label(source: ReviewSource) -> str:
+    """The report wording of `source`, naming an unknown stored value."""
+    if source.is_unknown:
+        return f"unknown source '{source.value}'"
+    return DECISION_SOURCE_LABELS[source]
+
+
+def decision_source_counts(decisions) -> dict[ReviewSource, int]:
+    """Count the decided papers in `decisions` by source, in report order.
+
+    The known sources are always present; unknown ones follow, sorted by
+    their stored value.
+    """
+    counts = {source: 0 for source in DECISION_SOURCE_LABELS}
+    unknown: dict[ReviewSource, int] = {}
+    for decision in decisions:
+        if decision.is_decided:
+            bucket = unknown if decision.source.is_unknown else counts
+            bucket[decision.source] = bucket.get(decision.source, 0) + 1
+    for source in sorted(unknown, key=lambda s: s.value):
+        counts[source] = unknown[source]
+    return counts
+
+
+def decision_source_items(decisions) -> list[tuple[str, int]]:
+    """Return `(label, count)` for each source that decided a paper.
+
+    Sources without decisions are left out; the human row is always
+    there when anything was decided, so that "0 human" is said aloud.
+    """
+    counts = decision_source_counts(decisions)
+    if not any(counts.values()):
+        return []
+    return [
+        (source_label(source), count)
+        for source, count in counts.items()
+        if count or source is ReviewSource.HUMAN
+    ]
+
+
+def decision_sources_sentence(decisions) -> str:
+    """One sentence stating who decided, e.g. for an abstract.
+
+    Empty when nothing is decided. Labels contain commas, so the parts
+    are separated by semicolons.
+    """
+    items = decision_source_items(decisions)
+    if not items:
+        return ""
+    parts = "; ".join(f"{count} {label}" for label, count in items)
+    return f"Decisions by source: {parts}."
+@
+
+A decision recorded by [[sessions decide --source agent]] or [[--source
+llm]] replaces whatever was decided before, and a classifier run may
+have stored fields saying how it decided (the model, the prompt, the
+reason).  Left in place, they would describe a decision that no longer
+exists, and a report would attribute the agent's verdict to that model
+run.  [[clear_machine_audit]] forgets them; it names no field itself
+but reads [[MACHINE_AUDIT_FIELDS]], so the code that adds such a field
+registers it there and every replacing path clears it.  The classifier's
+confidence is not among them: [[sessions decide]] keeps or replaces it
+deliberately (\cref{sec:sessions-decide}).
+
+<<review data structures>>=
+MACHINE_AUDIT_FIELDS: tuple[str, ...] = ()
+
+
+def clear_machine_audit(decision) -> None:
+    """Forget the audit fields a classifier run stored on `decision`."""
+    for name in MACHINE_AUDIT_FIELDS:
+        setattr(decision, name, None)
+@
+
+The report's paper lists name the unreviewed machine decisions where
+they stand, not only in the counts, so that a reader who looks up one
+paper learns that nobody has checked it.  The mark is the same label.
+
+<<review data structures>>=
+def unreviewed_mark(decision) -> str:
+    """Label of an unreviewed or unknown-source decision, or "" otherwise."""
+    if decision.source.is_unreviewed:
+        return source_label(decision.source)
+    return ""
+@
+
+Let's pin the five values, which are what the session files store, and
+the questions the properties answer:
+
+<<test functions>>=
+class TestAgentDecisionSource:
+    """The agent source and the questions reports ask of a source."""
+
+    def test_stored_values(self):
+        assert ReviewSource("agent") is ReviewSource.AGENT_UNREVIEWED
+        assert ReviewSource("agent_reviewed") is ReviewSource.AGENT_REVIEWED
+        assert ReviewSource("llm") is ReviewSource.LLM_UNREVIEWED
+
+    def test_unreviewed_and_machine(self):
+        unreviewed = {s for s in ReviewSource if s.is_unreviewed}
+        assert unreviewed == {
+            ReviewSource.LLM_UNREVIEWED, ReviewSource.AGENT_UNREVIEWED,
+        }
+        assert [s for s in ReviewSource if not s.is_machine] == [
+            ReviewSource.HUMAN
+        ]
+
+    def test_review_keeps_the_machine_name(self):
+        assert ReviewSource.AGENT_UNREVIEWED.reviewed \
+            is ReviewSource.AGENT_REVIEWED
+        assert ReviewSource.LLM_UNREVIEWED.reviewed \
+            is ReviewSource.LLM_REVIEWED
+        assert ReviewSource.HUMAN.reviewed is ReviewSource.HUMAN
+        assert ReviewSource.AGENT_REVIEWED.reviewed \
+            is ReviewSource.AGENT_REVIEWED
+
+    def test_counts_only_decided_papers(self):
+        def d(status, source):
+            return ReviewDecision(
+                paper=Paper(title="T", authors=["A"]), provider="p",
+                status=status, source=source,
+            )
+        decisions = [
+            d(DecisionStatus.KEPT, ReviewSource.HUMAN),
+            d(DecisionStatus.PENDING, ReviewSource.HUMAN),
+            d(DecisionStatus.DISCARDED, ReviewSource.AGENT_UNREVIEWED),
+            d(DecisionStatus.DISCARDED, ReviewSource.AGENT_UNREVIEWED),
+            d(DecisionStatus.KEPT, ReviewSource.LLM_REVIEWED),
+        ]
+        assert decision_source_items(decisions) == [
+            ("human", 1),
+            ("LLM, reviewed by a human", 1),
+            ("agent, unreviewed", 2),
+        ]
+        assert decision_sources_sentence(decisions) == (
+            "Decisions by source: 1 human; 1 LLM, reviewed by a human; "
+            "2 agent, unreviewed."
+        )
+        assert unreviewed_mark(decisions[2]) == "agent, unreviewed"
+        assert unreviewed_mark(decisions[4]) == ""
+
+    def test_human_row_is_said_aloud(self):
+        decisions = [ReviewDecision(
+            paper=Paper(title="T", authors=["A"]), provider="p",
+            status=DecisionStatus.KEPT, source=ReviewSource.LLM_UNREVIEWED,
+        )]
+        assert decision_source_items(decisions) == [
+            ("human", 0), ("LLM, unreviewed", 1),
+        ]
+        assert decision_sources_sentence([]) == ""
+@
+
+The new values are stored as they are, so a session file written before
+they existed loads exactly as before, and a session that holds them
+survives a save, a load and a concurrent save by another process
+(\cref{sec:session-integrity}): a human's confirmation of an agent
+decision is a decision change like any other.
+
+<<test functions>>=
+class TestAgentSourcePersistence:
+    def _session(self, sources):
+        session = ReviewSession(
+            query="q", providers=["p"], timestamp=datetime(2026, 11, 18),
+            name="agent-src",
+        )
+        session.decisions = [
+            ReviewDecision(
+                paper=Paper(title=f"Paper {i}", authors=["A"], year=2024,
+                            doi=f"10.1/agent-src-{i}"),
+                provider="p", status=DecisionStatus.KEPT, source=source,
+                llm_confidence=0.6 if source.is_machine else None,
+            )
+            for i, source in enumerate(sources)
+        ]
+        return session
+
+    def test_round_trip(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        sources = list(ReviewSource)
+        save_session(self._session(sources))
+        loaded = load_session("agent-src")
+        assert [d.source for d in loaded.decisions] == sources
+        assert loaded.llm_review_statistics()["agent_unreviewed"] == 1
+        assert loaded.llm_review_statistics()["agent_reviewed"] == 1
+
+    def test_old_session_file_loads_unchanged(self, tmp_path, monkeypatch):
+        import json
+
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        path = save_session(self._session([
+            ReviewSource.HUMAN, ReviewSource.LLM_UNREVIEWED,
+            ReviewSource.LLM_REVIEWED, ReviewSource.HUMAN,
+        ]))
+        data = json.loads(path.read_text())
+        del data["decisions"][3]["source"]
+        path.write_text(json.dumps(data))
+        loaded = load_session("agent-src")
+        assert [d.source for d in loaded.decisions] == [
+            ReviewSource.HUMAN, ReviewSource.LLM_UNREVIEWED,
+            ReviewSource.LLM_REVIEWED, ReviewSource.HUMAN,
+        ]
+
+    def test_concurrent_save_keeps_a_confirmation(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        save_session(self._session([ReviewSource.AGENT_UNREVIEWED]))
+        enrich = load_session("agent-src")
+        review_ = load_session("agent-src")
+        review_.decisions[0].source = ReviewSource.AGENT_REVIEWED
+        save_session(review_)
+        enrich.decisions[0].paper.abstract = "Enriched."
+        save_session(enrich)
+        assert load_session("agent-src").decisions[0].source \
+            is ReviewSource.AGENT_REVIEWED
+@
+
+A stored source Scholar does not know survives a load and a save as it
+is, is never cited nor used as an example, is named in the counts, and
+is reported once:
+
+<<test functions>>=
+class TestUnknownReviewSource:
+    def _session(self):
+        session = ReviewSession(
+            query="q", providers=["p"], timestamp=datetime(2026, 11, 18),
+            name="unknown-src",
+        )
+        session.decisions = [
+            ReviewDecision(
+                paper=Paper(title="Kept", authors=["A"], year=2024,
+                            doi="10.1/unknown-src"),
+                provider="p", status=DecisionStatus.KEPT, tags=["ml"],
+                source=ReviewSource("manual"), is_example=True,
+            ),
+        ]
+        return session
+
+    def test_value_is_kept(self):
+        source = ReviewSource("manual")
+        assert source is ReviewSource("manual")
+        assert source.value == "manual" and source.is_unknown
+        assert source.is_unreviewed and not source.is_machine
+        assert source.reviewed is ReviewSource.HUMAN
+        assert source not in list(ReviewSource)
+        assert not ReviewSource.HUMAN.is_unknown
+
+    def test_round_trip_and_one_warning(self, tmp_path, monkeypatch, caplog):
+        import json
+        import logging
+
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        path = save_session(self._session())
+        data = json.loads(path.read_text())
+        data["decisions"][0]["source"] = "Agent"
+        path.write_text(json.dumps(data))
+        with caplog.at_level(logging.WARNING, logger="scholar.review"):
+            loaded = load_session("unknown-src")
+            save_session(loaded)
+            load_session("unknown-src")
+        warnings = [r for r in caplog.records if "unknown source" in r.message]
+        assert len(warnings) == 1
+        assert "'Agent'" in warnings[0].getMessage()
+        assert json.loads(path.read_text())["decisions"][0]["source"] \
+            == "Agent"
+
+    def test_never_cited_nor_an_example(self):
+        session = self._session()
+        decision = session.decisions[0]
+        label, order = audit_reason(
+            decision, theme_names={}, strings=AUDIT_STRINGS["en"],
+        )
+        assert order != AUDIT_ORDER_CITED
+        assert session.example_papers() == []
+        assert decision_source_items(session.decisions) == [
+            ("human", 0), ("unknown source 'manual'", 1),
+        ]
+        assert unreviewed_mark(decision) == "unknown source 'manual'"
 @
 
 \subsection{Review Decision}
@@ -478,6 +880,28 @@ LLM_AUDIT_FIELDS: tuple[str, ...] = (
 def llm_audit_of(decision: ReviewDecision) -> dict:
     """Return the LLM audit fields of `decision`, by name."""
     return {name: getattr(decision, name) for name in LLM_AUDIT_FIELDS}
+@
+
+They describe how a classifier run decided, so a decision that replaces
+the classifier's must forget them: we register them with
+[[clear_machine_audit]] (\cref{sec:review-source}).
+
+<<review data structures>>=
+MACHINE_AUDIT_FIELDS = MACHINE_AUDIT_FIELDS + LLM_AUDIT_FIELDS
+@
+
+<<test functions>>=
+def test_replacing_decision_forgets_the_classifier_run():
+    decision = ReviewDecision(
+        paper=Paper(title="C", authors=["A"], doi="10.5555/clear-audit"),
+        provider="p", status=DecisionStatus.KEPT,
+        source=ReviewSource.LLM_UNREVIEWED, llm_model="m-1",
+        llm_decided_at="2026-11-18T10:00:00+00:00",
+        llm_prompt_version="abcd", llm_reason="Fits.",
+        llm_abstract_truncated=True,
+    )
+    clear_machine_audit(decision)
+    assert llm_audit_of(decision) == {name: None for name in LLM_AUDIT_FIELDS}
 @
 
 Let's check the round trip: the fields survive a save and a load, a
@@ -1011,7 +1435,7 @@ class ReviewSession:
         """
         return [
             d for d in self.decisions
-            if d.is_decided and d.tags and (
+            if d.is_decided and d.tags and not d.source.is_unknown and (
                 d.source == ReviewSource.HUMAN or d.is_example
             )
         ]
@@ -1024,6 +1448,8 @@ class ReviewSession:
         - human: Human-only decisions
         - llm_unreviewed: LLM decisions pending review
         - llm_reviewed: LLM decisions confirmed by user
+        - agent_unreviewed: agent decisions pending review
+        - agent_reviewed: agent decisions confirmed by user
         - examples: Training examples for LLM
         - pending: Papers not yet decided
         """
@@ -1031,21 +1457,19 @@ class ReviewSession:
             1 for d in self.decisions
             if d.source == ReviewSource.HUMAN and d.is_decided
         )
-        llm_unreviewed = sum(
-            1 for d in self.decisions
-            if d.source == ReviewSource.LLM_UNREVIEWED
-        )
-        llm_reviewed = sum(
-            1 for d in self.decisions
-            if d.source == ReviewSource.LLM_REVIEWED
-        )
+
+        def count(source: ReviewSource) -> int:
+            return sum(1 for d in self.decisions if d.source == source)
+
         examples = len(self.example_papers())
         pending = len(self.pending_papers())
 
         return {
             "human": human,
-            "llm_unreviewed": llm_unreviewed,
-            "llm_reviewed": llm_reviewed,
+            "llm_unreviewed": count(ReviewSource.LLM_UNREVIEWED),
+            "llm_reviewed": count(ReviewSource.LLM_REVIEWED),
+            "agent_unreviewed": count(ReviewSource.AGENT_UNREVIEWED),
+            "agent_reviewed": count(ReviewSource.AGENT_REVIEWED),
             "examples": examples,
             "pending": pending,
         }
@@ -2937,10 +3361,7 @@ def read_session_file(session_path: Path) -> ReviewSession:
 
             # Load LLM-related fields with backward compatibility
             source_str = dec_data.get("source", "human") or "human"
-            try:
-                source = ReviewSource(source_str)
-            except ValueError:
-                source = ReviewSource.HUMAN
+            source = ReviewSource(str(source_str))
             is_example = dec_data.get("is_example", False) or False
             llm_confidence = dec_data.get("llm_confidence")
             found_by = without_superseded_links([
@@ -2966,8 +3387,36 @@ def read_session_file(session_path: Path) -> ReviewSession:
     except (json.JSONDecodeError, KeyError, OSError, ValueError,
             TypeError) as e:
         raise SessionFileError(session_path, e) from e
+    warn_about_unknown_sources(session_path, session)
     session._baseline = SessionBaseline.of(session)
     return session
+@
+
+A decision of unknown source (\cref{sec:review-source}) loads as it is,
+and is treated as unreviewed; the user is told once per session file
+and process, since [[save_session]] re-reads the file on every save and
+a warning per save would bury the first.
+
+<<review session functions>>=
+_WARNED_UNKNOWN_SOURCES: set[tuple[str, tuple[str, ...]]] = set()
+
+
+def warn_about_unknown_sources(session_path: Path, session) -> None:
+    """Warn once that `session` holds decisions of unknown source."""
+    values = tuple(sorted({
+        d.source.value for d in session.decisions if d.source.is_unknown
+    }))
+    key = (str(session_path), values)
+    if not values or key in _WARNED_UNKNOWN_SOURCES:
+        return
+    _WARNED_UNKNOWN_SOURCES.add(key)
+    count = sum(1 for d in session.decisions if d.source.is_unknown)
+    logger.warning(
+        "%s: %d decision(s) with unknown source %s; they are kept as "
+        "they are and treated as unreviewed (never cited) until a human "
+        "decides them",
+        session_path.name, count, ", ".join(repr(v) for v in values),
+    )
 @
 
 The file is re-read, merged and replaced under [[file_lock]]
@@ -6118,7 +6567,8 @@ biblatex owns the formatting and the title stays consistent with the
 bibliography entry. The matrix table has one column per tag, which does
 not fit a page with horizontal headers, hence the rotated headers; a
 [[\checkmark]] marks membership because an empty cell reads more easily
-than a word in a dense grid.
+than a word in a dense grid. The list table puts the mark of an unreviewed
+machine decision after the title, as the paper lists below do.
 
 <<review report generation>>=
 def format_list_table(
@@ -6141,7 +6591,8 @@ def format_list_table(
         year = decision.paper.year or "---"
         tags = ", ".join(escape_latex(t) for t in sorted(decision.tags))
         lines.append(
-            f"\\citetitle{{{cite_key(decision)}}} & {year} & {tags} \\\\"
+            f"\\citetitle{{{cite_key(decision)}}}"
+            f"{unreviewed_suffix_latex(decision)} & {year} & {tags} \\\\"
         )
     lines.append(r"\end{longtable}")
     return lines
@@ -6189,6 +6640,7 @@ def format_matrix_table(
 @
 
 \subsection{Provenance sections}
+\label{sec:report-provenance}
 
 The report body has two halves that other documents want separately. The
 provenance half describes how the corpus was assembled: research context,
@@ -6248,65 +6700,72 @@ class TestReportLLMScreening:
         assert any("model m-1: 1" in line for line in lines)
 @
 
-When the LLM took part in the review, the summary reports how many of its
-decisions the reviewer confirmed or changed, split by direction; a session
-without LLM decisions omits those lines so the table does not suggest a
-step that never happened. A changed decision is recognised by
-[[is_example]]: corrected decisions become training examples for later
-LLM rounds, which is exactly the set we want to count.
+The summary says who decided before it says anything else about the
+decisions (issue~\#163).  The kept, discarded and pending counts are
+followed by one row per decision source ([[decision_source_items]],
+\cref{sec:review-source}), so a review whose discards are mostly
+unreviewed LLM output says so in the same place it gives the number of
+discards.
 
-<<add summary counts>>=
-has_llm_decisions = any(
-    d.source in (ReviewSource.LLM_UNREVIEWED, ReviewSource.LLM_REVIEWED)
-    for d in session.decisions
+When a machine took part in the review, the summary also reports how
+many of its decisions the reviewer confirmed or changed, split by
+direction; a session without such decisions omits those lines so the
+table does not suggest a step that never happened.  A changed decision
+is recognised by [[is_example]]: corrected decisions become training
+examples for later LLM rounds, which is exactly the set we want to
+count.  The LLM and the agent get separate rows because they are
+separate procedures, and a reader judging how reliable the screening
+was needs the agreement rate of each.  [[sessions export]] prints the
+same rows, so [[machine_review_rows]] computes them once.
+
+<<review report generation>>=
+MACHINE_SOURCES = (
+    ("LLM", ReviewSource.LLM_UNREVIEWED),
+    ("Agent", ReviewSource.AGENT_UNREVIEWED),
 )
 
-llm_confirmed = 0
-llm_changed_total = 0
-llm_changed_kept_to_discarded = 0
-llm_changed_discarded_to_kept = 0
 
-if has_llm_decisions:
-    llm_confirmed = sum(
-        1
-        for d in session.decisions
-        if d.source == ReviewSource.LLM_REVIEWED and not d.is_example
-    )
-    llm_changed_total = sum(
-        1
-        for d in session.decisions
-        if d.source == ReviewSource.LLM_REVIEWED and d.is_example
-    )
-    llm_changed_kept_to_discarded = sum(
-        1
-        for d in session.decisions
-        if d.source == ReviewSource.LLM_REVIEWED
-        and d.is_example
-        and d.status == DecisionStatus.DISCARDED
-    )
-    llm_changed_discarded_to_kept = sum(
-        1
-        for d in session.decisions
-        if d.source == ReviewSource.LLM_REVIEWED
-        and d.is_example
-        and d.status == DecisionStatus.KEPT
-    )
+def machine_review_rows(decisions) -> list[tuple[str, int]]:
+    """Return `(label, count)` rows of confirmed and changed machine decisions.
 
+    Rows appear per machine (LLM, agent) only when it decided something.
+    """
+    rows: list[tuple[str, int]] = []
+    for name, unreviewed in MACHINE_SOURCES:
+        reviewed = unreviewed.reviewed
+        mine = [d for d in decisions if d.source in (unreviewed, reviewed)]
+        if not mine:
+            continue
+        changed = [d for d in mine if d.source is reviewed and d.is_example]
+        rows.extend([
+            (f"{name} confirmed", sum(
+                1 for d in mine if d.source is reviewed and not d.is_example
+            )),
+            (f"{name} changed", len(changed)),
+            (f"{name} changed (kept->discarded)", sum(
+                1 for d in changed if d.status == DecisionStatus.DISCARDED
+            )),
+            (f"{name} changed (discarded->kept)", sum(
+                1 for d in changed if d.status == DecisionStatus.KEPT
+            )),
+        ])
+    return rows
+@
+
+<<add summary counts>>=
 summary_items = [
     f"\\item[Kept] {len(session.kept_papers())}",
     f"\\item[Discarded] {len(session.discarded_papers())}",
     f"\\item[Pending] {len(session.pending_papers())}",
 ]
-
-if has_llm_decisions:
-    summary_items.extend(
-        [
-            f"\\item[LLM confirmed] {llm_confirmed}",
-            f"\\item[LLM changed] {llm_changed_total}",
-            f"\\item[LLM changed (kept->discarded)] {llm_changed_kept_to_discarded}",
-            f"\\item[LLM changed (discarded->kept)] {llm_changed_discarded_to_kept}",
-        ]
-    )
+summary_items.extend(
+    f"\\item[Decided: {escape_latex(label)}] {count}"
+    for label, count in decision_source_items(session.decisions)
+)
+summary_items.extend(
+    f"\\item[{label}] {count}"
+    for label, count in machine_review_rows(session.decisions)
+)
 
 lines.extend(
     [
@@ -6448,6 +6907,31 @@ list per tag. A paper with several tags appears under each of them; that
 repetition is intended, because a reader looking up one theme should see
 everything filed under it. Without tags the papers form a single list.
 
+Each entry carries the mark of an unreviewed machine decision
+([[unreviewed_mark]], \cref{sec:review-source}) after the citation.  The
+lists are where a reader of the report meets the papers one by one, and
+a paper an agent kept without anyone reading it must not look like one
+the author screened.
+
+<<review report generation>>=
+def unreviewed_suffix_latex(decision: ReviewDecision) -> str:
+    """LaTeX suffix marking an unreviewed machine decision, or ""."""
+    mark = unreviewed_mark(decision)
+    return f" \\emph{{({escape_latex(mark)})}}" if mark else ""
+
+
+def paper_item_latex(
+    decision: ReviewDecision,
+    cite_key: Callable[[ReviewDecision], str],
+) -> str:
+    """One list entry of the report: the full citation and its mark."""
+    return (
+        f"\\item \\fullcite{{{cite_key(decision)}}}"
+        + unreviewed_suffix_latex(decision)
+    )
+@
+
+
 <<add kept papers by theme>>=
 if session.kept_papers():
     lines.extend([
@@ -6463,13 +6947,13 @@ if session.kept_papers():
             lines.append(f"{sub}{{{escape_latex(theme)}}}")
             lines.append(r"\begin{enumerate}")
             for decision in papers_with_theme:
-                lines.append(f"\\item \\fullcite{{{cite_key(decision)}}}")
+                lines.append(paper_item_latex(decision, cite_key))
             lines.append(r"\end{enumerate}")
             lines.append("")
     else:
         lines.append(r"\begin{enumerate}")
         for decision in session.kept_papers():
-            lines.append(f"\\item \\fullcite{{{cite_key(decision)}}}")
+            lines.append(paper_item_latex(decision, cite_key))
         lines.append(r"\end{enumerate}")
         lines.append("")
 @
@@ -6491,13 +6975,13 @@ if session.discarded_papers():
             lines.append(f"{sub}{{{escape_latex(motivation)}}}")
             lines.append(r"\begin{enumerate}")
             for decision in papers_with_motivation:
-                lines.append(f"\\item \\fullcite{{{cite_key(decision)}}}")
+                lines.append(paper_item_latex(decision, cite_key))
             lines.append(r"\end{enumerate}")
             lines.append("")
     else:
         lines.append(r"\begin{enumerate}")
         for decision in session.discarded_papers():
-            lines.append(f"\\item \\fullcite{{{cite_key(decision)}}}")
+            lines.append(paper_item_latex(decision, cite_key))
         lines.append(r"\end{enumerate}")
         lines.append("")
 @
@@ -6531,7 +7015,9 @@ class TestReviewDecisionsBuilder:
 
 The report's abstract is deterministic: it restates the research question
 and the counts, which is all a reader needs to decide whether to open the
-document.
+document.  The counts include who decided
+([[decision_sources_sentence]]), since a reader deciding whether to
+trust the review needs that before the number of papers means anything.
 
 <<review report generation>>=
 def build_review_report_abstract(session: ReviewSession) -> str:
@@ -6553,6 +7039,10 @@ def build_review_report_abstract(session: ReviewSession) -> str:
         f"{lead} The search covered {providers} and yielded {total} papers "
         f"({kept} kept, {discarded} discarded, {pending} pending)."
     )
+
+    sources = decision_sources_sentence(session.decisions)
+    if sources:
+        summary += " " + sources
 
     if session.snowball_rounds:
         summary += " Manual snowballing was used to discover additional papers."
@@ -6660,6 +7150,71 @@ class TestReportModes:
         assert r"\begin{refsection}" in content
         assert r"\section{Kept Papers}" in content
         assert (tmp_path / "report.bib").read_text().startswith("@article{")
+@
+
+The report must say who decided, in the summary, in the abstract and
+next to each paper (issue~\#163).  One session with every kind of
+decision checks all three places at once; the human decision must stay
+unmarked, since the marks are only useful if they single out the
+decisions nobody checked.
+
+<<test functions>>=
+class TestReportDecisionSources:
+    def _session(self):
+        def d(title, status, source, tags, is_example=False):
+            return ReviewDecision(
+                paper=Paper(title=title, authors=[title], year=2024),
+                provider="p", status=status, tags=tags, source=source,
+                is_example=is_example,
+            )
+        session = ReviewSession(
+            query="q", providers=["p"], timestamp=datetime(2026, 11, 18),
+        )
+        session.decisions = [
+            d("Human", DecisionStatus.KEPT, ReviewSource.HUMAN, ["ml"]),
+            d("Agent", DecisionStatus.KEPT,
+              ReviewSource.AGENT_UNREVIEWED, ["ml"]),
+            d("Model", DecisionStatus.DISCARDED,
+              ReviewSource.LLM_UNREVIEWED, ["off-topic"]),
+            d("Checked", DecisionStatus.DISCARDED,
+              ReviewSource.AGENT_REVIEWED, ["off-topic"], is_example=True),
+            d("Open", DecisionStatus.PENDING, ReviewSource.HUMAN, []),
+        ]
+        return session
+
+    def test_summary_counts_decisions_by_source(self, tmp_path):
+        path = tmp_path / "report.tex"
+        generate_latex_report(self._session(), path)
+        content = path.read_text()
+        assert r"\item[Decided: human] 1" in content
+        assert r"\item[Decided: agent, reviewed by a human] 1" in content
+        assert r"\item[Decided: LLM, unreviewed] 1" in content
+        assert r"\item[Decided: agent, unreviewed] 1" in content
+        assert r"\item[Agent confirmed] 0" in content
+        assert r"\item[Agent changed (kept->discarded)] 1" in content
+        assert r"\item[LLM confirmed] 0" in content
+
+    def test_abstract_says_who_decided(self):
+        abstract = build_review_report_abstract(self._session())
+        assert "Decisions by source: 1 human; " \
+            "1 agent, reviewed by a human; 1 LLM, unreviewed; " \
+            "1 agent, unreviewed." in abstract
+
+    def test_lists_mark_unreviewed_machine_decisions(self):
+        session = self._session()
+        keys = {d.paper.title: d.paper.title.lower()
+                for d in session.decisions}
+        lines = build_review_decisions_latex(
+            session, lambda d: keys[d.paper.title]
+        )
+        assert r"\item \fullcite{agent} \emph{(agent, unreviewed)}" in lines
+        assert r"\item \fullcite{model} \emph{(LLM, unreviewed)}" in lines
+        assert r"\item \fullcite{human}" in lines
+        assert r"\item \fullcite{checked}" in lines
+        assert any(
+            line.startswith(r"\citetitle{agent} \emph{(agent, unreviewed)} &")
+            for line in lines
+        )
 @
 
 \subsection{Audit table}
@@ -6910,9 +7465,11 @@ both tags on it; looking only at the first tag would file the paper
 under the category and count no cited rows at all. The rule therefore
 splits the tags into category tags, note tags and theme tags and takes
 the theme from the last group. Second, an LLM keep is a candidate, not
-a citation: only a decision a human made (or reviewed) counts as cited,
-which is also what the [[decision_source]] column of the CSV export
-says. Third, when the caller names its themes with [[--theme]], that
+a citation, and so is an agent's: only a decision a human made (or
+reviewed) counts as cited, which is also what the [[decision_source]]
+column of the CSV export says. The test is
+[[ReviewSource.is_unreviewed]] (\cref{sec:review-source}), so the two
+machine sources cannot drift apart. Third, when the caller names its themes with [[--theme]], that
 list is an allowlist: any other tag that is neither a category nor a
 known note is shown as a note, so a stray tag cannot pass for a theme.
 Without the list, every tag that is not a category or a note is a
@@ -6924,8 +7481,8 @@ decision: tags accumulate in the order they were given, so a reviewer
 who changes an LLM's \enquote{supports} to \enquote{false hit} leaves
 both, and taking the first once counted an explicitly rejected paper as
 supporting evidence in a published appendix. The confidence is shown
-for the rows whose category is the machine's: unreviewed LLM decisions
-and the ones a human confirmed as they stood. A human who changed the
+for the rows whose category is the machine's: unreviewed LLM or agent
+decisions and the ones a human confirmed as they stood. A human who changed the
 decision owns the new label, so no confidence goes with it. Finally, a
 theme that merely repeats the word \enquote{cited} adds nothing and is
 not repeated.
@@ -6986,11 +7543,10 @@ def audit_reason(
         theme_tags = [
             t for t in tags if t not in AUDIT_CATEGORIES and t not in notes
         ]
-    human_decision = decision.source != ReviewSource.LLM_UNREVIEWED
+    human_decision = not decision.source.is_unreviewed
     kept = decision.status == DecisionStatus.KEPT
-    machine_label = decision.source == ReviewSource.LLM_UNREVIEWED or (
-        decision.source == ReviewSource.LLM_REVIEWED
-        and not decision.is_example
+    machine_label = decision.source.is_unreviewed or (
+        decision.source.is_machine and not decision.is_example
     )
     confidence = ""
     if machine_label and decision.llm_confidence is not None:
@@ -7169,6 +7725,79 @@ class TestAuditReason:
         assert self._reason(DecisionStatus.DISCARDED, ["needs_fulltext"]) \
             == (r"needs\_fulltext", AUDIT_ORDER_OTHER)
         assert AUDIT_ORDER_PENDING < AUDIT_ORDER_OTHER
+@
+
+An agent's decisions follow the same rule as an LLM's: unreviewed, a
+keep is a candidate with the agent's confidence beside its category;
+reviewed by a human, it can be cited.  Before the agent source existed
+an agent recorded its keeps as [[human]] and the table cited them
+(issue~\#162), so the first case is the regression this pins.
+
+<<test functions>>=
+class TestAuditReasonAgentSource:
+    def _reason(self, status, tags, source, conf=None, is_example=False):
+        decision = ReviewDecision(
+            paper=Paper(title="P", authors=["A"], year=2024),
+            provider="p", status=status, tags=tags, source=source,
+            llm_confidence=conf, is_example=is_example,
+        )
+        return audit_reason(
+            decision, theme_names={}, strings=AUDIT_STRINGS["en"],
+        )
+
+    def test_unreviewed_agent_keep_is_not_cited(self):
+        agent = ReviewSource.AGENT_UNREVIEWED
+        assert self._reason(DecisionStatus.KEPT, ["ml"], agent, 0.7) \
+            == ("ml (0.70)", AUDIT_ORDER_OTHER)
+        assert self._reason(DecisionStatus.KEPT, [], agent) \
+            == ("pending, unclassified", AUDIT_ORDER_PENDING)
+        assert self._reason(
+            DecisionStatus.KEPT, ["supports-claim"], agent,
+        ) == ("supports the claim (n/a)", 1)
+
+    def test_reviewed_agent_keep_is_cited(self):
+        reviewed = ReviewSource.AGENT_REVIEWED
+        assert self._reason(DecisionStatus.KEPT, ["ml"], reviewed, 0.7) \
+            == (r"\emph{cited}: ml", AUDIT_ORDER_CITED)
+        assert self._reason(
+            DecisionStatus.KEPT, ["supports-claim"], reviewed, 0.7,
+        ) == ("supports the claim (0.70)", 1)
+        assert self._reason(
+            DecisionStatus.KEPT, ["supports-claim"], reviewed, 0.7,
+            is_example=True,
+        ) == ("supports the claim", 1)
+@
+
+Because the category is read from the tags, a decision that overturns
+an earlier one must not leave the earlier category behind
+(\url{https://github.com/dbosk/scholar/issues/177}).  When a record's
+status changes, [[sessions decide]] removes the old category tags,
+since the new decision brings its own, and keeps every other tag.
+Removing more was tried and lost data: dropping a discarded record's
+motivations along with its category also dropped the themes of a paper
+that had been kept, discarded and kept again, and a theme is the
+author's own reading of the paper.  A motivation left on a re-kept
+paper does less harm: the cited rule reads the status first, so the
+paper is cited all the same, and at worst the reason column names the
+leftover tag, which the author can remove.
+
+<<review report generation>>=
+def tags_after_status_change(tags: list[str]) -> list[str]:
+    """Return the tags a record keeps when a new decision changes its status.
+
+    Only the category tags (`AUDIT_CATEGORIES`) go; themes, motivations
+    and notes stay.
+    """
+    return [t for t in tags if t not in AUDIT_CATEGORIES]
+@
+
+<<test functions>>=
+class TestTagsAfterStatusChange:
+    def test_only_category_tags_go(self):
+        assert tags_after_status_change(
+            ["supports-claim", "ml", "no-abstract", "extended-tech-report",
+             "off-topic-false-hit"],
+        ) == ["ml", "no-abstract", "extended-tech-report"]
 @
 
 The same paper often arrives from several providers, sometimes with and
@@ -8712,6 +9341,10 @@ LLM provenance columns, so that a spreadsheet or a script can recompute
 any of the tables above. The last column is the session's paper id, the
 selector [[sessions decide --paper-id]] accepts, so a record without a
 DOI can be decided from the CSV without opening the TUI.
+The review columns ([[llm_review_outcome]], [[llm_change_direction]])
+describe how a human handled a machine decision and apply to the agent's
+decisions as much as to the LLM's; their names predate the agent source,
+and [[decision_source]] says which machine it was.
 
 <<review report generation>>=
 def generate_csv_report(session: ReviewSession, output_path: Path) -> None:
@@ -8726,7 +9359,8 @@ def generate_csv_report(session: ReviewSession, output_path: Path) -> None:
     - provider: search provider that returned the paper
     - decision_source: where the keep/discard decision originated
     - llm_confidence: 0.0-1.0 confidence for LLM decisions (if available)
-    - llm_review_outcome: human/unreviewed/confirmed/changed
+    - llm_review_outcome: human/unreviewed/confirmed/changed (for LLM
+      and agent decisions alike; `decision_source` tells them apart)
     - llm_change_direction: kept->discarded or discarded->kept (only for changed)
 
     Args:
@@ -8738,14 +9372,13 @@ def generate_csv_report(session: ReviewSession, output_path: Path) -> None:
     def llm_review_outcome(decision: ReviewDecision) -> str:
         if decision.source == ReviewSource.HUMAN:
             return "human"
-        if decision.source == ReviewSource.LLM_UNREVIEWED:
+        if decision.source.is_unreviewed:
             return "unreviewed"
-        if decision.source == ReviewSource.LLM_REVIEWED:
-            return "changed" if decision.is_example else "confirmed"
-        return ""
+        return "changed" if decision.is_example else "confirmed"
 
     def llm_change_direction(decision: ReviewDecision) -> str:
-        if decision.source != ReviewSource.LLM_REVIEWED or not decision.is_example:
+        reviewed = decision.source.is_machine and not decision.source.is_unreviewed
+        if not reviewed or not decision.is_example:
             return ""
         if decision.status == DecisionStatus.DISCARDED:
             return "kept->discarded"
@@ -8803,6 +9436,44 @@ def generate_csv_report(session: ReviewSession, output_path: Path) -> None:
                     get_paper_id(paper),
                 ]
             )
+@
+
+An agent's decisions get the same review columns as an LLM's, told apart
+by [[decision_source]]:
+
+<<test functions>>=
+class TestCsvReportAgentSource:
+    def test_agent_rows_carry_their_review_outcome(self, tmp_path):
+        import csv
+
+        def d(title, status, source, is_example=False):
+            return ReviewDecision(
+                paper=Paper(title=title, authors=["A"], year=2024),
+                provider="p", status=status, tags=["t"], source=source,
+                is_example=is_example,
+            )
+        session = ReviewSession(
+            query="q", providers=["p"], timestamp=datetime(2026, 11, 18),
+        )
+        session.decisions = [
+            d("Unreviewed", DecisionStatus.KEPT,
+              ReviewSource.AGENT_UNREVIEWED),
+            d("Changed", DecisionStatus.KEPT,
+              ReviewSource.AGENT_REVIEWED, is_example=True),
+            d("Confirmed", DecisionStatus.KEPT, ReviewSource.AGENT_REVIEWED),
+        ]
+        path = tmp_path / "r.csv"
+        generate_csv_report(session, path)
+        rows = {
+            r["title"]: (r["decision_source"], r["llm_review_outcome"],
+                         r["llm_change_direction"])
+            for r in csv.DictReader(path.open())
+        }
+        assert rows == {
+            "Unreviewed": ("agent", "unreviewed", ""),
+            "Changed": ("agent_reviewed", "changed", "discarded->kept"),
+            "Confirmed": ("agent_reviewed", "confirmed", ""),
+        }
 @
 
 \subsection{Testing Report Generation}

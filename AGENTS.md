@@ -554,12 +554,50 @@ confirmation goes to stderr so `-f json`/`-f bibtex` stdout stays pure.
 `sessions show` prints each paper's id (`doi:…`/`hash:…`, the value
 `--paper-id` takes) under its title, and `show -f json` carries `doi` and
 `paper_id`, so a decision never needs a CSV detour.
-`--source llm` stores the decision as an unreviewed LLM decision
-(agent-driven screening that the TUI still queues for confirmation),
-with `--confidence/-c 0..1` in `llm_confidence` like `llm classify`
-(validated; ignored with a note for human decisions); a
-human `decide` on such a row marks it `llm_reviewed`, with `is_example`
-set when the status changed, mirroring the TUI.
+`--source human|agent|llm` says who decided (#162). It defaults to
+`human` only when stdin is a terminal; otherwise (scripts, agents) a
+missing `--source` exits 2 before loading the session. `agent` (an AI
+agent's own verdict) and `llm` (a classifier's verdict relayed) store
+unreviewed decisions (`ReviewSource.AGENT_UNREVIEWED`/`LLM_UNREVIEWED`,
+values `agent`/`llm`) that the TUI queues for confirmation, with
+`--confidence/-c 0..1` in `llm_confidence` like `llm classify`
+(validated; ignored with a note for human decisions; a machine decision
+without `-c` gets None, never an earlier run's number); a human `decide`
+(or TUI confirm) on such a row marks it `agent_reviewed`/`llm_reviewed`
+(`ReviewSource.reviewed`), with `is_example` set when the status
+changed. Ask a source `is_unreviewed` / `is_machine` instead of
+listing members. A machine `decide` also calls
+`review.clear_machine_audit(decision)`, which sets every field named in
+`review.MACHINE_AUDIT_FIELDS` to None (empty here; classifier audit
+fields register there so a replaced decision does not keep the old
+run's model/prompt/reason). A machine `decide` never replaces a decided
+paper whose source is `human`, `llm_reviewed` or `agent_reviewed`:
+the batch is refused unsaved (exit 2, each conflict named) unless
+`--force`. When `decide` changes a record's status, only its old
+category tags (`AUDIT_CATEGORIES`) are dropped before the new `--tag`s
+are added (`review.tags_after_status_change`, #177); themes,
+motivations and notes stay (dropping motivations lost themes on
+keep→discard→keep). Same status: tags append as before.
+**Unknown stored sources** (e.g. `manual`, which no Scholar version
+wrote, or a hand-edited `Agent`) load as `ReviewSource` pseudo-members
+via `_missing_` (`is_unknown`; value kept verbatim on save), count as
+unreviewed (never cited, not in `example_papers`, queued in the TUI;
+a human review makes them `human`), are shown as "unknown source
+'<value>'", and are warned about once per file and process
+(`warn_about_unknown_sources`).
+**Old installs:** a Scholar older than this change reads `agent`,
+`agent_reviewed` (and any unknown source) as `human` and writes that
+back on its next save. Reinstall every scholar installation (pipx,
+other venvs) before anyone uses `--source agent`.
+Who decided is shown everywhere decisions are counted (#163): the
+LaTeX report (summary "Decided: <source>" rows, abstract sentence,
+"(agent, unreviewed)" marks in the paper lists and overview table),
+`llm synthesize` (both formats' summary), `sessions show` ("Decided
+by:", marks after titles; JSON `source` per decision and
+`decision_sources`), `llm status` (Agent rows) and the export's
+confirmed/changed table (`machine_review_rows`, LLM and agent apart).
+Labels come from `review.DECISION_SOURCE_LABELS` /
+`decision_source_items` (decided papers only).
 Together these let scripted/agent-driven systematic reviews produce the same
 session record and `sessions export` audit trail as TUI reviews.
 
@@ -746,8 +784,10 @@ report body builders (`build_review_provenance_latex`,
   (`author_surname`; a blank author gives an empty surname) reduced to case-folded letters and digits, year ignored; joined
   provider strings like `openalex; dblp` are split, mapped to codes and
   deduplicated; the best-placed decision wins). The *last* category tag
-  is the decision (`decide -t` appends); confidence is shown for
-  unreviewed and human-confirmed LLM rows, not for changed ones, and
+  is the decision (`decide -t` appends while the status stays the
+  same; a status change replaces the old category, #177); confidence is
+  shown for unreviewed and human-confirmed LLM or agent rows, not for
+  changed ones, and
   such a row without one shows `AUDIT_STRINGS[lang]["no_confidence"]`
   (`n/a`, `saknas`) because the caption promises a confidence. The
   escapers decode HTML entities, strip inline markup, repair
@@ -758,10 +798,11 @@ report body builders (`build_review_provenance_latex`,
   note tags (`AUDIT_STRINGS[lang]["notes"]`: `recorded-not-cited`,
   `duplicate-record-of-cited-source`, `extended-tech-report`, …) and
   theme tags (the rest; with `--theme` given, only the listed tags).
-  *Cited* = kept by a human decision (source `human` or `llm_reviewed`)
-  with a theme tag or no tags; otherwise the last category tag
-  (`audit_category`), with the confidence for unreviewed LLM rows; notes
-  are appended in parentheses, note-only rows are "other". An LLM keep
+  *Cited* = kept by a decision that is not `is_unreviewed` (source
+  `human`, `llm_reviewed` or `agent_reviewed`) with a theme tag or no
+  tags; otherwise the last category tag (`audit_category`), with the
+  confidence for unreviewed LLM or agent rows; notes are appended in
+  parentheses, note-only rows are "other". An LLM's or an agent's keep
   is a candidate, not a citation. Order: cited (0), `supports-claim` (1),
   `qualifies-claim` (2), `adjacent-subtopic` (3),
   `off-topic-false-hit` (4), pending (5), other (6). The status wins
