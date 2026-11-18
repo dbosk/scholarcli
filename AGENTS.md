@@ -565,7 +565,11 @@ values `agent`/`llm`) that the TUI queues for confirmation, with
 (or TUI confirm) on such a row marks it `agent_reviewed`/`llm_reviewed`
 (`ReviewSource.reviewed`), with `is_example` set when the status
 changed. Ask a source `is_unreviewed` / `is_machine` instead of
-listing members.
+listing members. When `decide` changes a record's status, its old
+category tags (and all non-note tags of a formerly discarded record,
+its motivations) are dropped before the new `--tag`s are added
+(`review.tags_after_status_change`, #177); themes and note tags stay.
+Same status: tags append as before.
 Who decided is shown everywhere decisions are counted (#163): the
 LaTeX report (summary "Decided: <source>" rows, abstract sentence,
 "(agent, unreviewed)" marks in the paper lists and overview table),
@@ -761,9 +765,10 @@ report body builders (`build_review_provenance_latex`,
   (`author_surname`; a blank author gives an empty surname) reduced to case-folded letters and digits, year ignored; joined
   provider strings like `openalex; dblp` are split, mapped to codes and
   deduplicated; the best-placed decision wins). The *last* category tag
-  is the decision (`decide -t` appends); confidence is shown for
-  unreviewed and human-confirmed LLM or agent rows, not for changed
-  ones, and
+  is the decision (`decide -t` appends while the status stays the
+  same; a status change replaces the old category, #177); confidence is
+  shown for unreviewed and human-confirmed LLM or agent rows, not for
+  changed ones, and
   such a row without one shows `AUDIT_STRINGS[lang]["no_confidence"]`
   (`n/a`, `saknas`) because the caption promises a confidence. The
   escapers decode HTML entities, strip inline markup, repair
