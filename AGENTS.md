@@ -565,7 +565,11 @@ values `agent`/`llm`) that the TUI queues for confirmation, with
 (or TUI confirm) on such a row marks it `agent_reviewed`/`llm_reviewed`
 (`ReviewSource.reviewed`), with `is_example` set when the status
 changed. Ask a source `is_unreviewed` / `is_machine` instead of
-listing members. When `decide` changes a record's status, its old
+listing members. A machine `decide` also calls
+`review.clear_machine_audit(decision)`, which sets every field named in
+`review.MACHINE_AUDIT_FIELDS` to None (empty here; classifier audit
+fields register there so a replaced decision does not keep the old
+run's model/prompt/reason). When `decide` changes a record's status, its old
 category tags (and all non-note tags of a formerly discarded record,
 its motivations) are dropped before the new `--tag`s are added
 (`review.tags_after_status_change`, #177); themes and note tags stay.
