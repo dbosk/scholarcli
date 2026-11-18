@@ -551,26 +551,36 @@ whatever the years), then `link_doi_less_copies` folds a DOI-less copy
 into the one published DOI copy whose `legacy_hash_paper_id` equals its
 id (`doi_copy_index`/`doi_copy_of`; preprints and ambiguous choices are
 left alone, and so is a copy without a year or a first author,
-`foldable_copy`). In sessions, `fold_doi_less_copies` runs at the end
-of `create_review_session`: a pending, untagged human copy with no
-LLM audit fields (or an equal decision: `decision_state` includes the
-source and `LLM_AUDIT_FIELDS`, so a fold never relabels a source)
-folds into the other, taking the DOI paper and uniting
-`found_by`/providers (not if both ids have notes). A fold is recorded
-as a `CopyFold` in `session._folds` until saved: the note moves
-(`migrate_paper_id`) only after `save_session` wrote the file, and only
-for a named session (`move_folded_notes`); `merge_concurrent_changes`
-first calls `undo_overtaken_folds`, which undoes a fold when the file
-holds a state for either id that differs from the baseline (another
-process decided a copy meanwhile), so the three-way merge keeps that
-decision; `warn_if_decisions_dropped` allows only for folds whose
-folded-away copy the file holds as decided (`folds_dropping_decisions`).
-Nothing unreconciled is silent: `conflicting_copies` (pairs with
-different statuses, plus `same_id_copies`), `alike_copies` (same status,
-different tags/source: not folded, merging tags is a judgement) and
+`foldable_copy`). In sessions an append never folds (folding at
+append time raced other processes: double folds, notes moved by
+`get_note` on read, undo losing enrichment, stale saves resurrecting
+copies). `scholar sessions reconcile S [--dry-run]`
+(`reconcile_session`) takes the session file lock (reentrant, so the
+inner `save_session` takes it again), loads fresh, folds every
+`foldable_copies` pair with `reconcile_copies` (an `is_unscreened` copy
+-- pending, untagged, human, no confidence or `LLM_AUDIT_FIELDS` -- into
+the other, or two equal decisions: `decision_state` includes source and
+audit fields, so a fold never relabels a source; not if both ids have
+notes), saves, and only then moves notes with `migrate_paper_id`. Each
+fold leaves a tombstone in `ReviewSession.folded` (`{old_id: new_id}`,
+the DOI-less id always the old one; saved as `"folded"` only when
+non-empty, united with the file's on save). `merge_concurrent_changes`
+calls `apply_tombstones`: an in-memory decision under a tombstoned id
+is dropped (links/provider united into the target) when it is
+unscreened or equal to the target, moves its decision to an unscreened
+target, and otherwise stays beside it (a conflict). `repoint_folded_ids`
+repoints snowball `source_papers` and LLM sample `paper_id`s;
+`create_review_session` routes a result under a tombstoned id to its
+target. The drop guard allows only for decided copies the file holds
+under a tombstoned id that the session no longer holds.
+Nothing unreconciled is silent: `foldable_copies` (counted with the
+reconcile hint), `conflicting_copies` (pairs with different statuses,
+plus `same_id_copies`), `alike_copies` (same status, different
+tags/source: not folded, merging tags is a judgement) and
 `possible_copies` (DOI-less decisions sharing an `audit_work_key` with a
-DOI decision but in neither list) are shown by `sessions show` (lines;
-possible copies counted, ids in JSON) and counted in the report, which
+DOI decision but in none of those lists) are shown by `sessions show`
+(lines; foldable and possible copies counted, ids in JSON) and counted
+in the report, which
 also states "Unique works" from the audit rows. **Remaining gap**: the
 pairing uses the exact title + surname hash, the audit work key is
 looser (punctuation, case, year), so on the real sessions 2995 DOI-less
@@ -858,7 +868,7 @@ report body builders (`build_review_provenance_latex`,
   (`AUDIT_VERSION_NOTES`) as "duplicates or other versions of cited
   sources", discards under an exclusion criterion
   (`audit_exclusion_criterion`: a discard with no category and no note
-  tag, its first tag that is not a `--theme`; e.g. `no-abstract`) per
+  tag, its last tag that is not a `--theme`, which the row shows too; e.g. `no-abstract`) per
   criterion as "excluded by the criterion <tag>" (`no-abstract`:
   "excluded for lack of an abstract", `AUDIT_STRINGS[lang]["criteria"]`),
   the rest as "other hits" (all localised). Criteria are the review's own labels, so
