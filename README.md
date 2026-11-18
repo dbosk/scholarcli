@@ -288,7 +288,7 @@ also asks api.ipify.org for the exit address (a third-party request, so
 only on demand).
 
 Requests identify themselves as
-`scholar/<version> (+https://github.com/dbosk/scholar)`. Your
+`scholar/<version> (+https://github.com/dbosk/scholarcli)`. Your
 `SCHOLAR_EMAIL` is not in it, so publishers never see the address; only
 the services that ask for one (OpenAlex, Crossref, Unpaywall) get it,
 through their own parameters. Set `SCHOLAR_USER_AGENT` to replace it. Scholar does not imitate a browser: a Cloudflare challenge
