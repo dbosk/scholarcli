@@ -207,6 +207,13 @@ part. COMPLETE results are served to everyone (unless
 `SCOPUS_VIEW=standard`); default-view results only when COMPLETE is not
 available, which a new process learns from one `count=1` probe
 (`_complete_confirmed()`); a failed probe still serves the cache.
+When it is served because the probe was inconclusive (HTTP 429/5xx/403,
+a bad key, `RateLimited`, a network error; a *refusal* is the normal
+off-campus case and silent, and so is `SCOPUS_VIEW=standard`), the
+provider logs one WARNING per process naming the reason and the remedy
+`scholar cache clear --provider scopus` (#139). The route (proxy or
+direct) is deliberately not part of the key: what changes the data is
+the view the route entitles, and that is already keyed.
 
 `ScopusProvider.get_paper_by_doi()` (a one-result `DOI("...")` search)
 makes Scopus the *last* entry of `ENRICHMENT_PROVIDERS`. It returns
@@ -679,8 +686,13 @@ shared registry let one test's titles leak into the next), and
 `fresh_rate_limiters` returns the limiter registry to its import-time
 state after every test (test-created limiters dropped, the others'
 limits, last request and warning flag reset). It restores rather than
-empties: `providers limits` lists Crossref/Unpaywall only because their
-import registered limiters. No test needs to pop `ratelimit._LIMITERS`.
+empties: `providers limits` lists Crossref/Unpaywall only because
+importing `scholar.crossref`/`scholar.unpaywall` registers their
+limiters. `scholar.cli` imports Unpaywall lazily, so the fixture imports
+`scholar.providers`, `crossref` and `unpaywall` itself (inside the
+fixture, never at conftest level, #132) before taking its snapshot;
+otherwise the first test to trigger the import lost the registration at
+teardown (#131). No test needs to pop `ratelimit._LIMITERS`.
 
 Per-test fixtures cannot protect state touched at import or at exit:
 provider caches load when their module is imported (during collection)
@@ -733,6 +745,12 @@ never goes stale) and says how many it kept; `cache info` lists them on
 their own line. `clear_cache()` also empties the in-memory copy of each
 deleted cache in `CACHE_REGISTRY`, else the exit hook would write it
 back (the CLI loads `crossref.pkl` at import).
+
+`scholar cache clear --provider NAME` (repeatable) deletes only
+`NAME.pkl` (`clear_cache(providers=[...])`), also emptying its in-memory
+cache. Valid names are the registered providers plus `crossref` and
+`unpaywall`; an unknown one exits 2 listing them. It cannot be combined
+with `--include-llm` (exit 2 / `ValueError`).
 
 Environment variable: `SCHOLAR_CACHE_DIR` to override cache location.
 

@@ -10826,6 +10826,8 @@ class ScopusProvider:
         )
         self.view_mode = scopus_view_mode(view)
         self._complete_ok: bool | None = None
+        self._complete_doubt: str | None = None
+        self._doubt_reported = False
         self._cache: dict = load_cache(self.name)
         register_cache(self.name, self._cache)
         self._limiter = limiter_for(self)
@@ -11036,7 +11038,26 @@ logger.info(
 if self.view_mode != "standard" and complete_key in self._cache:
     return self._cache[complete_key]
 if standard_key in self._cache and not self._complete_confirmed():
+    <<warn once that the cached standard view may be outdated>>
     return self._cache[standard_key]
+@
+
+Serving on after an inconclusive probe is silent no longer: the
+reason the probe left in [[_complete_doubt]] (a refusal leaves none,
+since that is the expected off-campus answer) goes into one warning per
+process.  The remedy it names is explained in
+\cref{sec:scopus-cache-doubt}.
+
+<<warn once that the cached standard view may be outdated>>=
+if self._complete_doubt and not self._doubt_reported:
+    self._doubt_reported = True
+    logger.warning(
+        "scopus: serving cached standard-view results (no abstracts, "
+        "first author only) because the COMPLETE view could not be "
+        "confirmed (%s). If this network is entitled to it, run "
+        "`scholar cache clear --provider scopus` and search again.",
+        self._complete_doubt,
+    )
 <<scopus provider>>=
 
     def _complete_confirmed(self) -> bool:
@@ -11045,13 +11066,15 @@ if standard_key in self._cache and not self._complete_confirmed():
             return self.view_mode == "complete"
         if self._complete_ok is None and self.api_key:
             try:
-                self._get_best_view(
+                response = self._get_best_view(
                     self._headers(),
                     dict(SCOPUS_PROBE_PARAMS),
                     retry=False,
                 )
-            except (RateLimited, requests.exceptions.RequestException):
-                pass
+                if self._complete_ok is None:
+                    self._complete_doubt = f"HTTP {response.status_code}"
+            except (RateLimited, requests.exceptions.RequestException) as e:
+                self._complete_doubt = type(e).__name__
         return self._complete_ok is True
 
     def _headers(self) -> dict:
@@ -11628,6 +11651,134 @@ def test_check_reports_the_view(self):
         status, message = ScopusProvider(api_key="k", view="complete").check()
     assert status == HEALTH_HTTP_ERROR
     assert "SCOPUS_VIEW=complete" in message
+@
+
+\subsection{Serving a cached standard view without knowing the entitlement}
+\label{sec:scopus-cache-doubt}
+
+A standard-view entry is the right answer off campus and the wrong one
+on campus, and the probe is what tells the two apart.
+It has three outcomes.
+A refusal is the ordinary off-campus case and needs no comment; success
+makes the entry unreachable; but anything else (a throttled or failing
+server, a spent quota, no network) leaves the question open, and the
+entry is then served as the only data at hand.
+That is the case where a user on the subscribing network can get
+abstract-less results without any sign of it, which is what
+\url{https://github.com/dbosk/scholar/issues/139} reports.
+We keep the behaviour, since a cache that vanished with the network would
+be worse, but [[_complete_confirmed]] records why it could not decide in
+[[_complete_doubt]], and the search says so, with how to refresh.
+While the question stays open the probe is repeated on the next search
+that finds a standard-view entry, but the warning is given only once
+per process: one is enough to explain every such result of the run.
+We do not key the cache on the route (direct or through a proxy), as the
+issue also suggests: what changes the data is the view the route
+entitles us to, and the view is already part of the key.
+The remedy is [[scholar cache clear --provider scopus]] followed by a
+search on the entitled network: the next search then fetches the
+COMPLETE view and caches it under its own key.
+
+The tests seed a standard-view cache with the fake service of
+[[TestScopusView]], then let the probe of a second \enquote{process}
+fail in each of the ways the code distinguishes.  The fake probe
+answers are hand-written because the live service cannot be asked to
+throttle on demand and Scopus is not to be queried by tests
+(the 429 and 5xx bodies are never read, only the status code).
+
+<<test functions>>=
+class TestScopusInconclusiveProbe:
+  """Serving cached standard-view results when COMPLETE is unconfirmed."""
+
+  REMEDY = "cache clear --provider scopus"
+
+  @staticmethod
+  def seeded_cache() -> dict:
+    """A cache holding one standard-view entry, as left off campus."""
+    cache = {}
+    with patch("requests.get", TestScopusView.service(False, [])):
+      TestScopusView.process(cache).search("q", limit=5)
+    assert len(cache) == 1
+    return cache
+
+  @staticmethod
+  def answering(status: int):
+    """A fake `requests.get` answering every request with `status`."""
+    response = Mock(status_code=status, ok=False, headers={}, text="")
+    return lambda *args, **kwargs: response
+
+  @pytest.mark.parametrize("status", [429, 503])
+  def test_unanswered_probe_warns_once(self, status, caplog):
+    """A throttled probe still serves the cache, and says so, once."""
+    import logging
+
+    provider = TestScopusView.process(self.seeded_cache())
+    with patch("requests.get", self.answering(status)):
+      with caplog.at_level(logging.WARNING):
+        first = provider.search("q", limit=5)
+        second = provider.search("q", limit=5)
+    assert first[0].abstract is None and len(second) == 1
+    warnings = [
+        r for r in caplog.records
+        if r.levelno == logging.WARNING and r.name == "scholar.providers"
+    ]
+    assert len(warnings) == 1
+    assert f"HTTP {status}" in warnings[0].getMessage()
+    assert self.REMEDY in warnings[0].getMessage()
+    assert "abstract" in warnings[0].getMessage()
+
+  def test_refused_probe_is_the_normal_case(self, caplog):
+    """Off campus the probe is refused: standard is right, no warning."""
+    import logging
+
+    provider = TestScopusView.process(self.seeded_cache())
+    with patch("requests.get", TestScopusView.service(False, [])):
+      with caplog.at_level(logging.WARNING):
+        papers = provider.search("q", limit=5)
+    assert papers[0].abstract is None
+    assert caplog.records == [] or all(
+        r.levelno < logging.WARNING for r in caplog.records
+    )
+
+  def test_standard_mode_never_warns(self, caplog):
+    """`SCOPUS_VIEW=standard` asked for this view: nothing to warn of."""
+    import logging
+
+    provider = TestScopusView.process(self.seeded_cache(), view="standard")
+    with patch("requests.get", self.answering(503)):
+      with caplog.at_level(logging.WARNING):
+        assert len(provider.search("q", limit=5)) == 1
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+  def test_probe_that_cannot_be_made_warns(self, caplog):
+    """A spent quota or a missing network is named by its class."""
+    import logging
+
+    cache = self.seeded_cache()
+    cases = [
+        ("RateLimited", None),
+        ("ConnectionError", requests.exceptions.ConnectionError()),
+    ]
+    for word, error in cases:
+      caplog.clear()
+      provider = TestScopusView.process(cache)
+      if error is None:
+        # the limiter is shared by all instances: patch, then restore
+        patched = patch.object(
+            provider._limiter, "acquire",
+            side_effect=RateLimited("scopus", "weekly quota spent"),
+        )
+      else:
+        patched = patch("requests.get", side_effect=error)
+      with patched, caplog.at_level(logging.WARNING):
+        assert len(provider.search("q", limit=5)) == 1
+      warnings = [
+          r.getMessage() for r in caplog.records
+          if r.levelno == logging.WARNING and r.name == "scholar.providers"
+      ]
+      assert len(warnings) == 1, word
+      assert word in warnings[0]
+      assert self.REMEDY in warnings[0]
 @
 
 \subsection{Auto-registration}
