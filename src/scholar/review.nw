@@ -82,7 +82,7 @@ from pathlib import Path
 from unittest.mock import Mock
 
 from scholar.review import *
-from scholar.scholar import Paper, SearchFilters
+from scholar.scholar import Paper, SearchFilters, filters_key
 
 
 <<test functions>>
@@ -107,6 +107,7 @@ import unicodedata
 from cachetools import cachedmethod
 
 from scholar.scholar import Paper, SearchFilters, merge_version_of
+from scholar.scholar import filters_key
 from scholar.scholar import hits_label, result_outcome
 from scholar.notes import (
     get_paper_id, get_query_hash, get_data_dir,
@@ -177,9 +178,15 @@ named a query that had never returned the paper
 (\url{https://github.com/dbosk/scholar/issues/128}).  Only the moment a
 result is turned into decisions knows which search a paper came from,
 so that is where the link is recorded (\cref{sec:review-found-by}).  A
-link is the [[(query, provider)]] key of the search's [[SearchRecord]],
-the key that identifies a record in the session, so it always resolves
-to the stored query, filters and limit.  The list stays empty when
+link is the [[(query, provider, filters)]] key of the search's
+[[SearchRecord]], the key that identifies a record in the session
+(\cref{sec:search-record-key}), so it always resolves to the stored
+query, filters and limit.  Its third part is the [[filters_key]] of the
+record's filters, the empty string for an unfiltered search.  Links
+saved before filters were part of the key have only the query and the
+provider; they load with [[None]] in the third part unless the session
+holds exactly one record with that query and provider
+(\cref{sec:session-persistence}).  The list stays empty when
 nothing was recorded: decisions saved before the link existed, and
 papers added by snowballing, which no search returned.
 
@@ -200,9 +207,11 @@ class ReviewDecision:
         source: Where the decision came from (human or LLM).
         is_example: True if this paper is a training example for LLM.
         llm_confidence: Confidence score from LLM (0.0-1.0), if applicable.
-        found_by: The `(query, provider)` keys of the search records whose
-            results contained the paper, in the order recorded; empty when not
-            recorded (sessions saved before the link existed, snowballing).
+        found_by: The `(query, provider, filters key)` keys of the search
+            records whose results contained the paper, in the order
+            recorded; empty when not recorded (sessions saved before the
+            link existed, snowballing). The filters key is `None` for an
+            old link that could not be tied to one record.
     """
     paper: Paper
     provider: str
@@ -211,7 +220,7 @@ class ReviewDecision:
     source: ReviewSource = ReviewSource.HUMAN
     is_example: bool = False
     llm_confidence: float | None = None
-    found_by: list[tuple[str, str]] = field(default_factory=list)
+    found_by: list[tuple[str, str, str | None]] = field(default_factory=list)
 
     def __post_init__(self):
         """Coerce None list fields to empty lists."""
@@ -220,10 +229,16 @@ class ReviewDecision:
         if self.found_by is None:
             self.found_by = []
 
-    def record_search(self, query: str, provider: str) -> None:
-        """Note that the search `(query, provider)` returned this paper."""
-        if (query, provider) not in self.found_by:
-            self.found_by.append((query, provider))
+    def record_search(
+        self, query: str, provider: str, key: str | None
+    ) -> None:
+        """Note that the search `(query, provider, key)` returned this paper.
+
+        `key` is the `filters_key` of the search's filters, or `None` for
+        an old link that names no filters.
+        """
+        if (query, provider, key) not in self.found_by:
+            self.found_by.append((query, provider, key))
 
     @property
     def is_decided(self) -> bool:
@@ -418,6 +433,22 @@ retries: we cannot reconstruct what an old search returned, and claiming
 \enquote{answered} for it is no worse than what such a record has always
 claimed.
 
+\label{sec:search-record-key}
+A search is identified by its query, its provider \emph{and} its
+filters.  The same words sent to OpenAlex with [[--year 2010-2019]] and
+with [[--year 2020-2024]] are two searches, with their own papers and
+their own hit counts.  When the key was only [[(query, provider)]], the
+second run replaced the first one's record, and the first run's filters
+and hits were lost although its papers stayed in the session
+(\url{https://github.com/dbosk/scholar/issues/140}).  The filters enter
+the key through [[filters_key]] (\cref{sec:filters-key} in the
+[[scholar]] module), the canonical string of the stored dictionary,
+because two dictionaries can describe the same filters in different
+orders.  The limit is deliberately not part of the key: it decides how
+many of a search's papers we fetch, not which search it is, and a re-run
+with a larger limit should replace the earlier record of that search,
+not stand beside it.
+
 <<review data structures>>=
 @dataclass
 class SearchRecord:
@@ -437,6 +468,11 @@ class SearchRecord:
     hits: int | None = None
     error: str | None = None
     retries: int = 0
+
+    @property
+    def key(self) -> tuple[str, str, str]:
+        """The `(query, provider, filters key)` identifying the search."""
+        return (self.query, self.provider, filters_key(self.filters))
 @
 
 
@@ -657,13 +693,15 @@ track which query was used with which provider so that reports accurately
 reflect the search methodology.
 
 We provide helper methods for managing these records. The
-[[add_query_provider_pair]] method records a search only if its
-query-provider pair is not already present, preventing duplicates when
+[[add_query_provider_pair]] method records a search only if no record
+with its key (query, provider and filters, \cref{sec:search-record-key})
+is present yet, preventing duplicates when
 appending results to an existing session; its [[filters]] and [[limit]]
 arguments default to [[None]] so older callers that only know the query and
 provider keep working. The [[query_provider_pairs]] property derives the
 [[(query, provider)]] pairs from the records, so every reader written against
-the old field is unaffected. The [[queries_for_provider]] method retrieves all
+the old field is unaffected; a pair may now occur twice, once per set of
+filters, as it is two searches. The [[queries_for_provider]] method retrieves all
 queries used with a specific provider, and [[search_record_for]] retrieves the
 first whole record for a provider---query, filters, and limit.
 [[search_record]] looks a record up by its full key, which is what a
@@ -671,7 +709,13 @@ paper's [[found_by]] link holds and what [[found-via]] needs to rebuild the
 search.  [[search_record_for]] cannot serve that purpose: a session with
 several queries on one provider has several records for it, and the first
 is merely the most recent search
-(\url{https://github.com/dbosk/scholar/issues/128}).
+(\url{https://github.com/dbosk/scholar/issues/128}).  The same holds one
+level down for an old link that names no filters (a filters key of
+[[None]]): [[search_record]] answers it only when exactly one record has
+that query and provider.  With two, the link could have come from
+either, and picking one would name filters that may never have returned
+the paper---the mistake of \#128 again---so it answers [[None]] and the
+caller reports the link as unresolved.
 
 <<query-provider pair methods>>=
 def add_query_provider_pair(
@@ -686,7 +730,11 @@ def add_query_provider_pair(
     retries: int = 0,
 ) -> None:
     """
-    Record a search if its query-provider pair is not already present.
+    Record a search unless a record with its key is already present.
+
+    The key is the query, the provider and the filters (see
+    `SearchRecord.key`), so the same query with other filters is
+    recorded as a search of its own.
 
     This tracks which query was used with which provider, enabling
     different queries for different providers (e.g., natural language
@@ -694,13 +742,12 @@ def add_query_provider_pair(
     filters and limit applied so the search can be reproduced exactly,
     and its outcome (hits, error, retries).
     """
-    if (query, provider) not in self.query_provider_pairs:
-        self.search_records.append(
-            SearchRecord(
-                query, provider, filters, limit,
-                hits=hits, error=error, retries=retries,
-            )
-        )
+    record = SearchRecord(
+        query, provider, filters, limit,
+        hits=hits, error=error, retries=retries,
+    )
+    if record.key not in {r.key for r in self.search_records}:
+        self.search_records.append(record)
 
 @property
 def query_provider_pairs(self) -> list[tuple[str, str]]:
@@ -727,12 +774,25 @@ def search_record_for(self, provider: str) -> SearchRecord | None:
             return record
     return None
 
-def search_record(self, query: str, provider: str) -> SearchRecord | None:
-    """Get the record of the search `(query, provider)`, or `None`."""
-    for record in self.search_records:
-        if (record.query, record.provider) == (query, provider):
-            return record
-    return None
+def search_record(
+    self, query: str, provider: str, key: str | None = None
+) -> SearchRecord | None:
+    """Get the record of the search `(query, provider, key)`, or `None`.
+
+    `key` is the `filters_key` of the search's filters. With `key`
+    `None` (an old link that names no filters) the record is returned
+    only if it is the one record with that query and provider.
+    """
+    if key is not None:
+        for record in self.search_records:
+            if record.key == (query, provider, key):
+                return record
+        return None
+    same_pair = [
+        record for record in self.search_records
+        if (record.query, record.provider) == (query, provider)
+    ]
+    return same_pair[0] if len(same_pair) == 1 else None
 @
 
 \subsubsection{Snowballing Methods}
@@ -1336,9 +1396,11 @@ def create_review_session(
     return session
 @
 
-When the same query is searched again on the same provider, the new
-record wins: [[add_query_provider_pair]] keeps the first record of a
-pair, and the current results are added before the previous session's.
+When the same query is searched again on the same provider with the
+same filters, the new record wins: [[add_query_provider_pair]] keeps the
+first record of a key, and the current results are added before the
+previous session's.  A run with other filters is another search and
+leaves the earlier record alone (\cref{sec:search-record-key}).
 That is right when the re-run answered---it is the newer answer---but
 wrong when it failed.  Re-running a query while a provider is down would
 otherwise overwrite \enquote{12 hits} with \enquote{failed}, although the
@@ -1349,10 +1411,7 @@ happened, and the session keeps the answer that its papers came from.
 
 <<keep an earlier answer over a failed re-run>>=
 for i, current in enumerate(session.search_records):
-    same_search = (
-        (current.query, current.provider)
-        == (record.query, record.provider)
-    )
+    same_search = current.key == record.key
     if same_search and current.error and not record.error:
         session.search_records[i] = record
 @
@@ -1409,6 +1468,174 @@ class TestSearchRecordOutcome:
         )
         record = session.search_record_for("dblp")
         assert (record.hits, record.error) == (1, None)
+@
+
+Filters are part of a search's key (\cref{sec:search-record-key}).
+Let's verify it with the two runs of
+\url{https://github.com/dbosk/scholar/issues/140}: one query on one
+provider, once per year range, appended to one session.  Both records
+must survive with their own filters and hits, each paper must link to
+the run that returned it, and the failed re-run rule must still apply
+within one filter set---and only there: a failed run with new filters
+is a failed search, which an answer of other filters cannot stand in
+for.  Everything goes through the real
+[[create_review_session]], [[save_session]] and [[load_session]].
+
+<<test functions>>=
+class TestFiltersInSearchKey:
+    """A query run with other filters is a search of its own (#140)."""
+
+    OLD = {"year": "2010-2019"}
+    NEW = {"year": "2020-2024"}
+
+    @staticmethod
+    def _result(papers, filters, error=None):
+        from scholar.scholar import SearchResult
+        return SearchResult(
+            query="Q", provider="openalex", timestamp="t", papers=papers,
+            filters=filters, error=error,
+        )
+
+    def _two_runs(self):
+        old = Paper(title="Old", authors=["A"], doi="10.1/fk-old")
+        new = Paper(title="New", authors=["B"], doi="10.1/fk-new")
+        both = Paper(title="Both", authors=["C"], doi="10.1/fk-both")
+        save_session(create_review_session(
+            [self._result([old, both], self.OLD)], "Q", session_name="fk",
+        ))
+        save_session(create_review_session(
+            [self._result([new, both], self.NEW)], "Q", session_name="fk",
+        ))
+        return load_session("fk")
+
+    def test_both_runs_keep_their_record(self):
+        session = self._two_runs()
+        records = {
+            r.filters["year"]: r.hits for r in session.search_records
+        }
+        assert records == {"2010-2019": 2, "2020-2024": 2}
+
+    def test_each_paper_links_to_its_run(self):
+        links = {d.paper.doi: d.found_by for d in self._two_runs().decisions}
+        old_key, new_key = filters_key(self.OLD), filters_key(self.NEW)
+        assert links["10.1/fk-old"] == [("Q", "openalex", old_key)]
+        assert links["10.1/fk-new"] == [("Q", "openalex", new_key)]
+        assert links["10.1/fk-both"] == [
+            ("Q", "openalex", old_key), ("Q", "openalex", new_key),
+        ]
+
+    def test_links_resolve_to_their_own_record(self):
+        session = self._two_runs()
+        for decision in session.decisions:
+            for query, provider, key in decision.found_by:
+                record = session.search_record(query, provider, key)
+                assert filters_key(record.filters) == key
+
+    def test_failed_rerun_with_same_filters_keeps_the_answer(self):
+        self._two_runs()
+        session = create_review_session(
+            [self._result([], self.OLD, error="HTTP 503")],
+            "Q", session_name="fk",
+        )
+        old = [r for r in session.search_records if r.filters == self.OLD]
+        assert [(r.hits, r.error) for r in old] == [(2, None)]
+        assert len(session.search_records) == 2
+
+    def test_failed_run_with_other_filters_stays_failed(self):
+        paper = Paper(title="Old", authors=["A"], doi="10.1/fk-old")
+        save_session(create_review_session(
+            [self._result([paper], self.OLD)], "Q", session_name="fk",
+        ))
+        session = create_review_session(
+            [self._result([], self.NEW, error="HTTP 503")],
+            "Q", session_name="fk",
+        )
+        outcomes = {
+            r.filters["year"]: (r.hits, r.error)
+            for r in session.search_records
+        }
+        assert outcomes == {
+            "2010-2019": (1, None), "2020-2024": (0, "HTTP 503"),
+        }
+
+    def test_concurrent_saves_keep_both_records(self):
+        first = Paper(title="Old", authors=["A"], doi="10.1/fk-old")
+        save_session(create_review_session(
+            [self._result([first], self.OLD)], "Q", session_name="fk",
+        ))
+        stale = load_session("fk")
+        save_session(create_review_session(
+            [self._result([first], self.NEW)], "Q", session_name="fk",
+        ))
+        stale.decisions[0].status = DecisionStatus.KEPT
+        save_session(stale)
+        session = load_session("fk")
+        assert sorted(r.filters["year"] for r in session.search_records) == [
+            "2010-2019", "2020-2024",
+        ]
+        assert len(session.decisions[0].found_by) == 2
+        assert session.decisions[0].status == DecisionStatus.KEPT
+@
+
+Files saved before filters joined the key hold two-part links
+(\cref{sec:session-persistence}).  Let's verify the two cases: a link
+whose query and provider match one record is tied to it, and saved with
+its filters from then on; a link that matches two records stays
+unresolved, and [[search_record]] refuses to pick one.
+
+<<test functions>>=
+class TestOldTwoPartLinks:
+    """Links from before #140 load, resolved only when certain."""
+
+    @staticmethod
+    def _write(records, links):
+        import json
+        from scholar.review import _get_sessions_dir
+        data = {
+            "query": "Q", "name": "old-links", "providers": ["openalex"],
+            "timestamp": datetime.now().isoformat(),
+            "search_records": [
+                {"query": "Q", "provider": "openalex", "filters": f,
+                 "limit": None, "hits": 1, "error": None, "retries": 0}
+                for f in records
+            ],
+            "decisions": [{
+                "paper_id": "doi:10.1/old-link", "provider": "openalex",
+                "status": "kept", "tags": [], "source": "human",
+                "found_by": links,
+                "paper": {"title": "T", "authors": ["A"],
+                          "doi": "10.1/old-link", "sources": ["openalex"]},
+            }],
+        }
+        path = _get_sessions_dir() / "old-links.json"
+        path.write_text(json.dumps(data))
+        return path
+
+    def test_unique_link_is_resolved_and_saved_with_filters(self):
+        import json
+        path = self._write(
+            [{"year": "2020"}], [{"query": "Q", "provider": "openalex"}]
+        )
+        session = load_session("old-links")
+        key = filters_key({"year": "2020"})
+        assert session.decisions[0].found_by == [("Q", "openalex", key)]
+        save_session(session)
+        saved = json.loads(path.read_text())["decisions"][0]["found_by"]
+        assert saved == [{"query": "Q", "provider": "openalex",
+                          "filters": key}]
+
+    def test_ambiguous_link_stays_unresolved(self):
+        import json
+        path = self._write(
+            [{"year": "2020"}, {"year": "2021"}],
+            [{"query": "Q", "provider": "openalex"}],
+        )
+        session = load_session("old-links")
+        assert session.decisions[0].found_by == [("Q", "openalex", None)]
+        assert session.search_record("Q", "openalex") is None
+        save_session(session)
+        saved = json.loads(path.read_text())["decisions"][0]["found_by"]
+        assert saved == [{"query": "Q", "provider": "openalex"}]
 @
 
 Papers from the previous session that do not appear in the current search
@@ -1585,9 +1812,10 @@ this run, a renamed or adopted entry, a previous decision, or a new one),
 the decision records the search that returned it ([[record_search]]).  The
 link has to be made here: this loop is the only place that still knows
 which [[SearchResult]], and so which search record, a paper came from.
-The result's [[(query, provider)]] is exactly the key
-[[add_query_provider_pair]] recorded above, merged results included
-([[q | q]], [[openalex, dblp]]), so the link always names a stored record.
+The result's query, provider and [[filters_key]] of its filters are
+exactly the key [[add_query_provider_pair]] recorded above, merged
+results included ([[q | q]], [[openalex, dblp]]), so the link always
+names a stored record.
 A decision rebuilt from the previous session copies that session's links,
 and the new one is added to them: a paper returned by three queries keeps
 all three.
@@ -1610,6 +1838,7 @@ for d in session.decisions:
             provenance_lookup[key] = d
 
 for result in results:
+    link = (result.query, result.provider, filters_key(result.filters))
     for paper in result.papers:
         paper = without_homonym_numbers(
             _normalize_paper_identifiers(paper)
@@ -1622,7 +1851,7 @@ for result in results:
                 existing.paper = existing.paper.merge_with(paper)
             except ValueError:
                 pass
-            existing.record_search(result.query, result.provider)
+            existing.record_search(*link)
             continue
 
         renamed = renamed_lookup.pop(paper_id, None)
@@ -1634,13 +1863,13 @@ for result in results:
             ).merge_with(paper)
             decision_lookup.pop(old_id, None)
             decision_lookup[paper_id] = renamed
-            renamed.record_search(result.query, result.provider)
+            renamed.record_search(*link)
             continue
 
         adopted = provenance_lookup.get(paper_id)
         if adopted is not None:
             adopted.paper = merge_version_of(adopted.paper, paper)
-            adopted.record_search(result.query, result.provider)
+            adopted.record_search(*link)
             continue
 
         replaced = None
@@ -1657,7 +1886,7 @@ for result in results:
             replaced.paper = merge_version_of(paper, replaced.paper)
             decision_lookup[paper_id] = replaced
             provenance_lookup[old_id] = replaced
-            replaced.record_search(result.query, result.provider)
+            replaced.record_search(*link)
             continue
 
         # Check for previous decision (prefer session data over notes)
@@ -1721,7 +1950,7 @@ for result in results:
                 status=DecisionStatus.PENDING,
             )
 
-        decision.record_search(result.query, result.provider)
+        decision.record_search(*link)
         session.decisions.append(decision)
         decision_lookup[paper_id] = decision
 @
@@ -1767,9 +1996,10 @@ class TestFoundByLinks:
 
     def test_each_paper_names_the_searches_that_returned_it(self):
         links = self._links(self._two_searches())
-        assert links["10.1/fb-first"] == [("q1", "openalex")]
+        assert links["10.1/fb-first"] == [("q1", "openalex", "")]
         assert links["10.1/fb-both"] == [
-            ("q1", "openalex"), ("q2", "openalex"), ("q2", "arxiv"),
+            ("q1", "openalex", ""), ("q2", "openalex", ""),
+            ("q2", "arxiv", ""),
         ]
 
     def test_old_files_load_without_links(self):
@@ -1799,7 +2029,7 @@ class TestFoundByLinks:
         save_session(stale)
         links = self._links(load_session("links"))
         assert set(links["10.1/fb-first"]) == {
-            ("q1", "openalex"), ("q2", "openalex"),
+            ("q1", "openalex", ""), ("q2", "openalex", ""),
         }
 @
 
@@ -1866,6 +2096,7 @@ def create_notes_session() -> ReviewSession:
 @
 
 \subsection{Session Persistence}
+\label{sec:session-persistence}
 
 Sessions can be saved and loaded for interrupted workflows. The session file
 includes [[search_records]] to track which query, filters, and limit were used
@@ -1876,8 +2107,25 @@ carry [[search_records]]; files from before filters were persisted carry only a
 files carry neither, so we reconstruct one record per provider by pairing the
 single [[query]] with each provider in [[providers]].
 Each decision carries its [[found_by]] links as a list of
-[[{"query", "provider"}]] objects; files from before the links existed
+[[{"query", "provider", "filters"}]] objects, [[filters]] holding the
+record's [[filters_key]]; files from before the links existed
 have none, and their decisions load with an empty list.
+
+Files written before filters were part of a search's key hold links
+without [[filters]].  Such a link is tied to a record when it is loaded,
+if the session holds exactly one record with its query and provider:
+then it can only mean that record.  Doing it at load time, rather than
+whenever the link is read, matters for sessions that grow: a later run
+of the same query with other filters adds a second record, and the old
+link, still unresolved, would become ambiguous although it was certain
+when the file was written.  Once resolved, it is saved with its filters
+like any new link.  A link that matches two or more records stays
+unresolved ([[None]]) and is written back without [[filters]], so the
+file still says that we do not know.  One limit remains: a session that
+ran one query with two filter sets \emph{before} this change kept only
+the later run's record, and its links resolve to that record.  The
+earlier run's filters were lost when the file was written, and no reader
+can recover them.
 
 Saving is where a session can lose its decisions, so [[save_session]] does
 more than serialise: it merges what other processes saved since this one
@@ -2053,7 +2301,7 @@ def read_session_file(session_path: Path) -> ReviewSession:
             is_example = dec_data.get("is_example", False) or False
             llm_confidence = dec_data.get("llm_confidence")
             found_by = [
-                (link["query"], link["provider"])
+                _load_found_by_link(session, link)
                 for link in dec_data.get("found_by") or []
             ]
 
@@ -2126,8 +2374,7 @@ data = {
             "is_example": d.is_example,
             "llm_confidence": d.llm_confidence,
             "found_by": [
-                {"query": query, "provider": provider}
-                for query, provider in d.found_by
+                _found_by_link_data(link) for link in d.found_by
             ],
             "paper": d.paper.to_dict(include_refs_cites=True),
         }
@@ -2141,6 +2388,34 @@ atomic_write_text(
     json.dumps(data, indent=2, ensure_ascii=False),
     backup=True,
 )
+@
+
+A link is written as an object rather than a list, so that the two
+forms tell themselves apart by the presence of [[filters]], not by
+length or position: a resolved link carries its filters key (the empty
+string for an unfiltered search), an unresolved old link carries none.
+Reading applies the rule above, through [[search_record]], which answers
+a link without filters only when one record has its query and provider.
+
+<<review session functions>>=
+def _found_by_link_data(link: tuple[str, str, str | None]) -> dict:
+    """Serialise one `found_by` link; an unresolved link has no filters."""
+    query, provider, key = link
+    data = {"query": query, "provider": provider}
+    if key is not None:
+        data["filters"] = key
+    return data
+
+
+def _load_found_by_link(
+    session: ReviewSession, data: dict
+) -> tuple[str, str, str | None]:
+    """Read one `found_by` link, resolving an old one if it is certain."""
+    query, provider = data["query"], data["provider"]
+    if "filters" in data:
+        return (query, provider, data["filters"])
+    record = session.search_record(query, provider)
+    return (query, provider, record.key[2] if record else None)
 @
 
 The test makes the race happen on purpose.  Process~A's merge starts
@@ -2252,7 +2527,10 @@ later save, but never a decision.  (Reading the file could not even show
 us the other process's metadata: the paper registry hands
 [[Paper.from_dict]] the [[Paper]] objects this process already holds for
 the same ids.)  Search records and snowball rounds only
-ever accumulate, so we add any that only the file has.  So do a paper's
+ever accumulate, so we add any that only the file has; a record is the
+file's own when no record here has its key (query, provider and
+filters, \cref{sec:search-record-key}), so a run of the same query with
+other filters in another process is kept beside ours.  So do a paper's
 links to the searches that returned it ([[found_by]],
 \cref{sec:review-found-by}): each is a fact about a search that ran, not
 a judgement, so the links the file holds for a paper are added to the
@@ -2326,8 +2604,8 @@ def merge_concurrent_changes(
         own_ids.add(paper_id)
         theirs = disk_decisions.get(paper_id)
         if theirs is not None:
-            for query, provider in theirs.found_by:
-                decision.record_search(query, provider)
+            for link in theirs.found_by:
+                decision.record_search(*link)
         if theirs is None or paper_id not in base_states:
             continue
         mine, base_state = decision_state(decision), base_states[paper_id]
@@ -2348,8 +2626,9 @@ def merge_concurrent_changes(
 
     <<merge research context from disk>>
 
+    own_keys = {r.key for r in session.search_records}
     for record in on_disk.search_records:
-        if (record.query, record.provider) not in session.query_provider_pairs:
+        if record.key not in own_keys:
             session.search_records.append(record)
     own_rounds = {r.timestamp for r in session.snowball_rounds}
     for snowball_round in on_disk.snowball_rounds:
@@ -3211,6 +3490,7 @@ class TestSessionFunctions:
         result = Mock()
         result.provider = "test"
         result.query = "test query"
+        result.filters = None
         result.papers = [
             Paper(title="Paper 1", authors=["Author"], year=2024),
         ]
@@ -3229,6 +3509,7 @@ class TestSessionFunctions:
         r1 = Mock()
         r1.provider = "dblp"
         r1.query = "q1"
+        r1.filters = None
         r1.papers = [
             Paper(
                 title="Paper",
@@ -3243,6 +3524,7 @@ class TestSessionFunctions:
         r2 = Mock()
         r2.provider = "s2"
         r2.query = "q2"
+        r2.filters = None
         r2.papers = [
             Paper(
                 title="Paper",
@@ -3299,6 +3581,7 @@ class TestSessionFunctions:
             result = Mock()
             result.provider = "s2"
             result.query = "test query"
+            result.filters = None
             result.papers = [
                 Paper(
                     title="A Work",
@@ -3315,7 +3598,7 @@ class TestSessionFunctions:
             entry = merged.decisions[0].paper
             assert entry.doi == "10.48550/arXiv.2401.1"
             assert entry.abstract == "Publisher abstract."
-            assert merged.decisions[0].found_by == [("test query", "s2")]
+            assert merged.decisions[0].found_by == [("test query", "s2", "")]
 
     def test_surname_first_entry_keeps_its_decision(
         self, tmp_path, monkeypatch
@@ -3348,6 +3631,7 @@ class TestSessionFunctions:
             result = Mock()
             result.provider = "scopus"
             result.query = "test query"
+            result.filters = None
             result.papers = [
                 Paper(
                     title="A Work",
@@ -3368,7 +3652,7 @@ class TestSessionFunctions:
             assert decision.paper.authors == ["Elie Fares", "Mamoun Filali"]
             assert decision.paper.abstract == "Now with an abstract."
             assert get_paper_id(decision.paper) != get_paper_id(stored)
-            assert decision.found_by == [("test query", "scopus")]
+            assert decision.found_by == [("test query", "scopus", "")]
 
     def test_homonym_numbered_entry_keeps_its_decision(
         self, tmp_path, monkeypatch
@@ -3407,6 +3691,7 @@ class TestSessionFunctions:
             result = Mock()
             result.provider = "dblp"
             result.query = "test query"
+            result.filters = None
             result.papers = [Paper(
                 title="A Work", authors=["Wei Wang", "Alice Smith"],
                 sources=["dblp"],
@@ -3420,7 +3705,7 @@ class TestSessionFunctions:
             assert decision.tags == ["background"]
             assert decision.paper.authors == ["Wei Wang", "Alice Smith"]
             assert get_paper_id(decision.paper) != get_paper_id(stored)
-            assert decision.found_by == [("test query", "dblp")]
+            assert decision.found_by == [("test query", "dblp", "")]
             note = get_note(decision.paper)
             assert note is not None and "read it" in note.note
 
@@ -3450,6 +3735,7 @@ class TestSessionFunctions:
             result = Mock()
             result.provider = "dblp"
             result.query = "test query"
+            result.filters = None
             result.papers = [Paper(
                 title="A Work", authors=["Wei Wang 0001"],
                 sources=["dblp"],
@@ -3516,6 +3802,7 @@ class TestSessionFunctions:
             result = Mock()
             result.provider = "s2"
             result.query = "test query"
+            result.filters = None
             result.papers = [
                 Paper(
                     title="A Work",
@@ -3535,7 +3822,7 @@ class TestSessionFunctions:
             assert decision.paper.doi == "10.48550/arXiv.2401.1"
             assert decision.status == DecisionStatus.KEPT
             assert decision.paper.abstract == "Publisher abstract."
-            assert decision.found_by == [("test query", "s2")]
+            assert decision.found_by == [("test query", "s2", "")]
 
     def test_save_and_load_session(self, tmp_path, monkeypatch):
         """Can save and load a session."""
@@ -3617,6 +3904,7 @@ class TestSessionFunctions:
         result = Mock()
         result.provider = "openalex"
         result.query = "new query"
+        result.filters = None
         result.papers = [
             Paper(
                 title="Paper 1", authors=["Author 1"], year=2024,
@@ -3685,6 +3973,7 @@ class TestSessionFunctions:
         result = Mock()
         result.provider = "dblp"
         result.query = "new query"
+        result.filters = None
         result.papers = [
             Paper(
                 title="New Paper", authors=["Author 2"], year=2024,
@@ -3724,6 +4013,7 @@ class TestSessionFunctions:
         result = Mock()
         result.provider = "openalex"
         result.query = "new query"
+        result.filters = None
         result.papers = [
             Paper(title="Paper", authors=["Author"], year=2024),
         ]
@@ -6357,6 +6647,15 @@ The counts are per code, because rows and records both pass through
 [[SSRN]] are one database.  A record from before outcomes were stored
 has no error to count, so it counts as answered.
 
+Each record counts as one query.  Since filters are part of a record's
+key (\cref{sec:search-record-key}), the same words run with two year
+ranges are two records and so two queries here.  That is what the
+sentence should say: the database was asked two different questions,
+each of which could fail on its own, and \enquote{failed for 1 of 2
+queries} is exactly true when one year range failed and the other
+answered.  Counting the words once would hide either the failure or
+the answer, so the wording stays as it is.
+
 <<review report generation>>=
 def audit_search_shortfalls(
     records: list[SearchRecord],
@@ -6493,6 +6792,22 @@ class TestAuditDatabasesFailures:
                 build_audit_table_latex(session, label="x", lang=lang)
             )
             assert expected in text
+@
+
+A query run with two filter sets counts as two queries, as argued above:
+
+<<test functions>>=
+class TestAuditCountsFilteredRuns:
+    def test_two_filter_sets_are_two_queries(self):
+        records = [
+            SearchRecord("q", "dblp", {"year": "2010-2019"}, hits=3),
+            SearchRecord("q", "dblp", {"year": "2020-2024"}, hits=0,
+                         error="non-JSON response"),
+        ]
+        rows = [AuditRow("t", "2015", ["DBLP"], DecisionStatus.KEPT, "r", 0)]
+        assert audit_databases_sentence(
+            rows, AUDIT_STRINGS["en"], records
+        ) == "Databases: DBLP (failed for 1 of 2 queries)."
 @
 
 The table itself follows the conventions of the appendix it is meant for:

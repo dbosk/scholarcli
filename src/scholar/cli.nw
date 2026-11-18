@@ -6420,9 +6420,11 @@ app.add_typer(prov_app, name="prov")
 The record for one paper in one session pins the command to the search that
 actually returned the paper: re-running every query would reproduce the
 whole session, not the one result we are citing.  Each decision keeps the
-[[(query, provider)]] keys of the searches that returned its paper
-([[found_by]], \cref{sec:review-found-by}), and [[search_record]] turns a
-key back into the stored search with its filters and limit.  Those become
+[[(query, provider, filters)]] keys of the searches that returned its
+paper ([[found_by]], \cref{sec:review-found-by}), and [[search_record]]
+turns a key back into the stored search with its filters and limit.  The
+filters are part of the key, so the same query run with two filter sets
+gives two different commands, each with its own flags.  Those become
 the same flags the [[bibtex+prov]] formatter emits, through the shared
 [[_search_command]], so the command reproduces the \emph{exact} search and
 not a broader one.  A paper that several searches returned gets a record
@@ -6477,44 +6479,65 @@ def _found_via_records(session, decision) -> list[dict]:
             "limit": record.limit,
             "link": link,
         })
+    for query, provider in unresolved:
+        candidates = [
+            record for record in session.search_records
+            if (record.query, record.provider) == (query, provider)
+        ]
+        records.append(_missing_link_record(base, provider, candidates))
     if not records:
         candidates = [
             record for record in session.search_records
             if record.provider == decision.provider
         ]
-        records.append({
-            **base,
-            "command": None,
-            "provider": decision.provider,
-            "provider_query": None,
-            "filters": None,
-            "limit": None,
-            "link": "missing",
-            "candidate_queries": [r.query for r in candidates],
-            "candidate_commands": [
-                _search_command(r.query, r.provider, r.filters, r.limit)
-                for r in candidates
-            ],
-        })
+        records.append(
+            _missing_link_record(base, decision.provider, candidates)
+        )
     return records
+
+
+def _missing_link_record(base: dict, provider: str, candidates) -> dict:
+    """A provenance record without a command, listing the candidates."""
+    return {
+        **base,
+        "command": None,
+        "provider": provider,
+        "provider_query": None,
+        "filters": None,
+        "limit": None,
+        "link": "missing",
+        "candidate_queries": [r.query for r in candidates],
+        "candidate_commands": [
+            _search_command(r.query, r.provider, r.filters, r.limit)
+            for r in candidates
+        ],
+    }
 @
 
 A recorded link whose search record is gone cannot be turned into a
 command; that does not happen (records are never removed), and we skip such
-a link rather than fail.  The inference compares the provider string
+a link rather than fail.  An old link that names no filters and matches
+several records---one query run with two filter sets
+(\cref{sec:search-record-key} in the [[review]] module)---is not gone
+but unresolved.  It is reported like a missing link, under
+[[Not reproducible:]], with the records of its query and provider as the
+candidates, each with its own filter flags; the paper's resolved links
+are still printed beside it.  Choosing one of the candidates would be
+the guess that \#128 showed to be wrong.  The inference compares the provider string
 exactly, so a merged provider such as [[openalex, dblp]] infers only its
 own merged record.
 
 <<find the searches that returned the paper>>=
+unresolved = []
 if decision.found_by:
     link = "recorded"
-    searches = [
-        record for record in (
-            session.search_record(query, provider)
-            for query, provider in decision.found_by
-        )
-        if record is not None
-    ]
+    searches = []
+    for query, provider, key in decision.found_by:
+        record = session.search_record(query, provider, key)
+        if record is not None:
+            searches.append(record)
+        elif key is None:
+            unresolved.append((query, provider))
 else:
     link = "inferred"
     searches = [
@@ -7237,6 +7260,82 @@ def test_found_via_reports_snowballed_paper(self, tmp_path, monkeypatch):
 
     assert "FOUND-VIA:" not in result.output
     assert "snowballing" in result.output
+@
+
+One query run with two filter sets is two searches
+(\url{https://github.com/dbosk/scholar/issues/140}), and a paper each
+run returned must name its own run, filter flags included.  An old
+two-part link that both runs match is reported as not reproducible, with
+both runs as the candidates---not the provider's other searches, which
+the link rules out---never as a guessed FOUND-VIA line.  The
+sessions are built through the real [[create_review_session]], as
+[[search -n]] builds them, and the old file is written by hand in the
+format of the time.
+
+<<test functions>>=
+class TestFoundViaFilters:
+  """prov found-via tells runs with different filters apart (#140)."""
+
+  @staticmethod
+  def _search_into(session_name, papers, year, query="Q"):
+    from scholar.review import create_review_session, save_session
+    from scholar.scholar import SearchResult
+    result = SearchResult(
+      query=query, provider="openalex", timestamp="t", papers=papers,
+      filters={"year": year},
+    )
+    save_session(
+      create_review_session([result], query, session_name=session_name)
+    )
+
+  def test_each_paper_names_its_own_run(self, tmp_path, monkeypatch):
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+    old = Paper(title="Old", authors=["A"], year=2015, doi="10.1/fv-old")
+    new = Paper(title="New", authors=["B"], year=2022, doi="10.1/fv-new")
+    self._search_into("fv", [old], "2010-2019")
+    self._search_into("fv", [new], "2020-2024")
+
+    for paper, year in ((old, "2010-2019"), (new, "2020-2024")):
+      result = runner.invoke(
+        app, ["prov", "found-via", paper.id, "-f", "json"]
+      )
+      records = json.loads(result.output)
+      assert [r["command"] for r in records] == [
+        f"scholar search Q -p openalex --year {year}"
+      ]
+      assert records[0]["link"] == "recorded"
+
+  def test_ambiguous_old_link_is_not_reproducible(
+    self, tmp_path, monkeypatch
+  ):
+    from scholar.review import _get_sessions_dir
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+    paper = Paper(title="P", authors=["A"], year=2015, doi="10.1/fv-amb")
+    self._search_into("fv", [paper], "2010-2019")
+    self._search_into("fv", [], "2020-2024")
+    self._search_into("fv", [], "2020-2024", query="Other")
+    path = _get_sessions_dir() / "fv.json"
+    data = json.loads(path.read_text())
+    for decision in data["decisions"]:
+      for link in decision["found_by"]:
+        del link["filters"]
+    path.write_text(json.dumps(data))
+
+    result = runner.invoke(app, ["prov", "found-via", paper.id])
+    assert result.exit_code == 0
+    assert "FOUND-VIA:" not in result.output
+    assert "Not reproducible:" in result.output
+
+    as_json = runner.invoke(
+      app, ["prov", "found-via", paper.id, "-f", "json"]
+    )
+    records = json.loads(as_json.output)
+    assert [r["link"] for r in records] == ["missing"]
+    assert records[0]["command"] is None
+    assert records[0]["candidate_commands"] == [
+      "scholar search Q -p openalex --year 2020-2024",
+      "scholar search Q -p openalex --year 2010-2019",
+    ]
 @
 
 

@@ -58,8 +58,15 @@ Providers self-register via `register_provider()` at module load time.
   result as 0: format counts with `hits_label(hits, error, retries)`
   ("12", "failed (reason)", "25, incomplete (reason)").
 - Session `SearchRecord`s store the same outcome (`hits`, `error`,
-  `retries`; old records load as `hits=None`). A failed re-run of the
-  same (query, provider) does not overwrite an earlier answered record.
+  `retries`; old records load as `hits=None`). A record's identity is
+  `SearchRecord.key` = `(query, provider, filters_key(filters))` (#140):
+  the same query with other filters (`--year`, `--in`, ...) is a record
+  of its own, the limit is not part of the key. `filters_key`
+  (`scholar.py`) is `SearchFilters(**stored).cache_key()` plus any
+  unknown keys as sorted JSON; `""` for no filters. A failed re-run of
+  the same key does not overwrite an earlier answered record. The audit
+  caption counts each record as one query (two filter sets = two
+  queries, on purpose).
 
 ### Search Flow
 
@@ -446,17 +453,24 @@ reconstructing a `Paper` from the `.bib` fields and reusing `Paper.id`
 ### Search Provenance (`prov found-via`)
 
 Each `ReviewDecision` records the searches that returned its paper in
-`found_by`: `(query, provider)` keys of the session's `SearchRecord`s
-(merged `q | q` / `openalex, dblp` keys included), set in
+`found_by`: `(query, provider, filters key)` keys of the session's
+`SearchRecord`s (merged `q | q` / `openalex, dblp` keys included), set in
 `create_review_session` on every branch that resolves a result to a
-decision, persisted as `found_by` in the session JSON, and unioned from
-disk by `merge_concurrent_changes` (#128). `prov found-via` prints one
-command per link via `ReviewSession.search_record(query, provider)` and
+decision, persisted as `found_by` in the session JSON
+(`{"query", "provider", "filters"}`), and unioned from
+disk by `merge_concurrent_changes` (#128). Old two-part links (no
+`"filters"`) are resolved at load when exactly one record has that
+query and provider; otherwise they stay `(q, p, None)` and are saved
+back without `"filters"`. `ReviewSession.search_record(q, p, key)`
+matches the full key; with `key=None` it answers only a unique
+(q, p). `prov found-via` prints one
+command per resolved link via `search_record` and
 `cli._search_command` (shared with `bibtex+prov`'s `_found_via`; undoes
 the merge joins). JSON `link` is `recorded`, `inferred` (no links, but
 the provider ran exactly one search in the session) or `missing` (no
 command; printed under `Not reproducible:` with `candidate_queries`,
-never with the `FOUND-VIA:` token). Old sessions get links when their
+never with the `FOUND-VIA:` token; an ambiguous old link is `missing`
+with the records of its query and provider as candidates). Old sessions get links when their
 searches are re-run with `-n` (cache hits cost nothing). Never fall back
 to `search_record_for(provider)`: with several queries on a provider it
 returns the latest search, which is how #128 named wrong queries.
