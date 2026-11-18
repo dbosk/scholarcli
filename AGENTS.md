@@ -594,6 +594,26 @@ invalid afterwards gets no decision (stays pending) and is listed in
 `LLMBatchResult.withheld`, which `llm classify` prints at the end.
 Sessions without category tags are classified as before.
 
+### Snowball and Tuxedo Subcommands (lazy)
+
+`scholar snowball` and `scholar tuxedo` come from the git submodules
+(do not edit them) through their `register_commands(app)` hooks, but are
+imported only when they run (#130): importing them (pandas, Textual,
+openai) at startup made every command 2.3-2.8 s slower. `app` is created
+with `cls=LazySubcommandGroup` (`cli.nw`, `<<lazy subcommand group>>`),
+which lists a `LazySubcommandStub` per name in `LAZY_SUBCOMMANDS` (name →
+help text, a copy guarded by a drift test) when `find_submodule()` finds
+a spec (`scholar.<name>`, then `<name>`; nothing imported), so help and
+first-word completion import nothing. `resolve_command` (dispatch and
+completion descent) swaps the stub for `load_lazy_subcommand(name)`, the
+command the hook registers on a scratch Typer app. A failing import is a
+one-line usage error (exit 2); under completion it completes to nothing.
+There is no `register_submodules()` any more; tests need no setup. Keep
+heavy imports out of `cli.py`'s module level (`scholar.crossref` loads
+its cache on import): `TestLazySubcommands` runs `main()` in a child
+interpreter and fails if `--help` imports tuxedo, snowball, openai or
+`scholar.crossref`.
+
 ### Interactive Tutorials (`scholar tutorial`)
 
 `scholar tutorial list|run|review` is [pytorial](https://github.com/dbosk/pytorial)
