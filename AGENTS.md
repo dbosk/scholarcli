@@ -231,7 +231,8 @@ refusal sets `last_error` (else it would read as 0 works).
   (`preprint_versions`/`published_versions`) and
   `audit_work_key` when its title is non-empty, plus the title alone
   for a session paper without authors; `matched_by` `doi`,
-  `title+author` or `title`. A title match is dropped
+  `title+author` or `title` (a session paper without authors records
+  `title` on every title key, #152). A title match is dropped
   (`_plausibly_same_work`) when both papers have different DOIs not
   joined by a version link, or both years are more than 1 apart.
   Buckets per decision: bearing = cited by the audit rule
