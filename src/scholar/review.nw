@@ -110,7 +110,7 @@ from cachetools import cachedmethod
 from scholar.scholar import Paper, SearchFilters, merge_version_of
 from scholar.scholar import filters_key, filter_flags
 from scholar.scholar import hits_label, result_outcome
-from scholar.scholar import parts_returning
+from scholar.scholar import parts_returning, result_total
 from scholar.scholar import RANKED_PROVIDERS, is_ranked_provider
 from scholar.notes import (
     get_paper_id, get_query_hash, get_data_dir,
@@ -456,7 +456,10 @@ repeated before the answer was accepted.  Records written before these
 fields existed load with [[hits]] unknown ([[None]]), no error and no
 retries: we cannot reconstruct what an old search returned, and claiming
 \enquote{answered} for it is no worse than what such a record has always
-claimed.
+claimed.  The record also keeps the [[total]] the service reported, and
+whether it was an estimate, so that a count cut at the limit reads as
+one (\url{https://github.com/dbosk/scholar/issues/166}); older records
+load with the total unknown.
 
 \label{sec:search-record-key}
 A search is identified by its query, its provider \emph{and} its
@@ -485,6 +488,9 @@ class SearchRecord:
     the number of papers the search produced (``None`` for records that
     predate it), ``error`` why the provider failed (``None`` when it
     answered), and ``retries`` how often the search was repeated.
+    ``total`` is the number of matching records the service reported
+    (``None`` when unknown), ``total_estimated`` whether it called that
+    an estimate.
     """
     query: str
     provider: str
@@ -493,6 +499,8 @@ class SearchRecord:
     hits: int | None = None
     error: str | None = None
     retries: int = 0
+    total: int | None = None
+    total_estimated: bool = False
 
     @property
     def key(self) -> tuple[str, str, str]:
@@ -589,6 +597,8 @@ def search_outcome_label(record: SearchRecord) -> str:
     return hits_label(
         record.hits, record.error, record.retries,
         ranked=is_ranked_provider(record.provider),
+        total=record.total, limit=record.limit,
+        estimated=record.total_estimated,
     )
 @
 
@@ -840,7 +850,11 @@ with its key (query, provider and filters, \cref{sec:search-record-key})
 is present yet, preventing duplicates when
 appending results to an existing session; its [[filters]] and [[limit]]
 arguments default to [[None]] so older callers that only know the query and
-provider keep working. The [[query_provider_pairs]] property derives the
+provider keep working.  [[add_search_record]] does the same for a record
+that already exists, such as one from the previous session: adding the
+record itself, rather than rebuilding it from its fields, keeps every
+field of it, also those added after this code was written.
+The [[query_provider_pairs]] property derives the
 [[(query, provider)]] pairs from the records, so every reader written against
 the old field is unaffected; a pair may now occur twice, once per set of
 filters, as it is two searches. The [[queries_for_provider]] method retrieves all
@@ -870,6 +884,8 @@ def add_query_provider_pair(
     hits: int | None = None,
     error: str | None = None,
     retries: int = 0,
+    total: int | None = None,
+    total_estimated: bool = False,
 ) -> None:
     """
     Record a search unless a record with its key is already present.
@@ -884,10 +900,14 @@ def add_query_provider_pair(
     filters and limit applied so the search can be reproduced exactly,
     and its outcome (hits, error, retries).
     """
-    record = SearchRecord(
+    self.add_search_record(SearchRecord(
         query, provider, filters, limit,
         hits=hits, error=error, retries=retries,
-    )
+        total=total, total_estimated=total_estimated,
+    ))
+
+def add_search_record(self, record: SearchRecord) -> None:
+    """Add `record` unless a record with its key is already present."""
     if record.key not in {r.key for r in self.search_records}:
         self.search_records.append(record)
 
@@ -1509,9 +1529,11 @@ def create_review_session(
     for result in results:
         for part in search_parts_of(result):
             error, retries = result_outcome(part)
+            total, estimated = result_total(part)
             session.add_query_provider_pair(
                 part.query, part.provider, part.filters, part.limit,
                 hits=len(part.papers), error=error, retries=retries,
+                total=total, total_estimated=estimated,
             )
 
     # Merge with previous session's searches (if any), preserving their filters
@@ -1520,11 +1542,9 @@ def create_review_session(
         current_run = list(session.search_records)
         for record in previous_session.search_records:
             <<keep an earlier answer over a failed re-run>>
+            <<keep a wider earlier search over a narrower re-run>>
             <<let a re-run replace a legacy record>>
-            session.add_query_provider_pair(
-                record.query, record.provider, record.filters, record.limit,
-                hits=record.hits, error=record.error, retries=record.retries,
-            )
+            session.add_search_record(record)
     
     # Collect paper IDs from current search results
     current_paper_ids = set()
@@ -1590,6 +1610,142 @@ of it.  [[replaced_links]] maps each replaced key to its successor, and
 once all decisions are built every link is moved
 ([[<<point links at the records that replaced theirs>>]]); duplicates
 that the move creates are merged, keeping the first.
+
+\label{sec:wider-record}
+A re-run with a smaller limit is the opposite case: it answered, but
+asked for less.  The limit is not part of the key
+(\cref{sec:search-record-key}), so a run with [[-l 5]] after one with
+[[-l 0]] is the same search, and the newer record used to win.  The
+session then said \enquote{limit 5, hits 5} for fifty linked papers,
+and [[found-via]] built its command from that record, a command that
+returns five of them (\url{https://github.com/dbosk/scholar/issues/166}).
+A narrower run of the same query, provider and filters fetches the
+first part of what the wider one fetched, so the wider record already
+accounts for its papers: we keep the wider record and record nothing
+new.  The narrower run's papers link to the key they share with it, so
+their links name the wider record without being moved.  (Should the
+service have reordered its ranking in between, a paper of the narrower
+run may not have been among the wider run's; re-run today, the wider
+search returns it, which is what the link claims.)
+
+\enquote{Wider} compares the limits, with no limit ([[None]], or 0)
+the widest; [[-l 0]] is stored as the large internal cap and so is
+wide already.  A legacy record's missing limit means \emph{unknown},
+not unlimited, so a legacy record is never wider; it has its own rule
+below.  The rule applies only when both runs answered: a failed re-run
+is the case above, and a failed wider record does not stand in for a
+narrower answer.
+
+<<keep a wider earlier search over a narrower re-run>>=
+for i, current in enumerate(session.search_records):
+    if (current.key == record.key
+            and any(current is c for c in current_run)
+            and not record.is_legacy
+            and not record.error and not current.error
+            and search_width(record.limit) > search_width(current.limit)):
+        session.search_records[i] = record
+<<review session functions>>=
+def search_width(limit: int | None) -> float:
+    """How many results a search with `limit` may fetch; no limit is all."""
+    return float("inf") if not limit else float(limit)
+@
+
+Let's verify the run of \url{https://github.com/dbosk/scholar/issues/166}:
+fifty papers with the internal cap of [[-l 0]], then five with [[-l 5]].
+The session keeps the wide record, every paper links to it, and the
+report labels it with its total.  The other direction, a wider run
+after a narrower one, replaces the narrow record as before; a failed
+wide run does not displace a narrow answer; and the total survives a
+save, while a record saved before it existed loads with the total
+unknown.
+
+<<test functions>>=
+class TestWiderRecordKept:
+    """A narrower re-run never replaces a wider record (#166)."""
+
+    WIDE = 10_000
+
+    @staticmethod
+    def _result(papers, limit, total=None, error=None):
+        from scholar.scholar import SearchResult
+        return SearchResult(
+            query="q", provider="openalex", timestamp="t", papers=papers,
+            limit=limit, total=total, error=error,
+        )
+
+    @staticmethod
+    def _papers(n):
+        return [Paper(title=f"P{i}", authors=["A"], doi=f"10.1/wide-{i}")
+                for i in range(n)]
+
+    def test_narrow_rerun_keeps_wide_record(self):
+        papers = self._papers(50)
+        save_session(create_review_session(
+            [self._result(papers, self.WIDE, total=50)], "q",
+            session_name="wide",
+        ))
+        save_session(create_review_session(
+            [self._result(papers[:5], 5, total=50)], "q",
+            session_name="wide",
+        ))
+        session = load_session("wide")
+        assert [(r.limit, r.hits, r.total)
+                for r in session.search_records] == [(self.WIDE, 50, 50)]
+        record = session.search_records[0]
+        assert all(
+            session.search_record(*link) is record
+            for d in session.decisions for link in d.found_by
+        )
+
+    def test_wider_rerun_replaces_narrow_record(self):
+        papers = self._papers(6)
+        save_session(create_review_session(
+            [self._result(papers[:5], 5, total=6)], "q",
+            session_name="widen",
+        ))
+        session = create_review_session(
+            [self._result(papers, self.WIDE, total=6)], "q",
+            session_name="widen",
+        )
+        assert [(r.limit, r.hits) for r in session.search_records] == [
+            (self.WIDE, 6),
+        ]
+
+    def test_failed_wide_record_does_not_displace_answer(self):
+        papers = self._papers(3)
+        save_session(create_review_session(
+            [self._result([], self.WIDE, error="HTTP 503")], "q",
+            session_name="failed-wide",
+        ))
+        session = create_review_session(
+            [self._result(papers, 5, total=3)], "q",
+            session_name="failed-wide",
+        )
+        assert [(r.limit, r.hits, r.error)
+                for r in session.search_records] == [(5, 3, None)]
+
+    def test_total_round_trip_and_old_records(self):
+        import json
+        from scholar.review import _get_sessions_dir
+        save_session(create_review_session(
+            [self._result(self._papers(5), 5, total=2130)], "q",
+            session_name="totals",
+        ))
+        session = load_session("totals")
+        record = session.search_records[0]
+        assert (record.total, record.total_estimated) == (2130, False)
+        assert search_outcome_label(record) == (
+            "5 of 2,130 (capped at 5)"
+        )
+        path = _get_sessions_dir() / "totals.json"
+        data = json.loads(path.read_text())
+        for rec in data["search_records"]:
+            del rec["total"], rec["total_estimated"]
+        path.write_text(json.dumps(data))
+        record = load_session("totals").search_records[0]
+        assert (record.total, record.total_estimated) == (None, False)
+        assert search_outcome_label(record) == "5 (capped at 5)"
+@
 
 <<let a re-run replace a legacy record>>=
 if record.is_legacy:
@@ -2805,6 +2961,8 @@ def read_session_file(session_path: Path) -> ReviewSession:
                     hits=rec.get("hits"),
                     error=rec.get("error"),
                     retries=rec.get("retries") or 0,
+                    total=rec.get("total"),
+                    total_estimated=rec.get("total_estimated") is True,
                 )
                 for rec in data["search_records"]
             ]
@@ -2898,6 +3056,8 @@ data = {
             "hits": r.hits,
             "error": r.error,
             "retries": r.retries,
+            "total": r.total,
+            "total_estimated": r.total_estimated,
         }
         for r in session.search_records
     ],
@@ -6604,6 +6764,7 @@ AUDIT_STRINGS: dict[str, dict] = {
         "search_failed_merged": (
             "failed for {n} of {total} {queries}, in a merged record"
         ),
+        "search_capped": "capped at the limit for {n} of {total} {queries}",
         "query": "query",
         "queries": "queries",
         "title": "Title",
@@ -6678,6 +6839,7 @@ AUDIT_STRINGS: dict[str, dict] = {
         "search_failed_merged": (
             "misslyckades för {n} av {total} {queries}, i en sammanslagen post"
         ),
+        "search_capped": "nådde träffgränsen för {n} av {total} {queries}",
         "query": "sökfråga",
         "queries": "sökfrågor",
         "title": "Titel",
@@ -7350,7 +7512,7 @@ def audit_databases_sentence(
         for provider in row.providers:
             if provider not in used and provider not in RANKED_SHORT_NAMES:
                 used.append(provider)
-    for short, (failed, _, total, merged_failed) in shortfalls.items():
+    for short, (failed, _, total, merged_failed, _) in shortfalls.items():
         if failed + merged_failed < total and short not in used:
             used.append(short)
     names: list[str] = []
@@ -7418,6 +7580,14 @@ its providers (the merge prefixes each error with its provider).  Then
 the failure is each provider's, and it is counted apart, so the note
 can say that it comes from a merged record.
 
+A search that answered can still have stopped at its limit, and the
+coverage statement should not let a reader take it for the whole
+answer (\url{https://github.com/dbosk/scholar/issues/166}).  So a
+fifth count is of the searches that reached their limit while the
+service reported more, or reported no total at all: \enquote{capped at
+the limit for 2 of 5 queries}.  It is the same test as the
+\enquote{capped at} of [[count_label]] in the [[scholar]] module.
+
 <<review report generation>>=
 def merged_record_failed_everywhere(record: SearchRecord) -> bool:
     """Whether every provider of a merged record failed outright."""
@@ -7430,17 +7600,30 @@ def merged_record_failed_everywhere(record: SearchRecord) -> bool:
     return set(record.merged_providers) <= named
 
 
+def search_was_capped(record: SearchRecord) -> bool:
+    """Whether an answered search stopped at its limit with more left.
+
+    True when the hits reached a positive limit and the service
+    reported more, or reported no total; see `count_label`.
+    """
+    if record.error or record.is_merged or not record.limit:
+        return False
+    if record.hits is None or record.hits != record.limit:
+        return False
+    return record.total is None or record.total > record.hits
+
+
 def audit_search_shortfalls(
     records: list[SearchRecord],
-) -> dict[str, tuple[int, int, int, int]]:
+) -> dict[str, tuple[int, int, int, int, int]]:
     """Count searches per provider code that failed, ended incomplete,
-    all of them, and those that failed inside a merged record."""
+    all of them, failed inside a merged record, and were capped."""
     counts: dict[str, list[int]] = {}
     for record in records:
         if is_ranked_provider(record.provider):
             continue
         for short in provider_short_names(record.provider):
-            tally = counts.setdefault(short, [0, 0, 0, 0])
+            tally = counts.setdefault(short, [0, 0, 0, 0, 0])
             tally[2] += 1
             if record.is_merged:
                 if merged_record_failed_everywhere(record):
@@ -7449,22 +7632,26 @@ def audit_search_shortfalls(
                 tally[1] += 1
             elif record.error:
                 tally[0] += 1
+            elif search_was_capped(record):
+                tally[4] += 1
     return {short: tuple(tally) for short, tally in counts.items()}
 
 
 def audit_search_notes(
-    shortfall: tuple[int, int, int, int] | None, strings: dict
+    shortfall: tuple[int, int, int, int, int] | None, strings: dict
 ) -> list[str]:
-    """Localised notes on a database's failed and incomplete searches."""
+    """Localised notes on a database's failed, incomplete and capped
+    searches."""
     if not shortfall:
         return []
-    failed, incomplete, total, merged_failed = shortfall
+    failed, incomplete, total, merged_failed, capped = shortfall
     queries = strings["query"] if total == 1 else strings["queries"]
     notes = []
     for count, template in (
         (failed, strings["search_failed"]),
         (incomplete, strings["search_incomplete"]),
         (merged_failed, strings["search_failed_merged"]),
+        (capped, strings["search_capped"]),
     ):
         if count:
             notes.append(
@@ -7606,6 +7793,31 @@ class TestAuditMergedRecords:
         )
         assert "i en sammanslagen post" in audit_databases_sentence(
             rows, AUDIT_STRINGS["sv"], records
+        )
+@
+
+A search that reached its limit with more left is named as capped, in
+both languages; one that reached it with nothing left, or did not
+reach it, is not:
+
+<<test functions>>=
+class TestAuditCapped:
+    """Searches stopped at their limit are noted (#166)."""
+
+    def test_capped_note(self):
+        records = [
+            SearchRecord("q1", "dblp", None, 100, hits=100, total=2130),
+            SearchRecord("q2", "dblp", None, 100, hits=100),
+            SearchRecord("q3", "dblp", None, 100, hits=100, total=100),
+            SearchRecord("q4", "dblp", None, 100, hits=12, total=12),
+        ]
+        rows = [AuditRow("t", "2020", ["DBLP"], DecisionStatus.KEPT,
+                         "r", 0)]
+        assert audit_databases_sentence(
+            rows, AUDIT_STRINGS["en"], records
+        ) == "Databases: DBLP (capped at the limit for 2 of 4 queries)."
+        assert "nådde träffgränsen för 2 av 4 sökfrågor" in (
+            audit_databases_sentence(rows, AUDIT_STRINGS["sv"], records)
         )
 @
 

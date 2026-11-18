@@ -1330,6 +1330,55 @@ class TestSearchRecordsPerProvider:
         assert "dead: q" in shown.stdout
         assert "failed (non-JSON response)" in shown.stdout
         assert "incomplete" not in shown.stdout
+
+    def test_csv_names_each_providers_search(self, monkeypatch):
+        self._providers(monkeypatch)
+        result = runner.invoke(app, [
+            "search", "q", "-p", "good", "-p", "dead", "-f", "csv",
+        ])
+        assert "# Search: good: 1" in result.stdout
+        assert "# Search: dead: failed (non-JSON response)" in result.stdout
+@
+
+A search cut at its limit must say so wherever its count appears
+(\url{https://github.com/dbosk/scholar/issues/166}): the CSV keeps its
+plain count and adds the reported total and the cap on lines of their
+own, and the session listing shows \enquote{1 of 2,130 (capped at 1)}.
+
+<<test functions>>=
+class TestSearchShowsTotals:
+    """A capped search shows the total and the cap (#166)."""
+
+    def _provider(self, monkeypatch):
+        from scholar import providers
+
+        mock = Mock(last_total=2130, last_total_estimated=False,
+                    last_error=None, last_retries=0)
+        mock.name = "big"
+        mock.MAX_LIMIT = None
+        mock.search.return_value = [
+            Paper(title="First", authors=["A"], doi="10.1/big-1"),
+        ]
+        monkeypatch.setattr(providers, "PROVIDERS", {"big": mock})
+
+    def test_csv_and_session(self, tmp_path, monkeypatch):
+        import json as _json
+
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        self._provider(monkeypatch)
+        result = runner.invoke(
+            app, ["search", "q", "-l", "1", "-n", "big", "-f", "csv"]
+        )
+        assert "# Results: 1\n" in result.stdout
+        assert "# Total reported: 2130" in result.stdout
+        assert "# Capped at limit: 1" in result.stdout
+
+        shown = runner.invoke(app, ["sessions", "show", "big"])
+        assert "hits: 1 of 2,130 (capped at 1)" in shown.stdout
+        data = _json.loads(runner.invoke(
+            app, ["sessions", "show", "big", "-f", "json"]
+        ).stdout)
+        assert data["search_records"][0]["total"] == 2130
 @
 
 A provider skipped for its spent quota is a search that failed, not one
@@ -6604,6 +6653,8 @@ def sessions_show(
                     "hits": r.hits,
                     "error": r.error,
                     "retries": r.retries,
+                    "total": r.total,
+                    "total_estimated": r.total_estimated,
                     **(
                         {"ranked": True}
                         if is_ranked_provider(r.provider) else {}
@@ -10530,7 +10581,7 @@ gets its own line with the reason, worded by [[hits_label]] as in every
 other view, and so does one that answered only in part.
 
 <<cli imports>>=
-from scholar.scholar import hits_label, is_ranked_provider
+from scholar.scholar import hits_label, is_ranked_provider, result_total
 
 <<formatter classes>>=
 class TableFormatter:
@@ -10570,17 +10621,50 @@ class TableFormatter:
             self.console.print(table)
 
             ranked = is_ranked_provider(result.provider)
-            label = hits_label(
-                len(result.papers), result.error, ranked=ranked
-            )
+            label = result_hits_label(result)
             if result.error:
                 self.console.print(
                     f"[yellow]Results: {escape(label)}[/yellow]"
                 )
             elif not result.papers:
                 self.console.print("[dim]No results found.[/dim]")
-            elif ranked:
+            elif ranked or label != str(len(result.papers)):
                 self.console.print(f"[dim]Results: {escape(label)}[/dim]")
+            for line in part_hits_lines(result):
+                self.console.print(f"[dim]{escape(line)}[/dim]")
+@
+
+A count that stopped at the limit is shown with the total the provider
+reported and the cap (\enquote{100 of 2,130 (capped at 100)},
+[[count_label]] in the [[scholar]] module), so that the table does not
+present the first page of an answer as all of it
+(\url{https://github.com/dbosk/scholar/issues/166}).  A merged result
+has no total of its own; below it, each provider's search gets a line
+with its own count, total and error
+(\url{https://github.com/dbosk/scholar/issues/164}), since the merged
+count cannot say which provider answered what.  Both views and the CSV
+share the two helpers.
+
+<<formatter classes>>=
+def result_hits_label(result) -> str:
+    """The hits label of a result, with its total and cap if known."""
+    total, estimated = result_total(result)
+    return hits_label(
+        len(result.papers), result.error,
+        ranked=is_ranked_provider(result.provider),
+        total=total, limit=getattr(result, "limit", None),
+        estimated=estimated,
+    )
+
+
+def part_hits_lines(result) -> list[str]:
+    """One line per provider search of a merged result; none otherwise."""
+    parts = getattr(result, "parts", None)
+    if not isinstance(parts, list) or not parts:
+        return []
+    return [
+        f"{part.provider}: {result_hits_label(part)}" for part in parts
+    ]
 @
 
 Let's verify the table formatter produces correct output:
@@ -10627,7 +10711,12 @@ provider, so it is where a failure must show: it reads
 [[failed (reason)]] instead of 0 (or [[N, incomplete (reason)]]),
 deliberately not a number, so a script that parses it stops instead of
 recording a zero.  Retries get a line of their own, which keeps the
-count of an answered search a plain number:
+count of an answered search a plain number, and so do the total the
+provider reported ([[# Total reported:]]) and a count that stopped at
+the limit ([[# Capped at limit:]]), for the same reason
+(\url{https://github.com/dbosk/scholar/issues/166}).  A merged result
+adds one [[# Search:]] line per provider with that provider's own
+outcome (\url{https://github.com/dbosk/scholar/issues/164}):
 
 <<formatter classes>>=
 class CSVFormatter:
@@ -10647,6 +10736,16 @@ class CSVFormatter:
             print(f"# Results: {label}")
             if result.retries:
                 print(f"# Retries: {result.retries}")
+            total, estimated = result_total(result)
+            if total is not None:
+                about = " (estimate)" if estimated else ""
+                print(f"# Total reported: {total}{about}")
+            if (not result.error and result.limit
+                    and len(result.papers) == result.limit
+                    and (total is None or total > len(result.papers))):
+                print(f"# Capped at limit: {result.limit}")
+            for line in part_hits_lines(result):
+                print(f"# Search: {line}")
             print()
 
             # Header row
@@ -10692,7 +10791,10 @@ reconstructs --- the search is fully described by its query, providers,
 filters, and limit, and JSON is the natural place to expose all four to a
 machine reader.  The [[error]] and [[retries]] of the result go along
 for the same reason: a consumer counting papers must be able to tell a
-failed provider from an empty answer.
+failed provider from an empty answer.  So do the [[total]] the provider
+reported (\url{https://github.com/dbosk/scholar/issues/166}) and, for a
+merged result, the [[searches]] it was made of, each with its own
+count, total and error (\url{https://github.com/dbosk/scholar/issues/164}).
 
 <<formatter classes>>=
 class JSONFormatter:
@@ -10710,6 +10812,20 @@ class JSONFormatter:
                 "limit": result.limit,
                 "error": result.error,
                 "retries": result.retries,
+                "total": result_total(result)[0],
+                "total_estimated": result_total(result)[1],
+                **({"searches": [
+                    {
+                        "query": part.query,
+                        "provider": part.provider,
+                        "hits": len(part.papers),
+                        "total": result_total(part)[0],
+                        "total_estimated": result_total(part)[1],
+                        "error": part.error,
+                        "retries": part.retries,
+                    }
+                    for part in result.parts
+                ]} if getattr(result, "parts", None) else {}),
                 "papers": [
                     {
                         "title": p.title,

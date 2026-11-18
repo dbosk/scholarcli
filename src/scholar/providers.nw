@@ -201,6 +201,25 @@ section of the core module).  A third-party provider without the
 attributes simply always reads as having answered, which is what every
 provider read as before.
 
+\label{sec:reported-total}
+A third optional attribute, [[last_total]], is the number of matching
+records the service \emph{reported} for the last search, or [[None]]
+when it reports none or the answer was not read; [[last_total_estimated]]
+says that the service calls the number an estimate.  A search fetches
+at most its limit, so its hit count alone cannot say whether the
+service had more: 100 hits of a search limited to 100 may be all there
+was or the first page of 2\,130
+(\url{https://github.com/dbosk/scholar/issues/166}).  The total is what
+tells the two apart.  A provider resets it with [[last_error]] and sets
+it from the first page it reads: OpenAlex's [[meta.count]], DBLP's
+[[@total]], Web of Science's [[total]] and [[RecordsFound]], IEEE
+Xplore's [[total_records]], HAL's [[numFound]], Scopus's
+[[opensearch:totalResults]] and arXiv's feed total.  Each is read where
+the provider already reads it to stop paging, so no field is newly
+assumed.  A provider that filters records after fetching them (arXiv's
+year filter) reports none, because the service's total counts records
+the filter removes.
+
 <<provider protocol>>=
 class SearchProvider(Protocol):
     """Protocol for search providers."""
@@ -3418,6 +3437,7 @@ class OpenAlexProvider:
         the API's per-request maximum (200 results per page).
         """
         self.last_error = None
+        self.last_total = None
         cache_key = (
             self.CACHE_VERSION,
             query,
@@ -3494,6 +3514,9 @@ while True:
         <<keep the pages that arrived before [[failure]]>>
     if page is None:
         break
+    if self.last_total is None:
+        count = (getattr(page, "meta", None) or {}).get("count")
+        self.last_total = count if isinstance(count, int) else None
     for work in page:
         all_papers.append(self._convert_work(work))
         if len(all_papers) >= limit:
@@ -6699,6 +6722,7 @@ def search(
     """
     self.last_error = None
     self.last_retries = 0
+    self.last_total = None
     sanitized = self._sanitize_query(query)
     cache_key = (query, limit, filters.cache_key() if filters else "")
     if cache_key in self._cache:
@@ -7107,6 +7131,9 @@ def _fetch_pages(
         hits, total = self._fetch_one_page(
             effective_query, current_page_size, offset
         )
+        if offset == 0:
+            # `_parse_total` reads an absent @total as 0: unknown then
+            self.last_total = total if total or not hits else None
         if not hits:
             # No more results available
             break
@@ -8218,6 +8245,7 @@ def search(
 ) -> list[Paper]:
     """Search Web of Science for papers matching the query."""
     self.last_error = None
+    self.last_total = None
     cache_key = (query, limit, filters.cache_key() if filters else "")
     if cache_key in self._cache:
         return self._cache[cache_key]
@@ -8336,6 +8364,8 @@ def _search_starter(
             # Check if we've fetched all available results
             metadata = data.get("metadata", {})
             total = metadata.get("total", 0)
+            if self.last_total is None and "total" in metadata:
+                self.last_total = total
             if len(all_papers) >= total:
                 break
 
@@ -8416,6 +8446,8 @@ def _search_expanded(
 
             # Check if we've fetched all available results
             total = query_result.get("RecordsFound", 0)
+            if self.last_total is None and "RecordsFound" in query_result:
+                self.last_total = total
             if first_record > total:
                 break
 
@@ -10268,6 +10300,7 @@ def search(
     the API's per-request maximum (200 results per page).
     """
     self.last_error = None
+    self.last_total = None
     cache_key = (query, limit, filters.cache_key() if filters else "")
     if cache_key in self._cache:
         return self._cache[cache_key]
@@ -10336,6 +10369,8 @@ def _search_uncached(
 
             # Check if we've fetched all available results
             total = data.get("total_records", 0)
+            if self.last_total is None and "total_records" in data:
+                self.last_total = total
             if start_record > total:
                 break
 
@@ -11195,11 +11230,12 @@ class PacedArxivClient(arxiv.Client):
         super().__init__(delay_seconds=0.0, **kwargs)
         self._limiter = limiter
         self._session = network.new_session()
+        self.last_total: int | None = None
 
     def _parse_feed(self, url, first_page=True, _try_index=0):
         self._limiter.acquire()
         try:
-            return super()._parse_feed(
+            feed = super()._parse_feed(
                 url, first_page=first_page, _try_index=_try_index
             )
         except arxiv.HTTPError as e:
@@ -11208,7 +11244,18 @@ class PacedArxivClient(arxiv.Client):
                     reason="rate limited (HTTP 429)"
                 )
             raise
+        if first_page:
+            total = getattr(getattr(feed, "header", None),
+                            "total_results", None)
+            self.last_total = total if isinstance(total, int) else None
+        return feed
 @
+
+The client also keeps the total of the first page it parses
+([[last_total]]), the number of records arXiv reports for the query;
+the package reads it from the feed header ([[feed.header.total_results]]
+in [[arxiv]] 4.1, where [[Client._results]] uses it to stop paging), and
+the provider passes it on.
 
 Let's verify that each page request is paced at the declared rate and
 counted, and that a final 429 puts arXiv on cooldown.
@@ -11305,6 +11352,7 @@ class ArxivProvider:
         allowing immediate retry.
         """
         self.last_error = None
+        self.last_total = None
         # Check cache first
         cache_key = (query, limit, filters.cache_key() if filters else "")
         if cache_key in self._cache:
@@ -11448,6 +11496,8 @@ for attempt in range(self.MAX_RETRIES):
             all_papers.append(paper)
 
         logger.debug(f"arxiv: Retrieved {len(all_papers)} papers")
+        if not (filters and filters.year):
+            self.last_total = getattr(self._client, "last_total", None)
 
         # Only cache successful results
         if all_papers:
@@ -13134,6 +13184,7 @@ def search(
     exceeds the page size.
     """
     self.last_error = None
+    self.last_total = None
     cache_key = (query, limit, filters.cache_key() if filters else "")
     if cache_key in self._cache:
         return self._cache[cache_key]
@@ -13187,6 +13238,9 @@ def _fetch_pages(
         docs, total = self._fetch_one_page(
             query, filter_queries, min(page_size, remaining), start
         )
+        if start == 0 and isinstance(total, int):
+            # an absent numFound reads as 0: unknown when docs came
+            self.last_total = total if total or not docs else None
         if not docs:
             break
 
@@ -14114,6 +14168,7 @@ class ScopusProvider:
         exceeds the per-request maximum of 25 results.
         """
         self.last_error = None
+        self.last_total = None
         standard_key = (
             query,
             limit,
@@ -14177,6 +14232,8 @@ class ScopusProvider:
                 results = data.get("search-results", {})
                 declared = results.get("opensearch:totalResults")
                 total = int(declared or 0)
+                if declared is not None and self.last_total is None:
+                    self.last_total = total
                 entries = scopus_result_entries(results)
                 if (declared is not None and total == 0) or not entries:
                     break
@@ -15596,6 +15653,111 @@ class TestScopusIntegration:
         assert paper.sources == ["scopus"]
 @
 
+
+\section{Reported totals}
+
+Each provider sets [[last_total]] from the response field it already
+reads to stop paging (\cref{sec:reported-total}).  Let's verify it for
+each, with a search limited to one record from a service that reports
+many, and that a total the response leaves out is unknown rather than
+0.  The responses have the shapes of this chapter's paging tests,
+reduced to the fields the code reads; the fields themselves were not
+newly assumed, since the paging already depends on each of them.
+
+<<test functions>>=
+class TestReportedTotals:
+  """Every provider reports the total its service gave (#166)."""
+
+  @staticmethod
+  def _json(data):
+    response = Mock(status_code=200, ok=True, headers={})
+    response.json.return_value = data
+    response.raise_for_status = Mock()
+    return response
+
+  def test_openalex(self):
+    provider = OpenAlexProvider(api_key=None)
+
+    class Page(list):
+      meta = {"count": 2130}
+
+    def pages(per_page):
+      yield Page([{"id": "W1"}])
+
+    with patch("pyalex.Works") as works:
+      works.return_value.search.return_value.paginate = pages
+      provider.search("total query", limit=1)
+    assert provider.last_total == 2130
+
+  def test_dblp(self):
+    provider = DBLPProvider()
+    hits = {"@total": "1500", "hit": [{"info": {"title": "Paper"}}]}
+    with patch("requests.get",
+               return_value=self._json({"result": {"hits": hits}})):
+      provider.search("total", limit=1)
+    assert provider.last_total == 1500
+    del hits["@total"]
+    with patch("requests.get",
+               return_value=self._json({"result": {"hits": hits}})):
+      provider.search("no total", limit=1)
+    assert provider.last_total is None
+
+  def test_wos_starter(self):
+    provider = WebOfScienceProvider(
+      starter_api_key="test_key", expanded_api_key=None
+    )
+    data = {"metadata": {"total": 75}, "hits": [{"title": "Paper"}]}
+    with patch("requests.get", return_value=self._json(data)):
+      provider.search("total", limit=1)
+    assert provider.last_total == 75
+
+  def test_ieee(self):
+    provider = IEEEXploreProvider(api_key="test_key")
+    data = {"total_records": 350, "articles": [
+      {"title": "Paper", "authors": {"authors": []}},
+    ]}
+    with patch("requests.get", return_value=self._json(data)):
+      provider.search("total", limit=1)
+    assert provider.last_total == 350
+
+  def test_hal(self):
+    provider = HALProvider()
+    data = {"response": {"numFound": 42, "docs": [{"title_s": ["P"]}]}}
+    with patch("requests.get", return_value=self._json(data)):
+      provider.search("total", limit=1)
+    assert provider.last_total == 42
+
+  def test_scopus(self, monkeypatch):
+    monkeypatch.setenv("SCOPUS_VIEW", "standard")
+    provider = ScopusProvider(api_key="test_key")
+    data = {"search-results": {
+      "opensearch:totalResults": "30",
+      "entry": [{"@_fa": "true", "dc:title": "Paper"}],
+    }}
+    with patch("requests.get", return_value=self._json(data)):
+      provider.search("total", limit=1)
+    assert provider.last_total == 30
+
+  def test_arxiv_client_and_provider(self, monkeypatch):
+    from types import SimpleNamespace
+    provider = ArxivProvider()
+    feed = SimpleNamespace(header=SimpleNamespace(total_results=77))
+    monkeypatch.setattr(
+      arxiv.Client, "_Client__try_parse_feed",
+      lambda self, url, first_page, try_index: feed,
+    )
+    provider._client._parse_feed("https://export.arxiv.org/x")
+    assert provider._client.last_total == 77
+
+    provider._client = Mock(last_total=77)
+    provider._client.results.return_value = iter([])
+    provider.search("total", limit=1)
+    assert provider.last_total == 77
+    provider._client.results.return_value = iter([])
+    provider.search("total, years", limit=1,
+                    filters=SearchFilters(year="2020"))
+    assert provider.last_total is None
+@
 
 \section{Dependencies}
 

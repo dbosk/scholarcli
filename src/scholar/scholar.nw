@@ -78,6 +78,8 @@ from .scholar import search, filter_papers, filters_key, deduplicate_papers
 from .scholar import deduplicate_versions, merge_version_of
 from .scholar import get_registry, isolated_registry
 from .scholar import hits_label, provider_outcome, result_outcome
+from .scholar import count_label, provider_total, result_total
+from .scholar import search_provider, parts_returning
 from .scholar import applied_filters, without_search_in, filter_flags
 from .scholar import RANKED_PROVIDERS, is_ranked_provider
 from .scholar import normalize_venue
@@ -86,6 +88,11 @@ from .utils import safe_get_nested, ensure_list
 
 __all__ = [
     "hits_label",
+    "count_label",
+    "provider_total",
+    "result_total",
+    "search_provider",
+    "parts_returning",
     "RANKED_PROVIDERS",
     "is_ranked_provider",
     "provider_outcome",
@@ -2527,6 +2534,7 @@ class SearchResult:
     limit: int | None = None
     error: str | None = None
     retries: int = 0
+    <<search result total>>
     <<search result parts>>
 
     <<search result methods>>
@@ -2594,6 +2602,64 @@ def provider_outcome(provider) -> tuple[str | None, int]:
     return _read_outcome(provider, "last_error", "last_retries")
 @
 
+A result also keeps the number of matching records the service
+reported ([[total]], [[None]] when it reported none) and whether the
+service calls it an estimate ([[total_estimated]]).  The hit count is
+what we fetched, at most the limit; the total is what there was, and
+only the two together tell a complete search from one cut at its limit
+(\url{https://github.com/dbosk/scholar/issues/166}, [[count_label]]
+below).  Providers report it through the optional attributes
+[[last_total]] and [[last_total_estimated]] (the providers chapter says
+which response field each reads), read as tolerantly as the outcome: a
+[[Mock]]'s auto-attribute, a negative number or a [[bool]] reads as
+unknown.  A merged result has no total of its own; each of its parts
+keeps its provider's.
+
+<<search result total>>=
+total: int | None = None
+total_estimated: bool = False
+<<functions>>=
+def provider_total(provider) -> tuple[int | None, bool]:
+    """Return `(total, estimated)` the provider reported for its last search.
+
+    Reads the optional `last_total` and `last_total_estimated`
+    attributes; anything but a non-negative integer total reads as
+    unknown (`None`), and the flag is true only if it is `True`.
+    """
+    total = getattr(provider, "last_total", None)
+    if not isinstance(total, int) or isinstance(total, bool) or total < 0:
+        total = None
+    estimated = getattr(provider, "last_total_estimated", False) is True
+    return total, estimated and total is not None
+
+
+def result_total(result) -> tuple[int | None, bool]:
+    """Return `(total, estimated)` of a `SearchResult`-like object."""
+    return provider_total(SimpleNamespace(
+        last_total=getattr(result, "total", None),
+        last_total_estimated=getattr(result, "total_estimated", False),
+    ))
+@
+
+<<test functions>>=
+class TestProviderTotal:
+    """Tests for provider_total."""
+
+    def test_reported_total_is_read(self):
+        assert provider_total(Mock(last_total=2130)) == (2130, False)
+        assert provider_total(
+            Mock(last_total=5000, last_total_estimated=True)
+        ) == (5000, True)
+
+    def test_unknown_reads_as_none(self):
+        class Plain:
+            name = "plain"
+        assert provider_total(Plain()) == (None, False)
+        assert provider_total(Mock()) == (None, False)
+        assert provider_total(Mock(last_total=True)) == (None, False)
+        assert provider_total(Mock(last_total=-1)) == (None, False)
+@
+
 The session code meets the same problem one step later: it is handed
 search results, and its tests hand it [[Mock]]s standing in for them.
 [[result_outcome]] reads a result's [[error]] and [[retries]] with the
@@ -2620,26 +2686,72 @@ def hits_label(
     retries: int = 0,
     *,
     ranked: bool = False,
+    total: int | None = None,
+    limit: int | None = None,
+    estimated: bool = False,
 ) -> str:
     """Describe a search outcome for display: a count, or a failure.
 
     Returns "" when nothing is known (`hits` is None and no error).
     With `ranked`, the hits are the length of a ranked list (semantic
-    search) and are labelled so, not as a count of matches.
+    search) and are labelled so, not as a count of matches. `total`
+    (the number the service reported, `estimated` if it says so) and
+    `limit` turn a count into "100 of 2,130 (capped at 100)".
     """
     if error and not hits:
         label = f"failed ({error})"
     elif error:
-        label = f"{hits}, incomplete ({error})"
+        label = f"{count_label(hits, total, limit, estimated)}, " \
+                f"incomplete ({error})"
     elif hits is None:
         return ""
     elif ranked:
         label = f"top {hits}, ranked (not a count)"
     else:
-        label = str(hits)
+        label = count_label(hits, total, limit, estimated)
     if retries:
         noun = "retry" if retries == 1 else "retries"
         label += f" after {retries} {noun}"
+    return label
+@
+
+A count alone hides how much the search left out.  Most searches stop
+at their limit, and a session showed 100 hits for a query that matched
+2\,130 records, indistinguishable from a query that matched exactly
+100 (\url{https://github.com/dbosk/scholar/issues/166}).  So when the
+service reported more than were fetched, the count says of how many
+(\enquote{100 of 2,130}, \enquote{of about} for an estimate), and when
+the count reached the limit and the total does not show that nothing
+was left, it says that the limit cut it
+(\enquote{100 (capped at 100)}).  A count that is everything there was
+stays a plain number, so every label from before reads as it did.
+Ranked lists keep their own wording: their length is the limit by
+design, not a cap.
+
+<<functions>>=
+def count_label(
+    hits: int,
+    total: int | None = None,
+    limit: int | None = None,
+    estimated: bool = False,
+) -> str:
+    """A count of hits, with the reported total and the cap when they matter.
+
+    "12" when that is all; "100 of 2,130" when the service reported
+    more; "(capped at 100)" added when the hits reached a positive
+    `limit` and the total does not show that nothing was left.
+    """
+    more = total is not None and total > hits
+    capped = (
+        bool(limit) and hits == limit and (total is None or total > hits)
+    )
+    if not more and not capped:
+        return str(hits)
+    label = f"{hits:,}"
+    if more:
+        label += f" of {'about ' if estimated else ''}{total:,}"
+    if capped:
+        label += f" (capped at {limit:,})"
     return label
 @
 
@@ -2676,6 +2788,26 @@ class TestSearchOutcome:
         assert hits_label(25, "HTTP 429") == "25, incomplete (HTTP 429)"
         assert hits_label(3, retries=1) == "3 after 1 retry"
         assert hits_label(0, retries=2) == "0 after 2 retries"
+
+    def test_totals_and_caps(self):
+        """A count says of how many, and when the limit cut it (#166)."""
+        assert hits_label(100, total=2130, limit=100) == (
+            "100 of 2,130 (capped at 100)"
+        )
+        assert hits_label(100, limit=100) == "100 (capped at 100)"
+        assert hits_label(100, total=100, limit=100) == "100"
+        assert hits_label(40, total=40, limit=100) == "40"
+        assert hits_label(40, total=900) == "40 of 900"
+        assert hits_label(100, total=5000, limit=100, estimated=True) == (
+            "100 of about 5,000 (capped at 100)"
+        )
+        assert hits_label(25, "HTTP 429", total=300) == (
+            "25 of 300, incomplete (HTTP 429)"
+        )
+        assert hits_label(0, "HTTP 503", total=300) == "failed (HTTP 503)"
+        assert hits_label(50, ranked=True, limit=50) == (
+            "top 50, ranked (not a count)"
+        )
 @
 
 \paragraph{A ranked list is not a count.}
@@ -3132,6 +3264,10 @@ provider responded (\cref{sec:doi-normalization}).
 Because a single-provider search is routed through this method, the copy
 preserves the result's [[filters]], [[limit]], [[error]] and [[retries]]
 so that the search metadata survives for provenance reconstruction.
+It is a [[replace]] of the result rather than a new one built field by
+field, so that a field added to [[SearchResult]] later (its reported
+total, its dates) survives as well without anyone remembering this
+place.
 
 <<search result methods>>=
 def deduplicate(self) -> "SearchResult":
@@ -3142,16 +3278,7 @@ def deduplicate(self) -> "SearchResult":
         f"Deduplicated {self.provider}: {len(deduped)} unique papers "
         f"({duplicates} duplicates removed)"
     )
-    return SearchResult(
-        query=self.query,
-        provider=self.provider,
-        timestamp=self.timestamp,
-        papers=deduped,
-        filters=self.filters,
-        limit=self.limit,
-        error=self.error,
-        retries=self.retries,
-    )
+    return replace(self, papers=deduped)
 @
 
 \subsubsection{Testing search results}
@@ -3722,14 +3849,40 @@ def search_provider(
     logger.debug(f"Querying {provider.name} with limit={limit}")
     result.papers = provider.search(query, limit=limit, filters=filters)
     result.error, result.retries = provider_outcome(provider)
+    result.total, result.total_estimated = provider_total(provider)
     for paper in result.papers:
         clean_paper_text(paper)
     label = hits_label(
         len(result.papers), result.error, result.retries,
         ranked=is_ranked_provider(provider.name),
+        total=result.total, limit=limit,
+        estimated=result.total_estimated,
     )
     logger.info(f"{provider.name}: {label}")
     return result
+@
+
+Let's verify that the total a provider reports reaches the result, and
+that a provider reporting none leaves it unknown:
+
+<<test functions>>=
+class TestSearchProviderTotal:
+    """search_provider copies the reported total onto the result."""
+
+    def test_total_reaches_the_result(self):
+        provider = Mock(last_total=2130, last_total_estimated=False,
+                        last_error=None, last_retries=0)
+        provider.name = "reporting"
+        provider.search.return_value = [Paper(title="A", authors=["X"])]
+        result = search_provider(provider, "q", 1)
+        assert (result.total, result.total_estimated) == (2130, False)
+
+    def test_no_total_is_unknown(self):
+        provider = Mock()
+        provider.name = "silent"
+        provider.search.return_value = []
+        result = search_provider(provider, "q", 1)
+        assert result.total is None
 @
 
 \subsubsection{Testing the search interface}
@@ -3941,6 +4094,7 @@ import json
 import logging
 import shlex
 import re
+from types import SimpleNamespace
 
 from scholar.utils import is_preprint_paper, legacy_hash_paper_id
 

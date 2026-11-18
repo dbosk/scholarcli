@@ -95,6 +95,26 @@ Providers self-register via `register_provider()` at module load time.
   be split"); the audit caption counts them as a query of each provider
   but marks a failure only when every provider in them failed
   (`merged_record_failed_everywhere`, "…, in a merged record").
+- Totals and caps (#166). Providers set `last_total` (+
+  `last_total_estimated`) from the field they already page on
+  (OpenAlex `meta.count`, DBLP `@total`, WoS `total`/`RecordsFound`,
+  IEEE `total_records`, HAL `numFound`, Scopus
+  `opensearch:totalResults`, arXiv feed header; none with arXiv's
+  client-side year filter; an absent field is `None`, not 0), reset
+  next to `last_error`. `search_provider` reads them Mock-safely
+  (`provider_total`) into `SearchResult.total`/`total_estimated`,
+  stored on `SearchRecord`. `hits_label(..., total=, limit=,
+  estimated=)` / `count_label`: "100 of 2,130 (capped at 100)" (capped
+  when hits == limit and the total does not show nothing was left);
+  plain counts read as before. CSV keeps `# Results: N` numeric and
+  adds `# Total reported:` / `# Capped at limit:` / per-provider
+  `# Search:` lines; JSON adds `total` and `searches`. Audit caption:
+  "capped at the limit for k of n queries" (`search_was_capped`). A
+  narrower re-run (same key, smaller limit, both answered) never
+  replaces a wider record: the wider one is kept, nothing new is
+  recorded, links already share the key (`search_width`: None/0 =
+  all; legacy records never count as wider).
+  `ReviewSession.add_search_record(record)` carries records over whole.
 
 ### Search Flow
 
