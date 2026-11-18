@@ -133,27 +133,45 @@ quotes, parentheses, `|`, a word-initial `+`/`-`, `*`) or a search
 without a limit (`None`, `<= 0`, or `UNLIMITED_PROVIDER_LIMIT`, now
 defined in `scholar.scholar` and imported by the CLI) goes to
 `/paper/search/bulk` (`_search_bulk`, pages by `token` until it is
-empty/absent or the limit is reached; `s2_bulk_query` translates
-AND→`+`, OR→`|`, NOT/AND NOT→`-` outside quoted phrases); plain words
+empty/absent or the limit is reached; with a finite limit it sends
+`sort=citationCount:desc` and `last_via` is `"bulk, most cited first"`
+(capped bulk answers are otherwise arbitrary, paperId order); without
+a limit it stops at `S2_BULK_SAFETY_CAP` = 100,000 papers and records
+"stopped at the 100000-paper safety cap" as incomplete;
+`s2_bulk_query` translates AND→`+`, OR→`|`, NOT/AND NOT→`-` outside
+quoted phrases and quotes unquoted hyphenated words, since bulk reads
+an inner `-` as negation, #161 comment: `re-execution` 18,149 vs 251;
+`s2_mixes_and_or` → WARNING for ungrouped AND/OR, no documented
+precedence). `s2_foreign_field_syntax` refuses Scopus/WoS/arXiv field
+codes before any request: `last_error` "query uses <db> field syntax,
+not supported by Semantic Scholar" (failed, not cached). Plain words
 with a limit stay on `/paper/search` (`_search_uncached`), which never
 asks past offset 1000 and sets `last_error = S2_RELEVANCE_CEILING`
 ("relevance search stops at 1000", shown as "1000, incomplete (...)")
 when it stops there with more asked for and reported. Bulk results are
 cached under the relevance key plus `"bulk"` (old relevance entries,
 including the wrong zeros of Boolean queries, are never served for a
-bulk search; plain-word entries keep serving). Both return a
-`PapersWithTotal` (list + `total`, pickled into the cache by name: keep
-the name); `search` sets `last_total` (None for old plain-list
-entries) and `last_total_estimated = True` (the description calls both
-totals "Approximate"), and `last_via` (`"bulk"` or None). `via` flows
+bulk search; plain-word entries keep serving). **The cache holds
+built-in types only** (an older scholar unpickles the shared file): the
+papers as a plain list, the total beside it as
+`cache[("__s2_total__", key)] = (total, True)` (`s2_cached_total`,
+missing → None); the snippet backend likewise keeps
+`("__s2_ranked__", key) = (scores, fetched_at)`. A test unpickles a
+written cache with `scholar.providers` unimportable. `search` sets
+`last_total` and `last_total_estimated = True` (the description calls
+both totals "Approximate"; read by the records change, #166, not by
+`Search.execute` yet), and `last_via` (`"bulk"`, `"bulk, most cited
+first"` or None). `--in title-abstract` is honoured on bulk (it
+matches title+abstract by default): `SemanticScholarProvider.
+applied_filters` reads `_routed` (query, bulk) noted by `search`; only
+the relevance search warns, once per search. `via` flows
 `provider_via()` → `SearchResult.via` (kept through `merge` as
 `"s2: bulk"` and `deduplicate`) → `result_via()` →
 `SearchRecord.via` (saved/loaded as `"via"`, old files → None; not part
-of the record key) → `sessions show` ("s2 (bulk search): q", JSON
+of the record key) → `sessions show` ("s2 (via bulk): q", JSON
 `via` when set). Bulk stems terms and matches title+abstract only
 (`scholar syntax` says so). Not verified live: what `-` does before a
-parenthesis or phrase, and whether an unquoted hyphenated word is
-read as a negation.
+parenthesis or phrase.
 
 ### Title-and-Abstract Search (`--in`)
 
@@ -261,8 +279,12 @@ refusal sets `last_error` (else it would read as 0 works).
   `QUOTA_GROUP = "s2"`): one `/graph/v1/snippet/search` request with
   `limit=1000`, `fields=snippet.snippetKind`, reduced by
   `s2_snippet_works` to works (each once, at its best snippet, score
-  kept) in a `RankedPapers`; snippets carry no DOI or year, so works
-  match by title and first author. The 2000-character question limit
+  kept) in a `RankedPapers`; snippets carry no DOI or year, so one
+  `POST /paper/batch` (`CorpusId:` ids, `fields=externalIds,year`,
+  through `_request`/`_send`, which now take a `json_body`) fills them
+  in; if it fails, nothing is cached and `last_note` ("... matched by
+  title and first author only") appears as `note` in the check's
+  text/JSON/evidence (`check_note`). The 2000-character question limit
   applies to `openalex` only. Per question one
   provider search (quota pre-check → failed with the limiter's reason),
   then `review.check_against_sessions(papers, sessions, known)` →
