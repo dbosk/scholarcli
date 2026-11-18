@@ -108,6 +108,30 @@ construction). Exception: `WebOfScienceProvider` uses a sentinel, so an
 explicit `None` disables that tier (the legacy `WOS_API_KEY` still
 fills it).
 
+### Title-and-Abstract Search (`--in`)
+
+`scholar search/rq --in title-abstract` sets `SearchFilters.search_in`
+(#135; values in `SEARCH_IN_CHOICES`, a Typer `Enum` in the CLI so a bad
+value is a usage error). It is a filter: in `as_dict`/`cache_key` only
+when set (old cache keys unchanged), in the session record's key, and
+rendered back by `_search_flags` as `--in title-abstract`. Per provider
+(docs cited in `providers.nw`, section "Searching title and abstract
+only"; `scholar syntax` has a "Default Search Fields" table):
+- OpenAlex + source-pinned servers: scoped parameter
+  `search.title_and_abstract=` instead of `search=` (which also matches
+  full text). The filter form `title_and_abstract.search` is deprecated
+  in OpenAlex's docs. `_base_query(query, filters)` is the seam;
+  subclasses must pass `filters` on. Boolean queries work (checked live
+  2026-11-18 via `meta.x_query.oql`). OpenAlex lacks abstracts for many
+  works (its docs: >60% of 2022 works have one, ~45% pre-2000), so this
+  is not the same search as in WoS/Scopus.
+- Scopus: query wrapped as `TITLE-ABS-KEY(...)` unless it already has a
+  field code (`SCOPUS_FIELD_CODE`; then a warning). WoS: nothing to do
+  (`TS=` = title, abstract, author keywords, Keywords Plus).
+- S2, DBLP, IEEE, arXiv, HAL: `warn_search_in_ignored()` logs
+  "`<name>: --in title-abstract not supported, ignoring`" and searches
+  as usual.
+
 ### Preprint-Server Providers and Groups
 
 The seven source-pinned providers exist because their servers have no

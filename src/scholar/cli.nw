@@ -757,7 +757,148 @@ pub_type: Annotated[
         help="Publication type(s): article, conference, review, book, preprint, dataset. "
              "Repeatable. Supported: all providers (with varying type mappings).",
     ),
+] = None,
+<<search field option>>
+@
+
+\subsubsection{Where the query is matched}
+
+The [[--in]] option sets [[SearchFilters.search_in]]
+(\cref{sec:search-in} in the [[scholar]] module).  Its only value,
+[[title-abstract]], asks for matches in title and abstract instead of a
+provider's default fields, which for OpenAlex include the full text
+(\url{https://github.com/dbosk/scholar/issues/135}).  The help names the
+providers that honour it, because the others warn and search as usual:
+a user comparing databases needs to know which counts are comparable
+before running the search, not only from a log line afterwards.
+[[scholar syntax]] lists what each provider searches by default.  The
+option is typed by an [[Enum]] of the values in [[SEARCH_IN_CHOICES]],
+so Typer rejects any other value with a usage error (exit code~2) that
+lists the valid ones, and a typo never silently runs a full-text
+search.  (A [[click.Choice]] passed as [[click_type]] validated too, but
+with the Typer release we use its error escaped as a traceback.)  The
+command bodies pass on the enum's [[value]], the plain string that
+[[SearchFilters]] stores and serialises.  The option sits with the
+filters because it is one: it reaches the cache
+keys, the session's search record and the reproduced command the same
+way.  Since [[rq]] shares [[<<search filter options>>]], it gets the
+option too.
+
+<<search field option>>=
+search_in: Annotated[
+    Optional[SearchIn],
+    typer.Option(
+        "--in",
+        help="Match the query in title-abstract only, not each "
+             "provider's default fields (OpenAlex: also full text). "
+             "Honoured: OpenAlex and its preprint servers, Scopus "
+             "(TITLE-ABS-KEY), WoS (TS= already covers title, abstract, "
+             "keywords). Ignored with a warning: Semantic Scholar, DBLP, "
+             "IEEE, arXiv, HAL. See 'scholar syntax'.",
+    ),
 ] = None
+<<cli imports>>=
+from enum import Enum
+from scholar.scholar import SEARCH_IN_CHOICES
+<<constants>>=
+SearchIn = Enum(
+    "SearchIn",
+    {value.replace("-", "_"): value for value in SEARCH_IN_CHOICES},
+    type=str,
+)
+@
+
+Let's verify the option end to end with a fake provider that remembers
+the filters it was given (a stand-in for a remote service, which the
+test must not reach): the value reaches the provider, a search without
+it sends no filters at all, an unknown value is refused, and a session
+that ran one query both ways keeps two searches, each shown and
+reproduced with its own flags.
+
+<<test functions>>=
+class TestSearchInOption:
+  """search --in title-abstract reaches the provider and the session."""
+
+  class _FieldsProvider:
+    """A provider fake that remembers the filters of each search."""
+    name = "fake"
+    MAX_LIMIT = None
+    last_error = None
+    last_retries = 0
+
+    def __init__(self, papers):
+      self.papers = papers
+      self.seen = []
+
+    def search(self, query, limit=100, filters=None):
+      self.seen.append(filters)
+      if filters and filters.search_in:
+        return self.papers[:1]
+      return self.papers
+
+  def _install(self, monkeypatch, papers):
+    from scholar import providers
+    fake = self._FieldsProvider(papers)
+    monkeypatch.setattr(providers, "PROVIDERS", {"fake": fake})
+    return fake
+
+  def test_value_reaches_the_provider(self, monkeypatch):
+    fake = self._install(monkeypatch, [])
+    result = runner.invoke(
+      app, ["search", "q", "-p", "fake", "--in", "title-abstract",
+            "-f", "json"]
+    )
+    assert result.exit_code == 0
+    assert fake.seen[0].search_in == "title-abstract"
+
+  def test_default_sends_no_filters(self, monkeypatch):
+    fake = self._install(monkeypatch, [])
+    runner.invoke(app, ["search", "q", "-p", "fake", "-f", "json"])
+    assert fake.seen == [None]
+
+  def test_unknown_value_is_refused(self, monkeypatch):
+    fake = self._install(monkeypatch, [])
+    result = runner.invoke(
+      app, ["search", "q", "-p", "fake", "--in", "fulltext"]
+    )
+    assert result.exit_code == 2
+    assert fake.seen == []
+
+  def test_session_keeps_both_runs(self, tmp_path, monkeypatch):
+    from scholar.review import load_session
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+    narrow = Paper(title="In abstract", authors=["A"], doi="10.1/in-ta")
+    broad = Paper(title="In full text", authors=["B"], doi="10.1/in-ft")
+    self._install(monkeypatch, [narrow, broad])
+    for extra in ([], ["--in", "title-abstract"]):
+      result = runner.invoke(
+        app, ["search", "q", "-p", "fake", "-n", "both", "-f", "json"]
+        + extra
+      )
+      assert result.exit_code == 0
+
+    session = load_session("both")
+    assert sorted(
+      (r.filters or {}).get("search_in", "") for r in session.search_records
+    ) == ["", "title-abstract"]
+    assert sorted(r.hits for r in session.search_records) == [1, 2]
+
+    shown = runner.invoke(app, ["sessions", "show", "both"])
+    assert "--in title-abstract" in shown.stdout
+
+    found = runner.invoke(
+      app, ["prov", "found-via", broad.id, "-f", "json"]
+    )
+    assert [r["command"] for r in json.loads(found.output)] == [
+      "scholar search q -p fake"
+    ]
+    found = runner.invoke(
+      app, ["prov", "found-via", narrow.id, "-f", "json"]
+    )
+    assert sorted(r["command"] for r in json.loads(found.output)) == [
+      "scholar search q -p fake",
+      "scholar search q -p fake --in title-abstract",
+    ]
 @
 
 \subsection{Executing the search}
@@ -794,13 +935,16 @@ logger.debug(f"Limit per provider: {limit_label}")
 
 # Build search filters from CLI options
 filters = None
-if any([year, open_access, venue, min_citations is not None, pub_type]):
+if any([
+    year, open_access, venue, min_citations is not None, pub_type, search_in,
+]):
     filters = SearchFilters(
         year=year,
         open_access=open_access,
         venue=venue,
         min_citations=min_citations,
         pub_types=pub_type,
+        search_in=search_in.value if search_in else None,
     )
 
 s = Search(query)
@@ -1498,13 +1642,16 @@ if not provider_names:
 
 <<build rq search filters>>=
 filters = None
-if any([year, open_access, venue, min_citations is not None, pub_type]):
+if any([
+    year, open_access, venue, min_citations is not None, pub_type, search_in,
+]):
     filters = SearchFilters(
         year=year,
         open_access=open_access,
         venue=venue,
         min_citations=min_citations,
         pub_types=pub_type,
+        search_in=search_in.value if search_in else None,
     )
 @
 
@@ -3557,6 +3704,8 @@ table2.add_row("arxiv", "[red]✗[/]", '[green]✓[/] "..."', "[green]✓[/] ti:
 console.print(table2)
 console.print()
 
+<<default search fields table>>
+
 # Examples
 console.print("[bold]Examples:[/bold]")
 console.print()
@@ -3589,6 +3738,68 @@ docs = [
 ]
 for provider, url in docs:
     console.print(f"  [cyan]{provider:12}[/]  {url}")
+@
+
+\subsection{Which fields a query searches}
+
+The same query matches different parts of a paper on different
+providers, which makes counts incomparable without the user knowing it
+(\url{https://github.com/dbosk/scholar/issues/135}).  A third table
+therefore says what each provider searches by default and what
+[[--in title-abstract]] does there (\cref{sec:search-in} in the
+[[scholar]] module).  Every entry comes from the provider's own
+documentation, cited with the providers
+(\cref{sec:providers-search-in} in the [[providers]] module):
+OpenAlex's search page (title, abstract, full text and keywords),
+Clarivate's Web of Science Starter API reference ([[TS]]: title,
+abstract, author keywords, Keywords Plus), IEEE's Metadata API page
+([[querytext]]: all configured metadata fields and the abstract) and
+HAL's search API page (the [[text]] index, several fields).  Where the
+documentation says nothing about the default---Semantic Scholar's
+relevance search, Scopus without a field code, arXiv without a field
+prefix---the table says so rather than guess, and DBLP's entry is
+marked unverified because its documentation pages could not be read
+when this was written.
+
+<<default search fields table>>=
+table3 = Table(title="Default Search Fields", box=box.HORIZONTALS)
+table3.add_column("Provider", style="cyan")
+table3.add_column("Query matches by default")
+table3.add_column("With --in title-abstract")
+
+table3.add_row("s2", "not stated in its API docs", "ignored (warning)")
+table3.add_row("openalex", "title, abstract, full text, keywords",
+               "title and abstract")
+table3.add_row("ssrn, biorxiv, ...", "as openalex (one source)",
+               "title and abstract")
+table3.add_row("dblp", "unverified", "ignored (warning)")
+table3.add_row("wos", "TS=: title, abstract, author keywords, "
+               "Keywords Plus", "unchanged (already so)")
+table3.add_row("ieee", "all metadata fields and abstract",
+               "ignored (warning)")
+table3.add_row("scopus", "not stated in its API docs",
+               "TITLE-ABS-KEY(): title, abstract, keywords")
+table3.add_row("arxiv", "not stated in its API manual",
+               "ignored (warning)")
+table3.add_row("hal", "HAL's text index (several fields)",
+               "ignored (warning)")
+
+console.print(table3)
+console.print()
+@
+
+Let's verify that the table is shown and names the option:
+
+<<test functions>>=
+class TestSyntaxSearchFields:
+    """scholar syntax says which fields each provider searches."""
+
+    def test_table_is_shown(self):
+        result = runner.invoke(app, ["syntax"])
+        assert result.exit_code == 0
+        assert "Default Search Fields" in result.stdout
+        assert "--in title-abstract" in result.stdout
+        assert "TITLE-ABS-KEY()" in result.stdout
 @
 
 \subsection{Testing syntax command}
@@ -8889,6 +9100,8 @@ def _search_flags(filters: dict | None, limit: int | None) -> list[str]:
         flags.append(f"--min-citations {filters['min_citations']}")
     for pub_type in filters.get("pub_types") or []:
         flags.append(f"--type {pub_type}")
+    if filters.get("search_in"):
+        flags.append(f"--in {filters['search_in']}")
     if limit is not None and limit != DEFAULT_SEARCH_LIMIT:
         shown = 0 if limit >= UNLIMITED_PROVIDER_LIMIT else limit
         flags.append(f"--limit {shown}")
