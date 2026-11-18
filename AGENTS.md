@@ -187,7 +187,7 @@ Providers self-register via `register_provider()` at module load time.
 
 | Provider | Name | API | Auth |
 |----------|------|-----|------|
-| Semantic Scholar | `s2` | REST API (`requests`) | `S2_API_KEY` (optional) |
+| Semantic Scholar | `s2` | REST API (`requests`): relevance search, or bulk search for operators / `-l 0` | `S2_API_KEY` (optional) |
 | OpenAlex | `openalex` | `pyalex` client | `OPENALEX_API_KEY` (optional, 10x daily budget), `SCHOLAR_EMAIL` (optional) |
 | DBLP | `dblp` | REST API | None required |
 | Web of Science | `wos` | REST API | `WOS_API_KEY` (required) |
@@ -214,6 +214,58 @@ environment is the normal key source. Tests wanting no key must
 construction). Exception: `WebOfScienceProvider` uses a sentinel, so an
 explicit `None` disables that tier (the legacy `WOS_API_KEY` still
 fills it).
+
+### Semantic Scholar: relevance vs bulk search (#161)
+
+`SemanticScholarProvider.search` picks the endpoint per search
+(`s2_uses_bulk(query, limit)`, providers.nw `sec:s2-two-searches`, API
+description https://api.semanticscholar.org/graph/v1/swagger.json):
+a query with operators (`s2_has_operators`: UPPERCASE AND/OR/NOT,
+quotes, parentheses, `|`, a word-initial `+`/`-`, `*`) or a search
+without a limit (`None`, `<= 0`, or `UNLIMITED_PROVIDER_LIMIT`, now
+defined in `scholar.scholar` and imported by the CLI) goes to
+`/paper/search/bulk` (`_search_bulk`, pages by `token` until it is
+empty/absent or the limit is reached; with a finite limit it sends
+`sort=citationCount:desc` and `last_via` is `"bulk, most cited first"`
+(capped bulk answers are otherwise arbitrary, paperId order); without
+a limit it stops at `S2_BULK_SAFETY_CAP` = 100,000 papers and records
+"stopped at the 100000-paper safety cap" as incomplete;
+`s2_bulk_query` translates AND→`+`, OR→`|`, NOT/AND NOT→`-` outside
+quoted phrases and quotes unquoted hyphenated words, since bulk reads
+an inner `-` as negation, #161 comment: `re-execution` 18,149 vs 251;
+`s2_mixes_and_or` → WARNING for ungrouped AND/OR, no documented
+precedence). `s2_foreign_field_syntax` refuses Scopus/WoS/arXiv field
+codes before any request: `last_error` "query uses <db> field syntax,
+not supported by Semantic Scholar" (failed, not cached). Plain words
+with a limit stay on `/paper/search` (`_search_uncached`), which never
+asks past offset 1000 and sets `last_error = S2_RELEVANCE_CEILING`
+("relevance search stops at 1000", shown as "1000, incomplete (...)")
+when it stops there with more asked for and reported. Bulk results are
+cached under the relevance key plus `"bulk"` (old relevance entries,
+including the wrong zeros of Boolean queries, are never served for a
+bulk search; plain-word entries keep serving). **The cache holds
+built-in types only** (an older scholar unpickles the shared file): the
+papers as a plain list; fetch time and total go through the shared
+hooks (`start_answer`/`answer_from_cache`/`fetching_now`/
+`cache_answer`) into the `(FETCH_META_KEY, key)` dict side entry; the
+snippet backend also keeps `("__s2_ranked__", key) = (scores,
+fetched_at)`. A test unpickles a written cache with
+`scholar.providers` unimportable. `search` sets `last_total` and
+`last_total_estimated = True` (the description calls both totals
+"Approximate"), and `last_via` (`"bulk"`, `"bulk, most cited first"`
+or None). `--in title-abstract` is honoured on bulk (it matches
+title+abstract by default): `SemanticScholarProvider.applied_filters`
+reads `_routed` (query, bulk) noted by `search`, so `search_provider`
+re-reads `applied_filters` after the search; only the relevance search
+warns, once per search. `via` flows `provider_via()` (in
+`search_provider`) → `SearchResult.via` (kept through `merge` as
+`"s2: bulk"` and `deduplicate`) → `result_via(part)` per part in
+`create_review_session` → `SearchRecord.via` (saved/loaded as `"via"`,
+old files → None; not part of the record key nor of `record_rank`, so
+a newer or wider bulk re-run replaces a relevance record, as intended) → `sessions show` ("s2 (via bulk): q", JSON
+`via` when set). Bulk stems terms and matches title+abstract only
+(`scholar syntax` says so). Not verified live: what `-` does before a
+parenthesis or phrase.
 
 ### Title-and-Abstract Search (`--in`)
 
@@ -315,7 +367,19 @@ refusal sets `last_error` (else it would read as 0 works).
   same number, "up to 50 works" (largest) when they differ or some do
   not say, "the works" when none does.
 - **`scholar sessions check S [S ...] -s Q [-s Q2] [-k DOI|title-part]
-  [-l N≤50] [-f table|csv|json] [-o DIR]`**: per question one
+  [-l N≤50] [-f table|csv|json] [-o DIR] [-b openalex|s2-snippets]`**:
+  `-b s2-snippets` uses `SemanticScholarSnippetSearch` (providers.nw
+  `sec:s2-snippets`; unregistered, name `s2-snippets`, own cache,
+  `QUOTA_GROUP = "s2"`): one `/graph/v1/snippet/search` request with
+  `limit=1000`, `fields=snippet.snippetKind`, reduced by
+  `s2_snippet_works` to works (each once, at its best snippet, score
+  kept) in a `RankedPapers`; snippets carry no DOI or year, so one
+  `POST /paper/batch` (`CorpusId:` ids, `fields=externalIds,year`,
+  through `_request`/`_send`, which now take a `json_body`) fills them
+  in; if it fails, nothing is cached and `last_note` ("... matched by
+  title and first author only") appears as `note` in the check's
+  text/JSON/evidence (`check_note`). The 2000-character question limit
+  applies to `openalex` only. Per question one
   provider search (quota pre-check → failed with the limiter's reason),
   then `review.check_against_sessions(papers, sessions, known)` →
   `(CheckRow[], KnownRow[])`. `session_match_index` keys: `Paper.id`
@@ -1162,8 +1226,12 @@ needs a key sets it explicitly. It also resets `pyalex.config.email`
 and (except for live tests) `pyalex.config.api_key`, which the OpenAlex
 providers built at import (during collection) had set from the
 developer's environment (#160; pyalex is imported inside the fixture).
-Registered providers still keep their own `api_key` attributes from
-import time. The autouse `block_network` fixture
+For non-live tests it also sets the registered providers' key
+attributes (`PROVIDER_KEY_ATTRIBUTES`: `api_key`, `inst_token`, WoS's
+`_api_key`/`_starter_key`/`_expanded_key` and the derived
+`_api_tier`/`_api_url`) to None, restored afterwards (#174);
+`test_keys_read_at_import_are_cleared_in_tests` checks it in a
+subprocess with dummy keys in the environment. The autouse `block_network` fixture
 refuses DNS and connections to anything but loopback and **fails the
 test** naming the hosts (providers swallow errors, so a refusal alone
 would go unnoticed). Both exempt `@pytest.mark.integration` tests, which
