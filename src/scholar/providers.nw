@@ -1218,10 +1218,60 @@ def check_provider(
     try:
         status, message = provider.check()
     except requests.RequestException as e:
-        return ProviderHealth(
-            provider.name, True, HEALTH_NETWORK_ERROR, str(e)
-        )
-    return ProviderHealth(provider.name, True, status, message)
+        status, message = HEALTH_NETWORK_ERROR, str(e)
+    return ProviderHealth(
+        provider.name, True, status, network.redact_secrets(message)
+    )
+@
+
+A probe that fails before it gets an answer---a dead proxy, a refused
+connection---raises, and the exception's message names the URL it
+tried.
+IEEE Xplore takes its key in the URL, and so did the OpenAlex probe, so
+the health table used to print the key (issue~\#159).
+Every message the check reports therefore passes
+[[redact_secrets]] (\cref{sec:redact-secrets} in the network
+chapter), which hides the values of key-like URL parameters.
+It is applied to every message, not only to the exceptions, because a
+provider's own detail may quote a URL too.
+
+The tests send the probe through a proxy that is not there: a local
+port that was bound and released, so the connection is refused at once
+and the real [[requests]] and [[urllib3]] write the message.
+The key and the contact address are made up, and the test asserts
+only that they are absent: the OpenAlex probe sends the address as
+[[mailto]], which [[redact_secrets]] hides as well.
+
+<<test functions>>=
+class TestHealthMessagesHideKeys:
+  """A failed probe never shows the API key it sent."""
+
+  FAKE_KEY = "SECRETKEY123"
+  FAKE_EMAIL = "fake.developer@example.invalid"
+
+  @staticmethod
+  def dead_proxy():
+    import socket
+
+    with socket.socket() as sock:
+      sock.bind(("127.0.0.1", 0))
+      port = sock.getsockname()[1]
+    return f"http://127.0.0.1:{port}"
+
+  @pytest.mark.parametrize("variable, make_provider", [
+    ("OPENALEX_API_KEY", OpenAlexProvider),
+    ("IEEE_API_KEY", IEEEXploreProvider),
+  ], ids=["openalex", "ieee"])
+  def test_dead_proxy_message_hides_the_key(
+      self, monkeypatch, variable, make_provider):
+    monkeypatch.setenv(variable, self.FAKE_KEY)
+    monkeypatch.setenv("SCHOLAR_EMAIL", self.FAKE_EMAIL)
+    monkeypatch.setenv("SCHOLAR_PROXY", self.dead_proxy())
+    health = check_provider(make_provider())
+    assert health.status == HEALTH_NETWORK_ERROR
+    assert "proxy" in health.message.lower()
+    assert self.FAKE_KEY not in health.message
+    assert "fake.developer" not in health.message
 @
 
 Let's verify the cross-provider logic: unconfigured providers are never
@@ -3345,6 +3395,7 @@ class OpenAlexProvider:
             api_key or os.environ.get(OPENALEX_API_KEY_VAR, "").strip()
         ) or None
         pyalex.config.api_key = self.api_key
+        <<let [[pyalex]] hand over every refused response>>
         network.configure_pyalex()
         self._cache: dict = load_cache(self.name)
         register_cache(self.name, self._cache)
@@ -3377,17 +3428,11 @@ class OpenAlexProvider:
             return self._cache[cache_key]
         try:
             papers = self._search_uncached(query, limit, filters)
-        except RateLimited:
-            # The limiter already logged the reason once; do not cache.
-            return []
-        except requests.HTTPError as e:
-            self._note_http_error(e)
-            status = getattr(e.response, "status_code", None)
-            self.last_error = f"HTTP {status}" if status else str(e)
-            return []
-        except Exception as e:
-            logger.warning("%s: %s", self.name, e)
-            self.last_error = str(e) or type(e).__name__
+        except PagesCutShort as cut:
+            self.last_error = self._failure_reason(cut.failure)
+            return cut.papers
+        except Exception as failure:
+            self.last_error = self._failure_reason(failure)
             return []
         self._cache[cache_key] = papers
         return papers
@@ -3415,6 +3460,7 @@ class OpenAlexProvider:
         return all_papers
 
     <<openalex extension hooks>>
+    <<openalex failure reasons>>
     <<openalex check method>>
     <<openalex budget reporting>>
     <<openalex get paper by doi>>
@@ -3441,8 +3487,11 @@ of a tenth of a second.
 <<fetch openalex pages through the limiter>>=
 pages = iter(works.paginate(per_page=page_size))
 while True:
-    self._limiter.acquire()
-    page = next(pages, None)
+    try:
+        self._limiter.acquire()
+        page = next(pages, None)
+    except (RateLimited, requests.RequestException) as failure:
+        <<keep the pages that arrived before [[failure]]>>
     if page is None:
         break
     for work in page:
@@ -3478,11 +3527,13 @@ def test_openalex_pages_pass_the_limiter_first():
 When the limiter refuses, [[acquire()]] has already said so: it logs
 one warning per process, naming the provider, and then raises
 [[RateLimited]].
-[[search()]] therefore catches that exception on its own, before the
-catch-all, and returns an uncached empty list without a word.
-The catch-all would have logged the exception a second time, and since
-the exception's message starts with the provider name too, the line read
-\enquote{openalex: openalex: \dots}.
+[[search()]] therefore treats that exception apart from the others
+([[_failure_reason]], \cref{sec:openalex-cut-short}): it returns an
+uncached empty list without a word of its own, and records the
+limiter's reason in [[last_error]].
+Logging it as any other failure would have repeated the warning, and
+since the exception's message starts with the provider name too, the
+line read \enquote{openalex: openalex: \dots}.
 The source-pinned providers inherit [[search()]], and Semantic Scholar
 and arXiv, which pass the same limiter, catch it the same way.
 So does every other method of these three that passes the limiter and
@@ -3536,6 +3587,253 @@ def test_refused_request_is_logged_once(provider_class, request_once,
     assert dict(provider._cache) == cached_before
 @
 
+\subsubsection{A search cut short}
+\label{sec:openalex-cut-short}
+
+A search can fail after it has started: [[Search.execute]] asks the
+limiter before it calls [[search()]], but the limiter can refuse the
+second page of a paged search, and OpenAlex can answer a later page
+with a 429 or a 503.
+Such a search used to return an empty list in every case, and the
+refusal set no [[last_error]] at all (issue~\#150).
+The session then recorded zero hits, which in a review's table of
+queries and providers reads as \enquote{nothing matched}, and the pages
+that had already arrived were thrown away.
+
+A search cut short now ends the way the other providers end it: with
+the papers it got and a reason.
+The paging loop ([[<<fetch openalex pages through the limiter>>]])
+knows which pages arrived, while only
+[[search()]] sets [[last_error]] and decides what is cached, so the
+papers travel from one to the other inside an exception,
+[[PagesCutShort]], that also carries the failure.
+[[search()]] returns those papers, records the reason, and caches
+nothing, so the session shows \enquote{$N$, incomplete (reason)}
+([[hits_label]]) and the next run asks again.
+A failure before the first page is re-raised unchanged and recorded as
+failed, as before, but now with its reason.
+
+Only a refusal of the limiter and a failed request
+([[requests.RequestException]], which includes [[HTTPError]]) count as
+a cut: those are the failures that can strike between two pages.
+Any other exception is a fault in the request or in our own code, and
+keeping the pages would hide it.
+
+<<keep the pages that arrived before [[failure]]>>=
+if all_papers:
+    raise PagesCutShort(all_papers, failure) from failure
+raise
+<<openalex helpers>>=
+class PagesCutShort(Exception):
+    """A paged search that failed after some pages had arrived.
+
+    `papers` holds what arrived; `failure` is the exception that
+    stopped the paging.
+    """
+
+    def __init__(self, papers: list, failure: Exception):
+        super().__init__(str(failure))
+        self.papers = papers
+        self.failure = failure
+@
+
+Both outcomes, a failure and a cut, take their reason from one place.
+A refusal of the limiter is recorded with the limiter's own reason and
+not logged, for the reason given in \cref{sec:openalex-refusal}.
+A refused request names OpenAlex's own explanation
+([[_refusal_reason]], \cref{sec:openalex-refusal-reasons}), and
+anything else its message, shortened like OpenAlex's
+explanations: a [[pyalex]] [[QueryError]] carries the whole message of
+a 400, which lists every valid filter field in some five thousand
+characters.
+
+<<openalex failure reasons>>=
+def _failure_reason(self, failure: Exception) -> str:
+    """Log `failure` (unless the limiter did) and return its reason."""
+    if isinstance(failure, RateLimited):
+        return failure.reason
+    response = getattr(failure, "response", None)
+    if isinstance(failure, requests.HTTPError) and response is not None:
+        self._note_http_error(failure)
+        return self._refusal_reason(response)
+    text = network.redact_secrets(failure) or type(failure).__name__
+    logger.warning("%s: %s", self.name, text)
+    return shorten_reason(text)
+@
+
+The tests send [[pyalex]]'s requests to a local stand-in for
+OpenAlex, as [[S2Loopback]] does for Semantic Scholar
+(\cref{sec:s2-retrying}): the paging, the request and the parsing are
+the real ones, down to the retry policy that [[pyalex]] mounts in
+[[urllib3]].
+That last layer matters (\cref{sec:openalex-refusal-reasons}), and a
+stub of [[requests.Session.get]], like [[openalex_replay]], never
+reaches it.
+The page is the recorded DOI batch of \cref{sec:openalex-doi-batch}
+with a [[next_cursor]] added, so that [[pyalex]] asks for a second
+page.
+The limiter's refusal is a real one: the stand-in records a cooldown on
+the shared limiter when the first page is requested, as another
+[[scholar]] process could.
+
+<<test functions>>=
+class OpenAlexLoopback:
+  """A local stand-in for api.openalex.org.
+
+  `plan` holds the answers to give, in order: `(status, body)` or
+  `(status, body, headers)`, with `body` a dict or bytes, or a
+  callable, run when the request arrives, that returns one.  Once it
+  is empty every request gets an empty last page.  `paths` holds the
+  path and query of each request.
+  """
+
+  LAST_PAGE = {"meta": {"count": 0, "next_cursor": None}, "results": []}
+
+  def __init__(self):
+    import http.server
+    import threading
+
+    self.plan = []
+    self.paths = []
+    loopback = self
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+      def do_GET(self):
+        loopback.paths.append(self.path)
+        answer = (
+          loopback.plan.pop(0) if loopback.plan
+          else (200, OpenAlexLoopback.LAST_PAGE)
+        )
+        if callable(answer):
+          answer = answer()
+        status, body, *rest = answer
+        headers = rest[0] if rest else {}
+        if not isinstance(body, bytes):
+          body = json.dumps(body).encode()
+        self.send_response(status)
+        for name, value in headers.items():
+          self.send_header(name, value)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+      def log_message(self, *args):
+        pass
+
+    self.server = http.server.ThreadingHTTPServer(
+      ("127.0.0.1", 0), Handler
+    )
+    self.base = f"http://127.0.0.1:{self.server.server_address[1]}"
+    self.thread = threading.Thread(
+      target=self.server.serve_forever, daemon=True
+    )
+    self.thread.start()
+
+  def close(self):
+    self.server.shutdown()
+    self.server.server_close()
+
+
+@pytest.fixture
+def openalex_loopback(monkeypatch):
+  """Send every OpenAlex request to an `OpenAlexLoopback`."""
+  import requests.adapters
+
+  loopback = OpenAlexLoopback()
+  real_send = requests.adapters.HTTPAdapter.send
+
+  def send(adapter, request, **kwargs):
+    request.url = request.url.replace(
+      "https://api.openalex.org", loopback.base
+    )
+    return real_send(adapter, request, **kwargs)
+
+  monkeypatch.setattr(requests.adapters.HTTPAdapter, "send", send)
+  yield loopback
+  loopback.close()
+
+
+def first_of_two_pages():
+  """The recorded DOI batch as page one of a search with two pages."""
+  import copy
+
+  page = copy.deepcopy(RECORDED_OPENALEX_DOI_BATCH)
+  page["meta"].update(count=4, next_cursor="page-two")
+  return page
+
+
+class TestOpenAlexCutShort:
+  """A search that fails midway keeps its pages and says why."""
+
+  <<openalex cut short test methods>>
+@
+
+A refusal on the second page keeps the two works of the first, records
+the limiter's reason and caches nothing; the same holds for a
+source-pinned server, which inherits the search.
+Through [[Search.execute]] the outcome reaches the label a session
+shows.
+
+<<openalex cut short test methods>>=
+@staticmethod
+def refuse_after_first_page(loopback, provider):
+  def first_page_then_cooldown():
+    provider._limiter.record_limit_hit(retry_after=3600, reason="cooldown")
+    return 200, first_of_two_pages()
+
+  loopback.plan.append(first_page_then_cooldown)
+
+@pytest.mark.parametrize("make_provider", [
+  lambda: OpenAlexProvider(api_key=None),
+  lambda: OpenAlexSourceProvider("ssrn", "S4210172589", "SSRN"),
+], ids=["openalex", "source-pinned"])
+def test_refusal_after_a_page_keeps_it(self, openalex_loopback,
+                                       make_provider):
+  provider = make_provider()
+  self.refuse_after_first_page(openalex_loopback, provider)
+  cached_before = dict(provider._cache)
+  papers = provider.search("cut short by the limiter", limit=4)
+  assert [p.doi for p in papers] == [RECORDED_DOI_A, RECORDED_DOI_B]
+  assert "cooldown" in provider.last_error
+  assert len(openalex_loopback.paths) == 1
+  assert dict(provider._cache) == cached_before
+
+def test_session_label_says_incomplete(self, openalex_loopback):
+  provider = get_provider("openalex")
+  self.refuse_after_first_page(openalex_loopback, provider)
+  [result] = Search("cut short in a session").execute(
+    providers=["openalex"], limit=4
+  )
+  label = hits_label(len(result.papers), result.error)
+  assert label.startswith("2, incomplete (")
+  assert "cooldown" in label
+@
+
+A refusal before the first page is a failure with the limiter's
+reason, no longer a silent zero; a 503 on the second page keeps the
+first, with the status as the reason.
+
+<<openalex cut short test methods>>=
+def test_refusal_before_any_page_is_a_failure(self, openalex_loopback):
+  provider = OpenAlexProvider(api_key=None)
+  provider._limiter.record_limit_hit(retry_after=3600, reason="cooldown")
+  assert provider.search("refused at once", limit=4) == []
+  assert "cooldown" in provider.last_error
+  assert openalex_loopback.paths == []
+
+def test_server_error_after_a_page_keeps_it(self, openalex_loopback):
+  openalex_loopback.plan += [
+    (200, first_of_two_pages()), (503, b"{}"),
+  ]
+  provider = OpenAlexProvider(api_key=None)
+  papers = provider.search("cut short by the server", limit=4)
+  assert len(papers) == 2
+  assert provider.last_error.startswith("HTTP 503")
+  assert len(openalex_loopback.paths) == 2
+  assert "cursor=page-two" in openalex_loopback.paths[1]
+@
+
 \subsubsection{Health check}
 
 [[pyalex]] hides HTTP status codes behind its own exceptions, so the probe
@@ -3573,8 +3871,11 @@ def _probe(self, params: dict) -> tuple[str, str]:
     except RateLimited as e:
         return HEALTH_RATE_LIMITED, str(e)
     params = dict(params)
-    params.update(self._auth_params())
-    response = network.get(OPENALEX_API_URL, params=params, timeout=30)
+    params.update(self._auth_params(key_in_url=False))
+    response = network.get(
+        OPENALEX_API_URL, params=params, headers=self._auth_headers(),
+        timeout=30,
+    )
     if response.status_code == 429:
         # [[_record_429]] records every 429 itself, and a subclass may
         # route a 429 that is not about the budget to a limiter of its
@@ -3587,9 +3888,15 @@ def _probe(self, params: dict) -> tuple[str, str]:
             )
     else:
         self._record_response(response)
-    return classify_check_response(
-        response, authenticated=bool(self.api_key), expect_json=True
+    status, detail = classify_check_response(
+        response,
+        authenticated=bool(self.api_key),
+        key_hint=OPENALEX_API_KEY_VAR,
+        expect_json=True,
     )
+    if response.ok:
+        return status, detail
+    return status, self._probe_detail(response, status, detail)
 <<openalex constants>>=
 OPENALEX_API_URL = "https://api.openalex.org/works"
 OPENALEX_RATE_LIMIT_URL = "https://api.openalex.org/rate-limit"
@@ -3606,15 +3913,32 @@ the endpoint is the only way to read them without spending a request.
 A failure to read it must not turn a healthy probe into an error, so
 the message falls back to a plain \enquote{API key configured}.
 
+OpenAlex's authentication page
+(\url{https://help.openalex.org/api/authentication/}, read 2026-11-18)
+offers two ways to send the key, an [[api_key]] query parameter or an
+[[Authorization: Bearer]] header, which \enquote{work identically}; its
+header example is a [[/works]] request, while for the rate-limit
+endpoint it shows only the parameter.
+The probe of [[/works]] therefore sends the key as a bearer token
+([[_auth_headers]]), as [[pyalex]] does for every search, so a failed
+probe's URL no longer holds the key (issue~\#159).
+The rate-limit request keeps the documented parameter, and its failures
+are swallowed here; what could still carry the key into a message is
+caught by [[redact_secrets]] (\cref{sec:redact-secrets}).
+
 <<openalex budget reporting>>=
-def _auth_params(self) -> dict[str, str]:
-    """Query parameters carrying the key and contact email."""
+def _auth_params(self, key_in_url: bool = True) -> dict[str, str]:
+    """Query parameters carrying the contact email and, by default, the key."""
     params: dict[str, str] = {}
-    if self.api_key:
+    if self.api_key and key_in_url:
         params["api_key"] = self.api_key
     if pyalex.config.email:
         params["mailto"] = pyalex.config.email
     return params
+
+def _auth_headers(self) -> dict[str, str]:
+    """The key as a bearer token, the way pyalex sends it."""
+    return {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
 
 def budget(self) -> dict | None:
     """Return OpenAlex's rate-limit report for the key, or `None`."""
@@ -3849,27 +4173,43 @@ def _budget_spent(response, reason: str | None) -> bool:
         return False
     return daily_spent and not _credit_beyond_daily(response)
 
-def _note_http_error(self, error: requests.HTTPError) -> None:
-    """Log an HTTP failure, translating a spent budget into a reset time."""
+def _note_http_error(
+    self, error: requests.HTTPError, during: str | None = None
+) -> None:
+    """Log an HTTP failure, translating a spent budget into a reset time.
+
+    `during` names the operation for the log line ("DOI lookup for
+    ..."); every 429 is recorded on the limiter, whatever the operation.
+    """
     response = getattr(error, "response", None)
     if response is None or response.status_code != 429:
-        logger.warning("%s: %s", self.name, error)
+        reason = (
+            self._refusal_reason(response) if response is not None
+            else network.redact_secrets(error)
+        )
+        if during:
+            reason = f"{during} failed: {reason}"
+        logger.warning("%s: %s", self.name, reason)
         return
-    spent = self._record_429(response)
-    retry_at = self._limiter.check_available().retry_at
-    if spent:
-        hint = "" if self.api_key else (
-            f"; set {OPENALEX_API_KEY_VAR} for ten times the budget"
-        )
-        logger.warning(
-            "%s: daily budget spent; resets %s%s",
-            self.name, format_retry(retry_at), hint,
-        )
+    if self._record_429(response):
+        self._warn_budget_spent()
     else:
+        retry_at = self._limiter.check_available().retry_at
         logger.warning(
             "%s: rate limited (HTTP 429); retry %s",
             self.name, format_retry(retry_at),
         )
+
+def _warn_budget_spent(self) -> None:
+    """Warn that the group's budget is spent, with the reset and key hint."""
+    retry_at = self._limiter.check_available().retry_at
+    hint = "" if self.api_key else (
+        f"; set {OPENALEX_API_KEY_VAR} for ten times the budget"
+    )
+    logger.warning(
+        "%s: daily budget spent; resets %s%s",
+        self.name, format_retry(retry_at), hint,
+    )
 <<openalex helpers>>=
 def _rejection_reason(response) -> str | None:
     """Return the `reason` of an OpenAlex error body, if it has one."""
@@ -3986,8 +4326,10 @@ class TestOpenAlexApiKey:
             status, message = provider.check()
         assert status == HEALTH_OK
         probe, report = mock_get.call_args_list
-        assert probe.kwargs["params"]["api_key"] == "k-123"
+        assert probe.kwargs["headers"]["Authorization"] == "Bearer k-123"
+        assert "api_key" not in probe.kwargs["params"]
         assert report.args[0] == OPENALEX_RATE_LIMIT_URL
+        assert report.kwargs["params"]["api_key"] == "k-123"
         assert "$0.990 of $1.00 daily budget left" in message
 
     def test_check_without_key_says_so(self, monkeypatch):
@@ -4033,6 +4375,74 @@ class TestOpenAlexApiKey:
         assert availability.ok is False
         assert availability.quota is True
         assert availability.retry_at > time.time() + 3000
+@
+
+The constructor writes the email and the key into [[pyalex]]'s global
+configuration, and the providers in the registry are built when this
+module is imported, which in a test run happens while pytest collects,
+before any fixture runs.
+The conftest therefore empties both fields for every test
+(\cref{sec:test-configuration} in the cache chapter, issue~\#160).
+The test of that isolation has to see the import, so it starts a
+separate pytest process with a made-up address and key in the
+environment and runs one inner test there: at its start [[pyalex]] must
+hold neither, a [[pyalex]] request must carry neither a [[From]] header
+nor a bearer token, and the registered provider's probe parameters
+must carry no [[mailto]].
+The inner test names what leaked but never shows a value, since in
+the ordinary run the values would be the developer's own.
+In the ordinary run the inner test checks the same of the developer's
+own environment.
+
+<<test functions>>=
+class TestPyalexConfigIsolation:
+  """No test inherits a contact email or key from the import."""
+
+  FAKE_EMAIL = "fake.developer@example.invalid"
+
+  def test_pyalex_config_starts_clean(self):
+    """Checks without echoing the values, which may be real ones."""
+    import pyalex
+    import pyalex.api
+
+    request = requests.Request("GET", OPENALEX_API_URL).prepare()
+    request = pyalex.api.OpenAlexAuth(pyalex.config)(request)
+    leaks = [
+      name for name, leaked in [
+        ("pyalex.config.email", pyalex.config.email is not None),
+        ("pyalex.config.api_key", pyalex.config.api_key is not None),
+        ("From header", "From" in request.headers),
+        ("bearer token", "Authorization" in request.headers),
+        ("probe mailto",
+         "mailto" in get_provider("openalex")._auth_params()),
+      ] if leaked
+    ]
+    if leaks:
+      pytest.fail(f"inherited from the import: {', '.join(leaks)}")
+
+  def test_import_time_identity_is_cleared(self, tmp_path):
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    env = {
+      var: value for var, value in os.environ.items()
+      if var not in ("SCHOLAR_CACHE_DIR", "SCHOLAR_DATA_DIR")
+    }
+    env.update(SCHOLAR_EMAIL=self.FAKE_EMAIL,
+               OPENALEX_API_KEY="FAKE-KEY-160", TMPDIR=str(tmp_path))
+    inner = (
+      "tests/test_providers.py::TestPyalexConfigIsolation"
+      "::test_pyalex_config_starts_clean"
+    )
+    run = subprocess.run(
+      [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
+       inner],
+      cwd=Path(__file__).resolve().parent.parent, env=env,
+      capture_output=True, text=True, timeout=300,
+    )
+    assert run.returncode == 0, run.stdout[-2000:]
 @
 
 Prepaid credit (\cref{sec:openalex-prepaid}) is tested on what OpenAlex
@@ -4267,6 +4677,370 @@ def test_plain_lower_case_spent_budget_is_read(self, monkeypatch):
     availability = provider._limiter.check_available()
     assert availability.quota is True
     assert availability.retry_at > time.time() + 30000
+@
+
+\subsubsection{Refusals in OpenAlex's own words}
+\label{sec:openalex-refusal-reasons}
+
+On 2026-11-18 keyless searches were refused with HTTP 503 and the
+explanation \enquote{Anonymous search is paused} (issue~\#151).
+What reached the user was neither: the remedy, a key in
+[[OPENALEX_API_KEY]], was in the body, and the body was lost on the
+way.
+
+\paragraph{Letting the response through.}
+The first loss was in [[pyalex]].
+Its configuration (version 0.21, [[pyalex/api.py]]) sets
+[[max_retries]] to 0 and lists 429, 500 and 503 in [[retry_http_codes]],
+and every session it creates mounts a [[urllib3]] [[Retry]] built from
+the two.
+With no retries to spend, that policy does not retry anything: at the
+first 429, 500 or 503 [[urllib3]] gives up, and [[requests]] turns that
+into a [[RetryError]], which has no response.
+We checked this against a local server: a 503 or a 429 with a JSON body
+reached [[search()]] as \enquote{Max retries exceeded \dots (Caused by
+ResponseError('too many 503 error responses'))}, while a 403, outside
+the list, arrived as an [[HTTPError]] with its response.
+So the status, the body and the [[X-RateLimit-*]] headers of exactly
+the refusals that matter were gone, and the budget handling of
+\cref{sec:openalex-budget} never saw a real 429 from a search, only
+the ones its tests raised by hand.
+
+The constructor therefore empties [[retry_http_codes]].
+Nothing is lost: [[pyalex]] retried none of those statuses before, and
+a retry after a refusal is the limiter's decision, made with the
+[[Retry-After]] the response carries, not a back-off that the limiter
+never counts.
+The setting is [[pyalex]]'s global configuration, like the key and
+email the constructor already sets there.
+
+<<let [[pyalex]] hand over every refused response>>=
+pyalex.config.retry_http_codes = []
+@
+
+\paragraph{The explanation.}
+OpenAlex's error documentation
+(\url{https://help.openalex.org/api/errors/}, read 2026-11-18) shows
+error bodies as JSON objects with an [[error]], a short category such
+as \enquote{Invalid filter}, and a [[message]] that says what was
+wrong.
+A keyless request with an invalid filter on the same day,
+[[GET https://api.openalex.org/works?filter=author_name:test&per-page=1]],
+answered 400 with exactly these two fields: the [[error]]
+\enquote{Invalid query parameters error.} and a [[message]] that names
+the bad field and then lists every valid one, a body of 5\,614 bytes.
+So the [[message]] is the explanation, the [[error]] the fallback, and
+either is shortened to [[OPENALEX_REASON_MAX_CHARS]] characters: a
+reason is shown in a table cell and on one log line.
+A body that is not JSON, or has neither field, adds nothing, and the
+reason stays the bare status.
+
+<<openalex helpers>>=
+def openalex_error_message(response) -> str | None:
+    """Return the explanation in an OpenAlex error body, shortened.
+
+    The body's `message`, else its `error`; `None` when the body is
+    not a JSON object with either.
+    """
+    try:
+        body = response.json()
+    except ValueError:
+        return None
+    if not isinstance(body, dict):
+        return None
+    for field in ("message", "error"):
+        text = body.get(field)
+        if isinstance(text, str) and text.strip():
+            return shorten_reason(text)
+    return None
+
+
+def shorten_reason(text: str, limit: int | None = None) -> str:
+    """Return `text` on one line, cut to `limit` characters at a word."""
+    limit = limit or OPENALEX_REASON_MAX_CHARS
+    text = " ".join(text.split())
+    if len(text) <= limit:
+        return text
+    cut = text[:limit - len(REASON_ELLIPSIS)]
+    space = cut.rfind(" ")
+    if space > limit // 2:
+        cut = cut[:space]
+    return cut.rstrip(" ,;:") + REASON_ELLIPSIS
+<<openalex constants>>=
+OPENALEX_REASON_MAX_CHARS = 120
+REASON_ELLIPSIS = "..."
+@
+
+\paragraph{The key hint.}
+A refusal that a key would lift says so when no key is configured: a
+503 that OpenAlex explains in its body (the paused keyless search
+above) and a 429 that says the budget is spent ([[_budget_spent]],
+\cref{sec:openalex-budget}).
+Other refusals get no hint.
+A bare 503, or one whose body is not OpenAlex's JSON, is more likely an
+outage, or a proxy or load balancer in front of OpenAlex answering for
+it; a key would not help, and the hint would send the user to set one
+when the right move is to wait.
+A 400 is about the request, and a key would not change it; a 429 that
+is only about pace passes after its [[Retry-After]] with or without a
+key, and blaming the missing key there would send the user after the
+wrong cause.
+
+<<openalex failure reasons>>=
+def _refusal_reason(self, response) -> str:
+    """The status, OpenAlex's explanation and, if it helps, a key hint."""
+    reason = f"HTTP {response.status_code}"
+    message = openalex_error_message(response)
+    if message:
+        reason += f": {message}"
+    return reason + self._key_hint(response)
+
+def _key_hint(self, response) -> str:
+    """`"; no API key: set ..."` if a key would lift this refusal."""
+    if self.api_key:
+        return ""
+    status = response.status_code
+    if status == 429:
+        helps = self._budget_spent(response, _rejection_reason(response))
+    else:
+        helps = (
+            status in OPENALEX_KEYLESS_REFUSALS
+            and openalex_error_message(response) is not None
+        )
+    return f"; no API key: set {OPENALEX_API_KEY_VAR}" if helps else ""
+<<openalex constants>>=
+OPENALEX_KEYLESS_REFUSALS = frozenset({503})
+@
+
+The health probe ([[_probe]], \cref{sec:openalex}) talks to OpenAlex
+without [[pyalex]], so it always had the response, but it reported only
+\enquote{http error} and \enquote{HTTP 503}.
+Its detail now carries the same explanation and hint.
+The status that [[classify_check_response]] gives stays as it was,
+and a 429 that spends the budget is still decided before the probe
+gets here, so the handling of \cref{sec:openalex-budget} is unchanged;
+the probe also names [[OPENALEX_API_KEY]] when a key is rejected,
+where it used to end in \enquote{check or replace} and nothing.
+
+<<openalex failure reasons>>=
+def _probe_detail(self, response, status: str, detail: str) -> str:
+    """The health detail of a refused probe, in OpenAlex's words."""
+    message = openalex_error_message(response)
+    if message:
+        detail = f"HTTP {response.status_code}: {message}"
+        if status == HEALTH_KEY_REJECTED:
+            detail += f" -- check or replace {OPENALEX_API_KEY_VAR}"
+    return detail + self._key_hint(response)
+@
+
+The keyless answer also carries a [[meta.notice]] about the shared
+keyless budget, which the issue suggested showing in the health table.
+It is left out: it is not in the error documentation, its wording
+(with a price in it) is OpenAlex's to change at any time, and the
+detail already says \enquote{no API key ([[OPENALEX_API_KEY]]):
+keyless daily budget}.
+
+\paragraph{Tests.}
+The searches are tested through the local stand-in of
+\cref{sec:openalex-cut-short}, because the loss was below
+[[requests.Session.get]], in the retry policy, where [[openalex_replay]]
+does not reach.
+The 400 is the recording above, with the [[message]] cut after its
+sixth field name; the headers are those of the same response.
+The 503 body is written by hand, since a paused search cannot be
+provoked: its [[error]] is the issue's text, in the field shape of the
+documentation.
+The 429 body uses the documentation's [[error]] and [[reason]] values.
+
+<<test functions>>=
+OPENALEX_RECORDED_400 = (
+  b'{"error": "Invalid query parameters error.", "message": "author_name'
+  b' is not a valid field. Valid fields are underscore or hyphenated'
+  b' versions of: abstract.search, abstract.search.exact,'
+  b' apc_list.currency, apc_list.provenance, apc_list.value,'
+  b' apc_list.value_usd"}'
+)
+OPENALEX_RECORDED_400_HEADERS = {
+  "content-type": "application/json",
+  "x-ratelimit-cost-usd": "0",
+  "x-ratelimit-credits-used": "0",
+  "x-ratelimit-limit": "1000",
+  "x-ratelimit-limit-usd": "0.1",
+  "x-ratelimit-onetime-remaining": "0",
+  "x-ratelimit-prepaid-remaining-usd": "0",
+  "x-ratelimit-remaining": "841",
+  "x-ratelimit-remaining-usd": "0.0841",
+  "x-ratelimit-reset": "21155",
+}
+OPENALEX_PAUSED_503 = b'{"error": "Anonymous search is paused"}'
+OPENALEX_SPENT_429 = (
+  b'{"error": "Rate limit exceeded", "reason": "daily_budget"}'
+)
+OPENALEX_KEY_HINT = "; no API key: set OPENALEX_API_KEY"
+
+
+class TestOpenAlexRefusalReasons:
+  """A refused request is recorded with OpenAlex's own explanation."""
+
+  <<openalex refusal reason test methods>>
+@
+
+A paused search records the explanation, with the hint only when no key
+is configured, and logs the same line; before the change it recorded the
+[[urllib3]] message.
+
+<<openalex refusal reason test methods>>=
+@pytest.mark.parametrize("key, hint", [
+  (None, OPENALEX_KEY_HINT), ("k-1", ""),
+], ids=["keyless", "keyed"])
+def test_paused_search_records_the_explanation(
+    self, openalex_loopback, caplog, key, hint):
+  openalex_loopback.plan.append((503, OPENALEX_PAUSED_503))
+  provider = OpenAlexProvider(api_key=key)
+  with caplog.at_level(logging.WARNING):
+    assert provider.search("paused search", limit=5) == []
+  reason = "HTTP 503: Anonymous search is paused" + hint
+  assert provider.last_error == reason
+  assert f"openalex: {reason}" in caplog.text
+@
+
+A 503 without OpenAlex's explanation, an empty JSON object or a page
+of HTML as a gateway might send, is an outage as far as we can tell:
+no hint, in the search and in the probe alike.
+
+<<openalex refusal reason test methods>>=
+@pytest.mark.parametrize("body", [b"{}", b"<html>Service Unavailable</html>"],
+                         ids=["empty-json", "html"])
+def test_bare_503_gets_no_key_hint(self, openalex_loopback, monkeypatch,
+                                   body):
+  openalex_loopback.plan.append((503, body))
+  provider = OpenAlexProvider(api_key=None)
+  assert provider.search("outage", limit=5) == []
+  assert provider.last_error == "HTTP 503"
+  assert self.probe(monkeypatch, None, 503, {}, body) \
+    == (HEALTH_HTTP_ERROR, "HTTP 503")
+@
+
+A 429 from a real request now reaches the budget handling: the group is
+blocked until the reset, the warning gives the key hint, and the
+reason carries the explanation.
+A 400 arrives as [[pyalex]]'s [[QueryError]], which holds the whole
+[[message]], and is shortened.
+
+<<openalex refusal reason test methods>>=
+def test_real_429_reaches_the_budget_handling(
+    self, openalex_loopback, caplog):
+  openalex_loopback.plan.append(
+    (429, OPENALEX_SPENT_429, {"X-RateLimit-Reset": "3600"})
+  )
+  provider = OpenAlexProvider(api_key=None)
+  with caplog.at_level(logging.WARNING):
+    assert provider.search("budget spent for real", limit=5) == []
+  availability = provider._limiter.check_available()
+  assert availability.quota is True
+  assert availability.retry_at > time.time() + 3000
+  assert "daily budget spent" in caplog.text
+  assert "set OPENALEX_API_KEY" in caplog.text
+  assert provider.last_error == (
+    "HTTP 429: Rate limit exceeded" + OPENALEX_KEY_HINT
+  )
+
+def test_recorded_400_is_shortened(self, openalex_loopback):
+  openalex_loopback.plan.append(
+    (400, OPENALEX_RECORDED_400, OPENALEX_RECORDED_400_HEADERS)
+  )
+  provider = OpenAlexProvider(api_key=None)
+  assert provider.search("invalid filter", limit=5) == []
+  assert provider.last_error.startswith(
+    "author_name is not a valid field."
+  )
+  assert provider.last_error.endswith("...")
+  assert len(provider.last_error) <= OPENALEX_REASON_MAX_CHARS
+@
+
+The health probe gives the same explanation and hint in its detail,
+and a rejected key names the variable to check.
+
+<<openalex refusal reason test methods>>=
+@staticmethod
+def probe(monkeypatch, key, status, headers, body):
+  if key:
+    monkeypatch.setenv("OPENALEX_API_KEY", key)
+  provider = OpenAlexProvider()
+  with patch("requests.get",
+             return_value=openalex_response(status, headers, body)):
+    return provider.check()
+
+@pytest.mark.parametrize("key, status, body, expected", [
+  (None, 503, OPENALEX_PAUSED_503,
+   (HEALTH_HTTP_ERROR,
+    "HTTP 503: Anonymous search is paused" + OPENALEX_KEY_HINT)),
+  ("k-1", 503, OPENALEX_PAUSED_503,
+   (HEALTH_HTTP_ERROR, "HTTP 503: Anonymous search is paused")),
+  ("k-1", 401, b"",
+   (HEALTH_KEY_REJECTED,
+    "HTTP 401 -- check or replace OPENALEX_API_KEY")),
+], ids=["paused-keyless", "paused-keyed", "bad-key"])
+def test_probe_detail_explains(self, monkeypatch, key, status, body,
+                               expected):
+  assert self.probe(monkeypatch, key, status, {}, body) == expected
+
+def test_probe_detail_of_recorded_400_is_shortened(self, monkeypatch):
+  health, detail = self.probe(
+    monkeypatch, None, 400, OPENALEX_RECORDED_400_HEADERS,
+    OPENALEX_RECORDED_400,
+  )
+  assert health == HEALTH_HTTP_ERROR
+  assert detail.startswith("HTTP 400: author_name is not a valid field.")
+  assert detail.endswith("...")
+  assert len(detail) <= len("HTTP 400: ") + OPENALEX_REASON_MAX_CHARS
+@
+
+\paragraph{The lookups.}
+With the responses let through, a 429 can also reach the lookups that
+enrichment makes one paper at a time: [[get_paper_by_doi]],
+[[get_preprint_locations]] and [[search_preprints_by_title]]
+(\cref{sec:preprint-lookups}).
+They logged an [[HTTPError]] and returned nothing, but never showed the
+response to the limiter.
+A 429 there started no cooldown, so the next paper's lookup asked
+again at once, and the one after that, through a whole session.
+Each now hands the error to [[_note_http_error]], as the DOI batch
+already did: a 429 starts the cooldown its [[Retry-After]] asks for, or
+the quota block of a spent budget, and the lookup still returns its
+empty answer and caches nothing.
+The [[during]] argument keeps the operation in the log line.
+
+The test answers one lookup with a 429 and [[Retry-After: 30]] and then
+makes a DOI lookup: the limiter refuses it, and no second request
+reaches the stand-in.
+
+<<test functions>>=
+class TestOpenAlexLookupCooldown:
+  """A 429 on a lookup pauses the lookups that follow."""
+
+  PACE_429 = (
+    429,
+    b'{"error": "Rate limit exceeded", "reason": "requests_per_second"}',
+    {"Retry-After": "30"},
+  )
+
+  @pytest.mark.parametrize("first_lookup", [
+    lambda p: p.get_paper_by_doi(RECORDED_DOI_A),
+    lambda p: p.get_preprint_locations(RECORDED_DOI_A),
+    lambda p: p.search_preprints_by_title("Refractive changes at dusk"),
+  ], ids=["doi", "preprint-locations", "preprint-title"])
+  def test_429_pauses_the_next_lookup(self, openalex_loopback, caplog,
+                                      first_lookup):
+    openalex_loopback.plan.append(self.PACE_429)
+    provider = OpenAlexProvider(api_key=None)
+    cached_before = dict(provider._cache)
+    assert not first_lookup(provider)
+    with caplog.at_level(logging.WARNING):
+      assert provider.get_paper_by_doi(RECORDED_DOI_B) is None
+    assert len(openalex_loopback.paths) == 1
+    assert "rate limited" in caplog.text
+    assert dict(provider._cache) == cached_before
 @
 
 \subsubsection{Applying filters}
@@ -4676,10 +5450,12 @@ def get_paper_by_doi(self, doi: str | None) -> Paper | None:
             logger.debug("openalex: no work for DOI %s", doi)
             self._cache[cache_key] = None
             return None
-        logger.warning("openalex: DOI lookup failed: %s", e)
+        self._note_http_error(e, during=f"DOI lookup for {doi}")
         return None
     except Exception as e:
-        logger.warning("openalex: DOI lookup failed: %s", e)
+        logger.warning(
+            "openalex: DOI lookup failed: %s", network.redact_secrets(e)
+        )
         return None
 @
 
@@ -4798,10 +5574,13 @@ def _fetch_works_by_doi(self, batch: list[str]) -> list[dict] | None:
         # The limiter already logged the reason once
         return None
     except requests.exceptions.HTTPError as e:
-        self._note_http_error(e)
+        self._note_http_error(e, during="DOI batch lookup")
         return None
     except Exception as e:
-        logger.warning("%s: DOI batch lookup failed: %s", self.name, e)
+        logger.warning(
+            "%s: DOI batch lookup failed: %s",
+            self.name, network.redact_secrets(e),
+        )
         return None
     works = list(response)
     count = (getattr(response, "meta", None) or {}).get("count")
@@ -5184,15 +5963,14 @@ def get_preprint_locations(self, doi: str | None) -> list[dict]:
             logger.debug("openalex: no work for DOI %s", doi)
             self._cache[cache_key] = []
             return []
-        logger.warning(
-            "openalex: preprint-location lookup failed for %s: %s",
-            doi, e,
+        self._note_http_error(
+            e, during=f"preprint-location lookup for {doi}"
         )
         return []
     except Exception as e:
         logger.warning(
             "openalex: preprint-location lookup failed for %s: %s",
-            doi, e,
+            doi, network.redact_secrets(e),
         )
         return []
 
@@ -5295,9 +6073,13 @@ def search_preprints_by_title(
     except RateLimited:
         # The limiter already logged the reason once
         return []
+    except requests.exceptions.HTTPError as e:
+        self._note_http_error(e, during="preprint title search")
+        return []
     except Exception as e:
         logger.warning(
-            "openalex: preprint title search failed: %s", e
+            "openalex: preprint title search failed: %s",
+            network.redact_secrets(e),
         )
         return []
 
@@ -9346,6 +10128,13 @@ The two codes also demand different reactions, which
 mark the day exhausted; [[OVER_QPS]] means only \enquote{slow down}, so a
 short cooldown suffices and the day count is untouched.
 
+These details come from headers, never from the URL, and for a reason:
+IEEE takes its key as the [[apikey]] query parameter, so any message
+that quotes the request's URL quotes the key.
+The handlers below that log an exception's text (a connection failure,
+a [[raise_for_status]] error) pass it through [[redact_secrets]]
+(\cref{sec:redact-secrets}) first.
+
 <<ieee constants>>=
 IEEE_OVER_RATE_CODE = "ERR_403_DEVELOPER_OVER_RATE"
 IEEE_OVER_QPS_CODE = "ERR_403_DEVELOPER_OVER_QPS"
@@ -9559,7 +10348,7 @@ def _search_uncached(
         # Already logged with details in handle response errors
         return all_papers, False
     except Exception as e:
-        logger.warning("ieee: %s", e)
+        logger.warning("ieee: %s", network.redact_secrets(e))
         return all_papers, False
 
 def _record_mashery_rejection(self, response) -> None:
@@ -9655,10 +10444,14 @@ budget.
             # The limiter already logged the reason once
             return None
         except requests.exceptions.HTTPError as e:
-            logger.warning("ieee: DOI lookup error: %s", e)
+            logger.warning(
+                "ieee: DOI lookup error: %s", network.redact_secrets(e)
+            )
             return None
         except Exception as e:
-            logger.warning("ieee: DOI lookup failed: %s", e)
+            logger.warning(
+                "ieee: DOI lookup failed: %s", network.redact_secrets(e)
+            )
             return None
 
     <<convert ieee article>>
@@ -11290,7 +12083,9 @@ class TestPreprintSourceCheck:
         assert status == HEALTH_OK
         assert mock_get.call_count == 1
         params = mock_get.call_args.kwargs["params"]
-        assert params["api_key"] == "k-123"
+        headers = mock_get.call_args.kwargs["headers"]
+        assert headers["Authorization"] == "Bearer k-123"
+        assert "api_key" not in params
         assert params["filter"] == "locations.source.id:S123"
         assert "shares the openalex" in message
 @
@@ -11607,22 +12402,20 @@ it refuses before the semantic limiter has counted, or waited for, a
 request that will not be made.
 
 A refusal by either limiter must read as a failure, not as zero works.
-The inherited [[search()]] catches [[RateLimited]] and returns an
-empty, uncached list without setting [[last_error]] (the limiter has
-already logged the reason); for the [[openalex]] provider the
-pre-check in [[Search.execute]] makes that rare.  The semantic limiter
-is not the one [[Search.execute]] pre-checks, though, and after a 429
-(\cref{sec:openalex-semantic-429}) it is the one that refuses.  So the
-semantic request sets [[last_error]] to the limiter's reason before the
-refusal travels on, and the session records the search as failed.
+The semantic limiter is not the one [[Search.execute]] pre-checks, and
+after a 429 (\cref{sec:openalex-semantic-429}) it is the one that
+refuses, so for this provider a refusal at request time is the common
+case, not a race.
+The refusal needs no handling here: the inherited [[search()]] records
+any limiter's reason in [[last_error]] and caches nothing
+(\cref{sec:openalex-cut-short}), so the session records the search as
+failed.
+This request used to set [[last_error]] itself, because the inherited
+[[search()]] did not.
 
 <<pass both limiters>>=
-try:
-    self._limiter.acquire()
-    self._semantic_limiter.acquire()
-except RateLimited as refusal:
-    self.last_error = refusal.reason
-    raise
+self._limiter.acquire()
+self._semantic_limiter.acquire()
 
 <<create the semantic search limiter>>=
 self._semantic_limiter = get_limiter(
@@ -11762,8 +12555,12 @@ group until the reset; any other 429 starts the cooldown on the
 limiter without its [[X-RateLimit-Remaining]], for the reason
 \cref{sec:openalex-prepaid} gives: the count is the group's daily
 allowance, not a semantic quota.
-The warning names the semantic limiter's retry time, which is the one
-that applies.
+The warning for a pace 429 names the semantic limiter's retry time,
+which is the one that applies.
+A spent budget is warned about with the base class's own
+[[_warn_budget_spent]]: an earlier copy of that warning here had lost
+the hint to set [[OPENALEX_API_KEY]] (issue~\#152), and one shared
+message cannot drift from the other.
 
 <<semantic search 429 handling>>=
 def _record_429(self, response) -> bool:
@@ -11777,17 +12574,15 @@ def _record_429(self, response) -> bool:
     )
     return False
 
-def _note_http_error(self, error: requests.HTTPError) -> None:
+def _note_http_error(
+    self, error: requests.HTTPError, during: str | None = None
+) -> None:
     """Log a failure; a pace 429 names the semantic limiter's retry."""
     response = getattr(error, "response", None)
     if response is None or response.status_code != 429:
-        return super()._note_http_error(error)
+        return super()._note_http_error(error, during)
     if self._record_429(response):
-        retry_at = self._limiter.check_available().retry_at
-        logger.warning(
-            "%s: daily budget spent; resets %s",
-            self.name, format_retry(retry_at),
-        )
+        self._warn_budget_spent()
     else:
         retry_at = self._semantic_limiter.check_available().retry_at
         logger.warning(
@@ -12069,7 +12864,9 @@ def test_check_probes_a_semantic_search(self, monkeypatch):
   assert status == HEALTH_OK
   params = mock_get.call_args.kwargs["params"]
   assert params["search.semantic"] == "test"
-  assert params["api_key"] == "k-123"
+  assert "api_key" not in params
+  assert mock_get.call_args.kwargs["headers"]["Authorization"] \
+    == "Bearer k-123"
   assert "1 request/s" in message
 @
 
@@ -12152,6 +12949,31 @@ def test_check_pace_429_leaves_the_group_alone(self, monkeypatch):
     provider.check()
   assert not provider._semantic_limiter.check_available().ok
   assert provider._limiter.check_available().ok
+@
+
+The spent-budget warning is the base class's, hint included: without a
+key it names [[OPENALEX_API_KEY]], as the [[openalex]] provider's
+warning does, and with a key it does not.
+
+<<test functions>>=
+class TestOpenAlexSemanticBudgetWarning:
+  """A semantic search that meets a spent budget gives the key hint."""
+
+  @pytest.mark.parametrize("key, hinted", [(None, True), ("k-1", False)],
+                           ids=["keyless", "keyed"])
+  def test_spent_budget_warning_has_the_key_hint(
+      self, monkeypatch, caplog, key, hinted):
+    if key:
+      monkeypatch.setenv("OPENALEX_API_KEY", key)
+    provider = OpenAlexSemanticProvider()
+    sent = []
+    with caplog.at_level(logging.WARNING):
+      with _replay_semantic(sent, status=429,
+                            payload={"reason": "daily_budget"},
+                            headers={"X-RateLimit-Reset": "3600"}):
+        provider.search("budget gone, hint wanted", limit=5)
+    assert "openalex-semantic: daily budget spent" in caplog.text
+    assert ("set OPENALEX_API_KEY" in caplog.text) is hinted
 @
 
 The recording goes stale if OpenAlex changes the shape of its answer.

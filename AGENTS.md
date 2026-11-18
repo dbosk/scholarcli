@@ -231,7 +231,8 @@ refusal sets `last_error` (else it would read as 0 works).
   (`preprint_versions`/`published_versions`) and
   `audit_work_key` when its title is non-empty, plus the title alone
   for a session paper without authors; `matched_by` `doi`,
-  `title+author` or `title`. A title match is dropped
+  `title+author` or `title` (a session paper without authors records
+  `title` on every title key, #152). A title match is dropped
   (`_plausibly_same_work`) when both papers have different DOIs not
   joined by a version link, or both years are more than 1 apart.
   Buckets per decision: bearing = cited by the audit rule
@@ -269,6 +270,37 @@ show "failed". The keyed REST providers (S2/WoS/IEEE) set the generic
 `SEARCH_CUT_SHORT` in the `cacheable=False` branch; DBLP, Scopus,
 OpenAlex (+ source-pinned), HAL and arXiv set specific reasons. A new
 provider should do the same.
+
+OpenAlex (#150, #151): a limiter refusal sets `last_error` to its
+reason; a refusal or failed request after some pages keeps those pages
+(`PagesCutShort` from the paging loop → `N, incomplete (reason)`,
+uncached). A refused request that reaches scholar as an `HTTPError`
+records `HTTP <code>: <message>` from the JSON body (`message`, else
+`error`; `openalex_error_message`, shortened to
+`OPENALEX_REASON_MAX_CHARS` = 120), or `HTTP <code>` without one, plus
+`; no API key: set OPENALEX_API_KEY` when keyless and the refusal is a
+503 with OpenAlex's message in the body or a budget-spent 429;
+`providers check` gives the same detail. Two refusals pyalex raises
+itself as a `QueryError` before any `HTTPError`: a 400 whose `error`
+mentions "query parameters" (the exception holds the body's
+`message`) and a 401 whose `error` mentions "API key" (`error` plus
+pyalex's "Did you configure a valid API key?"). Those record the
+exception text, shortened, without the `HTTP <code>:` prefix. The
+constructor sets `pyalex.config.retry_http_codes =
+[]`: pyalex's default (`max_retries=0` with 429/500/503 listed) retried
+nothing but turned those statuses into a `RetryError` without a
+response, so no search ever saw a real 429 or 503 body. The per-paper
+lookups (`get_paper_by_doi`, `get_preprint_locations`,
+`search_preprints_by_title`) hand an `HTTPError` to
+`_note_http_error(e, during=...)`, so a 429 there starts a cooldown.
+
+Keys in messages (#159): `network.redact_secrets(text)` hides the
+values of `api_key`/`apikey`/`api-key`/`key` URL parameters and
+`mailto` (personal data, #160), in any case. `check_provider` applies it to every health message; the
+OpenAlex and IEEE (`apikey` in the URL) error logs use it. The OpenAlex
+`/works` probe sends the key as `Authorization: Bearer` (documented,
+as pyalex does); `/rate-limit` keeps the `api_key` parameter (the only
+form documented for it).
 
 ### Provider Health Checks
 
@@ -859,7 +891,12 @@ Unit tests are offline by construction (`tests/conftest.py`, tangled from
 key/option variable (`S2_API_KEY`, `OPENALEX_API_KEY`, `IEEE_API_KEY`,
 `WOS_*API_KEY`, `SCOPUS_API_KEY`, `SCOPUS_INST_TOKEN`, `SCOPUS_VIEW`),
 the contact emails and the proxy/User-Agent variables, so a test that
-needs a key sets it explicitly; the autouse `block_network` fixture
+needs a key sets it explicitly. It also resets `pyalex.config.email`
+and (except for live tests) `pyalex.config.api_key`, which the OpenAlex
+providers built at import (during collection) had set from the
+developer's environment (#160; pyalex is imported inside the fixture).
+Registered providers still keep their own `api_key` attributes from
+import time. The autouse `block_network` fixture
 refuses DNS and connections to anything but loopback and **fails the
 test** naming the hosts (providers swallow errors, so a refusal alone
 would go unnoticed). Both exempt `@pytest.mark.integration` tests, which
@@ -997,7 +1034,8 @@ requests/day and each `scholar` run is a fresh process.
   `record_response`, a keyed probe also reads `/rate-limit` for the
   detail column, and a search 429 that spends the budget becomes a
   quota block until `X-RateLimit-Reset` (`_note_http_error`), logged
-  with the reset time and a key hint.
+  with the reset time and a key hint (`_warn_budget_spent`, shared with
+  `openalex-semantic`).
   `openalex-semantic` (1 request/s) passes the group limiter and then
   a second limiter of its own, `get_limiter("oa-semantic",
   Limits(per_second=1.0))`: the group's 10/s cannot be lowered for one
