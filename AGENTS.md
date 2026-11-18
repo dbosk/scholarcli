@@ -1045,7 +1045,12 @@ requests/day and each `scholar` run is a fresh process.
   `RETRY_BACKOFF * 2**attempt` (at least `Retry-After`) via
   `ratelimit._sleep`. Like DBLP it records no mid-loop 429; when the
   retries run out (or `Retry-After` exceeds `MAX_RETRY_WAIT`) `_pause`
-  calls `record_limit_hit`, so every path gets the cooldown. The
+  calls `record_limit_hit`, so every path gets the cooldown;
+  connection errors (incl. `SSLError`/`ProxyError`) that persist pause
+  it for `CONNECTION_PAUSE` (60 s), so an unreachable S2 or a broken
+  proxy fails fast instead of 14 s of back-off per call. Every retry
+  adds to `last_retries`, which `search()` resets with `last_error`,
+  so a page answered after a 500 shows "N after 1 retry". The
   offline tests in `TestS2OneRequestPerSecond` time arrivals at a
   loopback server (`s2_loopback` rewrites the host in
   `HTTPAdapter.send`), threads and two subprocesses included.

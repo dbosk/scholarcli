@@ -1473,6 +1473,9 @@ read 18~November 2026) states both limits:
   \enquote{All endpoints} is the point: search, DOI lookup,
   citations, references and the PDF lookup of \cref{pdf-module} draw
   on one allowance, so they share one limiter.
+  The PDF lookup sends no key, but it is paced at whatever rate the
+  shared limiter last declared, keyed or anonymous, so it never goes
+  faster than the keyed rate.
   We declare 0.9 requests per second, not 1.0, and the next section
   explains the margin.
 \item[Without key] the unauthenticated endpoints are
@@ -1547,6 +1550,7 @@ class SemanticScholarProvider:
     RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
     RETRY_BACKOFF = 2.0            # seconds before the first retry
     MAX_RETRY_WAIT = 60.0          # longest Retry-After we wait out
+    CONNECTION_PAUSE = 60.0        # pause after connections kept failing
 
     def __init__(self, api_key: str | None = None):
         """
@@ -1563,6 +1567,8 @@ class SemanticScholarProvider:
         self._session = self._create_session()
         self._limiter = limiter_for(self)
         self._limiter.limits = self._current_limits()
+        self.last_error: str | None = None
+        self.last_retries = 0
 
     def is_available(self) -> bool:
         """Semantic Scholar is always available (API key is optional)."""
@@ -1779,9 +1785,32 @@ Because every endpoint and the 403 fallback go through [[_send]], the
 pause follows any of them, a DOI lookup or a page of citations as well
 as a search; the callers keep their own handling of the 429 or 5xx
 they get back.
-A connection error that persists is raised instead, after the last
-attempt, and starts no cooldown: it says more about our own network
-than about Semantic Scholar's willingness to serve.
+A connection error that persists is raised after the last attempt,
+and it pauses Semantic Scholar too, but only for [[CONNECTION_PAUSE]],
+a minute.
+[[requests.ConnectionError]] covers more than a server that is down:
+[[SSLError]] and [[ProxyError]] are subclasses of it, so a broken
+proxy, a missing network or a certificate problem on our side ends up
+here as well.
+Without a pause, every later call would repeat the four attempts and
+the 14~seconds of back-off between them: enriching a few thousand
+papers with Semantic Scholar unreachable would cost 14~seconds per
+paper.
+With it, the calls in that minute fail at once with [[RateLimited]]
+and are recorded as failed.
+The pause is short because the cause is more often ours than Semantic
+Scholar's, and a user who fixes the network or the proxy should not
+have to wait long (or reach for
+[[scholar providers limits --reset s2]]).
+
+Every retry is also counted in [[last_retries]].
+[[search]] resets it when it starts, next to [[last_error]], so after a
+search it holds the retries that search needed, and [[Search.execute]]
+records them on the [[SearchResult]]: a page that answered only after
+a 500 shows as \enquote{12 after 1 retry}, not as a plain 12
+(\cref{sec:provider-protocol}).
+Lookups outside a search (DOI, citations) add to it as well; nothing
+reads it there, and the next search starts it from zero again.
 
 <<semantic scholar request helper>>=
 def _send(self, url: str, params: dict) -> requests.Response:
@@ -1802,6 +1831,11 @@ def _send(self, url: str, params: dict) -> requests.Response:
             )
         except (requests.ConnectionError, requests.Timeout) as error:
             if attempt >= self.MAX_RETRIES:
+                self._pause(
+                    f"connection failed ({type(error).__name__})"
+                    f" after {attempt} retries",
+                    self.CONNECTION_PAUSE,
+                )
                 raise
             self._back_off(attempt, None, type(error).__name__)
         else:
@@ -1813,12 +1847,19 @@ def _send(self, url: str, params: dict) -> requests.Response:
             )
             if (attempt >= self.MAX_RETRIES
                     or (retry_after or 0.0) > self.MAX_RETRY_WAIT):
-                self._pause(response, retry_after, attempt)
+                kind = ("rate limited" if response.status_code == 429
+                        else "server error")
+                self._pause(
+                    f"{kind} (HTTP {response.status_code})"
+                    f" after {attempt} retries",
+                    retry_after,
+                )
                 return response
             self._back_off(
                 attempt, retry_after, f"HTTP {response.status_code}"
             )
         attempt += 1
+        self.last_retries += 1
 
 def _back_off(self, attempt: int, retry_after: float | None,
               what: str) -> None:
@@ -1832,11 +1873,8 @@ def _back_off(self, attempt: int, retry_after: float | None,
     )
     ratelimit._sleep(delay)
 
-def _pause(self, response: requests.Response,
-           retry_after: float | None, retries: int) -> None:
+def _pause(self, reason: str, retry_after: float | None) -> None:
     """Remember that the retries ran out, for every later request."""
-    kind = "rate limited" if response.status_code == 429 else "server error"
-    reason = f"{kind} (HTTP {response.status_code}) after {retries} retries"
     logger.warning("s2: %s; pausing Semantic Scholar", reason)
     self._limiter.record_limit_hit(retry_after=retry_after, reason=reason)
 @
@@ -1891,6 +1929,12 @@ The tests vary one thing at a time.
   processes, and each process gets its own cache directory so that
   neither overwrites the other's cache at exit.
   Before the fix, three of this test's five gaps were under 2~ms.
+\item[Reporting] A search whose page answers after one 500 must be
+  recorded with one retry, and labelled so, even when earlier lookups
+  left a count of their own in [[last_retries]].
+\item[Lost connections] Four dropped connections must pause the
+  provider for no longer than [[CONNECTION_PAUSE]], so that the next
+  lookup sends nothing.
 \end{description}
 The wall-clock tests take about eleven seconds together; the
 cross-process one is the longest, at about six.
@@ -2091,12 +2135,13 @@ class TestS2OneRequestPerSecond:
       for n in range(2):
         pdf.resolve_doi_s2(f"10.1/pdf-{n}")
 
-    threads = [threading.Thread(target=enrich),
-               threading.Thread(target=find_pdfs)]
+    threads = [threading.Thread(target=enrich, daemon=True),
+               threading.Thread(target=find_pdfs, daemon=True)]
     for thread in threads:
       thread.start()
     for thread in threads:
       thread.join(30)
+    assert not any(thread.is_alive() for thread in threads)
 
     assert len(s2_loopback.arrivals) == 5
     assert min(s2_loopback.gaps()) >= 0.15
@@ -2109,29 +2154,68 @@ class TestS2OneRequestPerSecond:
     import sys
 
     processes = []
-    for n in range(2):
-      env = dict(
-        os.environ, S2_API_KEY="test-key",
-        SCHOLAR_CACHE_DIR=str(tmp_path / f"cache-{n}"),
-      )
-      dois = [f"10.1/process-{n}-{i}" for i in range(3)]
-      processes.append(subprocess.Popen(
-        [sys.executable, "-c", S2_LOOKUP_PROCESS, s2_loopback.base,
-         *dois],
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE, text=True, env=env,
-      ))
-    for process in processes:
-      assert process.stdout.readline().strip() == "ready"
-    for process in processes:
-      process.stdin.write("go\n")
-      process.stdin.flush()
-    for process in processes:
-      _, errors = process.communicate(timeout=60)
-      assert process.returncode == 0, errors
+    try:
+      for n in range(2):
+        env = dict(
+          os.environ, S2_API_KEY="test-key",
+          SCHOLAR_CACHE_DIR=str(tmp_path / f"cache-{n}"),
+        )
+        dois = [f"10.1/process-{n}-{i}" for i in range(3)]
+        processes.append(subprocess.Popen(
+          [sys.executable, "-c", S2_LOOKUP_PROCESS, s2_loopback.base,
+           *dois],
+          stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+          stderr=subprocess.PIPE, text=True, env=env,
+        ))
+      for process in processes:
+        assert process.stdout.readline().strip() == "ready"
+      for process in processes:
+        process.stdin.write("go\n")
+        process.stdin.flush()
+      for process in processes:
+        _, errors = process.communicate(timeout=60)
+        assert process.returncode == 0, errors
+    finally:
+      for process in processes:
+        if process.poll() is None:
+          process.kill()
+        process.wait(10)
 
     assert len(s2_loopback.arrivals) == 6
     assert min(s2_loopback.gaps()) >= 1.0
+
+  def test_a_retried_page_is_reported(self, s2_loopback, monkeypatch):
+    """A search that answered after a 500 says so in its result."""
+    s2_loopback.plan.append(500)
+    provider = SemanticScholarProvider(api_key="test-key")
+    provider.last_retries = 3  # left over from earlier DOI lookups
+    monkeypatch.setitem(PROVIDERS, "s2", provider)
+
+    [result] = Search("a page answered on retry").execute(
+      providers=["s2"]
+    )
+    assert len(s2_loopback.arrivals) == 2
+    assert (result.error, result.retries) == (None, 1)
+    assert hits_label(
+      len(result.papers), result.error, result.retries
+    ) == "0 after 1 retry"
+
+  def test_lost_connections_pause_s2_briefly(self, s2_loopback):
+    """After the last dropped connection the next lookup fails fast."""
+    s2_loopback.plan.extend(["drop"] * 10)
+    provider = SemanticScholarProvider(api_key="test-key")
+
+    assert provider.get_paper_by_doi("10.1/unreachable") is None
+    assert len(s2_loopback.arrivals) == provider.MAX_RETRIES + 1
+    assert provider.get_paper_by_doi("10.1/still-unreachable") is None
+    assert len(s2_loopback.arrivals) == provider.MAX_RETRIES + 1
+
+    pause = provider._limiter.check_available()
+    assert not pause.ok
+    assert "connection failed" in pause.reason
+    assert pause.retry_at <= (
+      ratelimit._now() + provider.CONNECTION_PAUSE
+    )
 @
 
 \subsubsection{Health check}
@@ -2214,6 +2298,7 @@ def search(
     the API's per-request maximum (100 results per page).
     """
     self.last_error = None
+    self.last_retries = 0
     cache_key = (query, limit, filters.cache_key() if filters else "")
     if cache_key in self._cache:
         return self._cache[cache_key]
