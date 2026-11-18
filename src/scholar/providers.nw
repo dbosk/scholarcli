@@ -27,7 +27,7 @@ that static type checkers can verify.
 The chapter covers sixteen providers:
 \begin{description}
 \item[Semantic Scholar] AI-powered research database with 200M+ papers.
-  Uses the official [[semanticscholar]] client library.
+  Direct REST API through [[requests]].
 \item[OpenAlex] Open catalog of 250M+ works.
   Uses the [[pyalex]] client library.
 \item[DBLP] Computer science bibliography.
@@ -860,8 +860,8 @@ third-party providers keep working.
 The probe must \emph{not} reuse the provider's hardened request paths.  Those
 paths exist to maximise the chance of getting data---the Semantic Scholar
 provider, for instance, silently drops a rejected key and retries anonymously,
-and its retrying session turns a 429 into a [[RetryError]] after
-[[MAX_RETRIES]] delayed attempts.  Both behaviours mask precisely the
+and its request helper retries a 429 up to [[MAX_RETRIES]] times
+before it reports anything.  Both behaviours mask precisely the
 condition the health check
 exists to report.  Each [[check]] method therefore issues one raw request with
 the provider's real credentials and classifies the raw status code.
@@ -1273,18 +1273,33 @@ using the [[semanticscholar]] package.
 This gives us full control over rate limiting and error handling.
 
 The API endpoint is [[https://api.semanticscholar.org/graph/v1/paper/search]].
-An optional API key ([[S2_API_KEY]]) increases rate limits:
+An optional API key ([[S2_API_KEY]]) buys a rate of its own.
+The API page (\url{https://www.semanticscholar.org/product/api},
+read 18~November 2026) states both limits:
 \begin{description}
-\item[Without key] 100 requests per 5 minutes (we space requests 3 seconds
-  apart, a rate of $1/3$ request per second)
-\item[With key] 1 request per second sustained rate
+\item[With key] \enquote{The introductory rate limit for an API key is
+  1 RPS on all endpoints.}
+  \enquote{All endpoints} is the point: search, DOI lookup,
+  citations, references and the PDF lookup of \cref{pdf-module} draw
+  on one allowance, so they share one limiter.
+  We declare 0.9 requests per second, not 1.0, and the next section
+  explains the margin.
+\item[Without key] the unauthenticated endpoints are
+  \enquote{rate-limited to 1000 requests per second shared among all
+  unauthenticated users} and \enquote{may also be further throttled
+  during periods of heavy use.}
+  The page gives no per-client figure, so the pool tells us nothing
+  about how fast one client may go.
+  We keep spacing anonymous requests three seconds apart (a rate of
+  $1/3$), a conservative choice of ours, not a documented limit.
 \end{description}
 
 We implement:
 \begin{itemize}
 \item Adaptive rate limiting based on API key presence, through the shared
   rate limiter (\cref{ch:ratelimit})
-\item Exponential back-off retry on server errors (429, 5xx)
+\item Retries of throttled and failed requests (429, 5xx, a lost
+  connection), each one paced by the limiter like any other request
 \item Clear error messages explaining rate limits
 \end{itemize}
 
@@ -1335,9 +1350,12 @@ class SemanticScholarProvider:
     name = "s2"
     MAX_LIMIT: int | None = None   # No documented maximum
     API_URL = "https://api.semanticscholar.org/graph/v1/paper/search"
-    LIMITS = Limits(per_second=1 / 3)      # anonymous: 100 requests/5 min
-    KEYED_LIMITS = Limits(per_second=1.0)  # with S2_API_KEY
+    LIMITS = Limits(per_second=1 / 3)      # anonymous: our own choice
+    KEYED_LIMITS = Limits(per_second=0.9)  # with S2_API_KEY: 1 RPS - margin
     MAX_RETRIES = 3                # retries after the initial attempt
+    RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
+    RETRY_BACKOFF = 2.0            # seconds before the first retry
+    MAX_RETRY_WAIT = 60.0          # longest Retry-After we wait out
 
     def __init__(self, api_key: str | None = None):
         """
@@ -1370,17 +1388,37 @@ class SemanticScholarProvider:
 
 \subsubsection{Rate limiting and retry}
 
-We implement two layers of rate limiting:
+The requirement is that Semantic Scholar never receives more than one
+request per second from us, counting every endpoint, every retry, every
+thread and every [[scholar]] process.
+Two mechanisms serve it:
 \begin{description}
 \item[Proactive pacing] Every request first passes the shared limiter's
   [[acquire()]] (\cref{ch:ratelimit}), which spaces requests to the
   declared rate, counts them, and refuses while a remembered cooldown is
   active.
+  The limiter coordinates the threads of one process and separate
+  processes through its locks (\cref{sec:ratelimit-taking-turns}).
   The rate depends on whether we have a working API key.
-\item[Exponential back-off] If we still hit rate limits (HTTP 429) or
-  server errors (5xx), we retry with increasing delays, up to
-  [[MAX_RETRIES]] times.
+\item[Retries through the limiter] If we still hit rate limits (HTTP
+  429), server errors (5xx) or a lost connection, we retry up to
+  [[MAX_RETRIES]] times, and every retry is a request of its own that
+  passes [[acquire()]] first (next section).
 \end{description}
+
+The keyed rate is 0.9 requests per second rather than the documented
+1.0.
+The limiter spaces the moments it \emph{stamps}, and the request
+leaves a little later: after the state file is saved and the request
+is built.
+Those delays differ from request to request, and so does the network
+on the way, so two requests stamped exactly one second apart may
+arrive less than a second apart.
+An offline audit against a local server measured arrival gaps of
+0.990 to 0.999~seconds at the old rate of 1.0
+(\url{https://github.com/dbosk/scholar/issues/148}).
+At 0.9 the interval is 1.11~seconds, which leaves a tenth of a second
+for that variation.
 
 The provider used to pace itself with an instance timestamp and two
 intervals in \emph{seconds between requests}
@@ -1409,12 +1447,17 @@ The constructor declares it once too, so that
 The session itself comes from [[network.new_session]]
 (\cref{ch:network}), so its requests carry scholar's User-Agent and
 take the configured route.
-
-[[MAX_RETRIES]] is a named constant rather than a literal inside the [[Retry]]
-because the number is also \emph{reported}: when the retries are exhausted we
-tell the user how many attempts were made, and a message that disagreed with
-the actual configuration would send them chasing the wrong thing.  Both
-readings come from the one constant, so they cannot drift apart.
+It deliberately gets no [[urllib3]] [[Retry]].
+The session used to have one, with [[total=3]] and [[backoff_factor=1]],
+and its retries were sent from inside [[urllib3]], where the limiter
+cannot see them: one [[acquire]] let four requests out.
+The audit cited above measured a 500 retried after 0.003~s, a dropped
+connection after 0.002~s and a 429 without [[Retry-After]] after
+0.005~s.
+Without one, [[requests]]' [[HTTPAdapter]] uses its default,
+[[Retry(0, read=False)]] (read in its [[adapters.py]]), which never
+resends, so retrying is the request helper's job
+(\cref{sec:s2-retrying}).
 
 <<semantic scholar rate limiting>>=
 def _current_limits(self) -> Limits:
@@ -1432,14 +1475,8 @@ def _acquire(self) -> None:
     self._limiter.acquire()
 
 def _create_session(self) -> requests.Session:
-    """Create a session with exponential back-off retry logic."""
-    retry = Retry(
-        total=self.MAX_RETRIES,
-        backoff_factor=1,  # 1s, 2s, 4s delays
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET"],
-    )
-    return network.new_session(retry)
+    """Create a session that never resends a request by itself."""
+    return network.new_session()
 @
 
 \subsubsection{Requests and the stale-key fallback}
@@ -1467,11 +1504,12 @@ search either, so we log at [[error]] level and hand the 403 response back to
 the caller, which treats it as an empty result.
 
 Being the single chokepoint also makes [[_request]] the natural place to
-feed the persistent rate limiter (\cref{ch:ratelimit}): [[_acquire]]
-paces and counts each request and refuses while a persistent cooldown
-is active, and [[record_response()]] turns a 429 that survived the
-session's own retries into such a cooldown---so the \emph{next}
-[[scholar]] invocation waits it out instead of rediscovering it.
+feed the persistent rate limiter (\cref{ch:ratelimit}).
+It sends through [[_send]] (next section), where [[_acquire]] paces and
+counts every attempt and refuses while a persistent cooldown is active,
+and where retries that run out become such a cooldown---so the rest of
+this run and the \emph{next} [[scholar]] invocation wait it out instead
+of rediscovering it.
 The [[RateLimited]] this can raise is contained where every caller
 already contains network failures; the search catches it ahead of its
 catch-all, though, since [[acquire]] has logged the refusal already
@@ -1494,20 +1532,16 @@ def _request(self, url: str, params: dict) -> requests.Response:
     so the caller degrades to an empty result rather than raising.
     Raises `RateLimited` while a persistent cooldown is active.
     """
-    self._acquire()
-    headers = self._build_headers()
-    response = self._session.get(url, params=params, headers=headers, timeout=30)
+    response = self._send(url, params)
 
-    if response.status_code == 403 and "x-api-key" in headers:
+    if (response.status_code == 403
+            and self.api_key and not self._key_rejected):
         logger.warning(
             "s2: API key rejected (403) -- check or replace S2_API_KEY; "
             "falling back to anonymous access"
         )
         self._key_rejected = True
-        self._acquire()
-        response = self._session.get(
-            url, params=params, headers=self._build_headers(), timeout=30
-        )
+        response = self._send(url, params)
 
     if response.status_code == 403:
         logger.error(
@@ -1515,8 +1549,398 @@ def _request(self, url: str, params: dict) -> requests.Response:
             "returning no results for this request"
         )
 
-    self._limiter.record_response(response)
     return response
+@
+
+\subsubsection{Retrying through the limiter}
+\label{sec:s2-retrying}
+
+[[_send]] makes one request and retries it when the answer is worth
+waiting for: a 429 (throttled), a 500, 502, 503 or 504 (the server is
+struggling), or a connection that failed or timed out.
+Each retry is a request like any other, so it starts with [[_acquire]]:
+it is paced against every other Semantic Scholar request in this and
+in other processes, it is counted, and it is refused if a cooldown has
+begun meanwhile.
+This is the whole point of retrying here rather than in [[urllib3]]:
+the limiter sees every request that leaves.
+
+Between attempts we also back off, two seconds before the first retry
+and doubling after that ([[RETRY_BACKOFF]]).
+Pacing alone would retry a struggling server once a second; backing
+off gives it time.
+A 429 may say how long to wait in its [[Retry-After]] header, and then
+we wait at least that long.
+Both waits go through [[ratelimit._sleep]], the seam the test suite
+disables, as DBLP's back-off does (\cref{sec:dblp-transient-failures}).
+
+A 429 or 5xx in the middle of the loop is not handed to
+[[record_response]]: that would turn the 429 into a persistent
+cooldown, and the very next [[_acquire]] would refuse the retry, as
+DBLP's loop explains for its own 429s.
+When the retries run out, though, the server is saturated or down, and
+that is worth remembering: [[_pause]] records a cooldown, for as long
+as the last [[Retry-After]] asked, else the limiter's default.
+The same applies when a [[Retry-After]] asks for more than
+[[MAX_RETRY_WAIT]] seconds: we do not hold up a search for an hour, we
+pause Semantic Scholar for that hour instead.
+Because every endpoint and the 403 fallback go through [[_send]], the
+pause follows any of them, a DOI lookup or a page of citations as well
+as a search; the callers keep their own handling of the 429 or 5xx
+they get back.
+A connection error that persists is raised instead, after the last
+attempt, and starts no cooldown: it says more about our own network
+than about Semantic Scholar's willingness to serve.
+
+<<semantic scholar request helper>>=
+def _send(self, url: str, params: dict) -> requests.Response:
+    """GET `url`, retrying throttled and failed attempts.
+
+    Every attempt passes the limiter first.  Returns the first response
+    not worth retrying, or the last one once the retries are spent (and
+    then pauses Semantic Scholar).  Re-raises the last connection error.
+    Raises `RateLimited` while a cooldown is active.
+    """
+    attempt = 0
+    while True:
+        self._acquire()
+        try:
+            response = self._session.get(
+                url, params=params, headers=self._build_headers(),
+                timeout=30,
+            )
+        except (requests.ConnectionError, requests.Timeout) as error:
+            if attempt >= self.MAX_RETRIES:
+                raise
+            self._back_off(attempt, None, type(error).__name__)
+        else:
+            if response.status_code not in self.RETRY_STATUSES:
+                self._limiter.record_response(response)
+                return response
+            retry_after = ratelimit.parse_retry_after(
+                response.headers.get("Retry-After")
+            )
+            if (attempt >= self.MAX_RETRIES
+                    or (retry_after or 0.0) > self.MAX_RETRY_WAIT):
+                self._pause(response, retry_after, attempt)
+                return response
+            self._back_off(
+                attempt, retry_after, f"HTTP {response.status_code}"
+            )
+        attempt += 1
+
+def _back_off(self, attempt: int, retry_after: float | None,
+              what: str) -> None:
+    """Wait before retry `attempt + 1`, honouring `Retry-After`."""
+    delay = self.RETRY_BACKOFF * 2 ** attempt
+    if retry_after is not None:
+        delay = max(delay, retry_after)
+    logger.warning(
+        "s2: %s, retrying in %.1fs (retry %d of %d)",
+        what, delay, attempt + 1, self.MAX_RETRIES,
+    )
+    ratelimit._sleep(delay)
+
+def _pause(self, response: requests.Response,
+           retry_after: float | None, retries: int) -> None:
+    """Remember that the retries ran out, for every later request."""
+    kind = "rate limited" if response.status_code == 429 else "server error"
+    reason = f"{kind} (HTTP {response.status_code}) after {retries} retries"
+    logger.warning("s2: %s; pausing Semantic Scholar", reason)
+    self._limiter.record_limit_hit(retry_after=retry_after, reason=reason)
+@
+
+Let's verify the requirement where it is decided: at the server.
+These tests need real [[urllib3]] behaviour, since the bug they guard
+against lived in [[urllib3]]'s own retries, and real arrival times, so
+a mock of [[_session.get]] would prove nothing.
+They use a real local server instead: [[S2Loopback]] is an HTTP
+server on [[127.0.0.1]] that answers
+from a plan and notes when each request arrives, and the [[s2_loopback]]
+fixture rewrites [[https://api.semanticscholar.org]] to it inside
+[[HTTPAdapter.send]], below the session, so the provider's session, the
+PDF module's [[network.get]] and everything [[urllib3]] does run for
+real.
+Should the rewrite ever fail, the suite's network guard
+(\cref{sec:test-configuration}) fails the test instead of letting it
+reach the real API.
+The answers are minimal JSON bodies written by hand, not recordings:
+these tests are about when requests arrive, and what the bodies hold is
+covered by the parsing tests above.
+
+The tests vary one thing at a time.
+\begin{description}
+\item[Retries] A 500, a dropped connection and a 429 without
+  [[Retry-After]], then a 200: four requests at the real keyed rate,
+  with the back-off set to zero so that only the limiter can space
+  them.
+  Before the fix [[urllib3]] sent the retries within milliseconds
+  (the audit measured 2 to 5~ms).
+  The gaps are compared with 1.0~s, the documented limit, rather than
+  with the 1.11~s interval: the difference is the margin that absorbs
+  the variation between stamp and arrival, which is what it is for.
+\item[The [[Retry-After]] header] At a fast test rate, a
+  [[Retry-After: 1]] alone
+  must keep the retry a second away.
+  The sleep starts after the server has answered, so the gap cannot be
+  shorter than the header asked.
+\item[Spent retries] On each of the three lookups that used to lack it,
+  four 429s must pause the provider, so that the next lookup sends
+  nothing.
+\item[Threads] Enrichment lookups and PDF lookups from two threads at
+  five requests per second: five arrivals, at least 0.15~s apart, and
+  five counted.
+  The 0.05~s below the interval allows for the variation between stamp
+  and arrival, as the margin does at the real rate; the failure this
+  test guards against produced gaps under a millisecond.
+\item[Processes] Two [[scholar]] processes sharing one data directory,
+  three DOI lookups each at the real keyed rate, started together.
+  The subprocess script refuses every address but the loopback
+  interface itself, since the network guard does not reach into other
+  processes, and each process gets its own cache directory so that
+  neither overwrites the other's cache at exit.
+  Before the fix, three of this test's five gaps were under 2~ms.
+\end{description}
+The wall-clock tests take about eleven seconds together; the
+cross-process one is the longest, at about six.
+
+<<test functions>>=
+class S2Loopback:
+  """A local stand-in for api.semanticscholar.org that times arrivals.
+
+  `plan` holds the answers to give, in order: a status code, a
+  `(status, headers)` pair, or "drop" to close the connection without
+  answering.  Once it is empty every request gets a 200.  `arrivals`
+  holds the `time.monotonic()` of each request's arrival.
+  """
+
+  BODY = json.dumps({
+    "paperId": "loopback", "title": "Loopback paper",
+    "total": 0, "data": [],
+  }).encode()
+
+  def __init__(self):
+    import http.server
+    import threading
+
+    self.plan = []
+    self.arrivals = []
+    loopback = self
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+      def do_GET(self):
+        loopback.arrivals.append(time.monotonic())
+        answer = loopback.plan.pop(0) if loopback.plan else 200
+        if answer == "drop":
+          return
+        status, headers = (
+          answer if isinstance(answer, tuple) else (answer, {})
+        )
+        self.send_response(status)
+        for name, value in headers.items():
+          self.send_header(name, value)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(S2Loopback.BODY)))
+        self.end_headers()
+        self.wfile.write(S2Loopback.BODY)
+
+      def log_message(self, *args):
+        pass
+
+    self.server = http.server.ThreadingHTTPServer(
+      ("127.0.0.1", 0), Handler
+    )
+    self.base = f"http://127.0.0.1:{self.server.server_address[1]}"
+    self.thread = threading.Thread(
+      target=self.server.serve_forever, daemon=True
+    )
+    self.thread.start()
+
+  def gaps(self):
+    """Return the time between consecutive arrivals, in order."""
+    times = sorted(self.arrivals)
+    return [b - a for a, b in zip(times, times[1:])]
+
+  def close(self):
+    self.server.shutdown()
+    self.server.server_close()
+
+
+@pytest.fixture
+def s2_loopback(monkeypatch):
+  """Send every Semantic Scholar request to an `S2Loopback`."""
+  import requests.adapters
+
+  loopback = S2Loopback()
+  real_send = requests.adapters.HTTPAdapter.send
+
+  def send(adapter, request, **kwargs):
+    request.url = request.url.replace(
+      "https://api.semanticscholar.org", loopback.base
+    )
+    return real_send(adapter, request, **kwargs)
+
+  monkeypatch.setattr(requests.adapters.HTTPAdapter, "send", send)
+  yield loopback
+  loopback.close()
+
+
+S2_LOOKUP_PROCESS = """
+import socket
+import sys
+
+import requests.adapters
+
+base, dois = sys.argv[1], sys.argv[2:]
+real_getaddrinfo = socket.getaddrinfo
+
+
+def loopback_only(host, *args, **kwargs):
+    if host not in ("127.0.0.1", "localhost"):
+        raise OSError(f"this test process may not reach {host}")
+    return real_getaddrinfo(host, *args, **kwargs)
+
+
+socket.getaddrinfo = loopback_only
+real_send = requests.adapters.HTTPAdapter.send
+
+
+def send(adapter, request, **kwargs):
+    request.url = request.url.replace(
+        "https://api.semanticscholar.org", base
+    )
+    return real_send(adapter, request, **kwargs)
+
+
+requests.adapters.HTTPAdapter.send = send
+
+from scholar.providers import SemanticScholarProvider
+
+provider = SemanticScholarProvider()
+print("ready", flush=True)
+sys.stdin.readline()
+for doi in dois:
+    provider.get_paper_by_doi(doi)
+"""
+
+
+class TestS2OneRequestPerSecond:
+  """Semantic Scholar never gets two requests within 1/rate seconds."""
+
+  def test_keyed_rate_has_a_margin(self):
+    provider = SemanticScholarProvider(api_key="test-key")
+    assert provider._limiter.limits.per_second == 0.9
+
+  def test_the_session_never_resends(self):
+    provider = SemanticScholarProvider()
+    adapter = provider._session.get_adapter(provider.API_URL)
+    assert adapter.max_retries.total == 0
+
+  def test_retries_pass_the_limiter_at_the_real_rate(
+    self, s2_loopback, monkeypatch
+  ):
+    """A 500, a dropped connection and a bare 429 are each retried,
+    no sooner than the keyed rate allows."""
+    monkeypatch.setattr(ratelimit, "_sleep", time.sleep)
+    monkeypatch.setattr(SemanticScholarProvider, "RETRY_BACKOFF", 0.0)
+    s2_loopback.plan.extend([500, "drop", 429])
+    provider = SemanticScholarProvider(api_key="test-key")
+
+    assert provider.get_paper_by_doi("10.1/retried") is not None
+    assert len(s2_loopback.arrivals) == 4
+    assert min(s2_loopback.gaps()) >= 1.0
+    assert provider._limiter.status().day_count == 4
+
+  def test_retry_after_is_waited_out(self, s2_loopback, monkeypatch):
+    monkeypatch.setattr(ratelimit, "_sleep", time.sleep)
+    monkeypatch.setattr(SemanticScholarProvider, "RETRY_BACKOFF", 0.0)
+    monkeypatch.setattr(
+      SemanticScholarProvider, "KEYED_LIMITS",
+      ratelimit.Limits(per_second=10.0),
+    )
+    s2_loopback.plan.append((429, {"Retry-After": "1"}))
+    provider = SemanticScholarProvider(api_key="test-key")
+
+    assert provider.get_paper_by_doi("10.1/patient") is not None
+    assert len(s2_loopback.arrivals) == 2
+    assert s2_loopback.gaps()[0] >= 1.0
+
+  @pytest.mark.parametrize("lookup", [
+    "get_paper_by_doi", "get_paper_citations", "get_paper_references",
+  ])
+  def test_spent_retries_pause_every_path(self, s2_loopback, lookup):
+    """After the last retry the next request does not go out."""
+    s2_loopback.plan.extend([429] * 10)
+    provider = SemanticScholarProvider(api_key="test-key")
+
+    getattr(provider, lookup)("10.1/first")
+    assert len(s2_loopback.arrivals) == provider.MAX_RETRIES + 1
+    getattr(provider, lookup)("10.1/second")
+    assert len(s2_loopback.arrivals) == provider.MAX_RETRIES + 1
+    assert not provider._limiter.check_available().ok
+
+  def test_threads_take_turns(self, s2_loopback, monkeypatch):
+    """Enrichment lookups and a PDF lookup in two threads."""
+    import threading
+
+    from scholar import pdf
+
+    monkeypatch.setattr(ratelimit, "_sleep", time.sleep)
+    monkeypatch.setattr(
+      SemanticScholarProvider, "KEYED_LIMITS",
+      ratelimit.Limits(per_second=5.0),
+    )
+    provider = SemanticScholarProvider(api_key="test-key")
+
+    def enrich():
+      for n in range(3):
+        provider.get_paper_by_doi(f"10.1/enrich-{n}")
+
+    def find_pdfs():
+      for n in range(2):
+        pdf.resolve_doi_s2(f"10.1/pdf-{n}")
+
+    threads = [threading.Thread(target=enrich),
+               threading.Thread(target=find_pdfs)]
+    for thread in threads:
+      thread.start()
+    for thread in threads:
+      thread.join(30)
+
+    assert len(s2_loopback.arrivals) == 5
+    assert min(s2_loopback.gaps()) >= 0.15
+    assert provider._limiter.status().day_count == 5
+
+  def test_processes_take_turns(self, s2_loopback, tmp_path):
+    """Two scholar processes sharing one data directory."""
+    import os
+    import subprocess
+    import sys
+
+    processes = []
+    for n in range(2):
+      env = dict(
+        os.environ, S2_API_KEY="test-key",
+        SCHOLAR_CACHE_DIR=str(tmp_path / f"cache-{n}"),
+      )
+      dois = [f"10.1/process-{n}-{i}" for i in range(3)]
+      processes.append(subprocess.Popen(
+        [sys.executable, "-c", S2_LOOKUP_PROCESS, s2_loopback.base,
+         *dois],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, text=True, env=env,
+      ))
+    for process in processes:
+      assert process.stdout.readline().strip() == "ready"
+    for process in processes:
+      process.stdin.write("go\n")
+      process.stdin.flush()
+    for process in processes:
+      _, errors = process.communicate(timeout=60)
+      assert process.returncode == 0, errors
+
+    assert len(s2_loopback.arrivals) == 6
+    assert min(s2_loopback.gaps()) >= 1.0
 @
 
 \subsubsection{Health check}
@@ -1524,9 +1948,9 @@ def _request(self, url: str, params: dict) -> requests.Response:
 The health probe must bypass both resilience layers above.  [[_request]]'s
 stale-key fallback silently drops a rejected key and retries
 anonymously---exactly the condition the health check exists to surface---and
-[[_session]]'s [[Retry]] turns a 429 into a [[RetryError]] after
-[[MAX_RETRIES]] delayed attempts, which would misreport plain rate limiting
-as a network error.  So the
+[[_send]] retries a 429 up to [[MAX_RETRIES]] times and then pauses
+the provider, which would turn a one-request probe into four requests
+and a cooldown.  So the
 probe issues one raw [[requests.get]] with the configured key attached and
 lets [[classify_check_response]] read the raw status code
 (\cref{sec:provider-health}).
@@ -1676,20 +2100,6 @@ def _search_uncached(
 
         logger.debug(f"semantic_scholar: Retrieved {len(all_papers)} papers")
         return all_papers, True
-    except requests.exceptions.RetryError:
-        logger.warning(
-            "s2: Rate limited (429) after %d retries. "
-            "Get a free API key at "
-            "https://www.semanticscholar.org/product/api#api-key-form "
-            "and set S2_API_KEY environment variable.",
-            self.MAX_RETRIES,
-        )
-        # The session's own retries are exhausted, so this is genuine
-        # saturation: remember it across invocations (cf. DBLP).
-        self._limiter.record_limit_hit(
-            reason="rate limited (HTTP 429) after retries"
-        )
-        return all_papers, False
     except RateLimited:
         # The limiter already logged the reason once
         return all_papers, False
@@ -2029,7 +2439,9 @@ def _fetch_related_pages(
 Let's verify that a failed fetch leaves nothing in the cache, so the next
 call asks again, while a complete answer and a 404 are cached.
 Each case makes two calls with the same arguments and counts the
-requests that reach the session.
+requests that reach the session; a 429 or a 500 is retried
+(\cref{sec:s2-retrying}), so each such call makes [[MAX_RETRIES]]${}+1$
+requests.
 A 429 also puts Semantic Scholar on cooldown, which would keep the
 second call from asking for a reason of its own; the test lifts the
 cooldown between the calls, so that only the cache decides.
@@ -2064,7 +2476,9 @@ def test_s2_related_papers_cache_only_complete_answers(first, cached):
         provider.get_paper_citations("10.1/related", limit=5)
         ratelimit.reset_state(provider._limiter.name)
         provider.get_paper_citations("10.1/related", limit=5)
-    assert get.call_count == (1 if cached else 2)
+    attempts = (provider.MAX_RETRIES + 1
+                if first.status_code in provider.RETRY_STATUSES else 1)
+    assert get.call_count == attempts * (1 if cached else 2)
     assert (("citations", "DOI:10.1/related", 5) in provider._cache) == cached
 @
 
@@ -2131,7 +2545,6 @@ register_provider(SemanticScholarProvider())
 import time
 
 import requests
-from urllib3.util.retry import Retry
 @
 
 \subsection{Testing Semantic Scholar provider}
@@ -2228,28 +2641,23 @@ class TestSemanticScholarProvider:
         """The give-up warning names the status code and the retry count.
 
         "Rate limited after retries" left the reader guessing which limit
-        was hit and how hard we tried; both now come from MAX_RETRIES and
-        the documented status, so the message cannot drift from the
-        session's actual Retry configuration.
+        was hit and how hard we tried; both come from the response and
+        MAX_RETRIES, which also bounds the loop, so the message cannot
+        drift from what was actually done.
         """
         provider = SemanticScholarProvider()
+        throttled = Mock(status_code=429, headers={})
 
         with patch.object(
-            provider._session, "get",
-            side_effect=requests.exceptions.RetryError("too many 429s"),
-        ):
+            provider._session, "get", return_value=throttled,
+        ) as get:
             with caplog.at_level(logging.WARNING, logger="scholar.providers"):
                 assert provider.search("test") == []
 
+        assert get.call_count == provider.MAX_RETRIES + 1
         message = "\n".join(r.message for r in caplog.records)
-        assert "(429)" in message
+        assert "(HTTP 429)" in message
         assert f"after {provider.MAX_RETRIES} retries" in message
-
-    def test_retry_count_matches_session_configuration(self):
-        """MAX_RETRIES is what the session is actually configured with."""
-        provider = SemanticScholarProvider()
-        adapter = provider._session.get_adapter("https://api.example.com")
-        assert adapter.max_retries.total == provider.MAX_RETRIES
 
     def test_search_caches_successful_results(self):
         """A successful search is cached; the second call skips the API."""
@@ -2287,6 +2695,7 @@ class TestSemanticScholarProvider:
 
         throttled = Mock()
         throttled.status_code = 429
+        attempts = provider.MAX_RETRIES + 1
 
         recovered = Mock()
         recovered.status_code = 200
@@ -2296,7 +2705,8 @@ class TestSemanticScholarProvider:
         }
 
         with patch.object(
-            provider._session, "get", side_effect=[throttled, recovered]
+            provider._session, "get",
+            side_effect=[throttled] * attempts + [recovered],
         ) as mock_get:
             first = provider.search("test")
             assert first == []
@@ -2308,13 +2718,9 @@ class TestSemanticScholarProvider:
             second = provider.search("test")
             assert len(second) == 1
             assert second[0].title == "Recovered Paper"
-            assert mock_get.call_count == 2  # not served from cache
+            # not served from cache
+            assert mock_get.call_count == attempts + 1
             assert provider.last_error is None
-
-    def test_rate_limiting_with_api_key(self):
-        """A key declares one request per second to the limiter."""
-        provider = SemanticScholarProvider(api_key="test-key")
-        assert provider._limiter.limits.per_second == 1.0
 
     def test_rate_limiting_without_api_key(self):
         """Anonymous access is paced 3 s apart (a rate of 1/3)."""
