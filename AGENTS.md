@@ -541,6 +541,32 @@ content gaps via `merge_version_of` (never version-specific fields like
 `pdf_url`) and recording `Paper.preprint_versions`
 (`{"doi", "pdf_url"}`) for tier 0. Ambiguous groups are left untouched.
 
+**DOI-less copies and namesakes** (#170, `scholar.nw`
+`sec:same-work-guard`/`sec:doi-less-copies`, `review.nw`
+`sec:session-copies`): `plausibly_same_work` (moved from the sessions
+check; DOIs differ and are not version-linked, or years > 1 apart →
+not the same work) guards every title-based match. `deduplicate_papers`
+merges two hash-id copies only when it admits them (a DOI merges
+whatever the years), then `link_doi_less_copies` folds a DOI-less copy
+into the one published DOI copy whose `legacy_hash_paper_id` equals its
+id (`doi_copy_index`/`doi_copy_of`; preprints and ambiguous choices are
+left alone). In sessions, `fold_doi_less_copies` runs at the end of
+`create_review_session`: a pending, untagged copy (or an equal
+decision) folds into the other, taking the DOI paper, uniting
+`found_by`/providers and moving the note with `migrate_paper_id` (not
+if both ids have notes; an equal decided fold counts in
+`session._folded`, which `warn_if_decisions_dropped` allows for until
+the save). Copies decided differently stay and are listed
+by `conflicting_copies` in `sessions show` (text + JSON) and counted in
+the report, which also states "Unique works" from the audit rows.
+**Known limitation**: a DOI-less id is a hash of title + surname, so two
+works years apart share it, and decisions, notes and the registry
+cannot separate them without changing the id scheme. A session keeps
+the stored paper unmerged and notes the newcomer in
+`ReviewDecision.same_id_copies` (`{"year", "venue", "provider"}`,
+saved only when non-empty, unioned by the concurrent merge), which
+`sessions show` lists as a conflicting copy naming both years.
+
 ### Headless Review Sessions
 
 `scholar search -n <name>` persists the search to the named review session
