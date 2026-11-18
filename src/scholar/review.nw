@@ -1517,6 +1517,200 @@ class TestMergedRecords:
         assert search_outcome_label(record) == "failed (HTTP 503)"
 @
 
+\label{sec:superseded-merged}
+A merged record cannot be split, but it can be superseded.  When the
+user re-runs its query with the current code, the new run records one
+search per provider, and those records stood beside the old merged one
+(a copy of a real session went from 4 to 6 records for one re-run):
+the caption's \enquote{for k of n queries} and the report then counted
+that query twice for each of its providers.  Once there is a record of
+the same query and filters for \emph{every} provider the merged record
+names ([[merged_record_cover]]), the merged record says nothing those
+records do not, except a count that could never be attributed, so it is
+dropped ([[supersede_merged_records]]).  A merged record that only some
+providers have re-run stays: dropping it would lose the only record of
+the others.
+
+The papers linked to the merged record keep a link to the search, now
+per provider.  A paper that the new run returned already has links to
+the records of the providers that returned it ([[found_in]],
+\cref{sec:review-found-by}), which is more precise than the old link,
+so the old link is simply dropped.  A paper that the new run did not
+return is linked to the records of all the merged providers, which is
+what the old link said: one of them returned it.
+
+The positions of the query parts and the providers correspond, since
+the merge joined both in the same order ([[q1 | q2]] with
+[[openalex, dblp]]); a query whose parts are all equal, the usual case,
+covers every provider.  The rule runs wherever records come together:
+at the end of [[create_review_session]], and at the end of a save's
+merge with the file (\cref{sec:session-integrity}), since another
+process may have re-run the query, or may still hold the merged record
+this process dropped.
+
+<<review session functions>>=
+def merged_record_cover(
+    record: SearchRecord, records: list[SearchRecord]
+) -> list[SearchRecord] | None:
+    """The per-provider records that supersede a merged `record`, or None.
+
+    One record of the same query and filters is needed for each
+    provider the merged record names; None if any is missing.
+    """
+    if not record.is_merged:
+        return None
+    providers = record.merged_providers
+    queries = record.query.split(" | ")
+    if len(queries) != len(providers):
+        if len(set(queries)) != 1:
+            return None
+        queries = queries[:1] * len(providers)
+    key = filters_key(record.filters)
+    cover = []
+    for provider, query in zip(providers, queries):
+        match = next((
+            r for r in records
+            if not r.is_merged and r.provider == provider
+            and r.query == query and filters_key(r.filters) == key
+        ), None)
+        if match is None:
+            return None
+        cover.append(match)
+    return cover
+
+
+def supersede_merged_records(session: "ReviewSession") -> None:
+    """Drop each merged record that per-provider records fully cover.
+
+    Links to it are dropped where the paper links to a covering record
+    already, and otherwise replaced by links to all covering records.
+    """
+    for record in list(session.search_records):
+        cover = merged_record_cover(record, session.search_records)
+        if cover is None:
+            continue
+        session.search_records.remove(record)
+        cover_keys = [r.key for r in cover]
+        for decision in session.decisions:
+            old = [
+                link for link in decision.found_by
+                if link[:2] == (record.query, record.provider)
+                and link[2] in (None, record.key[2])
+            ]
+            if not old:
+                continue
+            links = [link for link in decision.found_by if link not in old]
+            if not any(link in cover_keys for link in links):
+                links += cover_keys
+            decision.found_by = without_superseded_links(
+                list(dict.fromkeys(links))
+            )
+@
+
+Let's verify the three cases with sessions written as old files are:
+a re-run on every provider replaces the merged record and repoints its
+links (a paper the re-run returned to its own provider, a paper it did
+not return to both); a re-run on one of the two providers leaves the
+merged record; and a save that meets the merged record in the file
+drops it again.
+
+<<test functions>>=
+class TestSupersededMergedRecords:
+    """Per-provider re-runs supersede an old merged record."""
+
+    @staticmethod
+    def _old_session(name):
+        import json
+        from scholar.review import _get_sessions_dir
+        merged_link = {"query": "q | q", "provider": "openalex, dblp",
+                       "filters": ""}
+
+        def decision(doi):
+            return {
+                "paper_id": f"doi:{doi}", "provider": "openalex, dblp",
+                "status": "kept", "tags": [], "source": "human",
+                "found_by": [merged_link],
+                "paper": {"title": doi, "authors": ["A"], "doi": doi,
+                          "sources": ["openalex"]},
+            }
+
+        path = _get_sessions_dir() / f"{name}.json"
+        path.write_text(json.dumps({
+            "query": "q", "name": name, "providers": ["openalex, dblp"],
+            "timestamp": datetime.now().isoformat(),
+            "search_records": [{
+                "query": "q | q", "provider": "openalex, dblp",
+                "filters": None, "limit": 100, "hits": 2, "error": None,
+                "retries": 0,
+            }],
+            "decisions": [decision("10.1/sm-again"), decision("10.1/sm-old")],
+        }))
+        return path
+
+    @staticmethod
+    def _result(provider, dois):
+        from scholar.scholar import SearchResult
+        return SearchResult(
+            query="q", provider=provider, timestamp="t", limit=100,
+            papers=[Paper(title=d, authors=["A"], doi=d) for d in dois],
+        )
+
+    def test_full_cover_replaces_and_repoints(self):
+        self._old_session("sm-full")
+        merged = self._result("openalex", ["10.1/sm-again"]).merge(
+            self._result("dblp", [])
+        )
+        created = create_review_session([merged], "q",
+                                        session_name="sm-full")
+        assert [r.provider for r in created.search_records] == [
+            "openalex", "dblp",
+        ]
+        save_session(created)
+        session = load_session("sm-full")
+        assert [r.provider for r in session.search_records] == [
+            "openalex", "dblp",
+        ]
+        links = {d.paper.doi: d.found_by for d in session.decisions}
+        assert links["10.1/sm-again"] == [("q", "openalex", "")]
+        assert links["10.1/sm-old"] == [
+            ("q", "openalex", ""), ("q", "dblp", ""),
+        ]
+
+    def test_partial_cover_keeps_the_merged_record(self):
+        self._old_session("sm-part")
+        save_session(create_review_session(
+            [self._result("openalex", ["10.1/sm-again"])], "q",
+            session_name="sm-part",
+        ))
+        session = load_session("sm-part")
+        assert sorted(r.provider for r in session.search_records) == [
+            "openalex", "openalex, dblp",
+        ]
+        old = next(d for d in session.decisions
+                   if d.paper.doi == "10.1/sm-old")
+        assert old.found_by == [("q | q", "openalex, dblp", "")]
+
+    def test_a_save_drops_it_from_the_file_too(self):
+        self._old_session("sm-save")
+        stale = load_session("sm-save")
+        merged = self._result("openalex", ["10.1/sm-again"]).merge(
+            self._result("dblp", [])
+        )
+        save_session(create_review_session([merged], "q",
+                                           session_name="sm-save"))
+        stale.decisions[0].status = DecisionStatus.DISCARDED
+        stale.decisions[0].tags = ["off-topic"]
+        save_session(stale)
+        session = load_session("sm-save")
+        assert [r.provider for r in session.search_records] == [
+            "openalex", "dblp",
+        ]
+        assert all(
+            link[1] != "openalex, dblp"
+            for d in session.decisions for link in d.found_by
+        )
+@
+
 
 \subsection{Review Session}
 
@@ -2459,6 +2653,7 @@ def create_review_session(
     # Convert search results to review decisions, merging with previous
     <<convert search results to decisions>>
     <<point links at the records that replaced theirs>>
+    supersede_merged_records(session)
     
     logger.info("Created session with %d papers (%d kept, %d discarded, %d pending)",
                len(session.decisions), len(session.kept_papers()),
@@ -3713,7 +3908,10 @@ The case of \url{https://github.com/dbosk/scholar/issues/164}: the
 default search merges OpenAlex, which answered, with DBLP, which
 failed.  The session must hold two records with their own outcomes, the
 paper only OpenAlex returned must link to OpenAlex alone, and a merged
-record already in the session from before must load and stay as it was.
+record already in the session from before, of providers this run does
+not all cover, must load and stay as it was (one that the run covers is
+superseded, \cref{sec:superseded-merged}; this test used OpenAlex and
+DBLP before that rule existed).
 The merge is the real [[SearchResult.merge]] that the search command
 runs.
 
@@ -3763,15 +3961,18 @@ class TestRecordsPerProvider:
         )
 
     def test_old_merged_record_loads_unchanged(self):
+        # A merged record of providers this run does not all cover
+        # (scopus was not re-run), so it is not superseded
+        # (sec:superseded-merged) and must stay as it was.
         import json
         from scholar.review import _get_sessions_dir
-        old = {"query": "q | q", "provider": "openalex, dblp",
+        old = {"query": "q | q", "provider": "openalex, scopus",
                "filters": None, "limit": 100, "hits": 25,
-               "error": "dblp: non-JSON response", "retries": 0}
+               "error": "scopus: HTTP 500", "retries": 0}
         path = _get_sessions_dir() / "merged-old.json"
         path.write_text(json.dumps({
             "query": "q", "name": "merged-old",
-            "providers": ["openalex, dblp"],
+            "providers": ["openalex, scopus"],
             "timestamp": datetime.now().isoformat(),
             "search_records": [old], "decisions": [],
         }))
@@ -3781,7 +3982,7 @@ class TestRecordsPerProvider:
         save_session(session)
         records = json.loads(path.read_text())["search_records"]
         assert [r["provider"] for r in records] == [
-            "openalex", "dblp", "openalex, dblp",
+            "openalex", "dblp", "openalex, scopus",
         ]
         merged = records[2]
         assert {k: merged[k] for k in old} == old
@@ -4527,6 +4728,7 @@ def merge_concurrent_changes(
         if snowball_round.timestamp not in own_rounds:
             session.snowball_rounds.append(snowball_round)
     <<merge the LLM review samples from disk>>
+    supersede_merged_records(session)
 
     session._invalidate_cache()
 @
