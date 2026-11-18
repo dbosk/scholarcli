@@ -391,7 +391,7 @@ identity of every outgoing request:
   for SOCKS) and exits 2 on a bad one, since a broken proxy would
   otherwise make every provider silently return nothing. Recommend
   `socks5h://` (DNS at the proxy).
-- **Identity**: `scholar/<version> (+https://github.com/dbosk/scholar)`,
+- **Identity**: `scholar/<version> (+https://github.com/dbosk/scholarcli)`,
   overridable by `SCHOLAR_USER_AGENT`. No email in it on purpose: the
   UA goes to every host (publishers included); OpenAlex/Crossref/
   Unpaywall get `SCHOLAR_EMAIL` via their own parameters. A
@@ -564,7 +564,19 @@ context (#107). `review.save_session` now:
 `scholar enrich` saves after every `ENRICH_SAVE_EVERY` (50) papers
 (`cli.nw`, `sec:enrich-chunks`): enrich → Crossref check → assign →
 `migrate_paper_id` for adoptions → `save_session`, per chunk. After such
-a run `.bak` holds only the state before the last chunk. Ctrl-C (and
+a run `.bak` holds only the state before the last chunk, so before the
+first chunk (only when there is something to enrich and the file
+exists) `review.keep_copy_before_run` copies the saved file to
+`<name>.json.pre-enrich-<UTC YYYYMMDDTHHMMSSZ>.bak` (atomic, under the
+session lock). Each run adds a copy and the newest
+`RUN_COPIES_KEPT` (3) are kept, so continuing an interrupted run does
+not overwrite the original; `review._utcnow` is the test seam for the
+time. The end-of-run and interrupt messages print the new path. The copy
+covers the session file only: preprint adoption also rewrites the notes
+and decision stores (`migrate_paper_id`), which a restore does not undo
+(the report says so when a run adopted one). The name does not end in
+`.json`, so the `*.json` globs of `list_sessions` and
+`sessions_mentioning` skip it (tested). Ctrl-C (and
 SIGTERM, turned into `KeyboardInterrupt` while the loop runs, so the
 atexit cache save still happens) prints `Interrupted: saved K of N
 papers; run again to continue` and exits 130.
