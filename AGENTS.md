@@ -802,9 +802,26 @@ requests/day and each `scholar` run is a fresh process.
   comes from OpenAlex: the health probe's
   `X-RateLimit-Remaining`/`X-RateLimit-Reset` headers are synced via
   `record_response`, a keyed probe also reads `/rate-limit` for the
-  detail column, and a search 429 with `X-RateLimit-Remaining-USD: 0`
-  becomes a quota block until `X-RateLimit-Reset` (`_note_http_error`),
-  logged with the reset time and a key hint.
+  detail column, and a search 429 that spends the budget becomes a
+  quota block until `X-RateLimit-Reset` (`_note_http_error`), logged
+  with the reset time and a key hint.
+- OpenAlex prepaid credit (#138) is drawn after the daily allowance,
+  and `X-RateLimit-Remaining(-USD)` count the allowance only (recorded
+  2026-11-18); prepaid/one-time credit come as
+  `X-RateLimit-Prepaid-Remaining-USD`/`X-RateLimit-Onetime-Remaining`.
+  So: the detail column adds `+ $5.00 prepaid (expires …) + N one-time
+  credits` when positive; a 429 is "spent" iff its body `reason` is
+  `daily_budget` (documented: daily and prepaid spent), else iff
+  `-Remaining-USD` ≤ 0 with no prepaid/one-time credit (headers read
+  via `ratelimit._get_header`, either case);
+  `OpenAlexProvider._record_response` drops `X-RateLimit-Remaining`
+  before the limiter sync while such credit is reported, and for a 429
+  whose `reason` is not `daily_budget`, so neither a spent day nor a
+  per-second 429 blocks the quota group. Consequence: while prepaid
+  credit is reported, `providers limits` gets no fresh remaining
+  count (an earlier one until the reset, then none). A zero stored
+  before the purchase stays until the reset
+  (`providers limits --reset openalex`).
 - Pacing is the limiter's job: S2 (`LIMITS` anonymous 1/3 per second,
   `KEYED_LIMITS` 1.0; `_acquire()` re-declares per request because a
   rejected key changes the rate), OpenAlex and arXiv (a
