@@ -76,6 +76,7 @@ Scholar package for structured literature searches.
 from .scholar import Search, SearchResult, Paper, SearchFilters
 from .scholar import search, filter_papers, filters_key, deduplicate_papers
 from .scholar import deduplicate_versions, merge_version_of
+from .scholar import link_doi_less_copies, plausibly_same_work
 from .scholar import get_registry, isolated_registry
 from .scholar import hits_label, provider_outcome, result_outcome
 from .scholar import applied_filters, without_search_in, filter_flags
@@ -106,6 +107,8 @@ __all__ = [
     "deduplicate_papers",
     "deduplicate_versions",
     "merge_version_of",
+    "link_doi_less_copies",
+    "plausibly_same_work",
     "get_registry",
     "isolated_registry",
     "safe_get_nested",
@@ -2756,9 +2759,32 @@ wholesale-preferred author list survives while the per-field union still fills
 any gaps from the other copy.
 This is what makes deduplication keep \enquote{the one with the most
 metadata} regardless of the order papers arrive in.
-A second pass, [[deduplicate_versions]] (\cref{sec:version-dedup}),
-then collapses published/preprint pairs of the same work, which share
-a title and authors but never an identity.
+Two further passes then join records that are one work under two
+identities: [[link_doi_less_copies]] (\cref{sec:doi-less-copies}) folds
+a record without a DOI into the record of the same work that has one,
+and [[deduplicate_versions]] (\cref{sec:version-dedup}) collapses
+published/preprint pairs of the same work, which share a title and
+authors but never an identity.
+
+An identity without a DOI is weaker than it looks. It is a hash of the
+title and the first author's surname, so two different works with the
+same title by authors of the same surname---an editorial series, a
+column, a talk given twice---share it, whatever their years. Merging
+them made one record of two works, with the year of whichever came
+first (issue~\#170). Two copies with a hash identity are therefore
+merged only when [[plausibly_same_work]] (\cref{sec:same-work-guard})
+lets them: their years are at most one apart, or one of them has no
+year. A DOI identity needs no such guard: the DOI is the work, and two
+providers' years for one DOI may well differ by more (OpenAlex's
+registration year against the issue year). Copies the guard keeps apart
+stay two entries in the list, both under the same [[Paper.id]]; what
+that means for a review session, which keys its decisions by the id, is
+discussed with the session (\cref{sec:session-copies}).
+
+Because one identity can now stand for several entries, the loop keeps
+a list of entry positions per identity instead of a dictionary from
+paper to paper; a copy joins the first entry of its identity that the
+guard admits.
 
 <<functions>>=
 def deduplicate_papers(papers: list[Paper]) -> list[Paper]:
@@ -2769,20 +2795,267 @@ def deduplicate_papers(papers: list[Paper]) -> list[Paper]:
     wholesale-preferred fields (authors, references, citations) survive,
     while other fields are unioned. Among copies with equal scores, the
     first-seen value of any conflicting field is kept, mirroring
-    ``Paper.merge_with``. A second pass collapses published/preprint
-    version pairs (see `deduplicate_versions`). The returned list
-    preserves first-seen order of unique papers.
+    ``Paper.merge_with``. Copies without a DOI merge only when their
+    years are at most one apart (see `plausibly_same_work`). Two more
+    passes fold a copy without a DOI into the copy with one (see
+    `link_doi_less_copies`) and collapse published/preprint version
+    pairs (see `deduplicate_versions`). The returned list preserves
+    first-seen order of unique papers.
     """
-    paper_map: dict[Paper, Paper] = {}
+    unique: list[Paper] = []
+    positions: dict[str, list[int]] = {}
     for paper in papers:
-        existing = paper_map.get(paper)
-        if existing is None:
-            paper_map[paper] = paper
-        elif paper.metadata_score > existing.metadata_score:
-            paper_map[paper] = paper.merge_with(existing)
+        slot = next(
+            (
+                i for i in positions.get(paper.id, [])
+                if paper.doi or plausibly_same_work(paper, unique[i])
+            ),
+            None,
+        )
+        if slot is None:
+            positions.setdefault(paper.id, []).append(len(unique))
+            unique.append(paper)
+            continue
+        existing = unique[slot]
+        if paper.metadata_score > existing.metadata_score:
+            unique[slot] = paper.merge_with(existing)
         else:
-            paper_map[paper] = existing.merge_with(paper)
-    return deduplicate_versions(list(paper_map.values()))
+            unique[slot] = existing.merge_with(paper)
+    return deduplicate_versions(link_doi_less_copies(unique))
+@
+
+Two copies of one title by one surname, four years apart, are two works;
+one year apart they are one, and so are copies of which one has no year;
+a DOI keeps its copies together whatever their years:
+
+<<test functions>>=
+class TestDeduplicateAcrossYears:
+  def test_doi_less_copies_years_apart_stay_two(self):
+    a = Paper(title="Editorial", authors=["J. Smith"], year=2018)
+    b = Paper(title="Editorial", authors=["J. Smith"], year=2022)
+    result = deduplicate_papers([a, b])
+    assert [p.year for p in result] == [2018, 2022]
+
+  def test_doi_less_copies_a_year_apart_merge(self):
+    a = Paper(title="A Work", authors=["Ada Lovelace"], year=2021,
+              sources=["dblp"])
+    b = Paper(title="A Work", authors=["Ada Lovelace"], year=2022,
+              abstract="Text.", sources=["hal"])
+    c = Paper(title="A Work", authors=["Ada Lovelace"], sources=["s2"])
+    result = deduplicate_papers([a, b, c])
+    assert len(result) == 1
+    assert result[0].abstract == "Text."
+    assert set(result[0].sources) == {"dblp", "hal", "s2"}
+
+  def test_a_doi_merges_whatever_the_years(self):
+    a = Paper(title="A Work", authors=["Ada Lovelace"], year=2018,
+              doi="10.1/x")
+    b = Paper(title="A Work", authors=["Ada Lovelace"], year=2022,
+              doi="10.1/X")
+    assert len(deduplicate_papers([a, b])) == 1
+
+  def test_a_third_copy_joins_the_entry_it_fits(self):
+    a = Paper(title="Editorial", authors=["J. Smith"], year=2018)
+    b = Paper(title="Editorial", authors=["J. Smith"], year=2022)
+    c = Paper(title="Editorial", authors=["J. Smith"], year=2023,
+              venue="CACM")
+    result = deduplicate_papers([a, b, c])
+    assert len(result) == 2
+    assert (result[0].year, result[1].venue) == (2018, "CACM")
+@
+
+\subsubsection{When two records are not the same work}
+\label{sec:same-work-guard}
+
+Title and first author's surname is a weak key.  Short generic titles
+(\enquote{Editorial}, \enquote{Introduction}) by authors with common
+surnames collide.  So a title match is dropped when the two records say
+outright that they are different works:
+\begin{description}
+\item[Different DOIs] Both have a DOI, the DOIs differ, and no version
+  link of either paper names the other's DOI.  Two DOIs are two
+  registered works; a preprint and its published version are joined by
+  the link, and then they match by DOI anyway.
+\item[Years apart] Both have a year and the years are more than one
+  apart.  One year of slack covers an online-first article and its
+  issue, or a preprint posted in December.
+\end{description}
+The guard was written for [[scholar sessions check]], which looks the
+works a semantic search returns up in the review's sessions by title
+(\cref{sec:semantic-check} in the review module), and moved here when
+deduplication needed the same answer to the same question: one rule,
+so that the check and the deduplication cannot disagree about which
+records are one work.  A version link is a [[preprint_versions]] or
+[[published_versions]] entry (\cref{sec:version-dedup}), compared as a
+[[Paper.id]].
+
+<<constants>>=
+SAME_WORK_YEAR_SLACK = 1
+<<functions>>=
+def version_link_dois(paper: Paper) -> list[str]:
+    """The DOIs of the paper's recorded preprint or published versions.
+
+    Each is given as a `Paper.id` (`doi:` and the normalised DOI).
+    """
+    links = (paper.preprint_versions or []) + (paper.published_versions or [])
+    return [
+        f"doi:{Paper._normalize_doi(link['doi'])}"
+        for link in links if isinstance(link, dict) and link.get("doi")
+    ]
+
+
+def plausibly_same_work(found: Paper, held: Paper) -> bool:
+    """Whether a title match between `found` and `held` may stand.
+
+    False when both have DOIs that differ and neither links the other's,
+    or when both have years more than `SAME_WORK_YEAR_SLACK` apart.
+    """
+    if found.doi and held.doi:
+        found_doi = f"doi:{Paper._normalize_doi(found.doi)}"
+        held_doi = f"doi:{Paper._normalize_doi(held.doi)}"
+        if (found_doi != held_doi
+                and found_doi not in version_link_dois(held)
+                and held_doi not in version_link_dois(found)):
+            return False
+    try:
+        if abs(int(found.year) - int(held.year)) > SAME_WORK_YEAR_SLACK:
+            return False
+    except (TypeError, ValueError):
+        pass
+    return True
+@
+
+<<test functions>>=
+class TestPlausiblySameWork:
+  def test_years_and_dois(self):
+    def paper(year=None, doi=None, **kw):
+      return Paper(title="T", authors=["A"], year=year, doi=doi, **kw)
+
+    assert plausibly_same_work(paper(2020), paper(2021))
+    assert not plausibly_same_work(paper(2020), paper(2022))
+    assert plausibly_same_work(paper(2020), paper(None))
+    assert plausibly_same_work(paper(2020, "10.1/a"), paper(2020))
+    assert not plausibly_same_work(paper(doi="10.1/a"), paper(doi="10.1/b"))
+    linked = paper(doi="10.1/a",
+                   preprint_versions=[{"doi": "10.48550/X", "pdf_url": None}])
+    assert plausibly_same_work(linked, paper(doi="10.48550/x"))
+@
+
+\subsubsection{A copy without a DOI of a work with one}
+\label{sec:doi-less-copies}
+
+One provider often records a paper without its DOI that another
+records with it: DBLP and HAL hold many conference papers without one.
+The two copies have different identities---a DOI and a hash---so
+identity-based deduplication keeps them apart, and a review screened
+the same work twice, sometimes to two different decisions
+(issue~\#170). The hash of the DOI-less copy is exactly the identity
+the DOI copy would have without its DOI ([[legacy_hash_paper_id]],
+\cref{utils-module}), so that is the key that joins them, with the same
+guard as above: the years must be plausible.
+
+The fold is only made when it is unambiguous. When two DOI copies of
+different DOIs share the hash, it cannot be told which one the
+DOI-less record belongs to, and it is left alone. A published DOI-less
+record is not folded into a preprint's DOI either: it is the other
+version, not a copy. The fold fills the gaps of the DOI copy from the
+DOI-less one with [[merge_version_of]] (\cref{sec:version-merge}),
+which never overwrites and never copies a venue, URL or PDF link: the
+two copies may describe different printings, and a DOI-less record's
+PDF link is not known to be the DOI's. That is why a DOI-less record
+that looks like a preprint (by its venue) is never folded, not even
+into a preprint's DOI copy: its PDF link is usually what it is kept
+for, and the fold would drop it. Next to a published copy it is left to
+the version pass, which records the link (\cref{sec:version-dedup});
+next to a DOI copy of the preprint it stays a record of its own.
+
+<<functions>>=
+def link_doi_less_copies(papers: list[Paper]) -> list[Paper]:
+    """Fold each copy without a DOI into the copy of the work with one.
+
+    A DOI-less paper joins the DOI paper whose title and first author
+    hash to the DOI-less paper's identity, when exactly one such paper
+    is a plausible match (`plausibly_same_work`) of the same kind
+    (published or preprint). The DOI paper gains the DOI-less copy's
+    missing content and sources; nothing is overwritten. Order is
+    preserved.
+    """
+    def is_preprint(paper: Paper) -> bool:
+        return is_preprint_paper(paper.doi, paper.venue)
+
+    with_doi: dict[str, list[int]] = {}
+    for i, paper in enumerate(papers):
+        if paper.doi:
+            key = legacy_hash_paper_id(paper.title, paper.authors)
+            with_doi.setdefault(key, []).append(i)
+
+    result = list(papers)
+    folded: set[int] = set()
+    for i, paper in enumerate(papers):
+        if paper.doi or not (paper.title or "").strip():
+            continue
+        targets = [
+            j for j in with_doi.get(paper.id, [])
+            if plausibly_same_work(paper, papers[j])
+            and is_preprint(paper) == is_preprint(papers[j])
+        ]
+        if len(targets) == 1 and not is_preprint(paper):
+            result[targets[0]] = merge_version_of(result[targets[0]], paper)
+            folded.add(i)
+    return [p for i, p in enumerate(result) if i not in folded]
+@
+
+The DOI-less DBLP copy folds into the OpenAlex one; a copy four years
+apart, a choice between two DOIs, a DOI-less preprint and a published
+record next to a preprint's DOI do not:
+
+<<test functions>>=
+class TestLinkDoiLessCopies:
+  def _doi(self, **kw):
+    return Paper(title="A Work", authors=["Ada Lovelace"], year=2021,
+                 doi="10.1145/1", sources=["openalex"], **kw)
+
+  def test_a_copy_without_doi_folds_into_the_doi_copy(self):
+    bare = Paper(title="A Work", authors=["Ada Lovelace"], year=2020,
+                 abstract="Text.", venue="CCS", sources=["dblp"])
+    result = deduplicate_papers([bare, self._doi()])
+    assert len(result) == 1
+    assert result[0].doi == "10.1145/1"
+    assert result[0].abstract == "Text."
+    assert result[0].venue is None
+    assert result[0].sources == ["openalex", "dblp"]
+
+  def test_years_apart_or_two_dois_stay_apart(self):
+    far = Paper(title="A Work", authors=["Ada Lovelace"], year=2016)
+    assert len(link_doi_less_copies([far, self._doi()])) == 2
+    other = Paper(title="A Work", authors=["Ada Lovelace"], year=2021,
+                  doi="10.1145/2")
+    bare = Paper(title="A Work", authors=["Ada Lovelace"], year=2021)
+    assert len(link_doi_less_copies([bare, self._doi(), other])) == 3
+
+  def test_a_doi_less_preprint_is_left_to_the_version_pass(self):
+    pre = Paper(title="A Work", authors=["Ada Lovelace"], year=2021,
+                venue="arXiv", pdf_url="https://arxiv.org/pdf/1")
+    assert len(link_doi_less_copies([pre, self._doi()])) == 2
+    result = deduplicate_papers([pre, self._doi()])
+    assert len(result) == 1
+    assert result[0].preprint_versions \
+      == [{"doi": None, "pdf_url": "https://arxiv.org/pdf/1"}]
+    arxiv = Paper(title="A Work", authors=["Ada Lovelace"], year=2021,
+                  doi="10.48550/arXiv.2101.1", venue="arXiv")
+    assert len(link_doi_less_copies([pre, arxiv])) == 2
+
+  def test_a_published_record_is_not_folded_into_a_preprint(self):
+    bare = Paper(title="A Work", authors=["Ada Lovelace"], year=2021,
+                 venue="CCS")
+    arxiv = Paper(title="A Work", authors=["Ada Lovelace"], year=2021,
+                  doi="10.48550/arXiv.2101.1", venue="arXiv")
+    assert len(link_doi_less_copies([bare, arxiv])) == 2
+
+  def test_an_untitled_record_is_never_folded(self):
+    a = Paper(title="", authors=["Ada Lovelace"])
+    b = Paper(title="", authors=["Ada Lovelace"], doi="10.1/u")
+    assert len(link_doi_less_copies([a, b])) == 2
 @
 
 \subsubsection{Merging alternate versions of a work}
