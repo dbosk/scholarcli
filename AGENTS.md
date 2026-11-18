@@ -895,8 +895,12 @@ needs a key sets it explicitly. It also resets `pyalex.config.email`
 and (except for live tests) `pyalex.config.api_key`, which the OpenAlex
 providers built at import (during collection) had set from the
 developer's environment (#160; pyalex is imported inside the fixture).
-Registered providers still keep their own `api_key` attributes from
-import time. The autouse `block_network` fixture
+For non-live tests it also sets the registered providers' key
+attributes (`PROVIDER_KEY_ATTRIBUTES`: `api_key`, `inst_token`, WoS's
+`_api_key`/`_starter_key`/`_expanded_key` and the derived
+`_api_tier`/`_api_url`) to None, restored afterwards (#174);
+`test_keys_read_at_import_are_cleared_in_tests` checks it in a
+subprocess with dummy keys in the environment. The autouse `block_network` fixture
 refuses DNS and connections to anything but loopback and **fails the
 test** naming the hosts (providers swallow errors, so a refusal alone
 would go unnoticed). Both exempt `@pytest.mark.integration` tests, which
