@@ -832,7 +832,9 @@ saved only when non-empty, unioned by the concurrent merge), which
 `scholar search -n <name>` persists the search to the named review session
 even without `--review`: it creates or appends (same
 `create_review_session()` merge the TUI uses — search records accumulate,
-prior decisions are preserved, new papers land pending). A paper the
+prior decisions are preserved, new papers land pending). It appends to
+`<name>.json` only, and `search q --review` without `-n` to the hash
+file of `q` only (#213, see Session Integrity). A paper the
 re-run returns again keeps its stored paper, gaps filled from the new
 copy (`stored_paper_with` → `Paper.merge_with`, stored values win,
 sources united; a DOI-less stored paper met by a DOI copy, found under
@@ -987,9 +989,26 @@ context (#107). `review.save_session` now:
   only sessions constructed in code have no baseline. Whenever the
   session does not continue a loaded file, the built baseline's
   `record_keys` are empty: nothing was loaded from the target, so the
-  legacy-record rule must not drop one of our legacy records. Known gap (#213): a
-  renamed id leaves the target the work twice (old id: its own
-  decision; new id: the loaded file's), reported by no copy list.
+  legacy-record rule must not drop one of our legacy records.
+- **an append loads only its own file** (#213):
+  `create_review_session` loads `load_own_session(name, query)`, the
+  file `own_session_file_name` gives (`<name>.json`, unnamed: the
+  query's hash), never `load_session`'s other guess (`search foo
+  --review` used to load named session foo's `foo.json`, whatever its
+  query, and copy its decisions into the hash file of query foo; `-n
+  foo` without `foo.json` the unnamed foo session's). When that other
+  file exists, one line names it and how to continue it (`pass -n
+  'foo'` / `search 'foo' without -n`): WARNING when the own file does
+  not exist (a new session starts where the old lookup continued the
+  other), INFO otherwise. A `<query>.json` too long for a file name
+  reads as absent (the old lookup raised `OSError`). So no append
+  saves into another file than it loaded; the #207 other-file
+  baseline now serves only an own file holding another identity (a
+  hand copy), where a renamed id still comes back beside the new one.
+  `load_session` keeps its tolerant lookup (name, then query hash) for
+  the user-facing commands (`sessions show/export/decide/...`, `llm`,
+  `enrich`, `verify`); `search -n`/`--review`, `rq` and the TUI all go
+  through `create_review_session`.
 
 `scholar enrich` saves after every `ENRICH_SAVE_EVERY` (50) papers
 (`cli.nw`, `sec:enrich-chunks`): enrich → Crossref check → assign →
