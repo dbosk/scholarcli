@@ -104,19 +104,30 @@ Providers self-register via `register_provider()` at module load time.
   otherwise it is listed as "Outcome not recorded: dblp"
   (`unrecorded_providers`, in the items and the abstract), not as "Not
   searched", also when another of its searches failed. `record_rank`
-  still ranks such a record as answered (the old run may have answered
-  with its linked papers), so a failed re-run does not replace it.
+  still ranks such a record as answered, but a re-run that failed
+  outright (or was skipped) replaces it unless the session has
+  evidence of an answer (`record_may_have_answered`, #190): a
+  decision's `found_by` names its key (an old `(q, p, None)` link
+  counts), or a decision's `provider` names its provider (as
+  `decision_provider_names`, also for decisions with links: records
+  without an outcome predate links, #128). Pre-#164 merged decisions
+  name every merged provider, so without evidence they keep such
+  records too; with sources only the providers the sources or
+  single-provider links name (`decision_provider_evidence`, below). A failed record
+  never counts as searched.
   Provider evidence (#191, review.nw `sec:provider-evidence`):
   pre-#164 merged searches wrote the merged string (`openalex, dblp`)
   on every paper, whichever returned it, and since #164 (and the #192
   repair) a multi-name string can also be honest, so
-  `decision_provider_evidence(decision)` keeps a name of a
-  multi-name `provider` only if a single-provider `found_by` link
-  (its provider splits into one name) or `paper.sources` names it
+  `decision_provider_evidence(decision)`, when the paper has
+  `sources`, keeps a name of `provider` only if a source or a
+  single-provider `found_by` link (its provider splits into one name)
+  names it; without sources nothing is ruled out, since links are
+  younger than the merged strings and miss old runs (#190's argument)
   (case-insensitive; string, sources and links all split on
   `PROVIDER_SEPARATORS`, since the notes-module fallback stores a
-  joined provider as a source). The string stands unchanged with no
-  such evidence at all, when the evidence names none of its providers
+  joined provider as a source). The string stands unchanged without
+  sources, when the evidence names none of its providers
   (`s2` alone, `previous`), with one name (a merged search wrote two
   or more), and for names not in `PROVIDER_FULL_NAMES` (`snowball`).
   Two decisions sharing a paper id share one registry `Paper`, so the
@@ -124,7 +135,7 @@ Providers self-register via `register_provider()` at module load time.
   confirm names, never add them (enrichment unions the enriching
   provider into `sources`; preprint adoption the candidate's); links
   add their provider at the end. Used by `decision_provider_names`
-  and `collect_audit_rows` (so the caption's rows part); the stored
+  (so also by #190's record replacement) and `collect_audit_rows` (so the caption's rows part); the stored
   `provider` is never rewritten, and displays (`sessions show`, TUI,
   CSV, JSON) show it as stored.
 - One record per provider search (#164). `SearchResult.parts` /
@@ -182,7 +193,11 @@ Providers self-register via `register_provider()` at module load time.
   source was last searched; older runs' links stay on the same key.
   `create_review_session` (new run first) and
   `merge_concurrent_changes` (own record first, for a shared key) both
-  use it.
+  use it through `session_preferred_record(a, b, links,
+  provider_names)`, which adds the one session-dependent rule (#190,
+  above; from the previous session's decisions, resp. the merged
+  decisions plus the file's provider names), so `record_rank` stays a
+  key of one record.
 - Search dates (#167). `SearchResult`/`SearchRecord` have `searched_at`
   (UTC ISO, the run; `utils.utc_now_iso`), `fetched_at` (when the
   service answered; for a cache hit the original fetch, `None` =
@@ -847,7 +862,17 @@ the batch is refused unsaved (exit 2, each conflict named) unless
 category tags (`AUDIT_CATEGORIES`) are dropped before the new `--tag`s
 are added (`review.tags_after_status_change`, #177); themes,
 motivations and notes stay (dropping motivations lost themes on
-keep→discard→keep). Same status: tags append as before.
+keep→discard→keep). Same status: tags append as before, except that a
+`--tag` in `AUDIT_CATEGORIES` also drops the old category tags (#195,
+`review.tags_after_decision`: a record holds one category).
+`--untag TAG` (repeatable) removes tags first, from every selected
+record (machine sources too; the `--force` guard is unchanged); a tag
+no selected record had is named once on stderr, not an error. A discard
+still needs a `--tag` on the command line. More than one category among
+the `--tag`s is refused (exit 2, before the session loads). `--untag` is
+part of a decision (needs `--keep`/`--discard`): a machine untag without
+`-c` clears `llm_confidence` and the audit fields (pass `-c` again), and
+a human untag of an unreviewed agent/LLM decision marks it `*_reviewed`.
 **Unknown stored sources** (e.g. `manual`, which no Scholar version
 wrote, or a hand-edited `Agent`) load as `ReviewSource` pseudo-members
 via `_missing_` (`is_unknown`; value kept verbatim on save), count as
@@ -1054,7 +1079,16 @@ report body builders (`build_review_provenance_latex`,
   (`author_surname`; a blank author gives an empty surname) reduced to case-folded letters and digits, year ignored; joined
   provider strings like `openalex; dblp` are split, mapped to codes and
   deduplicated, keeping only the names `decision_provider_evidence`
-  supports (#191, see Data Models); the best-placed decision wins). The *last* category tag
+  supports (#191, see Data Models); the best-placed decision gives the row its reason,
+  category, confidence, status and order, but the notes of every copy
+  are united, #196: `collect_audit_rows` passes the other copies'
+  `audit_note_tags` (what each copy's own row shows as notes: note
+  tags, plus stray tags under `--theme`; pending copies included, after
+  the pending label; none for criterion discards, whose other tags are
+  earlier criteria) to `audit_reason(..., also_notes=)`, best copy's
+  first, then in decision order, each once; themes are not united; a
+  lent version note makes the row a version row for the caption). The
+  per-decision CSV is unaffected. The *last* category tag
   is the decision (`decide -t` appends while the status stays the
   same; a status change replaces the old category, #177); confidence is
   shown for unreviewed and human-confirmed LLM or agent rows, not for

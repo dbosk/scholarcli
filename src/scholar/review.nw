@@ -96,7 +96,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 from collections.abc import Callable
 import glob
 import json
@@ -2756,6 +2756,8 @@ def create_review_session(
     replaced_links: dict[tuple, tuple] = {}
     if previous_session:
         current_run = list(session.search_records)
+        previous_links = linked_search_keys(previous_session.decisions)
+        previous_names = decision_provider_names(previous_session)
         for record in previous_session.search_records:
             <<keep the preferred record of each search>>
             <<let a re-run replace a legacy record>>
@@ -2868,7 +2870,10 @@ what its latest run returned.
 
 Two records with equal keys are a true tie, and the first argument
 wins, so the caller decides: the new run here, the process's own record
-in a save.
+in a save.  Both callers go through [[session_preferred_record]], which
+adds the one rule that needs the session's papers: a failed re-run
+replaces a record without an outcome unless a paper links to it or
+names its provider (\cref{sec:unknown-outcome-replaced}).
 
 <<keep the preferred record of each search>>=
 for i, current in enumerate(session.search_records):
@@ -2878,7 +2883,9 @@ for i, current in enumerate(session.search_records):
         and (current.query, current.provider)
         == (record.query, record.provider)
     )
-    if same_search and preferred_record(current, record) is record:
+    if same_search and session_preferred_record(
+        current, record, previous_links, previous_names
+    ) is record:
         session.search_records[i] = record
         if current.key != record.key:
             replaced_links[current.key] = record.key
@@ -2998,6 +3005,322 @@ class TestPreferredRecord:
         assert preferred_record(current, legacy) is current
         failed = self._r(limit=5, hits=0, error="HTTP 503")
         assert preferred_record(failed, legacy) is legacy
+@
+
+\paragraph{A failed re-run and a record without an outcome}
+\label{sec:unknown-outcome-replaced}
+
+One pair of records needs more than the two records to decide.  A
+record written before outcomes were kept has neither hits nor an error
+([[outcome_unknown]], \cref{sec:unrecorded-outcome}), and
+[[record_rank]] ranks it as answered, so a re-run of the same search
+that failed outright never replaced it.  A session holding
+[[SearchRecord("q", "dblp", None, 40)]] kept that record after a DBLP
+re-run that got the anti-bot page (\enquote{non-JSON response}): the
+failure was recorded nowhere, and the report went on saying
+\enquote{Outcome not recorded: dblp}
+(\url{https://github.com/dbosk/scholarcli/issues/190}).  Such a
+session could never say that the provider fails now, short of editing
+the file, although the session must say when each source was last
+searched and with what result.
+
+The reason for keeping an answered record over a failure is that the
+session holds the answer's papers.  For a record without an outcome
+that reason holds only if the session has papers that its run may have
+returned; then replacing the record would turn a possible answer into a
+failure, and the report would call the provider \enquote{not searched}
+beside its papers.  Without such papers the record shows nothing that
+the failure would hide; it only says that the query was once sent.  So
+the failed re-run replaces it unless the session has evidence of an
+answer, of either of two kinds.
+\begin{description}
+\item[A link] Some decision's [[found_by]] names the record
+  (\cref{sec:review-found-by}): its key, or, for an old link, only its
+  query and provider (filters key [[None]],
+  \cref{sec:session-persistence}), since that link may mean this
+  record.
+\item[A paper from the provider] Some decision's [[provider]] names the
+  record's provider, compared as [[decision_provider_names]] compares
+  it (\cref{sec:unrecorded-outcome}).  Links alone do not suffice,
+  because they are younger than outcomes: records without an outcome
+  were written before links were kept
+  (\url{https://github.com/dbosk/scholar/issues/128}), so their papers
+  almost never link to them.  A session searched on OpenAlex then, with
+  a re-run refused for a spent daily budget, would otherwise read
+  \enquote{Not searched: openalex} while it holds OpenAlex's papers.
+  Decisions with links count too: a paper that the old run returned
+  and a later run returned again carries only the later run's link, so
+  its links do not show that the old run did not return it.
+\end{description}
+The second kind is evidence about the provider, not about the query,
+so it keeps every record without an outcome of a provider the session
+has papers from, also of a query that returned none of them; such a
+record then stays \enquote{outcome not recorded}, which is what the
+session can tell.  And it is no proof: before one record was kept per
+provider search (\cref{sec:merged-records}), every paper of a merged
+search was given every merged provider's name.  Since
+[[decision_provider_names]] reads each decision through its evidence
+([[decision_provider_evidence]], \cref{sec:provider-evidence}), such a
+decision keeps DBLP's old record only when it has no evidence at all
+(no sources, no single-provider link) or its evidence names DBLP; one
+whose sources show that OpenAlex alone returned it no longer does.
+Without either
+kind, as in the issue's session, whose papers name OpenAlex only, the
+DBLP failure replaces the old record.
+A legacy record (\cref{sec:legacy-records}) has no outcome either, and
+in [[create_review_session]] it meets a re-run of its query and
+provider through the same call, so a failed re-run replaces a legacy
+record without evidence too; the legacy rule then has no links to move.
+
+Whether the session holds such evidence is a fact about the session,
+not about the record, so the rule cannot be part of [[record_rank]]:
+the rank is a key of one record, and it is what keeps
+[[preferred_record]] a total preorder.  The rule is a second step
+instead.  [[session_preferred_record]] asks [[preferred_record]] and
+overrides its choice in this one case.  The override applies to a pair
+of one record without an outcome and one failed outright, whichever
+argument each is, and [[preferred_record]] picks the record without an
+outcome in both orders; so the result still does not depend on the
+order of the arguments.  Both places that call [[preferred_record]]
+call this instead: [[create_review_session]] with the links and
+provider names of the previous session (a failed run has no papers, so
+it brings no evidence of its own), and the merge of a save
+(\cref{sec:session-integrity}) with those of the merged decisions.
+There the names come from both sides: for a paper that both hold, the
+merge unites the links but keeps this process's [[provider]] field, so
+the file's names would otherwise be lost, and a paper is evidence on
+either side.
+Applied in one place only, the other would undo it: a process that
+loaded the session before the re-run would save the old record back
+over the failure, and a process that did the re-run would get the old
+record back from its own file.
+
+<<review session functions>>=
+def linked_search_keys(decisions: list[ReviewDecision]) -> set[tuple]:
+    """The search keys that some decision's `found_by` names."""
+    return {link for decision in decisions for link in decision.found_by}
+
+
+def record_may_have_answered(
+    record: SearchRecord, links: set[tuple], provider_names: set[str]
+) -> bool:
+    """Whether the session has papers that `record`'s run may have returned.
+
+    A link in `links` names its key, or only its query and provider (an
+    old link, filters key `None`); or one of its providers is among
+    `provider_names` (lower-cased, as `decision_provider_names` gives).
+    """
+    return (
+        record.key in links
+        or (record.query, record.provider, None) in links
+        or any(
+            name.lower() in provider_names
+            for name in record.merged_providers
+        )
+    )
+
+
+def session_preferred_record(
+    a: SearchRecord,
+    b: SearchRecord,
+    links: set[tuple],
+    provider_names: set[str],
+) -> SearchRecord:
+    """Of two records of one search, the one a session keeps.
+
+    `preferred_record`, except that a run that failed outright replaces
+    a record without a recorded outcome when the session has no papers
+    that the record's run may have returned (`record_may_have_answered`
+    with the session's `links` and `provider_names`).
+    """
+    kept = preferred_record(a, b)
+    other = b if kept is a else a
+    if (outcome_unknown(kept) and failed_outright(other)
+            and not record_may_have_answered(kept, links, provider_names)):
+        return other
+    return kept
+@
+
+Let's verify the probe of the issue: a DBLP record without an outcome,
+then a DBLP re-run that fails, in a session whose paper names OpenAlex.
+The failure replaces the record, survives a save, and the report lists
+DBLP as not searched, with the failure as the reason, instead of under
+\enquote{Outcome not recorded}.  A link to the record keeps it, also an
+old link without filters, and so does a paper naming DBLP without any
+link, the case of the sessions written before links: an OpenAlex search
+re-run with a spent budget keeps its old record, and the report still
+counts OpenAlex as searched.  In the save's merge the same holds in
+both orders, the own record without an outcome and the file's failure
+or the other way round, and evidence on either side keeps the old
+record.
+
+<<test functions>>=
+class TestFailedRerunReplacesUnknownOutcome:
+    """A failed re-run replaces a record without an outcome or evidence."""
+
+    FAILURE = "non-JSON response (HTTP 200, text/html)"
+    SKIPPED = "skipped: daily quota spent; resets 2026-11-20T00:00Z"
+
+    @staticmethod
+    def _unknown():
+        return SearchRecord("q", "dblp", None, 40)
+
+    @classmethod
+    def _failed(cls):
+        return SearchRecord("q", "dblp", None, 40, hits=0, error=cls.FAILURE)
+
+    @staticmethod
+    def _session(records, evidence=None, name=None):
+        decision = ReviewDecision(
+            paper=Paper(title="Spacing", authors=["A"], year=2020,
+                        doi="10.1234/unknown-outcome-190"),
+            provider="openalex",
+        )
+        decision.record_search("q", "openalex", "")
+        if evidence == "linked":
+            decision.record_search("q", "dblp", "")
+        elif evidence == "named":
+            decision.provider = "openalex, DBLP"
+        session = ReviewSession(query="q", providers=["dblp", "openalex"],
+                                timestamp=datetime.now(), name=name)
+        session.search_records = list(records) + [
+            SearchRecord("q", "openalex", None, 40, hits=1),
+        ]
+        session.decisions = [decision]
+        return session
+
+    def _rerun(self, name, provider="dblp", error=None):
+        from scholar.scholar import SearchResult
+        return create_review_session([SearchResult(
+            query="q", provider=provider, timestamp="t", papers=[],
+            limit=40, error=error or self.FAILURE,
+        )], "q", session_name=name)
+
+    @staticmethod
+    def _dblp(session, provider="dblp"):
+        return [(r.hits, r.error) for r in session.search_records
+                if r.provider == provider]
+
+    def test_failed_rerun_replaces_record_without_evidence(self):
+        save_session(self._session([self._unknown()], name="unknown-190"))
+        session = self._rerun("unknown-190")
+        assert self._dblp(session) == [(0, self.FAILURE)]
+        save_session(session)
+        assert self._dblp(load_session("unknown-190")) == [
+            (0, self.FAILURE),
+        ]
+
+    def test_record_with_evidence_is_kept(self):
+        for evidence in ("linked", "named"):
+            name = f"{evidence}-190"
+            save_session(self._session([self._unknown()], evidence,
+                                       name=name))
+            session = self._rerun(name)
+            assert self._dblp(session) == [(None, None)], evidence
+
+    def test_paper_without_links_keeps_its_providers_record(self):
+        decision = ReviewDecision(
+            paper=Paper(title="Spacing", authors=["A"], year=2020,
+                        doi="10.1234/x198"),
+            provider="openalex",
+        )
+        session = ReviewSession(query="q", providers=["openalex"],
+                                timestamp=datetime.now(), name="probe-198")
+        session.search_records = [SearchRecord("q", "openalex", None, 40)]
+        session.decisions = [decision]
+        save_session(session)
+        after = self._rerun("probe-198", "openalex", self.SKIPPED)
+        assert self._dblp(after, "openalex") == [(None, None)]
+        items = dict(search_parameter_items(after))
+        assert items["Providers"] == "openalex"
+        assert "Not searched" not in items
+
+    def test_old_link_without_filters_keeps_the_record(self):
+        session = self._session([
+            self._unknown(),
+            SearchRecord("q", "dblp", {"year": "2020"}, 40, hits=2),
+        ], name="old-link-190")
+        session.decisions[0].found_by.append(("q", "dblp", None))
+        save_session(session)
+        assert ("q", "dblp", None) in (
+            load_session("old-link-190").decisions[0].found_by
+        )
+        after = self._rerun("old-link-190")
+        assert sorted(self._dblp(after), key=str) == [(2, None), (None, None)]
+
+    def test_report_turns_unrecorded_into_failed(self):
+        before = self._session([self._unknown()], name="report-190")
+        assert dict(search_parameter_items(before))[
+            "Outcome not recorded"] == "dblp"
+        save_session(before)
+        items = dict(search_parameter_items(self._rerun("report-190")))
+        assert "Outcome not recorded" not in items
+        assert items["Not searched"] == f"dblp ({self.FAILURE})"
+
+    def test_report_unchanged_with_evidence(self):
+        for evidence in ("linked", "named"):
+            before = self._session([self._unknown()], evidence,
+                                   name=f"report-{evidence}-190")
+            save_session(before)
+            after = self._rerun(f"report-{evidence}-190")
+            assert search_parameter_items(after) == (
+                search_parameter_items(before)
+            ), evidence
+
+    def test_concurrent_merge_in_both_orders(self):
+        for own, disk in [(self._unknown(), self._failed()),
+                          (self._failed(), self._unknown())]:
+            session = self._session([own])
+            merge_concurrent_changes(session, self._session([disk]))
+            assert self._dblp(session) == [(0, self.FAILURE)], own
+
+    def test_concurrent_merge_keeps_a_record_with_evidence_on_either_side(
+            self):
+        for own, disk in [(self._unknown(), self._failed()),
+                          (self._failed(), self._unknown())]:
+            for evidence in ("linked", "named"):
+                for mine in (True, False):
+                    session = self._session(
+                        [own], evidence if mine else None)
+                    on_disk = self._session(
+                        [disk], None if mine else evidence)
+                    merge_concurrent_changes(session, on_disk)
+                    assert self._dblp(session) == [(None, None)], (
+                        own, evidence, mine,
+                    )
+
+    def test_failed_rerun_replaces_legacy_record_without_evidence(self):
+        save_session(self._session([SearchRecord("q", "dblp")],
+                                   name="legacy-190"))
+        session = self._rerun("legacy-190")
+        assert self._dblp(session) == [(0, self.FAILURE)]
+        save_session(session)
+        assert self._dblp(load_session("legacy-190")) == [
+            (0, self.FAILURE),
+        ]
+
+    def test_evidence_in_either_argument_order(self):
+        unknown, failed = self._unknown(), self._failed()
+        for links, names in (({("q", "dblp", None)}, set()),
+                             ({("q", "dblp", "")}, set()),
+                             (set(), {"dblp"})):
+            for a, b in ((failed, unknown), (unknown, failed)):
+                assert session_preferred_record(
+                    a, b, links, names) is unknown
+        links = {("q", "openalex", ""), ("other", "dblp", None)}
+        names = {"openalex", "dblp-mirror"}
+        for a, b in ((failed, unknown), (unknown, failed)):
+            assert session_preferred_record(a, b, links, names) is failed
+
+    def test_stale_save_keeps_the_failure(self):
+        save_session(self._session([self._unknown()], name="stale-190"))
+        stale = load_session("stale-190")
+        save_session(self._rerun("stale-190"))
+        stale.decisions[0].status = DecisionStatus.KEPT
+        save_session(stale)
+        session = load_session("stale-190")
+        assert self._dblp(session) == [(0, self.FAILURE)]
+        assert session.decisions[0].status == DecisionStatus.KEPT
 @
 
 \label{sec:legacy-records}
@@ -6599,11 +6922,15 @@ def merge_concurrent_changes(
     <<merge research context from disk>>
 
     own_index = {r.key: i for i, r in enumerate(session.search_records)}
+    links = linked_search_keys(session.decisions)
+    provider_names = (
+        decision_provider_names(session) | decision_provider_names(on_disk)
+    )
     for record in on_disk.search_records:
         if record.key in own_index:
             i = own_index[record.key]
-            session.search_records[i] = preferred_record(
-                session.search_records[i], record
+            session.search_records[i] = session_preferred_record(
+                session.search_records[i], record, links, provider_names
             )
         elif record.key not in replaced:
             session.search_records.append(record)
@@ -8909,9 +9236,14 @@ The audit caption applies the same rule (\cref{sec:audit-databases}).
 
 The rule describes what the report claims, not which record a session
 keeps.  [[record_rank]] still ranks such a record as answered, so a
-failed re-run does not replace it: the old run may have answered with
-the papers linked to it, and replacing it would turn that into a
-failure.
+failed re-run does not replace it while a paper links to it or names
+its provider: the old run may have answered with them, and replacing
+it would turn that into a failure.  Otherwise the failed re-run
+replaces it (\cref{sec:unknown-outcome-replaced}).  A failed record
+never counts as searched, whatever the papers say, so the report then
+lists the provider under \enquote{Not searched} with the failure as
+the reason, unless another of its records answered, or has no outcome
+either and is listed under \enquote{Outcome not recorded}.
 
 <<review report generation>>=
 def outcome_unknown(record: SearchRecord) -> bool:
@@ -8987,10 +9319,17 @@ decision's [[provider]] as the paper's only source, and a link counts
 as single-provider only when its provider splits into one name,
 whatever the separator.
 
-Four cases keep the string as it is.  A decision without either kind of
-evidence---no single-provider link and no sources, as in sessions from
-before either was stored---has nothing better, and its names all count,
-as they did.  Evidence that names none of the string's providers, such
+Four cases keep the string as it is.  A paper without sources, as in
+sessions from before sources were stored, has nothing that can rule a
+name out, and its names all count, as they did.  A single-provider link
+confirms a name and adds one, but it does not rule any out: links are
+younger than the merged strings (they are kept since
+\url{https://github.com/dbosk/scholarcli/issues/128}), and a paper that
+an old run returned and a later run returned again carries only the
+later run's link, so its links do not show that the old run did not
+return it (\cref{sec:unknown-outcome-replaced} makes the same point for
+records).  Sources do not have that gap, as the next paragraph but one
+explains.  Evidence that names none of the string's providers, such
 as an enrichment source alone ([[s2]]) or the fallback's placeholder
 [[previous]], contradicts the string rather than choosing among its
 names, and is no better than none: dropping every name would leave the
@@ -9022,7 +9361,9 @@ Its absence tells as much: before \#164 a re-run gave the decision both
 the paper as returned and the merged string of that run, so the sources
 and the string come from the same search.  A single-provider link does
 add its provider when the string lacks it, since the link itself is
-proof; the order of the string is kept, and such names follow it.
+proof; the order of the string is kept, and such names follow it.  On
+the real sessions no decision with several names has a single-provider
+link but no sources, so the links' part changes no row there.
 
 One more limit comes from the paper registry: [[Paper.from_dict]]
 returns the registered object for an id it already holds, so two
@@ -9046,9 +9387,9 @@ page the paper's [[url]] is.
 def decision_provider_evidence(decision: ReviewDecision) -> list[str]:
     """The provider names of `decision` that its evidence supports.
 
-    A name of a multi-provider `provider` string counts when a
-    single-provider search link (`found_by`) or the paper's `sources`
-    names it. Without either kind of evidence, when the evidence names
+    When the paper has `sources`, a name of the `provider` string
+    counts only if a source or a single-provider search link
+    (`found_by`) names it. Without sources, when the evidence names
     none of the string's providers (so also for a string of one name),
     and for names not in `PROVIDER_FULL_NAMES`, the string stands.
     Single-provider links add their providers at the end.
@@ -9069,7 +9410,7 @@ def decision_provider_evidence(decision: ReviewDecision) -> list[str]:
     ]
     sources = [part for source in decision.paper.sources or []
                for part in split(source)]
-    if linked or sources:
+    if sources:
         attested = {n.lower() for n in linked + sources}
         kept = [
             name for name in names
@@ -9085,7 +9426,8 @@ def decision_provider_evidence(decision: ReviewDecision) -> list[str]:
 @
 
 Let's verify the rule: sources and single-provider links confirm a
-name, a merged link does not, nothing at all keeps every name, a lone
+name, a merged link does not, a link without sources rules nothing
+out, nothing at all keeps every name, a lone
 name stands, case and separators do not matter, a source cannot add a
 name but a link can, and a name no search writes is kept.  Then the
 splitting: a joined source confirms each of its names, evidence against
@@ -9109,11 +9451,18 @@ class TestDecisionProviderEvidence:
         decision = self._decision("openalex, dblp", sources=["openalex"])
         assert decision_provider_evidence(decision) == ["openalex"]
 
-    def test_single_provider_link_attests_without_sources(self):
+    def test_a_link_without_sources_rules_nothing_out(self):
         decision = self._decision(
             "openalex, dblp", links=[("q", "dblp", "")]
         )
-        assert decision_provider_evidence(decision) == ["dblp"]
+        assert decision_provider_evidence(decision) == ["openalex", "dblp"]
+
+    def test_a_link_confirms_beside_sources_in_the_strings_order(self):
+        decision = self._decision(
+            "dblp, openalex, wos", sources=["openalex"],
+            links=[("q", "dblp", "")],
+        )
+        assert decision_provider_evidence(decision) == ["dblp", "openalex"]
 
     def test_merged_link_attests_nothing(self):
         decision = self._decision(
@@ -9257,7 +9606,9 @@ class TestMergedProviderAttribution:
         rows = collect_audit_rows(
             session, theme_names={}, strings=AUDIT_STRINGS["en"]
         )
-        assert sorted(row.providers for row in rows) == [["DBLP"], ["OA"]]
+        assert sorted(row.providers for row in rows) == [
+            ["OA"], ["OA", "DBLP"],
+        ]
         assert searched_providers(session) == ["openalex", "dblp"]
         text = "\n".join(
             build_audit_table_latex(session, label="x", lang="en")
@@ -11302,6 +11653,22 @@ its category in the reason, marked as excluded, but sorts among the
 caption counts it separately. The adjacent and off-topic categories do
 not bear on the claim, so a discarded row there is simply what it says.
 
+Which tags a row shows as notes is decided in one place,
+[[audit_note_tags]], because a second reader needs the same answer: the
+work merge lends the notes of a work's other copies to the row that
+represents it (\cref{sec:audit-row-notes}), and it must lend exactly
+what each copy's own row would show.  The notes are a decision's note
+tags and, with [[--theme]], its stray tags.  A pending decision shows
+them as well, after the pending label: a note records a fact about the
+work, such as \enquote{recorded, not cited}, which holds before anyone
+has classified the record, and a pending row that hid it hid the fact.
+A discard under an exclusion criterion shows none, since its reason is
+the criterion alone and its other tags are the earlier criteria the
+reviewer replaced.  The notes lent by other copies reach
+[[audit_reason]] as [[also_notes]].
+
+<<review imports>>=
+from collections.abc import Sequence
 <<review report generation>>=
 def audit_category(tags: list[str]) -> str | None:
     """Return the deciding (last) audit category among `tags`, if any."""
@@ -11318,24 +11685,65 @@ def audit_excluded(decision: ReviewDecision) -> bool:
     )
 
 
+def audit_note_tags(
+    decision: ReviewDecision,
+    *,
+    theme_names: dict[str, str],
+    notes: dict[str, str],
+) -> list[str]:
+    """Return the tags `decision`'s own row shows as notes, known first.
+
+    Those are its note tags and, when the caller named its themes, every
+    other tag that is neither a category nor a theme.  A discard under
+    an exclusion criterion shows none: its reason is the criterion alone.
+    """
+    tags = decision.tags
+    if audit_exclusion_criterion(
+        decision, theme_names=theme_names, notes=notes
+    ) is not None:
+        return []
+    noted = [t for t in tags if t in notes]
+    if theme_names:
+        noted += [
+            t for t in tags
+            if t not in AUDIT_CATEGORIES and t not in notes
+            and t not in theme_names
+        ]
+    return noted
+
+
+def audit_note_text(tag: str, notes: dict[str, str]) -> str:
+    """Return how the audit table writes the note `tag`."""
+    return notes[tag] if tag in notes else escape_latex(tag)
+
+
+def audit_with_notes(label: str, texts: list[str]) -> str:
+    """Append the note `texts` to `label` in parentheses, if any."""
+    return f"{label} ({'; '.join(texts)})" if texts else label
+
+
 def audit_reason(
     decision: ReviewDecision,
     *,
     theme_names: dict[str, str],
     strings: dict,
+    also_notes: Sequence[str] = (),
 ) -> tuple[str, int]:
-    """Return the reason label and sort order for `decision`."""
+    """Return the reason label and sort order for `decision`.
+
+    `also_notes` are note tags of the work's other copies; they are
+    added to the label's notes, after the decision's own, each once.
+    """
     tags = list(decision.tags)
     notes = strings["notes"]
     category = audit_category(tags)
-    note_texts = [notes[t] for t in tags if t in notes]
+    own_notes = audit_note_tags(
+        decision, theme_names=theme_names, notes=notes
+    )
+    note_texts = [audit_note_text(t, notes) for t in own_notes]
+    <<add the notes of the work's other copies>>
     if theme_names:
         theme_tags = [t for t in tags if t in theme_names]
-        note_texts += [
-            escape_latex(t) for t in tags
-            if t not in AUDIT_CATEGORIES and t not in notes
-            and t not in theme_names
-        ]
     else:
         theme_tags = [
             t for t in tags if t not in AUDIT_CATEGORIES and t not in notes
@@ -11356,7 +11764,8 @@ def audit_reason(
     )
 
     if decision.status == DecisionStatus.PENDING:
-        return strings["pending"], AUDIT_ORDER_PENDING
+        return audit_with_notes(strings["pending"], note_texts), \
+            AUDIT_ORDER_PENDING
     if kept and human_decision and theme_tags:
         theme = theme_names.get(theme_tags[0], theme_tags[0])
         label = f"\\emph{{{strings['cited']}}}"
@@ -11372,16 +11781,17 @@ def audit_reason(
         label = strings[category] + confidence
         order = AUDIT_CATEGORIES[category]
     elif criterion is not None:
-        return escape_latex(criterion) + confidence, AUDIT_ORDER_OTHER
-    elif note_texts:
+        label = escape_latex(criterion) + confidence
+        return audit_with_notes(label, note_texts), AUDIT_ORDER_OTHER
+    elif own_notes:
         return "; ".join(note_texts), AUDIT_ORDER_OTHER
     elif not tags:
-        return strings["pending"], AUDIT_ORDER_PENDING
+        return audit_with_notes(strings["pending"], note_texts), \
+            AUDIT_ORDER_PENDING
     else:
-        return escape_latex(tags[0]) + confidence, AUDIT_ORDER_OTHER
-    if note_texts:
-        label += " (" + "; ".join(note_texts) + ")"
-    return label, order
+        label = escape_latex(tags[0]) + confidence
+        return audit_with_notes(label, note_texts), AUDIT_ORDER_OTHER
+    return audit_with_notes(label, note_texts), order
 @
 
 Each category, the confidence suffix and the fall-through cases are
@@ -11736,6 +12146,20 @@ paper does less harm: the cited rule reads the status first, so the
 paper is cited all the same, and at worst the reason column names the
 leftover tag, which the author can remove.
 
+The status is not the only way a record gets a second category.  An
+agent that re-decides a kept record with another category
+(\url{https://github.com/dbosk/scholar/issues/195}) leaves the status
+as it was, so the rule above removed nothing, and the record held two
+categories of which the audit table, reading the last, showed one.  A
+decision that brings a category of its own therefore also replaces the
+old one, whatever the status, and a decision may bring only one:
+[[sessions decide]] refuses several category [[--tag]]s before it
+touches the session.  Themes and motivations are still kept, for the
+reason above.  What the rules cannot do is remove a tag the author no
+longer wants, such as an exclusion criterion that a re-kept paper
+carries and the cited rule then reads as a theme; [[--untag]] removes
+named tags, before the new tags are added.
+
 <<review report generation>>=
 def tags_after_status_change(tags: list[str]) -> list[str]:
     """Return the tags a record keeps when a new decision changes its status.
@@ -11744,7 +12168,34 @@ def tags_after_status_change(tags: list[str]) -> list[str]:
     and notes stay.
     """
     return [t for t in tags if t not in AUDIT_CATEGORIES]
+
+
+def tags_after_decision(
+    tags: Sequence[str],
+    status_changed: bool,
+    new_tags: Sequence[str] = (),
+    removed_tags: Sequence[str] = (),
+) -> list[str]:
+    """Return a record's tags after `sessions decide` (before it adds).
+
+    The category tags go when the status changed or when `new_tags`
+    brings a category of its own (a record holds one category);
+    `removed_tags` go whatever they are. The rest stays.
+    """
+    if status_changed or any(t in AUDIT_CATEGORIES for t in new_tags):
+        tags = tags_after_status_change(tags)
+    return [t for t in tags if t not in removed_tags]
 @
+
+[[tags_after_decision]] is the one place that says which tags a decision
+leaves behind, so [[sessions decide]] has no tag logic of its own beyond
+calling it.  The category tags are dropped if the status changed (the
+rule above) or if the decision names a category itself, since the new
+category then stands in for the old one; [[removed_tags]] are removed
+whatever they are, categories included, and a name the record does not
+hold is ignored here (the command reports it).  The tags the decision
+adds come afterwards, from [[add_tag]], so a tag given to both options
+ends up on the record.
 
 <<test functions>>=
 class TestTagsAfterStatusChange:
@@ -11753,6 +12204,28 @@ class TestTagsAfterStatusChange:
             ["supports-claim", "ml", "no-abstract", "extended-tech-report",
              "off-topic-false-hit"],
         ) == ["ml", "no-abstract", "extended-tech-report"]
+
+
+class TestTagsAfterDecision:
+    """The pure rule behind `sessions decide`'s tags (#195)."""
+
+    TAGS = ["supports-claim", "ml", "no-abstract"]
+
+    def test_status_change_drops_categories_only(self):
+        assert tags_after_decision(self.TAGS, True) == ["ml", "no-abstract"]
+
+    def test_same_status_without_category_keeps_all(self):
+        assert tags_after_decision(self.TAGS, False, ["x"]) == self.TAGS
+
+    def test_a_new_category_replaces_the_old_one(self):
+        assert tags_after_decision(
+            self.TAGS, False, ["qualifies-claim", "x"],
+        ) == ["ml", "no-abstract"]
+
+    def test_removed_tags_go_and_missing_ones_do_not_matter(self):
+        assert tags_after_decision(
+            self.TAGS, False, [], ["no-abstract", "absent"],
+        ) == ["supports-claim", "ml"]
 @
 
 The same paper often arrives from several providers, sometimes with and
@@ -11760,7 +12233,9 @@ sometimes without a DOI, so a session may hold it more than once. The
 audit table is about works, not records: rows are merged on a work key,
 the providers are joined, and the best-placed decision wins---a cited
 copy over a category, a category over a note---because the paper is
-what it is whatever the other providers' copies were classified as. The
+what it is whatever the other providers' copies were classified as.
+The row's notes are the exception: they are united from all copies
+(\cref{sec:audit-row-notes}). The
 key is the title reduced to its letters and digits, case-folded, plus
 the first author's surname treated the same way. Punctuation, quotes
 and capitalisation differ between providers for the same work, and the
@@ -11838,6 +12313,8 @@ def collect_audit_rows(
 ) -> list[AuditRow]:
     """Merge the session's decisions into sorted audit rows."""
     rows: dict[tuple[str, str], AuditRow] = {}
+    copies: dict[tuple[str, str], list[ReviewDecision]] = {}
+    best: dict[tuple[str, str], ReviewDecision] = {}
     for decision in session.decisions:
         paper = decision.paper
         title = paper.title or ""
@@ -11854,8 +12331,10 @@ def collect_audit_rows(
             decision, theme_names=theme_names, notes=strings["notes"]
         )
         version = audit_version_note(decision)
+        copies.setdefault(key, []).append(decision)
         row = rows.get(key)
         if row is None:
+            best[key] = decision
             rows[key] = AuditRow(
                 title=escape_latex(shorten_title(title, title_limit)),
                 year=year,
@@ -11877,6 +12356,9 @@ def collect_audit_rows(
             row.status, row.reason, row.order = decision.status, reason, order
             row.excluded, row.criterion = excluded, criterion
             row.version = version
+            best[key] = decision
+    for key, row in rows.items():
+        <<unite the notes of the row's copies>>
     return sorted(rows.values(), key=lambda r: (r.order, r.title.lower()))
 @
 
@@ -12045,6 +12527,258 @@ class TestCollectAuditRows:
         assert dup.status == DecisionStatus.KEPT
         assert dup.reason == r"\emph{cited}: ml"
         assert [r.order for r in rows] == [0, 1, 5]
+@
+
+\paragraph{The notes of a work's copies}
+\label{sec:audit-row-notes}
+
+The best-placed copy used to give its row everything, notes included,
+and the notes of the other copies were lost
+(\url{https://github.com/dbosk/scholarcli/issues/196}).  One review
+tagged the DOI copy of four cited works [[cited-in-report]]; in each, a
+copy confirmed from the classifier and placed as well came first,
+represented the row, and the note vanished from the appendix, which
+then contradicted the review.  The only workaround was to tag every
+copy, and nothing told the author so.
+
+A note records a fact about the work---that it is cited in the report,
+that it is another version of a cited source, that it was judged on its
+title---and that fact holds whichever copy represents the row.  The
+category, the status and the confidence are different: each is the
+judgement of one record, a row can show only one, and the best-placed
+copy's is the one shown, as before.  So the row keeps the best copy's
+reason and place and adds the notes of the other copies.  The themes are
+not united, although they are tags as well: a theme is read as the
+reason a work is cited, so a theme lent by a discarded copy, or by a
+machine's keep, would make the row look like a citation the review
+never made.  A tag outside Scholar's note vocabulary, such as
+[[cited-in-report]], is a note only under [[--theme]]: without it, any
+tag that is neither a category nor a note is a theme, and stays with its
+copy.
+
+Each copy lends exactly the notes its own row would show
+([[audit_note_tags]]): a pending copy lends its notes like any other,
+and a discard under an exclusion criterion lends nothing, since its
+other tags are the earlier criteria the reviewer replaced, not notes.
+The best copy's own
+notes come first and the lent ones follow in the order of the
+decisions, each once, so a note on two copies is written once and the
+row reads the same on every export of the session.
+
+The best copy is known only once every copy has been seen, so the notes
+are united after the merge loop, and only a row whose other copies lend
+a note changes.  Its reason is computed again by [[audit_reason]] with
+the lent notes, which keeps one function deciding how a reason is
+written: the lent notes go in parentheses after the label, also after
+the pending label (after the pending copy's own notes) and after an
+exclusion criterion, and join the notes
+of a row whose reason is its notes.  The row's order and status are
+not touched, so a note never moves a work between the caption's
+categories: a cited row with a lent note is still cited.
+
+<<unite the notes of the row's copies>>=
+lent = [
+    tag
+    for copy in copies[key] if copy is not best[key]
+    for tag in audit_note_tags(
+        copy, theme_names=theme_names, notes=strings["notes"]
+    )
+]
+if lent:
+    row.reason, _ = audit_reason(
+        best[key], theme_names=theme_names, strings=strings,
+        also_notes=lent,
+    )
+    <<count a lent version note>>
+<<add the notes of the work's other copies>>=
+note_texts += [
+    audit_note_text(tag, notes)
+    for tag in dict.fromkeys(also_notes) if tag not in own_notes
+]
+@
+
+The caption counts the \enquote{other} rows by what their reason column
+shows (\cref{sec:audit-table}), and a row noted as another version of a
+cited source counts among the duplicates.  A lent version note is shown
+like the row's own, so it makes the row a version row too: a machine's
+keep under a theme, which alone would be one of the \enquote{other
+hits}, counts as a duplicate once a copy of it is noted as one.  A row
+under an exclusion criterion is still counted under its criterion, the
+reason its column leads with, as the caption already counts it.
+
+<<count a lent version note>>=
+row.version = row.version or any(
+    tag in AUDIT_VERSION_NOTES for tag in lent
+)
+@
+
+The first case is the one reported in issue~\#196: two copies placed
+equally, the first (and so the row's) confirmed from the classifier,
+the second, the DOI copy, carrying the reviewer's own note, with the
+themes named.  The second lends a note from Scholar's vocabulary,
+which needs no [[--theme]].  The others pin the order of the notes,
+what must \emph{not} travel---a theme, an exclusion criterion and the
+criterion it replaced---where lent notes go after a criterion, after
+the pending label of an untagged machine keep and on a pending copy,
+and that the row's place, and the caption's count, follow the rules
+above.
+
+<<test functions>>=
+class TestAuditRowUnitesNotes:
+  def _rows(self, *decisions, theme_names=None):
+    session = ReviewSession(
+      query="q", providers=["openalex"], timestamp=datetime.now(),
+    )
+    session.decisions = list(decisions)
+    return collect_audit_rows(
+      session, theme_names=theme_names or {}, strings=AUDIT_STRINGS["en"],
+    )
+
+  def _copy(self, status, tags, doi=None, source=ReviewSource.HUMAN,
+            conf=None, provider="openalex"):
+    return ReviewDecision(
+      paper=Paper(title="Recovery by Email", authors=["Ada Lovelace"],
+                  year=2024, doi=doi),
+      provider=provider, status=status, tags=tags, source=source,
+      llm_confidence=conf,
+    )
+
+  def test_a_note_on_the_losing_copy_reaches_the_row(self):
+    kept = DecisionStatus.KEPT
+    rows = self._rows(
+      self._copy(kept, ["supports-claim", "auth"],
+                 source=ReviewSource.LLM_REVIEWED, conf=0.9),
+      self._copy(kept, ["auth", "cited-in-report"], doi="10.1/a"),
+      theme_names={"auth": "account recovery"},
+    )
+    assert len(rows) == 1
+    assert rows[0].reason \
+      == r"\emph{cited}: account recovery (cited-in-report)"
+    assert rows[0].order == AUDIT_ORDER_CITED
+
+  def test_a_known_note_is_united_without_named_themes(self):
+    rows = self._rows(
+      self._copy(DecisionStatus.KEPT, ["supports-claim"],
+                 source=ReviewSource.LLM_UNREVIEWED, conf=0.9),
+      self._copy(DecisionStatus.DISCARDED, ["extended-tech-report"],
+                 doi="10.1/a", provider="dblp"),
+    )
+    assert rows[0].reason == "supports the claim (0.90) " \
+      "(extended report version of a cited source)"
+    assert (rows[0].order, rows[0].status) \
+      == (1, DecisionStatus.KEPT)
+
+  def test_best_copy_notes_first_then_others_once_in_order(self):
+    kept = DecisionStatus.KEPT
+    rows = self._rows(
+      self._copy(kept, ["ml", "no-abstract-title-only"]),
+      self._copy(kept, ["thesis-of-cited-source",
+                        "no-abstract-title-only"]),
+      self._copy(DecisionStatus.DISCARDED, ["erratum-to-cited-source"]),
+      self._copy(kept, ["ml", "thesis-of-cited-source"]),
+    )
+    assert rows[0].reason == r"\emph{cited}: ml (judged on title, " \
+      "no abstract available; thesis behind a cited source; " \
+      "erratum to a cited source)"
+
+  def test_themes_and_criteria_of_other_copies_do_not_travel(self):
+    llm = ReviewSource.LLM_UNREVIEWED
+    rows = self._rows(
+      self._copy(DecisionStatus.KEPT, ["supports-claim"], source=llm,
+                 conf=0.9),
+      self._copy(DecisionStatus.DISCARDED, ["off-topic-false-hit", "ml"],
+                 source=llm, conf=0.6),
+      self._copy(DecisionStatus.DISCARDED, ["usable", "no-abstract"]),
+    )
+    assert rows[0].reason == "supports the claim (0.90)"
+    rows = self._rows(
+      self._copy(DecisionStatus.KEPT, ["supports-claim"], source=llm,
+                 conf=0.9),
+      self._copy(DecisionStatus.DISCARDED, ["off-topic-false-hit", "ml"],
+                 source=llm, conf=0.6),
+      self._copy(DecisionStatus.DISCARDED, ["usable", "no-abstract"]),
+      theme_names={"ml": "ML"},
+    )
+    assert rows[0].reason == "supports the claim (0.90)"
+
+  def test_a_note_does_not_move_a_cited_row(self):
+    rows = self._rows(
+      self._copy(DecisionStatus.KEPT, []),
+      self._copy(DecisionStatus.KEPT, ["no-abstract-title-only"]),
+    )
+    assert (rows[0].reason, rows[0].order) == (
+      r"\emph{cited} (judged on title, no abstract available)",
+      AUDIT_ORDER_CITED,
+    )
+
+  def test_a_criterion_row_shows_lent_notes_after_its_criterion(self):
+    rows = self._rows(
+      self._copy(DecisionStatus.DISCARDED, ["no-abstract"]),
+      self._copy(DecisionStatus.DISCARDED, ["recorded-not-cited"]),
+    )
+    assert (rows[0].reason, rows[0].criterion) \
+      == ("no-abstract (recorded, not cited)", "no-abstract")
+
+  def test_an_untagged_machine_keep_shows_lent_notes(self):
+    rows = self._rows(
+      self._copy(DecisionStatus.KEPT, [],
+                 source=ReviewSource.LLM_UNREVIEWED, conf=0.7),
+      self._copy(DecisionStatus.DISCARDED, ["erratum-to-cited-source"]),
+    )
+    assert (rows[0].reason, rows[0].order) == (
+      "pending, unclassified (erratum to a cited source)",
+      AUDIT_ORDER_PENDING,
+    )
+
+  def test_a_pending_copy_shows_and_lends_its_notes(self):
+    pending, discarded = DecisionStatus.PENDING, DecisionStatus.DISCARDED
+    rows = self._rows(
+      self._copy(pending, ["recorded-not-cited"]),
+      self._copy(discarded, ["erratum-to-cited-source"]),
+    )
+    assert (rows[0].reason, rows[0].order) == (
+      "pending, unclassified (recorded, not cited; "
+      "erratum to a cited source)",
+      AUDIT_ORDER_PENDING,
+    )
+    rows = self._rows(
+      self._copy(DecisionStatus.KEPT, ["supports-claim"],
+                 source=ReviewSource.LLM_UNREVIEWED, conf=0.9),
+      self._copy(pending, ["recorded-not-cited", "usable"]),
+      theme_names={"ml": "ML"},
+    )
+    assert rows[0].reason \
+      == "supports the claim (0.90) (recorded, not cited; usable)"
+
+  def test_a_pending_row_shows_the_notes_of_its_other_copies(self):
+    rows = self._rows(
+      self._copy(DecisionStatus.DISCARDED,
+                 ["duplicate-record-of-cited-source"]),
+      self._copy(DecisionStatus.PENDING, []),
+    )
+    assert (rows[0].reason, rows[0].order) == (
+      "pending, unclassified (duplicate record of a cited source)",
+      AUDIT_ORDER_PENDING,
+    )
+
+  def test_the_caption_counts_a_united_version_note(self):
+    session = ReviewSession(
+      query="q", providers=["openalex"], timestamp=datetime.now(),
+    )
+    session.decisions = [
+      self._copy(DecisionStatus.KEPT, ["ml"],
+                 source=ReviewSource.LLM_UNREVIEWED, conf=0.8),
+      self._copy(DecisionStatus.DISCARDED,
+                 ["duplicate-record-of-cited-source"]),
+    ]
+    rows = collect_audit_rows(
+      session, theme_names={}, strings=AUDIT_STRINGS["en"],
+    )
+    assert rows[0].reason \
+      == "ml (0.80) (duplicate record of a cited source)"
+    caption = build_audit_table_latex(session, label="t")[5]
+    assert "1 duplicates or other versions of cited sources" in caption
+    assert "other hits" not in caption
 @
 
 \paragraph{The databases sentence}
