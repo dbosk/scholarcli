@@ -278,8 +278,10 @@ fetched_at)`. A test unpickles a written cache with
 "Approximate"), and `last_via` (`"bulk"`, `"bulk, most cited first"`
 or None). `--in title-abstract` is honoured on bulk (it matches
 title+abstract by default): `SemanticScholarProvider.applied_filters`
-reads `_routed` (query, bulk) noted by `search`, so `search_provider`
-re-reads `applied_filters` after the search; only the relevance search
+decides from the query and the limit `search_provider` passes (before
+and after the search, so a skipped search gets it too); `_routed`
+(query, bulk) noted by `search` is read only by a caller without a
+limit; only the relevance search
 warns, once per search. `via` flows `provider_via()` (in
 `search_provider`) → `SearchResult.via` (kept through `merge` as
 `"s2: bulk"` and `deduplicate`) → `result_via(part)` per part in
