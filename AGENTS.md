@@ -1286,23 +1286,33 @@ report body builders (`build_review_provenance_latex`,
   `--cited-from FILE.bib` (repeatable, `-f table` only, else exit 2;
   #218, review.nw `sec:audit-cited-from`/`sec:audit-cited-entries`).
   With it, *cited* = the text cites the work, whoever decided: the CLI
-  reads each entry as `prov import` does (`_parse_bib_entries` +
-  `_paper_from_entry`; year from `date` if no `year`; a second reading
-  with authors as written, so `Lopez Gallucci, N.` keeps its surname),
-  skips entries without title and DOI (named on stderr), and
+  reads the files with bibtexparser 2 (`_cited_bib_papers`, NOT `prov
+  import`'s line reader, which misses wrapped fields and bare years:
+  322 of 529 titles in intropy's `ltnotes.bib`; `LatexDecodingMiddleware`
+  plus the `names` functions called directly, since the name
+  middlewares skip a field spelled `Author`; the DOI from the
+  undecoded parse, since decoding turns `--` into an en dash; year
+  from `year`, else
+  `date`; a second reading surname first when it names another surname,
+  so `Lopez Gallucci, N.` matches either stored form), skips entries
+  without title and DOI and counts unparsable blocks (stderr), and
   `match_cited_entries(entries, session)` reuses the sessions check's
   lookup (`matching_entries` over `session_match_index`: DOI incl.
   version-link DOIs, else `audit_work_key` under `plausibly_same_work`)
   → `CitedEntry.works` (work keys) → `collect_audit_rows(...,
   cited_works=)` → `audit_reason(..., cited=True/False)` per copy
-  (None = old rule). Kept/pending + cited → order 0 (`\emph{cited}` +
+  (None = old rule). Copies are still ranked on the screening's order
+  (`audit_reason(cited=None)`), so the citation never changes which
+  copy gives the row. Kept/pending + cited → order 0 (`\emph{cited}` +
   theme/category, machine confidence kept; pending: ", pending,
   unclassified"); discarded + cited → own reason + note "cited in the
-  text"; a confirmed keep not cited → category order, else "kept, not
-  cited in the text" (other). Caption gets `cited_rule` before the
-  databases (en/sv); counts follow the rows. stderr: match counts (DOI
-  / title / not in session), then `cited_text_disagreements` lists the
-  excluded and the not-held entries (key: short title); not in the
+  text"; a keep not cited (any source) → category order, else "kept,
+  not cited in the text" (`audit_uncited_keep`, `AuditRow.uncited`;
+  own caption count `extra_uncited`, ahead of duplicates). Caption
+  gets `cited_rule` before the databases (en/sv), also when nothing
+  matched. stderr: match counts (DOI / title / not in session), then
+  `cited_text_disagreements` lists the excluded (any matched row
+  discarded) and the not-held entries (key: short title); not in the
   caption. Without the option the output is byte-identical (checked on
   real-session copies). Order: cited (0), `supports-claim` (1),
   `qualifies-claim` (2), `adjacent-subtopic` (3),
