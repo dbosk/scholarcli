@@ -1048,6 +1048,35 @@ next save (checked under 528d933).
 Together these let scripted/agent-driven systematic reviews produce the same
 session record and `sessions export` audit trail as TUI reviews.
 
+### Session Arguments
+
+Every command that takes a saved session (`sessions show/export/decide/
+relabel/resume/reconcile/check`, `llm classify/status/context/
+synthesize/sample`, `enrich`, `verify`) opens it with
+`cli.open_session_argument` → `review.load_session_argument` →
+`resolve_session_argument` (#237, review.nw `sec:session-arguments`):
+an argument ending in `.json` names that file in the sessions dir; a
+`.json` path is accepted only into the sessions dir, any other
+directory → `SessionArgumentError` "give a file name in <dir>" (taking
+the base name had opened the live file of that name instead). Any
+argument is also tried as `<arg>.json` and as its query's hash file.
+More than one existing file → `AmbiguousSessionError` (a
+`SessionArgumentError`; message names each file and what it holds,
+`describe_session_file`). Both → exit 2, nothing read or written. One
+file → read with `read_session_file` (the same file as the old
+`load_session` lookup); none → None, also for a query too long to be a
+file name. Tests of the commands stub `review.load_session_argument`.
+`sessions reconcile` re-reads the resolved file under the lock. `llm
+sample` and `sessions check` load a session named twice (`x x.json`)
+once (by `session_file_path`). The `sessions list` table shows `name
+(argument)` when they differ (`session_list_name`).
+`session_argument(session)` /
+`session_argument_for(label, path)` give what to type: the label, or
+the file name when the label opens another file or fits two; used by
+`list_sessions` (`argument` key), shell completion, `llm sample`'s drawn
+list and `--report`'s "not yet reviewed" list (`SampleReport.unreviewed`
+holds arguments). Never call `load_session` on a user-typed argument.
+
 ### Session Integrity
 
 Commands that load a session and save it much later (`scholar enrich`,
