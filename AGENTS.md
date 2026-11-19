@@ -853,15 +853,23 @@ the paper's own DOI, years apart) and ids `stored_paper_with` can
 merge (equal, or a DOI-less record vs a DOI copy; a hash-keyed record
 can rebuild with a DOI or a derived arXiv DOI, and then the returned
 copy stands) (#194). A namesake never takes the record's decision
-(#203, as `sec:session-copies` does for session files): a legacy-id
-record that is not `plausibly_same_work` is dropped (the DOI paper is
-new and pending, with the links; the restore brings the record back
-under its own id, no links); a DOI-less paper whose own-id record is
+(#203, as `sec:session-copies` does for session files). The lookup is
+`store_record_of` (own id, else for a DOI paper the legacy hash id):
+a legacy-id record counts only when `plausibly_same_work` with its
+rebuilt paper *without* a DOI (a hash-keyed record was decided
+DOI-less; a derived arXiv DOI must not make a preprint's record
+another work than its published version). One that does not is
+skipped (the DOI paper is new and pending, with the links; the
+restore brings the record back under its own id, no links); one that
+does is taken over and not restored again (`store_keys_taken`, asked
+before the restore, #211). A DOI-less paper whose own-id record is
 not plausibly its work (`is_record_namesake`; no id comparison, since
-a record can rebuild with a DOI) leaves the record's decision and
-paper as they were (record's provider, added by that branch since the
+a record can rebuild with a DOI) leaves the record's decision as the
+restore makes it (`restored_decision`, added by that branch since the
 restore skips returned ids) and is noted in its `same_id_copies`, no
 search link. A DOI paper under its own DOI is never a namesake.
+Record fields → decision: `decision_from_record` (restore too; an
+unknown source string stays an `is_unknown` pseudo-member).
 Tests of this
 path need `isolated_registry()` between runs, else `Paper.from_dict`
 returns the held object and hides the loss. The save
