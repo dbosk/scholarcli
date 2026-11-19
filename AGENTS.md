@@ -1037,8 +1037,9 @@ report body builders (`build_review_provenance_latex`,
   category, confidence, status and order, but the notes of every copy
   are united, #196: `collect_audit_rows` passes the other copies'
   `audit_note_tags` (what each copy's own row shows as notes: note
-  tags, plus stray tags under `--theme`; none for pending copies or
-  criterion discards) to `audit_reason(..., also_notes=)`, best copy's
+  tags, plus stray tags under `--theme`; pending copies included, after
+  the pending label; none for criterion discards, whose other tags are
+  earlier criteria) to `audit_reason(..., also_notes=)`, best copy's
   first, then in decision order, each once; themes are not united; a
   lent version note makes the row a version row for the caption). The
   per-decision CSV is unaffected. The *last* category tag
