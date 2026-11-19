@@ -941,6 +941,37 @@ by:", marks after titles; JSON `source` per decision and
 confirmed/changed table (`machine_review_rows`, LLM and agent apart).
 Labels come from `review.DECISION_SOURCE_LABELS` /
 `decision_source_items` (decided papers only).
+**Correcting a source** (#216): `scholar sessions relabel S --from SRC
+[--from ...|a,b] --to agent|llm (--doi D ...|--paper-id ID ...|--all)
+[--dry-run] [--note TEXT]` changes only the source of decided papers
+whose stored source is a `--from` value (pending papers never), via
+`review.relabel_source`: status, tags, confidence, `LLM_AUDIT_FIELDS`,
+`is_example`, `found_by`, provider stay; no `clear_machine_audit`.
+Targets are `review.RELABEL_TARGETS` (the `is_unreviewed` members):
+`human`, `llm_reviewed`, `agent_reviewed` claim a human's confirmation
+and exit 2 (a human confirms in the TUI or with `decide --source
+human`). An LLM call an agent (not a human) confirmed becomes `agent`,
+not `agent_reviewed` (that means agent proposed, human confirmed); its
+LLM trace stays as provenance. A relabelled `is_example` keeps the flag
+but stops being a classifier example (`CONFIRMED_SOURCES`). Usage
+errors exit 2 before loading (`--to` in `--from`, neither or both of
+`--all` and selectors, an unknown `--from` no decision holds); an
+unmatched selector exits 1 unsaved; a selected paper that is pending
+or has another source is named and skipped. A selector takes every
+decision of the paper. Prints `from -> to: N` counts; `--dry-run`
+writes nothing (no copy). Otherwise `keep_copy_before_run(session,
+"pre-relabel")`, one `_utcnow()` time for all records, `save_session`.
+Each decision records `ReviewDecision.relabelled`
+(`[{"from", "to", "at", "note"}]`, `add_relabel` once each): saved
+only when non-empty, old files load `[]`, kept by the append copy,
+united by `merge_concurrent_changes` (after `mine =
+decision_state(...)` is taken, since the list is part of
+`decision_state`: otherwise the union would read as a local change and
+a stale process would keep its old source). Shown by `sessions show`
+("(relabelled from human)", JSON `relabelled` when set) and the CSV
+column `source_relabelled` (`from->to time; ...`, before `paper_id`).
+A Scholar from before this loads such files but drops the list on its
+next save (checked under 528d933).
 Together these let scripted/agent-driven systematic reviews produce the same
 session record and `sessions export` audit trail as TUI reviews.
 
