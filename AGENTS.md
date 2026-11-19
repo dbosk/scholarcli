@@ -1130,8 +1130,10 @@ report body builders (`build_review_provenance_latex`,
   category, confidence, status and order (#204, one sort key
   `audit_copy_rank` = (tier, order, unreviewed): tier 0 = a keep or
   discard of the *work* by a confirmed source, i.e. not
-  `is_unreviewed`; a discard of the *record* (an `AUDIT_VERSION_NOTES`
-  note or an `audit_exclusion_criterion`, e.g. `no-abstract`), pending
+  `is_unreviewed`, topical criterion discards included; a discard of
+  the *record* (an `AUDIT_VERSION_NOTES` note, or a criterion in
+  `AUDIT_RECORD_CRITERIA` = `no-abstract`, `insufficient-information`;
+  the criterion skips named `--theme`s), pending
   copies and unreviewed/unknown sources are tier 1; on equal order a
   confirmed copy wins, not the machine's copy and its confidence; a human
   "qualifies, excluded" discard thus beats an unreviewed "supports"
