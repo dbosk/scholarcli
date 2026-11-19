@@ -832,7 +832,12 @@ saved only when non-empty, unioned by the concurrent merge), which
 `scholar search -n <name>` persists the search to the named review session
 even without `--review`: it creates or appends (same
 `create_review_session()` merge the TUI uses — search records accumulate,
-prior decisions are preserved, new papers land pending). A paper the
+prior decisions are preserved, new papers land pending). Every CLI
+append is named: `--review` without `-n` names the session after its
+query (`cli.nw`, `session_name = name if name else query`), so
+`search q --review` appends to `q.json`, or, when that does not exist,
+continues an unnamed session of query `q` in its hash file (#213, see
+Session Integrity). A paper the
 re-run returns again keeps its stored paper, gaps filled from the new
 copy (`stored_paper_with` → `Paper.merge_with`, stored values win,
 sources united; a DOI-less stored paper met by a DOI copy, found under
@@ -973,6 +978,15 @@ context (#107). `review.save_session` now:
   link too); else ours holds a status or changed → our pair whole,
   restored after the fill; else fill. `pdf_url` and the Crossref
   pair stay per field (Crossref never writes `None` there).
+  Crossref notices (`CROSSREF_NOTICE_FIELDS`: `updated_by`,
+  `newer_versions`) are united (#219, `united_crossref_notices`:
+  ours first, each notice whole, keyed by normalised DOI + `type` /
+  `relation`, DOI-less notices by equality; None+None → None,
+  []+None → []) when the paper has no paper state or both copies
+  changed them since the baseline (a retraction lost is worse than a
+  withdrawn notice kept, which `verify` replaces); only one side
+  changed → the three-way rule (ours as loaded → file's list; ours
+  changed, file as loaded → ours).
   `ACCUMULATED_PAPER_FIELDS` are never judged three ways: sources,
   keywords, tags united and `citation_count` max (by `merge_with`),
   `preprint_versions`/`published_versions` united by
@@ -984,7 +998,8 @@ context (#107). `review.save_session` now:
   (#209: other-file appends, new sessions, the ids a same-file append
   adds) has decision states only, since a built paper is no ancestor
   of the target's copy. No paper state (session never loaded or
-  built, paper new here) → nothing taken, gaps filled, ours wins.
+  built, paper new here) → nothing taken, gaps filled, ours wins
+  (Crossref notices united, above).
   `read_session_file` takes the baseline from the file's copy
   (`as_stored`), not from the registry's held object, else the
   file's older values would overwrite ours; the save's re-read passes
@@ -1041,9 +1056,34 @@ context (#107). `review.save_session` now:
   only sessions constructed in code have no baseline. Whenever the
   session does not continue a loaded file, the built baseline's
   `record_keys` are empty: nothing was loaded from the target, so the
-  legacy-record rule must not drop one of our legacy records. Known gap (#213): a
-  renamed id leaves the target the work twice (old id: its own
-  decision; new id: the loaded file's), reported by no copy list.
+  legacy-record rule must not drop one of our legacy records.
+- **an append loads only its own file** (#213):
+  `create_review_session` loads `load_own_session(name, query)`, the
+  file `own_session_file_name` gives (`<name>.json`, unnamed: the
+  query's hash), never `load_session`'s other guess (an unnamed append
+  for foo used to load named session foo's `foo.json`, whatever its
+  query; `search bar -n foo` without `foo.json` the unnamed foo
+  session's hash file). One exception, the `--review` default: a named
+  append without its own file whose name is its query continues the
+  hash file of that query if it holds an unnamed session of that query
+  (that command always did); the session stays unnamed
+  (`<<continue an unnamed session without a name>>`), so it saves back
+  there with the loaded baseline and is found again next run. When the
+  other file exists and is not continued, one line names it, what it
+  stores (`_stored_identity`: name, or the unnamed session's query) and
+  `pass -n '<its stem>'` to continue it: WARNING when the own file does
+  not exist, INFO otherwise. A `<query>.json` too long for a file name
+  reads as absent (the old lookup raised `OSError`).
+  `appends_to_loaded_file` compares `previous._loaded_from.name` with
+  `own_session_file_name(name, query)` (identities got hand copies
+  wrong: `-n a` on `a.json` holding b took the built baseline and a
+  renamed homonym id came back beside the new one). So every append
+  that loaded a file continues it; the #207 built baseline serves only
+  sessions that loaded nothing. `load_session` keeps its tolerant
+  lookup for the user-facing commands (`sessions show/export/decide/
+  ...`, `llm`, `enrich`, `verify`); `search -n`/`--review`, `rq` and the
+  TUI all go through `create_review_session`. Real sessions
+  (2026-11-19): no hash-named file, no unnamed session.
 
 `scholar enrich` saves after every `ENRICH_SAVE_EVERY` (50) papers
 (`cli.nw`, `sec:enrich-chunks`): enrich → Crossref check → assign →
