@@ -972,6 +972,13 @@ context (#107). `review.save_session` now:
   (a hand copy) logs one WARNING per file and process
   (`warn_about_foreign_name`) and is flagged by `sessions list`
   (`name_mismatch` in the JSON, a stderr line); neither is renamed.
+  The loaded `_baseline` goes with `_loaded_from` (#207): an append
+  that saves into another file takes `SessionBaseline.of(session)` at
+  the end of `create_review_session` instead (no baseline would let
+  the loaded file's decisions and context replace the target's; the
+  loaded one reset the target's decisions of papers it lacked and
+  dropped those under ids the append renamed). Same-file appends keep
+  the loaded baseline (a renamed id must not come back from the file).
 
 `scholar enrich` saves after every `ENRICH_SAVE_EVERY` (50) papers
 (`cli.nw`, `sec:enrich-chunks`): enrich → Crossref check → assign →

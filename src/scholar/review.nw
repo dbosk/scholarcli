@@ -2656,11 +2656,14 @@ saving it replaced the unreadable file and every decision in it.  We
 therefore load with [[strict=True]], which raises [[SessionFileError]]
 naming the file instead (\cref{sec:session-integrity}); the command fails
 and the file stays as it is, to be repaired or restored from its
-[[.bak]].  The new session also inherits the loaded session's baseline,
-so that saving it merges what other processes saved in the meantime just
-as saving the loaded session itself would, and, when it is the same
-session, the file it was loaded from, so that it is saved back there
-([[appends_to_loaded_file]], \cref{sec:session-own-file}).
+[[.bak]].  When the new session is the loaded one, it also inherits the
+file it was loaded from, so that it is saved back there, and the loaded
+session's baseline, so that saving it merges what other processes saved
+in the meantime just as saving the loaded session itself would
+([[appends_to_loaded_file]], \cref{sec:session-own-file}).  When it is
+another session, saved into another file, it takes neither: its
+baseline is then the state it is built with (at the end of the
+function), since the loaded baseline describes another file.
 
 <<review session functions>>=
 def _normalize_paper_identifiers(paper: Paper) -> Paper:
@@ -2742,8 +2745,8 @@ def create_review_session(
     if previous_session and previous_session.research_context:
         session.research_context = previous_session.research_context
     if previous_session:
-        session._baseline = previous_session._baseline
         if appends_to_loaded_file(previous_session, session_name, query):
+            session._baseline = previous_session._baseline
             session._loaded_from = previous_session._loaded_from
         session.folded = dict(previous_session.folded)
 
@@ -2787,6 +2790,7 @@ def create_review_session(
     <<convert search results to decisions>>
     <<point links at the records that replaced theirs>>
     supersede_merged_records(session)
+    <<take the session as built as the baseline of another file>>
     
     logger.info("Created session with %d papers (%d kept, %d discarded, %d pending)",
                len(session.decisions), len(session.kept_papers()),
@@ -8193,6 +8197,230 @@ class TestSaveToLoadedFile:
         a_path, b_path = self._renamed_copy()
         flags = {s["path"].name: s["name_mismatch"] for s in list_sessions()}
         assert flags == {"a.json": True, "b.json": False}
+@
+
+\paragraph{The baseline belongs to the file.}
+The merge of a save (\cref{sec:session-integrity}) judges each decision
+against the session's baseline: a decision that is still as it was
+loaded is not this process's, so the file's value wins.  A baseline
+therefore describes one file, the one it was taken from.
+[[create_review_session]] used to hand the loaded session's baseline to
+the new session whether or not the new session continues that file
+(\url{https://github.com/dbosk/scholar/issues/207}).  In the appends
+above that save into another file than the one they loaded,
+the merge then judged the other file against the loaded file's
+baseline.  Say [[search foo --review]] loads [[foo.json]] (session
+[[foo]] of query [[bar]]) and saves into the hash file of query
+[[foo]], which holds decisions of its own.  Two things went wrong.
+\begin{itemize}
+\item A paper that the target file has decided and the search returned
+  again, but that the loaded file does not hold, is a new, pending
+  paper of the new session and is not in the loaded baseline.  Nothing
+  said it was unchanged, so the pending decision replaced the file's.
+\item A paper whose id the append changed (a DBLP homonym number
+  dropped, \cref{sec:review-renamed-authors}) has its old id in the
+  loaded baseline and no longer in the session.  The merge read that as
+  \enquote{this process renamed it} and did not add the file's paper
+  under the old id: the target file lost that decision altogether.
+\end{itemize}
+Starting without a baseline, as a session that loaded nothing does,
+mends the second but not the first, and it does harm of its own: without
+a baseline every decision the session holds counts as this process's
+change, so for a paper both files hold the loaded file's decision
+replaced the target's, and the loaded file's research context replaced
+the target's too.  The loaded baseline did neither, by accident: it
+records the loaded file's decision and context as unchanged, so the
+merge took the target's.
+
+What the merge needs to know is what this process changed after it
+built the session.  So a session that will be saved into another file
+takes as its baseline the state it holds when [[create_review_session]]
+returns it.  What the user decides afterwards is not in that state and
+wins as before; everything else counts as unchanged, so where the
+target file differs (its own decision of a paper, its research context)
+the file's value is kept, and the target's papers that the session does
+not hold are added, under whatever ids they have.  That the append
+carries the loaded file's other decisions into the target at all comes
+from the lookup that found the loaded file, which this does not change.
+
+A session that continues the file it loaded keeps the loaded baseline
+instead.  It records what was loaded, so a decision another process
+saved meanwhile still wins over a decision this process only loaded,
+and a paper that this append renamed is not brought back from the file
+under its old id.  A baseline taken after the build would know neither.
+A session that loaded nothing still has no baseline; this concerns only
+the appends that loaded one file and save into another.
+
+<<take the session as built as the baseline of another file>>=
+if previous_session and session._loaded_from is None:
+    session._baseline = SessionBaseline.of(session)
+@
+
+Let's verify it with the scenarios of the issue.  Each test fills the
+target file with decisions of its own and checks that the append's save
+keeps them: the unnamed append that loads a named session's file, the
+named append that loads an unnamed session's hash file while the named
+file is created by another process before the save, and the append
+that drops a homonym number.  The last test is the same-file append,
+which must keep the loaded baseline: another process's decision wins,
+and the renamed paper's old id does not come back.
+
+<<test functions>>=
+class TestAppendBaselineFollowsTheFile:
+    """An append's baseline describes the file it is saved to (#207)."""
+
+    @staticmethod
+    def _session(name, query, decisions, context=None):
+        session = ReviewSession(
+            query=query, providers=["openalex"],
+            timestamp=datetime(2026, 11, 19), name=name,
+            research_context=context,
+        )
+        session.add_query_provider_pair(query, "openalex")
+        session.decisions = decisions
+        return session
+
+    @staticmethod
+    def _decision(paper, status=DecisionStatus.PENDING, tags=()):
+        return ReviewDecision(
+            paper=paper, provider="openalex", status=status, tags=list(tags),
+        )
+
+    @staticmethod
+    def _paper(doi):
+        return Paper(title=f"Paper {doi}", authors=["A"], doi=doi)
+
+    @staticmethod
+    def _result(query, papers):
+        result = Mock()
+        result.provider = "openalex"
+        result.query = query
+        result.filters = None
+        result.limit = None
+        result.papers = papers
+        return result
+
+    @staticmethod
+    def _saved(path):
+        data = json.loads(path.read_text())
+        statuses = {
+            d["paper_id"]: (d["status"], d["tags"]) for d in data["decisions"]
+        }
+        return statuses, data.get("research_context")
+
+    def _target_decisions(self):
+        """The target file's own decisions: both discarded."""
+        return [
+            self._decision(self._paper("10.5555/wp207-shared"),
+                           DecisionStatus.DISCARDED, ["off-topic"]),
+            self._decision(self._paper("10.5555/wp207-new"),
+                           DecisionStatus.DISCARDED, ["off-topic"]),
+        ]
+
+    def _search(self):
+        return self._result("foo", [self._paper("10.5555/wp207-new"),
+                                    self._paper("10.5555/wp207-shared")])
+
+    def _assert_target_kept(self, path):
+        statuses, context = self._saved(path)
+        assert statuses["doi:10.5555/wp207-new"] == (
+            "discarded", ["off-topic"])
+        assert statuses["doi:10.5555/wp207-shared"] == (
+            "discarded", ["off-topic"])
+        assert context == "target context"
+
+    def test_unnamed_append_keeps_the_hash_files_decisions(
+        self, tmp_path, monkeypatch
+    ):
+        """`search foo --review` loads foo.json, saves the hash file."""
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        save_session(self._session("foo", "bar", [
+            self._decision(self._paper("10.5555/wp207-shared"),
+                           DecisionStatus.KEPT, ["t1"]),
+        ], context="loaded context"))
+        target = save_session(self._session(
+            None, "foo", self._target_decisions(),
+            context="target context",
+        ))
+
+        session = create_review_session([self._search()], "foo")
+        assert save_session(session) == target
+        self._assert_target_kept(target)
+
+    def test_named_append_keeps_a_file_created_meanwhile(
+        self, tmp_path, monkeypatch
+    ):
+        """`search foo -n foo` loads the hash file; foo.json appears."""
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        save_session(self._session(None, "foo", [
+            self._decision(self._paper("10.5555/wp207-shared"),
+                           DecisionStatus.KEPT, ["t1"]),
+        ], context="loaded context"))
+
+        session = create_review_session([self._search()], "foo", "foo")
+        target = save_session(self._session(
+            "foo", "bar", self._target_decisions(),
+            context="target context",
+        ))
+        assert save_session(session) == target
+        self._assert_target_kept(target)
+
+    @staticmethod
+    def _homonym(number=" 0001"):
+        return Paper(title="Homonym paper", authors=[f"Wei Wang{number}"],
+                     year=2020)
+
+    def test_renamed_id_keeps_the_target_files_decision(
+        self, tmp_path, monkeypatch
+    ):
+        """The loaded id the append renamed is the target's id too."""
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        old_id = get_paper_id(self._homonym())
+        save_session(self._session("foo", "bar", [
+            self._decision(self._homonym(), DecisionStatus.KEPT, ["t1"]),
+        ]))
+        target = save_session(self._session(None, "foo", [
+            self._decision(self._homonym(), DecisionStatus.DISCARDED,
+                           ["off-topic"]),
+        ]))
+
+        session = create_review_session(
+            [self._result("foo", [self._homonym(number="")])], "foo"
+        )
+        assert old_id not in {get_paper_id(d.paper)
+                              for d in session.decisions}
+        assert save_session(session) == target
+        statuses, _ = self._saved(target)
+        assert statuses[old_id] == ("discarded", ["off-topic"])
+
+    def test_same_file_append_keeps_the_loaded_baseline(
+        self, tmp_path, monkeypatch
+    ):
+        """Continuing the loaded file merges as saving it would."""
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        old_id = get_paper_id(self._homonym())
+        path = save_session(self._session(None, "foo", [
+            self._decision(self._homonym(), DecisionStatus.KEPT, ["t1"]),
+            self._decision(self._paper("10.5555/wp207-shared")),
+        ]))
+
+        session = create_review_session(
+            [self._result("foo", [self._homonym(number="")])], "foo"
+        )
+        other = load_session("foo")
+        [shared] = [d for d in other.decisions
+                    if d.paper.doi == "10.5555/wp207-shared"]
+        shared.status = DecisionStatus.DISCARDED
+        shared.tags = ["off-topic"]
+        save_session(other)
+
+        assert save_session(session) == path
+        statuses, _ = self._saved(path)
+        assert statuses["doi:10.5555/wp207-shared"] == (
+            "discarded", ["off-topic"])
+        assert old_id not in statuses
+        assert statuses[get_paper_id(self._homonym(number=""))] == (
+            "kept", ["t1"])
 @
 
 \subsubsection{Persisting Query-Provider Pairs}
