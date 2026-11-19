@@ -1152,7 +1152,14 @@ notes`:
 A note is parsed into ordered segments — `personal` (verbatim) or `prov`
 (a parsed block) — by `_split_note_segments`. Entries are keyed by
 reconstructing a `Paper` from the `.bib` fields and reusing `Paper.id`
-(DOI, else title+author hash). All round-trip code lives in `cli.nw`'s
+(DOI, else title+author hash). Our `.bib` fields are escaped (#230), so
+`_paper_from_entry` undoes the `BIBTEX_SPECIALS` escapes (`_unescape_bib`)
+and, for a DOI-less entry, takes an existing note whose title escaped
+by `escape_bibtex` equals the entry's and whose id that title and the
+entry's authors give (`_noted_titles`, built once per command). Gap: a
+first import (no note yet) of a title with lossy escapes (curly quotes,
+dashes, dropped symbols) keys the note by the escaped text.
+All round-trip code lives in `cli.nw`'s
 `<<formatter classes>>` and `<<prov command>>` chunks.
 
 ### Search Provenance (`prov found-via`)
@@ -1234,7 +1241,11 @@ report body builders (`build_review_provenance_latex`,
   `v5`: cached prose cites keys literally). `search -f bibtex` and
   `bibtex+prov` use it too (#122, `cli._keyed_papers`: keys assigned
   once over all results in output order); this changed their keys
-  for comma-form names, apostrophes and clashes. `prov import/export`
+  for comma-form names, apostrophes and clashes. Their title, author
+  and journal go through `escape_bibtex` like the export's `.bib`
+  (#230; before, raw `& % $ # _` and symbols stopped pdfLaTeX); the
+  layout, field order and DOI (verbatim in biblatex) are unchanged.
+  `prov import/export`
   match entries by `Paper.id`, never by key, so old `.bib` files still
   round-trip.
 - `scholar sessions export -f table --lang en|sv --label L --track T
