@@ -836,7 +836,17 @@ the batch is refused unsaved (exit 2, each conflict named) unless
 category tags (`AUDIT_CATEGORIES`) are dropped before the new `--tag`s
 are added (`review.tags_after_status_change`, #177); themes,
 motivations and notes stay (dropping motivations lost themes on
-keep→discard→keep). Same status: tags append as before.
+keep→discard→keep). Same status: tags append as before, except that a
+`--tag` in `AUDIT_CATEGORIES` also drops the old category tags (#195,
+`review.tags_after_decision`: a record holds one category).
+`--untag TAG` (repeatable) removes tags first, from every selected
+record (machine sources too; the `--force` guard is unchanged); a tag
+no selected record had is named once on stderr, not an error. A discard
+still needs a `--tag` on the command line. More than one category among
+the `--tag`s is refused (exit 2, before the session loads). `--untag` is
+part of a decision (needs `--keep`/`--discard`): a machine untag without
+`-c` clears `llm_confidence` and the audit fields (pass `-c` again), and
+a human untag of an unreviewed agent/LLM decision marks it `*_reviewed`.
 **Unknown stored sources** (e.g. `manual`, which no Scholar version
 wrote, or a hand-edited `Agent`) load as `ReviewSource` pseudo-members
 via `_missing_` (`is_unknown`; value kept verbatim on save), count as
