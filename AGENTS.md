@@ -1126,8 +1126,12 @@ report body builders (`build_review_provenance_latex`,
   (`author_surname`; a blank author gives an empty surname) reduced to case-folded letters and digits, year ignored; joined
   provider strings like `openalex; dblp` are split, mapped to codes and
   deduplicated, keeping only the names `decision_provider_evidence`
-  supports (#191, see Data Models); the best-placed decision gives the row its reason,
-  category, confidence, status and order, but the notes of every copy
+  supports (#191, see Data Models); the best copy gives the row its reason,
+  category, confidence, status and order (#204, `audit_copy_rank`: a
+  keep by a confirmed source, i.e. not `is_unreviewed`, before every
+  other copy, then the order; confirmed discards rank with the
+  unreviewed and pending copies by order, so an unreviewed keep can
+  still outrank a human discard), but the notes of every copy
   are united, #196: `collect_audit_rows` passes the other copies'
   `audit_note_tags` (what each copy's own row shows as notes: note
   tags, plus stray tags under `--theme`; pending copies included, after

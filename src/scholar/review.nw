@@ -13064,6 +13064,9 @@ audit table is about works, not records: rows are merged on a work key,
 the providers are joined, and the best-placed decision wins---a cited
 copy over a category, a category over a note---because the paper is
 what it is whatever the other providers' copies were classified as.
+A copy kept by a confirmed decision comes before every other copy,
+whatever their places, since an unreviewed proposal must not speak
+over the review (\cref{sec:audit-row-copy}).
 The row's notes are the exception: they are united from all copies
 (\cref{sec:audit-row-notes}). The
 key is the title reduced to its letters and digits, case-folded, plus
@@ -13182,7 +13185,8 @@ def collect_audit_rows(
                 row.providers.append(provider)
         if not row.year:
             row.year = year
-        if order < row.order:
+        if audit_copy_rank(decision, order) \
+                < audit_copy_rank(best[key], row.order):
             row.status, row.reason, row.order = decision.status, reason, order
             row.excluded, row.criterion = excluded, criterion
             row.version = version
@@ -13609,6 +13613,165 @@ class TestAuditRowUnitesNotes:
     caption = build_audit_table_latex(session, label="t")[5]
     assert "1 duplicates or other versions of cited sources" in caption
     assert "other hits" not in caption
+@
+
+\paragraph{Which copy represents the row}
+\label{sec:audit-row-copy}
+
+The category order alone let a machine's proposal speak over the
+reviewer (\url{https://github.com/dbosk/scholarcli/issues/204}).  An
+unreviewed keep from the classifier without tags ranks as pending
+(order~5); a human keep tagged only with a note, such as
+[[recorded-not-cited]], or [[cited-in-report]] under [[--theme]],
+ranks as \enquote{other} (order~6).  So the machine's copy represented
+the work, and the row read \enquote{pending, unclassified
+(cited-in-report)} for a work a human had kept.  The same happens to a
+human keep with a weak category against a machine's stronger one: an
+unreviewed \enquote{supports the claim} outranked a human
+\enquote{adjacent subtopic}.  The order says how strongly a copy bears
+on the claim; it does not say whose judgement it is, and a proposal
+nobody has looked at is not a judgement of the review.
+
+A copy kept by a confirmed decision---a human's, or a machine's that a
+human confirmed ([[llm_reviewed]], [[agent_reviewed]]), that is, a
+source that is not [[is_unreviewed]]---therefore represents the row
+before any other copy, and the category order decides only within the
+two tiers: among the confirmed keeps, and among the rest.  An unknown
+source counts as unreviewed, as everywhere else
+(\cref{sec:review-source}), so it stays in the second tier.
+
+Confirmed discards stay in the second tier, ranked by the order as
+before, so an unreviewed keep can still represent a work a human
+discarded: an unreviewed \enquote{supports the claim} outranks a human
+discard under an exclusion criterion such as [[no-abstract]].  Whether
+a confirmed discard should come first too is a separate question, left
+open here; the issue is about keeps.
+
+Putting the confirmed keeps first has one effect on confirmed
+discards: a confirmed keep now represents the work also against a
+confirmed discard that the order placed higher (an \enquote{off-topic}
+discard against a note-only keep).  That is the price of ranking by
+one key.  Promoting the confirmed keeps over the unreviewed and pending
+copies only, and leaving them to the order against confirmed discards,
+is not a ranking: a note-only human keep (order~6) would beat an
+unreviewed \enquote{supports the claim} (order~1), which beats a
+human \enquote{off-topic} discard (order~4), which beats the keep, and
+the row would depend on the order of the decisions.  With one key,
+[[audit_copy_rank]], the lowest rank wins, and only between copies of
+equal rank does the first one win, as before.
+
+<<review report generation>>=
+def audit_copy_rank(decision: ReviewDecision, order: int) -> tuple[int, int]:
+    """Rank a copy of a work for representing its audit row; lower wins.
+
+    A copy kept by a confirmed (not unreviewed) source comes first, then
+    `order`, the place `audit_reason` gave the copy.
+    """
+    confirmed_keep = (
+        decision.status == DecisionStatus.KEPT
+        and not decision.source.is_unreviewed
+    )
+    return (0 if confirmed_keep else 1, order)
+@
+
+The first test is the case of issue~\#204, with the human copy both
+second and first, so the result cannot come from the order of the
+decisions.  Confirmed machine sources count as confirmed, an unknown
+source and an unreviewed agent do not, and the confirmed keep wins
+also against a stronger unreviewed category.  The last two pin what
+does not change: a confirmed discard against an unreviewed keep is
+ranked by the order, whichever wins.
+
+<<test functions>>=
+class TestAuditRowConfirmedCopyFirst:
+  def _rows(self, *decisions, theme_names=None):
+    session = ReviewSession(
+      query="q", providers=["openalex"], timestamp=datetime.now(),
+    )
+    session.decisions = list(decisions)
+    return collect_audit_rows(
+      session, theme_names=theme_names or {}, strings=AUDIT_STRINGS["en"],
+    )
+
+  def _copy(self, status, tags, source=ReviewSource.HUMAN, conf=None,
+            doi=None):
+    return ReviewDecision(
+      paper=Paper(title="Recovery by Email", authors=["Ada Lovelace"],
+                  year=2024, doi=doi),
+      provider="openalex", status=status, tags=tags, source=source,
+      llm_confidence=conf,
+    )
+
+  def _machine_keep(self, tags=(), source=ReviewSource.LLM_UNREVIEWED,
+                    conf=0.7):
+    return self._copy(DecisionStatus.KEPT, list(tags), source=source,
+                      conf=conf)
+
+  def test_a_human_note_only_keep_beats_an_untagged_machine_keep(self):
+    human = self._copy(DecisionStatus.KEPT, ["cited-in-report"],
+                       doi="10.1/a")
+    for decisions in ((self._machine_keep(), human),
+                      (human, self._machine_keep())):
+      rows = self._rows(*decisions, theme_names={"auth": "recovery"})
+      assert len(rows) == 1
+      assert (rows[0].reason, rows[0].status, rows[0].order) == (
+        "cited-in-report", DecisionStatus.KEPT, AUDIT_ORDER_OTHER,
+      )
+
+  def test_confirmed_machine_sources_are_confirmed(self):
+    for source in (ReviewSource.HUMAN, ReviewSource.LLM_REVIEWED,
+                   ReviewSource.AGENT_REVIEWED):
+      rows = self._rows(
+        self._machine_keep(),
+        self._copy(DecisionStatus.KEPT, ["recorded-not-cited"],
+                   source=source, conf=0.8),
+      )
+      assert (rows[0].reason, rows[0].order) \
+        == ("recorded, not cited", AUDIT_ORDER_OTHER), source
+
+  def test_unknown_and_unreviewed_sources_are_not(self):
+    for source in (ReviewSource("manual"),
+                   ReviewSource.AGENT_UNREVIEWED):
+      rows = self._rows(
+        self._machine_keep(),
+        self._copy(DecisionStatus.KEPT, ["recorded-not-cited"],
+                   source=source, conf=0.8),
+      )
+      assert (rows[0].reason, rows[0].order) == (
+        "pending, unclassified (recorded, not cited)",
+        AUDIT_ORDER_PENDING,
+      ), source
+
+  def test_a_confirmed_keep_beats_a_stronger_unreviewed_category(self):
+    rows = self._rows(
+      self._machine_keep(["supports-claim"], conf=0.9),
+      self._copy(DecisionStatus.KEPT, ["adjacent-subtopic"]),
+    )
+    assert (rows[0].reason, rows[0].order) \
+      == ("adjacent subtopic", AUDIT_CATEGORIES["adjacent-subtopic"])
+
+  def test_a_confirmed_discard_keeps_its_place_by_order(self):
+    rows = self._rows(
+      self._machine_keep(),
+      self._copy(DecisionStatus.DISCARDED, ["off-topic-false-hit"]),
+    )
+    assert (rows[0].status, rows[0].reason) \
+      == (DecisionStatus.DISCARDED, "other topic (false hit)")
+    rows = self._rows(
+      self._copy(DecisionStatus.DISCARDED, ["recorded-not-cited"]),
+      self._machine_keep(),
+    )
+    assert (rows[0].status, rows[0].reason) == (
+      DecisionStatus.KEPT, "pending, unclassified (recorded, not cited)",
+    )
+
+  def test_a_confirmed_keep_beats_a_confirmed_discard(self):
+    rows = self._rows(
+      self._copy(DecisionStatus.DISCARDED, ["off-topic-false-hit"]),
+      self._copy(DecisionStatus.KEPT, ["recorded-not-cited"]),
+    )
+    assert (rows[0].status, rows[0].reason) \
+      == (DecisionStatus.KEPT, "recorded, not cited")
 @
 
 \paragraph{The databases sentence}
