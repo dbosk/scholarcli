@@ -7137,6 +7137,107 @@ process that kept its own source over a concurrent relabel
 (\cref{sec:relabel-source} in the review module), and the reader
 should not take the record for the current state.
 
+\paragraph{A classifier trace under someone else's decision.}
+\label{sec:sessions-show-trace}
+The classifier's fields ([[llm_model]], [[llm_reason]], \dots,
+\cref{sec:llm-audit-fields} in the review module) can outlive the
+classifier's decision: [[sessions relabel]] keeps them when it turns a
+confirmed call into an agent's decision, [[sessions decide
+--keep-trace]] keeps them under an agent's correction
+(\cref{sec:sessions-decide}), and a human's decision never clears
+them.  A reader who sees an agent's discard next to a model's reason
+would take the reason for the agent's.  Nothing is stored to say
+which call the fields describe, and nothing needs to be: when a
+model is recorded but the source is not a classifier's, the fields
+describe an earlier call.  The listing says so after the title
+([[llm trace: earlier classifier call]]) and the JSON entry carries
+[["llm_trace": "earlier classifier call"]], only for such decisions.
+A decision whose source is [[llm]] or [[llm_reviewed]] is not marked:
+its fields describe the call that made it, which is why
+[[sessions decide]] refuses [[--keep-trace]] for a relayed classifier
+verdict (\cref{sec:sessions-decide}).
+
+The two classifier sources are named here rather than taken from the
+LLM review module's [[LLM_SOURCES]]: importing that module loads the
+synthesis caches, which [[sessions show]] has no use for.  A test keeps
+the two sets equal.
+
+<<sessions command>>=
+EARLIER_TRACE_LABEL = "earlier classifier call"
+CLASSIFIER_SOURCES = frozenset({"llm", "llm_reviewed"})
+
+
+def earlier_classifier_trace(decision) -> bool:
+    """Tell whether the classifier fields of `decision` describe an
+    earlier call: a model is recorded, but the current source is not a
+    classifier's (a relabel, an agent's correction, a human's decision).
+    """
+    return (
+        decision.llm_model is not None
+        and decision.source.value not in CLASSIFIER_SOURCES
+    )
+@
+
+Let's check that the corrected record of the issue is marked in both
+forms, and that a classifier's own decision and a decision without a
+model are not:
+
+<<test functions>>=
+class TestShowMarksAnEarlierClassifierCall:
+  <<show earlier classifier call test methods>>
+<<show earlier classifier call test methods>>=
+def _make_session(self, tmp_path, monkeypatch):
+  monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+  from scholar.review import (
+    DecisionStatus, ReviewDecision, ReviewSession, ReviewSource,
+    relabel_source, save_session,
+  )
+
+  def decided(title, source, **audit):
+    return ReviewDecision(
+      paper=Paper(title=title, authors=["A"], doi=f"10.1/{title}"),
+      provider="openalex", status=DecisionStatus.DISCARDED,
+      tags=["off-topic-false-hit"], source=source, **audit,
+    )
+
+  corrected = decided("corrected", ReviewSource.LLM_REVIEWED,
+                      llm_model="m-1", llm_reason="Fits.")
+  relabel_source(corrected, ReviewSource.AGENT_UNREVIEWED,
+                 at="2026-11-19T10:00:00+00:00")
+  save_session(ReviewSession(
+    query="q", providers=["openalex"], timestamp=datetime(2026, 11, 19),
+    name="shown", decisions=[
+      corrected,
+      decided("classified", ReviewSource.LLM_UNREVIEWED, llm_model="m-1"),
+      decided("agents", ReviewSource.AGENT_UNREVIEWED),
+    ],
+  ))
+
+def test_json_and_text_mark_only_the_earlier_call(
+  self, tmp_path, monkeypatch
+):
+  self._make_session(tmp_path, monkeypatch)
+  result = runner.invoke(app, ["sessions", "show", "shown", "-f", "json"])
+  assert result.exit_code == 0, result.output
+  traces = {d["title"]: d.get("llm_trace")
+            for d in json.loads(result.output)["decisions"]}
+  assert traces == {"corrected": "earlier classifier call",
+                    "classified": None, "agents": None}
+  result = runner.invoke(app, ["sessions", "show", "shown"])
+  assert result.exit_code == 0, result.output
+  flat = " ".join(result.output.split())
+  mark = "(llm trace: earlier classifier call)"
+  assert flat.count(mark) == 1
+  assert flat.index("corrected") < flat.index(mark) \
+    < flat.index("classified")
+
+def test_the_classifier_sources_match_the_llm_module(self):
+  from scholar.cli import CLASSIFIER_SOURCES
+  from scholar.llm_review import LLM_SOURCES
+
+  assert CLASSIFIER_SOURCES == LLM_SOURCES
+@
+
 Each line under \enquote{Queries by provider:} also says what the search
 returned, as recorded in the session (\cref{sec:search-result-error}):
 the hit count, or a highlighted \enquote{failed} with the reason.  This
@@ -7217,6 +7318,8 @@ def session_paper_line(decision) -> str:
     unreviewed = f" [magenta]({escape(mark)})[/magenta]" if mark else ""
     if decision.relabelled:
         unreviewed += f" [dim]({escape(relabel_mark(decision))})[/dim]"
+    if earlier_classifier_trace(decision):
+        unreviewed += f" [dim](llm trace: {EARLIER_TRACE_LABEL})[/dim]"
     return (
         f"  • {escape(paper.title or '')}{provider}{tags}{unreviewed}\n"
         f"    [dim]{escape(paper.id)}[/dim]"
@@ -7309,6 +7412,10 @@ def sessions_show(
                     "source": d.source.value,
                     "provider": d.provider,
                     **({"relabelled": d.relabelled} if d.relabelled else {}),
+                    **(
+                        {"llm_trace": EARLIER_TRACE_LABEL}
+                        if earlier_classifier_trace(d) else {}
+                    ),
                 }
                 for d in session.decisions
             ],
@@ -8694,6 +8801,17 @@ def sessions_decide(
                  "otherwise).",
         ),
     ] = False,
+    keep_trace: Annotated[
+        bool,
+        typer.Option(
+            "--keep-trace",
+            help="With --source agent: keep the stored record of the "
+                 "earlier classifier call (model, prompt version, "
+                 "reason, date, truncation) instead of clearing it. "
+                 "Needs -c. Refused with --source llm; no effect for a "
+                 "human decision.",
+        ),
+    ] = False,
 ) -> None:
     """
     Record keep/discard decisions in a saved session, without the TUI.
@@ -8725,11 +8843,23 @@ def sessions_decide(
     copies); deciding them is refused (exit 2) unless --all-copies is
     given, which gives every copy this decision.
 
+    An agent or LLM decision clears the fields an earlier classifier
+    call stored (model, prompt version, reason, date), since they
+    describe the decision being replaced. --keep-trace keeps them for
+    an agent's correction made on top of that call (--source agent
+    only; refused with --source llm, a new run whose trace would be
+    taken for the old one's). It needs -c, so the confidence shown is
+    the corrector's own. `sessions show` marks the kept fields as an
+    earlier classifier call.
+
     Examples:
         scholar sessions decide my-review --source human --keep \\
             --doi 10.1145/3568813 --tag misconceptions
         scholar sessions decide my-review --source agent --discard \\
             --doi 10.1145/3568813 --tag off-topic-false-hit -c 0.9
+        scholar sessions decide my-review --source agent --discard \\
+            --doi 10.1145/3568813 --tag off-topic-false-hit -c 0.8 \\
+            --keep-trace
     """
     from scholar.review import (
         AUDIT_CATEGORIES, CopyConflict, DecisionStatus, ReviewSource,
@@ -8806,6 +8936,7 @@ if len(categories_given) > 1:
     raise typer.Exit(2)
 <<refuse a relayed verdict whose category does not fit>>
 <<validate the decide confidence>>
+<<validate the kept trace>>
 @
 
 [[--source llm]] relays a classifier's verdict, and a classifier's
@@ -8905,7 +9036,8 @@ LLM) is stored as unreviewed, with [[is_example]] cleared since nobody
 has corrected it yet, and with the audit fields of any earlier
 classifier run cleared ([[clear_machine_audit]],
 \cref{sec:review-source}), since they describe the decision being
-replaced. A human decision on an unreviewed machine
+replaced, unless [[--keep-trace]] asks to keep them for a correction
+made on top of that run (below). A human decision on an unreviewed machine
 decision is a review and is delegated to [[mark_as_reviewed]];
 agreement means the status stands. Any other human decision simply
 overwrites status and source.
@@ -8916,7 +9048,8 @@ if source in MACHINE_DECISION_SOURCES:
     decision.status = status
     decision.source = ReviewSource(source)
     decision.is_example = False
-    clear_machine_audit(decision)
+    if not keep_trace:
+        clear_machine_audit(decision)
     decision.llm_confidence = confidence
 elif decision.source.is_unreviewed:
     mark_as_reviewed(
@@ -9065,6 +9198,214 @@ if confidence is not None and source not in MACHINE_DECISION_SOURCES:
         "[yellow]--confidence is the model's; ignored for a human "
         "decision.[/yellow]"
     )
+@
+
+\paragraph{Keeping the classifier's trace.}
+A machine decision clears the fields an earlier classifier run stored
+(above, in [[<<record one decision with its source>>]]), and by
+default that is right: a new verdict replaces the old one, and the
+old run's model, prompt and reason would describe a decision that no
+longer stands.  One case wants the opposite
+(\url{https://github.com/dbosk/scholarcli/issues/245}).  After
+[[sessions relabel]] has turned classifier calls that an agent
+confirmed into [[agent]] decisions (\cref{sec:sessions-relabel}),
+some of them still need a correction, such as a discarded record that
+carries the category [[supports-claim]].  The agent records the
+correction as its own verdict, but the classifier call it corrects is
+still part of the record: clearing it would drop the model and the
+prompt from the report's LLM screening section, which counts the
+decisions an LLM made first ([[first_made_by_llm]] in the LLM review
+module).  [[--keep-trace]] asks for that: the agent's decision is
+recorded as usual (status, tags with the category replacement and
+[[--untag]], source, [[is_example]] cleared, the guard against
+replacing a human decision and [[--force]], [[--all-copies]]), only
+[[clear_machine_audit]] is not called.  Without the flag nothing
+changes.
+
+The flag is for [[--source agent]] only.  A verdict relayed with
+[[--source llm]] is a new classifier run, and its decision would carry
+the old run's model, prompt and reason, which every reader (the
+report's LLM screening section, [[sessions show]]) takes for the
+run that made it: nothing on the record could tell the two apart.
+So that combination is a usage error (status~2), refused with the
+other options before the session is loaded.
+
+The flag needs [[--confidence]].  The confidence is not one of the
+classifier's fields: it belongs to whoever made the current decision,
+and the audit table prints it as that decider's number.  A machine
+decision without [[-c]] clears it (above), so a corrector that left
+it out would get the table's \enquote{missing} mark; but if the flag
+kept it, the classifier's number would be shown as the agent's
+without anybody having said so.  A correction on top of a kept trace
+therefore states its own number, and leaving it out is a usage error
+(status~2), refused with the other options before the session is
+loaded.  A human decision never clears the trace
+(\cref{sec:llm-audit-fields} in the review module), so for a human
+the flag has nothing to do: it is accepted with a note, as
+[[--confidence]] is, so that a script that always passes it keeps
+working, and it does not ask for [[-c]], which a human decision
+ignores.
+
+<<validate the kept trace>>=
+if keep_trace and source not in MACHINE_DECISION_SOURCES:
+    console.print(
+        "[yellow]--keep-trace has no effect here: a human decision never "
+        "clears the classifier's trace.[/yellow]"
+    )
+elif keep_trace and source == "llm":
+    console.print(
+        "[red]--keep-trace is for --source agent: a relayed classifier "
+        "verdict is a new run; its trace would be taken for the old "
+        "run's.[/red]"
+    )
+    raise typer.Exit(2)
+elif keep_trace and confidence is None:
+    console.print(
+        "[red]--keep-trace needs -c: state the confidence of this "
+        "decision, since the kept trace's is the classifier's.[/red]"
+    )
+    raise typer.Exit(2)
+@
+
+Nothing new is stored: the kept fields and the agent's source together
+already say that the fields describe an earlier call, and
+[[sessions show]] says so (\cref{sec:sessions-show-trace}).
+
+Let's check the case of the issue: a relabelled classifier call,
+discarded but tagged [[supports-claim]], corrected by the agent.  With
+the flag the category is replaced, the classifier's fields stay, the
+confidence is the agent's and the report still names the model;
+without it the fields are cleared, as before.  A relayed verdict
+([[--source llm]]) is refused with the flag, before the session is
+loaded.
+
+<<test functions>>=
+class TestDecideKeepsTheTrace:
+  <<decide keep-trace test methods>>
+<<decide keep-trace test methods>>=
+AUDIT = {
+  "llm_model": "m-1", "llm_decided_at": "2026-11-01T09:00:00+00:00",
+  "llm_prompt_version": "0123456789abcdef", "llm_reason": "Fits.",
+  "llm_abstract_truncated": False,
+}
+
+def _make_session(self, tmp_path, monkeypatch):
+  monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+  from scholar.review import (
+    DecisionStatus, ReviewDecision, ReviewSession, ReviewSource,
+    relabel_source, save_session, session_file_path,
+  )
+
+  decision = ReviewDecision(
+    paper=Paper(title="Unix lineage", authors=["A"], doi="10.1/unix"),
+    provider="openalex", status=DecisionStatus.DISCARDED,
+    tags=["supports-claim"], source=ReviewSource.LLM_REVIEWED,
+    is_example=True, llm_confidence=0.9, **self.AUDIT,
+  )
+  relabel_source(decision, ReviewSource.AGENT_UNREVIEWED,
+                 at="2026-11-19T10:00:00+00:00", note="agent checked")
+  session = ReviewSession(
+    query="q", providers=["openalex"], timestamp=datetime(2026, 11, 19),
+    name="trace", decisions=[decision],
+  )
+  save_session(session)
+  return session_file_path(session)
+
+def _decide(self, *args):
+  return runner.invoke(app, [
+    "sessions", "decide", "trace", "--doi", "10.1/unix", *args,
+  ])
+
+CORRECTION = ("--discard", "--tag", "off-topic-false-hit")
+
+def test_the_correction_keeps_the_classifier_call(
+  self, tmp_path, monkeypatch
+):
+  from scholar.llm_review import build_llm_screening_latex
+  from scholar.review import ReviewSource, llm_audit_of, load_session
+
+  self._make_session(tmp_path, monkeypatch)
+  result = self._decide(*self.CORRECTION, "-c", "0.8",
+                        "--source", "agent", "--keep-trace")
+  assert result.exit_code == 0, result.output
+  session = load_session("trace")
+  decision = session.decisions[0]
+  assert decision.tags == ["off-topic-false-hit"]
+  assert decision.source is ReviewSource.AGENT_UNREVIEWED
+  assert llm_audit_of(decision) == self.AUDIT
+  assert decision.llm_confidence == 0.8
+  assert decision.is_example is False
+  assert [r["to"] for r in decision.relabelled] == ["agent"]
+  report = " ".join(build_llm_screening_latex(session))
+  assert "model m-1: 1" in report
+  assert "0123456789abcdef" in report
+
+def test_without_the_flag_the_trace_is_cleared(
+  self, tmp_path, monkeypatch
+):
+  from scholar.llm_review import build_llm_screening_latex
+  from scholar.review import LLM_AUDIT_FIELDS, llm_audit_of, load_session
+
+  self._make_session(tmp_path, monkeypatch)
+  result = self._decide(*self.CORRECTION, "-c", "0.8", "--source", "agent")
+  assert result.exit_code == 0, result.output
+  session = load_session("trace")
+  assert llm_audit_of(session.decisions[0]) \
+    == dict.fromkeys(LLM_AUDIT_FIELDS)
+  assert "m-1" not in " ".join(build_llm_screening_latex(session))
+
+def test_the_flag_needs_a_confidence(self, tmp_path, monkeypatch):
+  path = self._make_session(tmp_path, monkeypatch)
+  content = path.read_bytes()
+  result = self._decide(*self.CORRECTION, "--source", "agent",
+                        "--keep-trace")
+  assert result.exit_code == 2, result.output
+  assert "--keep-trace needs -c" in " ".join(result.output.split())
+  assert path.read_bytes() == content
+  result = runner.invoke(app, [
+    "sessions", "decide", "no-such-session", "--doi", "10.1/x",
+    *self.CORRECTION, "--source", "agent", "--keep-trace",
+  ])
+  assert result.exit_code == 2
+
+def test_a_human_decision_only_notes_the_flag(
+  self, tmp_path, monkeypatch
+):
+  from dataclasses import asdict
+  from scholar.review import load_session
+
+  outcomes = []
+  for run, flag in (("with", ["--keep-trace"]), ("without", [])):
+    self._make_session(tmp_path / run, monkeypatch)
+    result = self._decide("--keep", "--tag", "ml", "--source", "human",
+                          *flag)
+    assert result.exit_code == 0, result.output
+    noted = "a human decision never clears" in " ".join(
+      result.output.split()
+    )
+    assert noted == bool(flag)
+    decision = load_session("trace").decisions[0]
+    outcomes.append({k: v for k, v in asdict(decision).items()
+                     if k != "paper"})
+  assert outcomes[0] == outcomes[1]
+  assert outcomes[0]["llm_model"] == "m-1"
+
+def test_a_relayed_verdict_cannot_keep_the_trace(
+  self, tmp_path, monkeypatch
+):
+  path = self._make_session(tmp_path, monkeypatch)
+  content = path.read_bytes()
+  result = self._decide(*self.CORRECTION, "-c", "0.9",
+                        "--source", "llm", "--keep-trace")
+  assert result.exit_code == 2, result.output
+  assert "a relayed classifier verdict is a new run" \
+    in " ".join(result.output.split())
+  assert path.read_bytes() == content
+  result = runner.invoke(app, [
+    "sessions", "decide", "no-such-session", "--doi", "10.1/x",
+    *self.CORRECTION, "-c", "0.9", "--source", "llm", "--keep-trace",
+  ])
+  assert result.exit_code == 2
 @
 
 Selection collects matches into a dict keyed by the decision object,
