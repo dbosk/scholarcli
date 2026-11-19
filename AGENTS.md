@@ -840,7 +840,8 @@ is still d's paper id, else the paper id (decisions made since,
 renamed ones, a fold's survivor, which so meets the DOI copy's
 baseline as before). The merge pairs via `pair_with_file` per paper
 id: first our keyed copies with a free file copy in their loaded state
-(first match), then the rest by order; links, notes, paper fields and
+(among several: same `found_by` set, then same provider, then order),
+then the rest by order; links, notes, paper fields and
 decision changes pass only within pairs. Unpaired file copies: the
 baseline's entries of the id no copy of ours carries were loaded and
 are gone here (renamed/folded/dropped), matched by state first, then
