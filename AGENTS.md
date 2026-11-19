@@ -936,22 +936,30 @@ context (#107). `review.save_session` now:
   `paper_state(paper)`, the `Paper.to_dict()` fields frozen into
   immutable copies, lists → tuples, dicts → sorted item tuples, so
   in-place changes are seen; `None` ≠ `()`). A field ours still has
-  as in the baseline takes the file's value if that differs (a
-  retraction `verify` saved, an Unpaywall `oa_status`); a field we
+  as in the baseline takes the file's value if that differs and is
+  not `None` (a retraction `verify` saved, an Unpaywall `oa_status`;
+  a `None` on disk is a gap from an older writer or a hand edit, so
+  Unpaywall clearing `oa_url` is not taken either); a field we
   changed keeps ours (also when both changed); then gaps are filled
   (#194, `paper_filled_from` = `ours.merge_with(theirs)`).
-  `ACCUMULATED_PAPER_FIELDS` (sources, keywords, tags united,
-  `citation_count` max) are never judged three ways. No baseline for
-  the paper (session never loaded, paper new here) → gaps only, ours
-  wins. `read_session_file` takes the baseline from the file's copy
+  `ACCUMULATED_PAPER_FIELDS` are never judged three ways: sources,
+  keywords, tags united and `citation_count` max (by `merge_with`),
+  `preprint_versions`/`published_versions` united by
+  `united_version_links` (ours first, links whole, matched by
+  normalised DOI, DOI-less links by equality; also without a
+  baseline). No baseline for the paper (session never loaded, paper
+  new here) → nothing taken, gaps filled, ours wins.
+  `read_session_file` takes the baseline from the file's copy
   (`as_stored`), not from the registry's held object, else the
-  file's older values would overwrite ours. Cost on an 11,162-paper
-  session copy: ~5 MB, load ~+10%. Nothing is taken or filled from a
-  namesake (`plausibly_same_work`; DOI-less hash ids collide). The
-  decision keeps its very `Paper` object when nothing changed. The file is
-  read with `read_session_file(path, use_registry=False)`, else the
-  registry would hand back our own objects and hide the file's copies;
-  a paper new on disk is registered (`register`), and if this process
+  file's older values would overwrite ours; the save's re-read passes
+  `record_baseline=False` (it never needs one). Cost on an
+  11,162-paper session copy: ~5 MB, load ~+10%. Nothing is taken or
+  filled from a namesake (`plausibly_same_work`; DOI-less hash ids
+  collide). The decision keeps its very `Paper` object when nothing
+  changed. The file is read with
+  `read_session_file(path, use_registry=False)`, else the registry
+  would hand back our own objects and hide the file's copies; a paper
+  new on disk is registered (`register`), and if this process
   already holds a copy of the same work, that copy wins, gaps filled
   from the file (a held namesake: the file's paper stays).
 - **guards**: `warn_if_decisions_dropped` logs a WARNING (session,
