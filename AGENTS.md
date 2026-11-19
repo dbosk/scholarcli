@@ -1036,6 +1036,11 @@ context (#107). `review.save_session` now:
   (a hand copy) logs one WARNING per file and process
   (`warn_about_foreign_name`) and is flagged by `sessions list`
   (`name_mismatch` in the JSON, a stderr line); neither is renamed.
+  A stored name is no key (named `foo` of query `bar` and the unnamed
+  session of query `foo` both list as "foo"), so code that lists
+  sessions reads each by its path, `load_listed_session(meta)` (#221:
+  `list_all_themes`, `list_papers_for_theme`,
+  `complete_session_paper_id`), never `load_session(meta["name"])`.
   The loaded `_baseline` goes with `_loaded_from` (#207): an append
   that saves into another file takes `SessionBaseline.of(session)` at
   the end of `create_review_session` instead (no baseline would let
