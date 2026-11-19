@@ -936,6 +936,18 @@ context (#107). `review.save_session` now:
 - **writes atomically**: `utils.atomic_write_text` (temp file in the
   same directory, fsync, `os.replace`), keeping the previous file as
   `<name>.json.bak` (one generation).
+- **saves to the file it loaded** (#181): `read_session_file` sets
+  `ReviewSession._loaded_from` (not persisted; `create_review_session`
+  carries it over only when `appends_to_loaded_file`: both identities
+  (name, else query hash) map to one file name; `search foo --review`
+  must not write into named session foo's file) and
+  `session_file_path` returns it, so lock, merge
+  re-read, `.bak`, write and `keep_copy_before_run` use the loaded
+  file, not the one the stored `name` maps to (`own_session_file_name`;
+  new sessions still use that). A file whose stored name maps elsewhere
+  (a hand copy) logs one WARNING per file and process
+  (`warn_about_foreign_name`) and is flagged by `sessions list`
+  (`name_mismatch` in the JSON, a stderr line); neither is renamed.
 
 `scholar enrich` saves after every `ENRICH_SAVE_EVERY` (50) papers
 (`cli.nw`, `sec:enrich-chunks`): enrich → Crossref check → assign →
