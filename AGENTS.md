@@ -1102,8 +1102,9 @@ is hidden on a still-pending reset paper and when the last relabel is
 older than the last reset, `relabel_after_reset`; JSON `resets`) and
 the CSV column `reset_from` (`status by source time [by NAME]; ...`,
 between `source_relabelled` and `paper_id`). Effects: audit table and
-report show pending; `llm sample --report` counts a reset sampled
-decision as not reviewed; `first_made_by_llm` is False for any pending
+report show pending; a sampled decision reset at or after the draw
+is gone from the sample (see Samples: `reset_since_draw`);
+`first_made_by_llm` is False for any pending
 paper; after a full reset the classifier vocabulary (tags of decided
 papers) is empty, so pass `llm classify --tag`.
 Together these let scripted/agent-driven systematic reviews produce the same
@@ -1749,6 +1750,15 @@ A human review leaves them untouched (they are the model's record).
   x* = 2 for n <= 50 else 3), because plain Wilson coverage dips near
   p = 0, where disagreement rates live. The sentence says the rate
   covers only the reviewed part while some is unreviewed.
+  A sampled paper with a reset record (`ReviewDecision.resets`, #248)
+  whose `at` >= the sample's `drawn_at` (both UTC ISO with seconds;
+  `llm_review.reset_since_draw` compares them as datetimes, as strings
+  if either fails to parse) no longer holds the drawn decision: it is
+  counted as `SampleReport.reset_since_draw` (JSON `reset_since_draw`,
+  sentence "N sampled decisions were reset to pending after the draw
+  and are not counted"), never as reviewed, changed or unreviewed, is
+  part of the `counted` total for sessions not given, and is not queued
+  by `sampled_for_review`. A reset before the draw counts as usual.
   `LLMSample.sessions` are labels (`session_label`: name or query);
   since #231 `session_files` (same order, `session_file_path(s).name`,
   saved only when present; old samples load with None) records each

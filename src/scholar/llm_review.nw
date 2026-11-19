@@ -4141,7 +4141,42 @@ passes to [[sessions decide]] next: the session's label, or its file
 name when the label would open another session or fit two
 (\url{https://github.com/dbosk/scholarcli/issues/237}).
 
+A sampled paper can also have been set back to pending after the draw
+([[sessions reset]], \cref{sec:reset-decision} in the review module).
+The decision the sample drew is then gone: it lives on only in the
+paper's reset history, and whatever the paper is decided next is a new
+call the sample never drew.  Counted as usual, a reset discard that the
+classifier then keeps and a human confirms would read as a discard the
+reviewer changed, and the paper would be listed as unreviewed while it
+waits for its new call.  So such a paper is counted apart, as
+[[reset_since_draw]], never as reviewed, changed or unreviewed
+(\url{https://github.com/dbosk/scholarcli/issues/248}).  The test is
+the paper's reset records: one made at or after the sample's
+[[drawn_at]] means the drawn decision was reset.  Both times are UTC
+times in the same ISO form, written by [[draw_llm_sample]] and by the
+reset from [[datetime.now(timezone.utc)]] with seconds; a reset in the
+very second of the draw counts as after it, since a decision reset
+just before a draw in the same second would have been pending and so
+not drawn.  They are compared as times when both parse, so a time
+written with another offset still compares rightly, and as strings
+otherwise.  A reset made before the draw is no concern: the sample drew
+the decision made after it.
+
 <<llm review sampling>>=
+def reset_since_draw(decision: ReviewDecision, drawn_at: str) -> bool:
+    """Tell whether `decision` was reset to pending at or after `drawn_at`."""
+    for record in getattr(decision, "resets", None) or []:
+        at = str(record.get("at") or "")
+        try:
+            after = (datetime.fromisoformat(at)
+                     >= datetime.fromisoformat(drawn_at))
+        except (TypeError, ValueError):
+            after = at >= drawn_at
+        if after:
+            return True
+    return False
+
+
 @dataclass
 class SampleReport:
     """What a sample shows so far, over the sessions it was reported on.
@@ -4161,6 +4196,7 @@ class SampleReport:
     reviewed: int = 0
     changed: int = 0
     not_found: int = 0
+    reset_since_draw: int = 0
     unreviewed: list[tuple[str, str]] = field(default_factory=list)
     interval: tuple[float, float] | None = None
 
@@ -4206,6 +4242,8 @@ def sample_reports(sessions: list[ReviewSession]) -> list[SampleReport]:
 decision = current.get(entry["paper_id"])
 if decision is None:
     report.not_found += 1
+elif reset_since_draw(decision, sample.drawn_at):
+    report.reset_since_draw += 1
 elif decision.is_decided and not is_unreviewed_machine(decision):
     report.reviewed += 1
     if decision.status.value != entry["status"]:
@@ -4219,7 +4257,8 @@ sample's papers they hold is what remains of the sample's size after
 the papers that were found in the given ones.
 
 <<count the papers of sessions not given>>=
-counted = report.reviewed + len(report.unreviewed) + report.not_found
+counted = (report.reviewed + len(report.unreviewed) + report.not_found
+           + report.reset_since_draw)
 report.not_found += max(0, report.size - counted)
 @
 
@@ -4298,7 +4337,9 @@ def pooled_sample_sessions(
 
 The TUI queues a sample for review through [[sampled_for_review]]:
 the session's sampled decisions that still wait for a human, in the
-order they were drawn, each once even when two samples drew it.
+order they were drawn, each once even when two samples drew it.  A
+paper reset since a sample's draw is not queued for that sample: its
+new call was never drawn.
 
 <<llm review sampling>>=
 def sampled_for_review(session: ReviewSession) -> list[ReviewDecision]:
@@ -4314,6 +4355,7 @@ def sampled_for_review(session: ReviewSession) -> list[ReviewDecision]:
             if (
                 decision is not None
                 and is_unreviewed_machine(decision)
+                and not reset_since_draw(decision, sample.drawn_at)
                 and entry["paper_id"] not in queued
             ):
                 queue.append(decision)
@@ -4339,7 +4381,9 @@ rate covers only the reviewed part.  That part is a random sample of
 the population only if which papers got reviewed had nothing to do
 with the papers themselves; a reviewer who skips the hard cases makes
 the rate look better than it is, and the reader should be told that
-the rate depends on it.
+the rate depends on it.  Papers reset since the draw are counted in
+the same way as those not found: the sentence says how many and that
+they are not counted.
 
 <<llm review sampling>>=
 def describe_sample_criteria(criteria: dict) -> str:
@@ -4383,6 +4427,11 @@ def sample_sentence(report: SampleReport) -> str:
                 "skipped rather than reviewed in the drawn order it may be "
                 "biased"
             )
+    if report.reset_since_draw:
+        text += (
+            f"; {report.reset_since_draw} sampled decisions were reset to "
+            "pending after the draw and are not counted"
+        )
     if report.not_found:
         text += (
             f"; {report.not_found} sampled decisions were not found in the "
@@ -4474,6 +4523,100 @@ class TestSampleReports:
         assert "none of it has been reviewed yet" in sample_sentence(report)
         assert "%" not in sample_sentence(report)
 @
+
+Let's check the case of the review of \#248: a sampled LLM discard is
+reset after the draw, classified again as a keep and confirmed by a
+human.  The sample never drew that keep, so it is neither reviewed nor
+changed, nor queued in between; it is counted apart, and named in the
+sentence.  A paper reset \emph{before} the draw was drawn as it is, so
+it counts as usual.
+
+<<test functions>>=
+class TestSampleResetSinceDraw:
+    """A decision reset after the draw is no longer the one drawn (#248)."""
+
+    <<sample reset since draw test methods>>
+
+<<sample reset since draw test methods>>=
+DRAWN = "2026-11-18T12:00:00+00:00"
+
+def _session(self):
+    from scholar.review import LLMSample
+
+    session = ReviewSession(query="r", providers=["p"],
+                            timestamp=datetime(2026, 11, 18), name="r")
+    session.decisions = [ReviewDecision(
+        paper=Paper(title="Drawn", authors=["A"],
+                    doi="10.5555/sample-reset"),
+        provider="p", status=DecisionStatus.DISCARDED, tags=["t"],
+        source=ReviewSource.LLM_UNREVIEWED, llm_model="m-1",
+    )]
+    session.llm_samples = [LLMSample(
+        sample_id=f"{self.DRAWN}/seed=1", seed=1, drawn_at=self.DRAWN,
+        criteria={"statuses": ["discarded"], "population_sources": ["llm"]},
+        sessions=["r"], population=10, population_digest="d", size=1,
+        papers=[{"paper_id": "doi:10.5555/sample-reset",
+                 "status": "discarded", "source": "llm",
+                 "confidence": 0.9}],
+    )]
+    return session
+
+def _reclassify_as_keep(self, decision):
+    decision.status = DecisionStatus.KEPT
+    decision.tags = ["t"]
+    decision.source = ReviewSource.LLM_UNREVIEWED
+    decision.llm_model = "m-2"
+
+def test_reset_after_the_draw_is_counted_apart(self):
+    from scholar.review import reset_decision
+
+    session = self._session()
+    decision = session.decisions[0]
+    reset_decision(decision, "2026-11-19T10:00:00+00:00")
+    (report,) = sample_reports([session])
+    assert report.reset_since_draw == 1
+    assert report.unreviewed == []
+    self._reclassify_as_keep(decision)
+    assert sampled_for_review(session) == []
+    decision.source = ReviewSource.LLM_REVIEWED
+    (report,) = sample_reports([session])
+    assert (report.reviewed, report.changed, report.not_found) == (0, 0, 0)
+    assert report.unreviewed == []
+    assert report.reset_since_draw == 1
+    assert "none of it has been reviewed yet; 1 sampled decisions were " \
+        "reset to pending after the draw and are not counted" \
+        in sample_sentence(report)
+
+def test_a_reset_in_the_second_of_the_draw_counts_as_after(self):
+    from scholar.review import reset_decision
+
+    session = self._session()
+    reset_decision(session.decisions[0], self.DRAWN)
+    (report,) = sample_reports([session])
+    assert report.reset_since_draw == 1
+
+def test_reset_before_the_draw_counts_as_usual(self):
+    from scholar.review import reset_decision
+
+    session = self._session()
+    decision = session.decisions[0]
+    decision.status = DecisionStatus.KEPT
+    reset_decision(decision, "2026-11-17T10:00:00+00:00")
+    decision.status = DecisionStatus.DISCARDED
+    decision.tags = ["t"]
+    decision.source = ReviewSource.LLM_UNREVIEWED
+    assert sampled_for_review(session) == [decision]
+    (report,) = sample_reports([session])
+    assert report.unreviewed == [("r", "doi:10.5555/sample-reset")]
+    assert report.reset_since_draw == 0
+    decision.status = DecisionStatus.KEPT
+    decision.source = ReviewSource.LLM_REVIEWED
+    (report,) = sample_reports([session])
+    assert (report.reviewed, report.changed, report.reset_since_draw) \
+        == (1, 1, 0)
+    assert "reset to pending" not in sample_sentence(report)
+@
+
 
 \subsection{The screening paragraphs of the report}
 
