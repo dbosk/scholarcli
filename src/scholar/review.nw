@@ -4024,6 +4024,42 @@ Papers from the previous session that do not appear in the current search
 results must still be included---the user has already reviewed them. We copy
 them directly from the previous session to preserve all metadata.
 
+A session without a session file has its decisions only in the old
+per-query store of the notes module, whose records
+([[ReviewDecisionRecord]], \cref{notes-module}) keep beside each
+decision the paper details needed to rebuild it: title, authors, year,
+DOI, abstract, venue, URL, PDF link and the provider that found it.
+Two places rebuild a paper from such a record: the restore below, for
+papers the re-run did not return, and the conversion of the search
+results (\cref{sec:decision-store-fallback}), for papers it did.  Both
+build it with [[paper_from_decision_record]], so a paper the re-run
+returns again starts from the same stored paper as one it does not.
+The record's provider is the paper's only known source; a record
+without one gets the placeholder [[previous]], as it always did (every
+record in the user's ten decision files names its provider, so the
+placeholder is a guard, not a common case).
+
+<<review session functions>>=
+def paper_from_decision_record(record: Any) -> Paper:
+    """The paper stored in a record of the old per-query decision store.
+
+    `record` is a `notes.ReviewDecisionRecord`.  Derived identifiers
+    (an arXiv DOI) are filled in, as for a paper loaded from a session.
+    """
+    paper = Paper(
+        title=record.title,
+        authors=record.authors if record.authors else [],
+        year=record.year,
+        doi=record.doi,
+        abstract=record.abstract,
+        venue=record.venue,
+        url=record.url,
+        pdf_url=record.pdf_url,
+        sources=[getattr(record, "provider", None) or "previous"],
+    )
+    return _normalize_paper_identifiers(paper)
+@
+
 <<restore papers not in current results>>=
 if prev_decision_lookup:
     # Use session data (preserves all fields)
@@ -4034,18 +4070,7 @@ elif previous_decisions:
     # Fallback to notes module (older format, no LLM fields)
     for paper_id, prev in previous_decisions.decisions.items():
         if paper_id not in current_paper_ids:
-            paper = Paper(
-                title=prev.title,
-                authors=prev.authors if prev.authors else [],
-                year=prev.year,
-                doi=prev.doi,
-                abstract=prev.abstract,
-                venue=prev.venue,
-                url=prev.url,
-                pdf_url=prev.pdf_url,
-                sources=[getattr(prev, "provider", None) or "previous"],
-            )
-            paper = _normalize_paper_identifiers(paper)
+            paper = paper_from_decision_record(prev)
             status = DecisionStatus.PENDING
             if prev.status == "kept":
                 status = DecisionStatus.KEPT
@@ -4580,31 +4605,7 @@ for result in results:
                 same_id_copies=list(prev_dec.same_id_copies),
             )
         elif prev_record:
-            # Fallback to notes module format
-            status = DecisionStatus.PENDING
-            if prev_record.status == "kept":
-                status = DecisionStatus.KEPT
-            elif prev_record.status == "discarded":
-                status = DecisionStatus.DISCARDED
-            tags = extract_tags_from_record(prev_record)
-
-            # Restore LLM fields from notes if available
-            source = ReviewSource.HUMAN
-            source_str = getattr(prev_record, "source", "human")
-            try:
-                source = ReviewSource(source_str)
-            except ValueError:
-                pass
-
-            decision = ReviewDecision(
-                paper=paper,
-                provider=found_by_provider,
-                status=status,
-                tags=tags,
-                source=source,
-                is_example=getattr(prev_record, "is_example", False),
-                llm_confidence=getattr(prev_record, "llm_confidence", None),
-            )
+            <<rebuild the decision from the old decision store>>
         else:
             # New paper, no previous decision
             decision = ReviewDecision(
@@ -4618,6 +4619,207 @@ for result in results:
             decision.record_search(*link)
         session.decisions.append(decision)
         decision_lookup[paper_id] = decision
+@
+
+\paragraph{A paper found again in the old decision store.}
+\label{sec:decision-store-fallback}
+When there is no session file, a paper's previous decision may be a
+record of the old per-query store.  Until November 2026 its decision
+was rebuilt around the copy the search returned alone, with only the
+search's provider, which dropped the abstract, venue, URL and PDF link
+that the record holds
+(\url{https://github.com/dbosk/scholarcli/issues/194}): the same loss as
+a session file's decision suffered before [[stored_paper_with]]
+(\url{https://github.com/dbosk/scholarcli/issues/192}).  So the record's
+paper is rebuilt as the restore does ([[paper_from_decision_record]])
+and goes through the same rule as a session file's paper: the stored
+values win, the returned copy fills the gaps, and a DOI-less record met
+by a DOI copy found under its legacy hash id lets the DOI copy keep its
+identity and version fields ([[merge_version_of]]).  The provider names
+both the record's provider and the search's ([[united_providers]]).
+
+The legacy-id lookup above takes a record without asking whether its
+work is the one returned, unlike the session file's lookup, which
+asks [[plausibly_same_work]].  A record of another work with the same
+title and first author would then lend its abstract to the returned
+paper, so the stored paper fills the returned one only when the two may
+be one work; otherwise the returned copy stands alone, as before.  The
+decision is still taken from the record, as it always was: which
+decision a namesake should get is a question of matching, not of
+keeping data, and is left as it is.
+
+Unlike a session file's paper, a record's paper need not have the id it
+is stored under.  The store keys a record by the id of the paper when
+it was decided, but the rebuilt paper takes the DOI the record holds,
+or one derived from an arXiv URL ([[_normalize_paper_identifiers]]),
+so a record kept under a DOI-less hash id can rebuild with a DOI.
+[[stored_paper_with]] handles two cases only: equal ids
+([[merge_with]], which refuses papers with different ids) and a
+DOI-less stored copy met by a DOI copy ([[merge_version_of]]).  A
+stored copy with a DOI met by a returned copy without one is neither,
+so then too the returned copy stands alone, as before.
+
+<<review session functions>>=
+def stored_paper_fills(returned: Paper, stored: Paper) -> bool:
+    """Whether `stored_paper_with(stored, returned)` may fill `returned`.
+
+    The two must be copies `stored_paper_with` can merge (equal ids,
+    or a DOI-less stored copy and a returned copy with a DOI) and
+    plausibly one work (`plausibly_same_work`).
+    """
+    mergeable = stored.id == returned.id or (
+        not stored.doi and bool(returned.doi)
+    )
+    return mergeable and plausibly_same_work(returned, stored)
+<<rebuild the decision from the old decision store>>=
+status = DecisionStatus.PENDING
+if prev_record.status == "kept":
+    status = DecisionStatus.KEPT
+elif prev_record.status == "discarded":
+    status = DecisionStatus.DISCARDED
+tags = extract_tags_from_record(prev_record)
+
+# Restore LLM fields from notes if available
+source = ReviewSource.HUMAN
+source_str = getattr(prev_record, "source", "human")
+try:
+    source = ReviewSource(source_str)
+except ValueError:
+    pass
+
+stored = paper_from_decision_record(prev_record)
+if stored_paper_fills(paper, stored):
+    paper = stored_paper_with(stored, paper)
+decision = ReviewDecision(
+    paper=paper,
+    provider=united_providers(
+        getattr(prev_record, "provider", None), found_by_provider
+    ),
+    status=status,
+    tags=tags,
+    source=source,
+    is_example=getattr(prev_record, "is_example", False),
+    llm_confidence=getattr(prev_record, "llm_confidence", None),
+)
+@
+
+The case is the one of \cref{sec:review-create-strict}'s fallback: a
+query reviewed before session files existed, its decisions only in the
+store, searched again by a provider that returns the paper without an
+abstract.  The store is written with [[save_search_decisions]], which
+is what remains of the code that wrote it, and nothing else is on disk.
+The second test is a paper that gained a DOI since it was decided, so
+its record is found under the legacy hash id; the third, a record of
+another work with the same title and first author, twenty years older.
+In both, the restore also brings the record back under its own id, a
+DOI-less copy beside the DOI one, as an append leaves such copies for
+[[sessions reconcile]] (\cref{sec:session-copies}); the tests look at
+the DOI copy.
+
+<<test functions>>=
+class TestDecisionStoreKeepsStoredPaper:
+  """A re-run of a decision-store-only query keeps the stored paper."""
+
+  DOI = "10.1109/ipdps.2014.73"
+
+  @staticmethod
+  def _store(paper_id, **fields):
+    from scholar.notes import ReviewDecisionRecord, save_search_decisions
+    save_search_decisions("old query", {paper_id: ReviewDecisionRecord(
+      status="discarded", tags=["off-topic"], title="A Study",
+      authors=["Ada Lovelace"], provider="openalex", **fields,
+    )})
+
+  @staticmethod
+  def _rerun(returned):
+    from scholar.scholar import SearchResult, isolated_registry
+    result = SearchResult(
+      query="old query", provider="s2", timestamp=datetime.now(),
+      papers=[returned], limit=10,
+    )
+    with isolated_registry():
+      session = create_review_session([result], "old query")
+    [decision] = [d for d in session.decisions
+                  if d.paper.doi == returned.doi]
+    return decision
+
+  def test_abstract_venue_and_links_are_kept(self):
+    self._store(f"doi:{self.DOI}", year=2014, doi=self.DOI,
+                abstract="stored abstract", venue="IPDPS 2014",
+                url="https://example.org/a",
+                pdf_url="https://example.org/a.pdf")
+    decision = self._rerun(Paper(
+      title="A Study", authors=["Ada Lovelace"], year=2015,
+      doi=self.DOI, venue="Proc. IPDPS", sources=["s2"],
+      citation_count=7,
+    ))
+    paper = decision.paper
+    assert paper.abstract == "stored abstract"
+    assert (paper.year, paper.venue) == (2014, "IPDPS 2014")
+    assert paper.url == "https://example.org/a"
+    assert paper.pdf_url == "https://example.org/a.pdf"
+    assert paper.citation_count == 7
+    assert paper.sources == ["openalex", "s2"]
+    assert decision.provider == "openalex, s2"
+    assert decision.status == DecisionStatus.DISCARDED
+    assert decision.tags == ["off-topic"]
+
+  def test_paper_that_gained_a_doi_keeps_its_abstract(self):
+    self._store(legacy_hash_paper_id("A Study", ["Ada Lovelace"]),
+                year=2014, venue="ICSE", abstract="stored abstract")
+    arxiv = "10.48550/arXiv.1301.00001"
+    decision = self._rerun(Paper(
+      title="A Study", authors=["Ada Lovelace"], year=2013,
+      doi=arxiv, venue="arXiv", sources=["s2"],
+    ))
+    paper = decision.paper
+    assert paper.doi == arxiv
+    assert (paper.year, paper.venue) == (2013, "arXiv")
+    assert paper.abstract == "stored abstract"
+    assert decision.status == DecisionStatus.DISCARDED
+
+  def test_another_work_lends_nothing(self):
+    self._store(legacy_hash_paper_id("A Study", ["Ada Lovelace"]),
+                year=1994, abstract="the older work")
+    decision = self._rerun(Paper(
+      title="A Study", authors=["Ada Lovelace"], year=2014,
+      doi=self.DOI, sources=["s2"],
+    ))
+    assert decision.paper.abstract is None
+    assert decision.paper.year == 2014
+@
+
+A record can also rebuild to another id than the one it is stored
+under: the store keyed it by the hash id of a paper without a DOI, but
+the record holds a DOI, or a URL from which an arXiv DOI is derived.
+When the search returns the paper without a DOI, the two copies have
+different ids and the DOI is on the stored side, the one case
+[[stored_paper_with]] does not handle; the returned copy stands, with
+the record's decision, as before
+(\url{https://github.com/dbosk/scholarcli/issues/194}: the first fix
+raised [[ValueError]] here).
+
+<<test functions>>=
+class TestDecisionStoreRecordWithAnotherId:
+  """A record that rebuilds to another id neither crashes nor merges."""
+
+  @pytest.mark.parametrize("fields", [
+    {"doi": "10.1/stored-194"},
+    {"url": "https://arxiv.org/abs/1301.00001"},
+  ])
+  def test_doi_less_return_keeps_the_decision(self, fields):
+    TestDecisionStoreKeepsStoredPaper._store(
+      legacy_hash_paper_id("A Study", ["Ada Lovelace"]),
+      year=2014, abstract="stored abstract", **fields,
+    )
+    decision = TestDecisionStoreKeepsStoredPaper._rerun(Paper(
+      title="A Study", authors=["Ada Lovelace"], year=2014,
+      sources=["s2"],
+    ))
+    assert decision.paper.doi is None
+    assert decision.paper.sources == ["s2"]
+    assert decision.status == DecisionStatus.DISCARDED
+    assert decision.tags == ["off-topic"]
 @
 
 Let's verify the links against the situation of
@@ -6385,9 +6587,14 @@ def load_session(
         return None
 
 
-def read_session_file(session_path: Path) -> ReviewSession:
+def read_session_file(
+    session_path: Path, *, use_registry: bool = True
+) -> ReviewSession:
     """
     Read one session file, recording its state as the session's baseline.
+
+    With `use_registry=False` the papers are the file's own, never the
+    `Paper` objects this process already holds for the same ids.
 
     Raises:
         SessionFileError: The file cannot be read or parsed.
@@ -6454,7 +6661,7 @@ def read_session_file(session_path: Path) -> ReviewSession:
                 paper_data["sources"] = [
                     s.strip() for s in paper_data["source"].split(",")
                 ] if paper_data["source"] else []
-            paper = Paper.from_dict(paper_data)
+            paper = Paper.from_dict(paper_data, use_registry=use_registry)
             paper = _normalize_paper_identifiers(paper)
             status = DecisionStatus(dec_data["status"])
             tags = dec_data.get("tags", []) or []
@@ -6776,13 +6983,19 @@ of a three-way merge:
   The other decision is still in the [[.bak]], so nothing is lost
   silently.
 \end{description}
-Paper metadata is not merged: this process's copy of a paper it holds
-wins, so a concurrent enrichment may still lose its \emph{metadata} to a
-later save, but never a decision.  (Reading the file could not even show
-us the other process's metadata: the paper registry hands
-[[Paper.from_dict]] the [[Paper]] objects this process already holds for
-the same ids.)  Search records and snowball rounds only
-ever accumulate, so we add any that only the file has; a record is the
+Paper metadata is merged field by field, ours first: for a paper both
+hold, this process's value wins wherever it has one, and the file's
+copy fills the fields this process's copy lacks
+([[paper_filled_from]], below).  Until November 2026 this process's
+copy won whole, so an enrichment another process saved between our
+load and our save (abstracts, keywords, PDF links) was overwritten by a
+save that had not touched the paper at all
+(\url{https://github.com/dbosk/scholarcli/issues/194}).  What the
+other process \emph{filled in} now survives; what it \emph{changed}
+does not: a field both copies hold keeps ours, also when the other
+process updated it after our load (see below).  Search records
+and snowball rounds only ever accumulate, so we add any that only the
+file has; a record is the
 file's own when no record here has its key (query, provider and
 filters, \cref{sec:search-record-key}), so a run of the same query with
 other filters in another process is kept beside ours.  When both hold a
@@ -6879,8 +7092,9 @@ def merge_concurrent_changes(
 
     Decisions and research context that `session` still has as loaded
     (its baseline) take the on-disk value; papers and search records
-    that only the file has are added. Changes made through `session`
-    are kept.
+    that only the file has are added; a paper both hold keeps the
+    values of `session`, its empty fields filled from the file's copy.
+    Changes made through `session` are kept.
     """
     base = session._baseline
     base_states = base.decisions if base else {}
@@ -6893,6 +7107,7 @@ def merge_concurrent_changes(
         own_ids.add(paper_id)
         theirs = disk_decisions.get(paper_id)
         if theirs is not None:
+            decision.paper = paper_filled_from(decision.paper, theirs.paper)
             for link in theirs.found_by:
                 decision.record_search(*replaced.get(link, link))
             for copy in theirs.same_id_copies:
@@ -6915,6 +7130,9 @@ def merge_concurrent_changes(
 
     for paper_id, theirs in disk_decisions.items():
         if paper_id not in own_ids and paper_id not in base_states:
+            held = get_registry().register(theirs.paper)
+            if plausibly_same_work(held, theirs.paper):
+                theirs.paper = paper_filled_from(held, theirs.paper)
             session.decisions.append(theirs)
     session.folded = {**on_disk.folded, **session.folded}
     apply_tombstones(session, base_states, disk_decisions)
@@ -7026,16 +7244,91 @@ logger.warning(
 )
 @
 
+\paragraph{Merging a paper both processes hold.}
+The paper of a decision is not judged three ways like the decision.  A
+paper's fields are facts gathered by searches and enrichment, and no
+code in scholar clears one once it is known (in November 2026 the
+sources assigned [[None]] to a paper field only in tests), so a field
+that one copy has and the other lacks was gathered by one process and
+not yet by the other, never removed on purpose.  Without a baseline
+of the papers, the copies are merged by the rule a re-run already
+applies to a stored paper ([[stored_paper_with]],
+\cref{sec:review-create-strict}): [[Paper.merge_with]] with this
+process's copy first.  Our value wins where both have one; the file's
+fills the rest; sources and keywords are united and the higher
+citation count kept.  The ids are equal by construction (the file's
+decisions are looked up by our paper's id), which is all
+[[merge_with]] asks.
+
+That rule has a limit, and it is a real one.  Where both copies hold a
+value, ours wins even when the other process \emph{replaced} it after
+our load: a newer Crossref result replacing an older one
+([[updated_by]], [[newer_versions]]; an empty list there is a
+result, \enquote{checked, no notices}, not a gap) or a newer Unpaywall
+result ([[oa_status]], [[oa_url]]) is undone by a save from a process
+that loaded the paper with the older one.  Telling a value
+the other process replaced from one we hold because we set it needs the
+paper as loaded, a baseline per paper as the decisions have; that is
+left for later.  Gaps, the common case of enrichment (abstracts,
+keywords, PDF links), are filled.
+
+An equal id is not always one work: two papers without a DOI share the
+hash id of their title and first author (\cref{sec:session-copies}).
+The file's copy may then be a namesake that another process put under
+our id, and filling our paper from it would give our work its
+abstract and venue.  So nothing is filled unless the copies may be one
+work ([[plausibly_same_work]], as everywhere a title match decides).
+
+[[merge_with]] builds a new [[Paper]] and changes neither copy, so the
+object the paper registry holds for this id, which other parts of this
+process may share, is not changed behind their back.  The decision
+gets the new object only when the file's copy added something: a save
+that has nothing to fill leaves the decision holding the very object it
+held, as before.  A paper new on disk is the reverse case: the file's
+copy is all we have of the decision, but this process may already hold
+the paper (the registry has it), and then that copy is ours and the
+file's fills its gaps.  Registering it also keeps the rule that a
+loaded paper is the one this process shares.  If the copy we hold is
+another work, the file's decision keeps the file's paper: the decision
+was taken on that work, and our namesake must not stand in for it.
+
+<<review session functions>>=
+def paper_filled_from(ours: Paper, theirs: Paper) -> Paper:
+    """`ours`, its empty fields filled from `theirs` (`Paper.merge_with`).
+
+    Returns `ours` itself, unchanged, when `theirs` adds nothing or is
+    another work (`plausibly_same_work`); otherwise a new `Paper`.
+    Neither argument is modified.
+    """
+    if theirs is ours or not plausibly_same_work(ours, theirs):
+        return ours
+    merged = ours.merge_with(theirs)
+    if all(
+        getattr(merged, f.name) == getattr(ours, f.name)
+        for f in fields(Paper)
+    ):
+        return ours
+    return merged
+<<review imports>>=
+from dataclasses import fields
+from scholar.scholar import get_registry
+@
+
 [[save_session]] reads the file just before writing.  When there is no
 file there is nothing to merge; when the file cannot be read we cannot
 merge either, and we say so, because the save is about to replace that
 file (its unreadable content survives in the [[.bak]]).
+The file is read without the paper registry
+([[use_registry=False]]): through it, [[Paper.from_dict]] would hand us
+the [[Paper]] objects this process already holds for the same ids, and
+the file's copies, the other process's enrichment among them, would
+never be seen.
 
 <<merge changes other processes saved>>=
 on_disk = None
 if session_path.exists():
     try:
-        on_disk = read_session_file(session_path)
+        on_disk = read_session_file(session_path, use_registry=False)
     except SessionFileError as error:
         logger.warning(
             "%s; replacing it, the unreadable version is kept as %s",
@@ -7048,6 +7341,214 @@ if on_disk is not None:
 The window that remains, between reading the file and replacing it, is
 milliseconds instead of hours, and [[save_session]] closes it by holding
 [[file_lock]] across both.
+
+Let's verify the paper merge with the race of
+\url{https://github.com/dbosk/scholarcli/issues/194}, in real
+processes, since a second process does not share our paper registry: A
+loads the session (as [[sessions decide]] or a long [[search -n]]
+would), B enriches the paper (an abstract, keywords and its own venue)
+and saves, then A decides the paper, having meanwhile found another
+venue, and saves.  The file must keep A's decision and venue and B's
+abstract and keywords.  We read the saved file itself, not a load, so
+that no registry stands between the test and what was written.
+
+<<test functions>>=
+class TestConcurrentSaveKeepsPaperData:
+  """A save fills its paper's gaps from the file, never empties them."""
+
+  DOI = "10.1109/ipdps.2014.73"
+
+  def _first_save(self, **fields):
+    from scholar.scholar import isolated_registry
+    with isolated_registry():
+      session = ReviewSession(
+        query="q", providers=["openalex"], timestamp=datetime.now(),
+        name="conc-194",
+      )
+      session.decisions = [ReviewDecision(
+        paper=Paper(title="A Study", authors=["Ada Lovelace"],
+                    year=2014, doi=self.DOI, sources=["openalex"],
+                    **fields),
+        provider="openalex", status=DecisionStatus.PENDING,
+      )]
+      save_session(session)
+
+  @staticmethod
+  def _saved():
+    import json
+    from scholar.review import _get_sessions_dir
+    data = json.loads((_get_sessions_dir() / "conc-194.json").read_text())
+    return {d["paper"]["doi"]: d for d in data["decisions"]}
+
+  B_ENRICHES = """
+    from dataclasses import replace
+    from scholar.review import load_session, save_session
+    session = load_session("conc-194")
+    [decision] = session.decisions
+    decision.paper = replace(decision.paper, abstract="from B",
+                             keywords=["hpc"], venue="B venue")
+    save_session(session)
+  """
+
+  def test_a_stale_save_keeps_the_other_enrichment(self):
+    import subprocess
+    import sys
+    import textwrap
+    self._first_save()
+    a = subprocess.Popen(
+      [sys.executable, "-c", textwrap.dedent("""
+        import sys
+        from dataclasses import replace
+        from scholar.review import (
+          DecisionStatus, load_session, save_session,
+        )
+        session = load_session("conc-194")
+        print("loaded", flush=True)
+        sys.stdin.readline()
+        [decision] = session.decisions
+        decision.status, decision.tags = DecisionStatus.KEPT, ["ml"]
+        decision.paper = replace(decision.paper, venue="A venue")
+        save_session(session)
+      """)],
+      stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+    )
+    try:
+      assert a.stdout.readline().strip() == "loaded"
+      subprocess.run([sys.executable, "-c",
+                      textwrap.dedent(self.B_ENRICHES)],
+                     check=True, timeout=120)
+      a.communicate("go\n", timeout=120)
+    finally:
+      if a.poll() is None:
+        a.kill()
+    assert a.returncode == 0
+    saved = self._saved()[self.DOI]
+    assert (saved["status"], saved["tags"]) == ("kept", ["ml"])
+    assert saved["paper"]["abstract"] == "from B"
+    assert saved["paper"]["keywords"] == ["hpc"]
+    assert saved["paper"]["venue"] == "A venue"
+@
+
+In one process the registry is what hid the file's copies, so the same
+race is played there too: A loads through the registry, B runs in its
+own registry, A saves.  The object the registry holds is not changed by
+the merge.  A paper that B added and this process already holds
+(here as a search result's copy without an abstract) is ours, its gaps
+filled from the file.
+
+<<test functions>>=
+class TestConcurrentSaveInOneProcess:
+  DOI = TestConcurrentSaveKeepsPaperData.DOI
+
+  def test_the_registry_does_not_hide_the_file(self):
+    import subprocess
+    import sys
+    import textwrap
+    from scholar.scholar import get_registry
+    helper = TestConcurrentSaveKeepsPaperData()
+    helper._first_save()
+    session = load_session("conc-194")
+    held = get_registry().get(f"doi:{self.DOI}")
+    subprocess.run([sys.executable, "-c",
+                    textwrap.dedent(helper.B_ENRICHES)],
+                   check=True, timeout=120)
+    session.decisions[0].status = DecisionStatus.KEPT
+    session.decisions[0].tags = ["ml"]
+    save_session(session)
+    saved = helper._saved()[self.DOI]
+    assert saved["paper"]["abstract"] == "from B"
+    assert saved["paper"]["venue"] == "B venue"
+    assert saved["status"] == "kept"
+    assert held.abstract is None and held.venue is None
+
+  def test_a_paper_new_on_disk_fills_the_held_copy(self):
+    from scholar.scholar import isolated_registry
+    other = "10.1/other-194"
+    TestConcurrentSaveKeepsPaperData()._first_save()
+    session = load_session("conc-194")
+    held = Paper.from_dict({"title": "Other", "authors": ["B"],
+                            "doi": other, "venue": "held venue"})
+    with isolated_registry():
+      theirs = load_session("conc-194")
+      theirs.decisions.append(ReviewDecision(
+        paper=Paper(title="Other", authors=["B"], doi=other,
+                    abstract="from disk", venue="disk venue"),
+        provider="s2", status=DecisionStatus.KEPT, tags=["ml"],
+      ))
+      save_session(theirs)
+    save_session(session)
+    [added] = [d for d in session.decisions if d.paper.doi == other]
+    assert added.paper.abstract == "from disk"
+    assert added.paper.venue == "held venue"
+    assert held.abstract is None
+    assert TestConcurrentSaveKeepsPaperData._saved()[other][
+      "paper"]["abstract"] == "from disk"
+
+  def test_nothing_to_fill_keeps_the_same_object(self):
+    ours = Paper(title="A", authors=["B"], doi=self.DOI, abstract="x")
+    theirs = Paper(title="A", authors=["B"], doi=self.DOI)
+    assert paper_filled_from(ours, theirs) is ours
+    filled = paper_filled_from(theirs, ours)
+    assert filled is not theirs and filled.abstract == "x"
+    assert theirs.abstract is None
+@
+
+Two works with the same title and first author share a hash id when
+neither has a DOI, so the file's copy under our id may be another
+work: here B keeps a 1994 paper under the id of our 2014 one.  Neither
+lends the other anything, also when the file's decision is new to us
+and the registry holds the other work: the file's decision keeps the
+file's paper.
+
+<<test functions>>=
+class TestConcurrentSaveAnotherWork:
+  @staticmethod
+  def _older(**fields):
+    return Paper(title="A Study", authors=["Ada Lovelace"], year=1994,
+                 abstract="the older work", venue="Old Venue", **fields)
+
+  def test_another_work_on_disk_lends_nothing(self):
+    from scholar.scholar import isolated_registry
+    with isolated_registry():
+      first = ReviewSession(query="q", providers=["dblp"],
+                            timestamp=datetime.now(), name="work-194")
+      first.decisions = [ReviewDecision(
+        paper=Paper(title="A Study", authors=["Ada Lovelace"],
+                    year=2014),
+        provider="dblp", status=DecisionStatus.PENDING,
+      )]
+      save_session(first)
+    session = load_session("work-194")
+    with isolated_registry():
+      theirs = load_session("work-194")
+      theirs.decisions[0].paper = self._older()
+      save_session(theirs)
+    session.decisions[0].status = DecisionStatus.KEPT
+    session.decisions[0].tags = ["ml"]
+    save_session(session)
+    paper = session.decisions[0].paper
+    assert paper.year == 2014
+    assert paper.abstract is None and paper.venue is None
+
+  def test_a_new_decision_keeps_its_own_work(self):
+    from scholar.scholar import isolated_registry
+    TestConcurrentSaveKeepsPaperData()._first_save()
+    session = load_session("conc-194")
+    held = Paper.from_dict({"title": "A Study",
+                            "authors": ["Ada Lovelace"], "year": 2014})
+    with isolated_registry():
+      theirs = load_session("conc-194")
+      theirs.decisions.append(ReviewDecision(
+        paper=self._older(), provider="dblp",
+        status=DecisionStatus.KEPT, tags=["ml"],
+      ))
+      save_session(theirs)
+    save_session(session)
+    [added] = [d for d in session.decisions if not d.paper.doi]
+    assert added.paper.year == 1994
+    assert added.paper.abstract == "the older work"
+    assert held.abstract is None
+@
 
 A save can also fail for want of space.  A review that ran with a full
 temporary volume left three copied sessions with more search records

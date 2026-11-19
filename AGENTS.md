@@ -281,7 +281,18 @@ a limit it stops at `S2_BULK_SAFETY_CAP` = 100,000 papers and records
 quoted phrases and quotes unquoted hyphenated words, since bulk reads
 an inner `-` as negation, #161 comment: `re-execution` 18,149 vs 251;
 `s2_mixes_and_or` → WARNING for ungrouped AND/OR, no documented
-precedence). `s2_foreign_field_syntax` refuses Scopus/WoS/arXiv field
+precedence).
+Hyphen quoting takes the whole blank-delimited token (`don't-care` →
+`"don't-care"`; leading `+ - | (` and trailing `| )` stay outside);
+a hyphenated word with `*` (`pre-print*`) is refused like foreign
+field syntax (`s2_hyphen_wildcard`; the docs define `*` for words
+only). A refused search has `last_via` None and `_routed` reset, so
+`applied_filters` reports no `--in` for it.
+`scholar.applied_filters(provider, query, filters, limit)` passes the
+limit to a provider method that names a `limit` parameter (S2's does,
+and recomputes the endpoint from query and limit), so a search skipped
+by the rate limiter records the same filters, hence key, as an
+answered one. `s2_foreign_field_syntax` refuses Scopus/WoS/arXiv field
 codes before any request: `last_error` "query uses <db> field syntax,
 not supported by Semantic Scholar" (failed, not cached). Plain words
 with a limit stay on `/paper/search` (`_search_uncached`), which never
@@ -302,8 +313,10 @@ fetched_at)`. A test unpickles a written cache with
 "Approximate"), and `last_via` (`"bulk"`, `"bulk, most cited first"`
 or None). `--in title-abstract` is honoured on bulk (it matches
 title+abstract by default): `SemanticScholarProvider.applied_filters`
-reads `_routed` (query, bulk) noted by `search`, so `search_provider`
-re-reads `applied_filters` after the search; only the relevance search
+decides from the query and the limit `search_provider` passes (before
+and after the search, so a skipped search gets it too); `_routed`
+(query, bulk) noted by `search` is read only by a caller without a
+limit; only the relevance search
 warns, once per search. `via` flows `provider_via()` (in
 `search_provider`) → `SearchResult.via` (kept through `merge` as
 `"s2: bulk"` and `deduplicate`) → `result_via(part)` per part in
@@ -829,7 +842,16 @@ keywords, sources), and the decision is kept whole
 (`dataclasses.replace`, lists copied) with `united_providers(old, new)`
 as provider; the duplicate, folded, renamed and adopted branches unite
 the provider too (#192; before, the decision was rebuilt around the
-returned copy, losing abstracts, sources and providers). Tests of this
+returned copy, losing abstracts, sources and providers). Without a
+session file, a decision from the old per-query decision store does
+the same with the record's paper (`paper_from_decision_record`, shared
+with the restore of papers not returned; provider
+`united_providers(record, search)`), filling only when
+`stored_paper_fills`: `plausibly_same_work` (a legacy-id record may be
+a namesake) and ids `stored_paper_with` can merge (equal, or a
+DOI-less record vs a DOI copy; a hash-keyed record can rebuild with a
+DOI or a derived arXiv DOI, and then the returned copy stands) (#194).
+Tests of this
 path need `isolated_registry()` between runs, else `Paper.from_dict`
 returns the held object and hides the loss. The save
 confirmation goes to stderr so `-f json`/`-f bibtex` stdout stays pure.
@@ -907,8 +929,21 @@ context (#107). `review.save_session` now:
   `session._baseline` (`SessionBaseline`, recorded by `read_session_file`
   and after each save). Decision fields and `research_context` this
   process did not change take the on-disk value. Papers, search records
-  and snowball rounds that only the file has are added. Paper metadata is
-  not merged (ours wins).
+  and snowball rounds that only the file has are added. Paper metadata
+  of a paper both hold is merged ours first (#194, `paper_filled_from`
+  = `ours.merge_with(theirs)`): the file's copy fills our empty
+  fields (gaps another process filled survive), sources/keywords
+  united; a field both hold keeps ours, even if the other process
+  updated it after our load (a newer Crossref `updated_by`/
+  `newer_versions` or Unpaywall `oa_status`/`oa_url` is lost: no
+  per-paper baseline yet). Nothing is filled from a namesake
+  (`plausibly_same_work`; DOI-less hash ids collide). The decision
+  keeps its very `Paper` object when nothing was filled. The file is
+  read with `read_session_file(path, use_registry=False)`, else the
+  registry would hand back our own objects and hide the file's copies;
+  a paper new on disk is registered (`register`), and if this process
+  already holds a copy of the same work, that copy wins, gaps filled
+  from the file (a held namesake: the file's paper stays).
 - **guards**: `warn_if_decisions_dropped` logs a WARNING (session,
   before/after decided counts, `.bak` path) when the save still leaves
   fewer decided papers than the file has, beyond this process's own
