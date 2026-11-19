@@ -557,6 +557,11 @@ At session append `review.py` strips it from incoming papers too
 (cached DBLP results still carry it) and reconciles entries stored with
 it like Scopus's surname-first ones (`homonym_free_id()` +
 `migrate_paper_id`, keeping decisions and notes).
+Papers stored with the number and not re-run keep it (in their id,
+authors and cite key, e.g. `00012014`); `audit_work_key` strips it
+(#233), so their audit rows and possible copies meet the plain-name
+copies; `cite_key_base` deliberately does not (keys already cited stay
+put; changing it would need a `SYNTHESIS_CACHE_VERSION` bump).
 
 ### Scopus Empty Results
 
@@ -1270,7 +1275,9 @@ report body builders (`build_review_provenance_latex`,
 - `scholar sessions export -f table --lang en|sv --label L --track T
   --theme TAG=NAME -o base` writes `base.tex`, always a fragment: one
   row per *work* (`audit_work_key`: title and first-author surname
-  (`author_surname`; a blank author gives an empty surname) reduced to case-folded letters and digits, year ignored; joined
+  (`author_surname`; a blank author gives an empty surname; DBLP's
+  homonym number is stripped first, #233) reduced to case-folded
+  letters and digits, year ignored; joined
   provider strings like `openalex; dblp` are split, mapped to codes and
   deduplicated, keeping only the names `decision_provider_evidence`
   supports (#191, see Data Models); the best copy gives the row its reason,
