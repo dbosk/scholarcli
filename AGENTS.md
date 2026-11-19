@@ -973,6 +973,15 @@ context (#107). `review.save_session` now:
   link too); else ours holds a status or changed → our pair whole,
   restored after the fill; else fill. `pdf_url` and the Crossref
   pair stay per field (Crossref never writes `None` there).
+  Crossref notices (`CROSSREF_NOTICE_FIELDS`: `updated_by`,
+  `newer_versions`) are united (#219, `united_crossref_notices`:
+  ours first, each notice whole, keyed by normalised DOI + `type` /
+  `relation`, DOI-less notices by equality; None+None → None,
+  []+None → []) when the paper has no paper state or both copies
+  changed them since the baseline (a retraction lost is worse than a
+  withdrawn notice kept, which `verify` replaces); only one side
+  changed → the three-way rule (ours as loaded → file's list; ours
+  changed, file as loaded → ours).
   `ACCUMULATED_PAPER_FIELDS` are never judged three ways: sources,
   keywords, tags united and `citation_count` max (by `merge_with`),
   `preprint_versions`/`published_versions` united by
@@ -984,7 +993,8 @@ context (#107). `review.save_session` now:
   (#209: other-file appends, new sessions, the ids a same-file append
   adds) has decision states only, since a built paper is no ancestor
   of the target's copy. No paper state (session never loaded or
-  built, paper new here) → nothing taken, gaps filled, ours wins.
+  built, paper new here) → nothing taken, gaps filled, ours wins
+  (Crossref notices united, above).
   `read_session_file` takes the baseline from the file's copy
   (`as_stored`), not from the registry's held object, else the
   file's older values would overwrite ours; the save's re-read passes
