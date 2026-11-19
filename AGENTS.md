@@ -846,11 +846,37 @@ returned copy, losing abstracts, sources and providers). Without a
 session file, a decision from the old per-query decision store does
 the same with the record's paper (`paper_from_decision_record`, shared
 with the restore of papers not returned; provider
-`united_providers(record, search)`), filling only when
-`stored_paper_fills`: `plausibly_same_work` (a legacy-id record may be
-a namesake) and ids `stored_paper_with` can merge (equal, or a
-DOI-less record vs a DOI copy; a hash-keyed record can rebuild with a
-DOI or a derived arXiv DOI, and then the returned copy stands) (#194).
+`united_providers(record, search)`; decision fields via
+`decision_from_record`), filling only when
+`stored_paper_fills`: `plausibly_same_work` (left for a record under
+the paper's own DOI, years apart) and ids `stored_paper_with` can
+merge (equal, or a DOI-less record vs a DOI copy; a hash-keyed record
+can rebuild with a DOI or a derived arXiv DOI, and then the returned
+copy stands) (#194). A namesake never takes the record's decision
+(#203, as `sec:session-copies` does for session files). The lookup is
+`store_record_of` (own id, else for a DOI paper the legacy hash id):
+a legacy-id record counts only when `plausibly_same_work` with its
+rebuilt paper *without* a DOI (a hash-keyed record was decided
+DOI-less; a derived arXiv DOI must not make a preprint's record
+another work than its published version). One that does not is
+skipped (the DOI paper is new and pending, with the links; the
+restore brings the record back under its own id, no links); one that
+does is taken over and not restored again (#211): the restore defers
+the keys the returned papers seek (`store_keys_sought`, papers
+normalised as in the conversion), the store branch notes the keys it
+uses (`used_store_keys`), and after the loop every deferred key not
+used is restored, so a record whose paper an earlier branch caught
+(`existing`, `replaced`, ...) stands beside as its own copy for
+`sessions reconcile`, never lost. A DOI-less paper whose own-id record is
+not plausibly its work (`is_record_namesake`; no id comparison, since
+a record can rebuild with a DOI) leaves the record's decision as the
+restore makes it (`restored_decision`, added by that branch since the
+restore skips returned ids) and is noted in its `same_id_copies`, no
+search link. A DOI paper under its own DOI is never a namesake.
+Record fields → decision: `decision_from_record` (restore too; an
+unknown source string stays an `is_unknown` pseudo-member); a record
+without a provider gets provider `previous`, like its paper's sources
+(the restore gave `""` before).
 Tests of this
 path need `isolated_registry()` between runs, else `Paper.from_dict`
 returns the held object and hides the loss. The save
@@ -972,6 +998,24 @@ context (#107). `review.save_session` now:
   (a hand copy) logs one WARNING per file and process
   (`warn_about_foreign_name`) and is flagged by `sessions list`
   (`name_mismatch` in the JSON, a stderr line); neither is renamed.
+  The loaded `_baseline` goes with `_loaded_from` (#207): an append
+  that saves into another file takes `SessionBaseline.of(session)` at
+  the end of `create_review_session` instead (no baseline would let
+  the loaded file's decisions and context replace the target's; the
+  loaded one reset the target's decisions of papers it lacked and
+  dropped those under ids the append renamed). Same-file appends keep
+  the loaded baseline (a renamed id must not come back from the file)
+  and add the built state only for ids it lacks (#214: a paper new in
+  this run, untouched, yields to another process's decision);
+  `record_keys` and the context stay as loaded. A session that loaded
+  nothing (brand new, or rebuilt from the decision store) takes the
+  built state too (#214: two processes creating one session at once);
+  only sessions constructed in code have no baseline. Whenever the
+  session does not continue a loaded file, the built baseline's
+  `record_keys` are empty: nothing was loaded from the target, so the
+  legacy-record rule must not drop one of our legacy records. Known gap (#213): a
+  renamed id leaves the target the work twice (old id: its own
+  decision; new id: the loaded file's), reported by no copy list.
 
 `scholar enrich` saves after every `ENRICH_SAVE_EVERY` (50) papers
 (`cli.nw`, `sec:enrich-chunks`): enrich → Crossref check → assign →
