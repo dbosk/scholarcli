@@ -1229,9 +1229,19 @@ whole. The `.bib` keeps it the same way. A table row's first escaped
 cell goes through `latex_row_cell` (`{}` before a leading `[` or `*`,
 else unchanged), so `\\` before it cannot read `[conference paper]` as
 a length (audit table, provider-specific queries table; the others
-start with `\citetitle` or a number). Still open: the standalone
-report loads no fontenc (OT1), where `« » Ð ð Þ þ Ą ą Ę ę Đ đ Ŋ ŋ Į į
-Ų ų Ǫ ǫ` fail as before; T1 hosts set them.
+start with `\citetitle` or a number). Readable characters beyond the
+cutoff are rendered, not wrapped: ligatures U+FB00–FB06 folded by NFKC
+(`LATIN_LIGATURES`, only these), super/subscripts U+2070–209C to
+`\textsuperscript{}`/`\textsubscript{}` (`LATEX_SCRIPT_CHARS`, built
+from names + NFKC; script minus → `-`), `ℓ` → `\ensuremath{\ell}`,
+`ʻ ʽ` → `` ` ``, `ʹ` → `'`; other spacing modifiers U+02B0–02FF do not
+make a run text (`SPACING_MODIFIERS`), so alone they are dropped. Cc
+controls are dropped inside runs too (they stop the T2A recipe).
+`latex_document` loads `\usepackage[T1]{fontenc}`
+(`STANDALONE_FONTENC`) before `LATEX_PACKAGES`: in OT1 `\textquotedbl`
+(any quoted query) and `« » ð þ` … failed; the one line is the only
+change to Latin-only standalone output. Fragments do not load it (the
+host's choice, like inputenc).
 `latex_document`/`latex_fragment` add `nonlatin_definition(marker)`
 only when the output uses the macro (`uses_nonlatin` over title,
 abstract, body, appendix and the `bib_text` callers pass), so Latin-only
@@ -1250,8 +1260,10 @@ hash id; `audit_title_cell`, `AuditRow.nonlatin_title`), and
 `TestNonLatinCompiles` (marker `latex`, registered in `pyproject.toml`;
 `-m "not latex"` skips; skipped without latexmk/biber/engine/pdftotext)
 compiles the standalone report and both fragments in a pdflatex+T1 host
-and the table under xelatex (DejaVu Serif, `pdftotext` shows the text);
-about a minute in all.
+and the table under xelatex and lualatex (DejaVu Serif, `pdftotext`
+shows the text; the lualatex run covers the `\directlua` line); the
+fixture has a quoted query, a `[`-row, `ĸ`, `CO₂`, a ligature. About
+30–60 s in all.
 
 - `scholar sessions export -f latex [--standalone|--no-standalone]` →
   `generate_latex_report(session, path, standalone=True)`. Always writes
