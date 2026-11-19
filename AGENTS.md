@@ -95,6 +95,16 @@ Providers self-register via `register_provider()` at module load time.
   incomplete in a merged record)", as in the caption
   (`searched_providers_text`). Failed and skipped
   records have no `search_source_date` and stay out of the periods.
+  Records from before outcomes were kept (`outcome_unknown`: `hits`
+  None and no error; every search since records its hits) do not show
+  that the provider answered (#188: DBLP served only its anti-bot page
+  then). Such a provider counts as searched only if a decision's
+  `provider` names it (`decision_provider_names`, joined forms split);
+  otherwise it is listed as "Outcome not recorded: dblp"
+  (`unrecorded_providers`, in the items and the abstract), not as "Not
+  searched", also when another of its searches failed. `record_rank`
+  still ranks such a record as answered (the old run may have answered
+  with its linked papers), so a failed re-run does not replace it.
 - One record per provider search (#164). `SearchResult.parts` /
   `found_in` (not compared): `merge` keeps the single-provider results
   it was made of and, per merged paper, the indices of the parts that
@@ -1049,7 +1059,11 @@ report body builders (`build_review_provenance_latex`,
   names the session (it is a `%` comment in the fragment) and ends with
   a full-name-first "Databases:" sentence built from the providers
   the session searched (search records that answered at least once,
-  zero hits included, plus the rows; rows only for old sessions); one
+  zero hits included, plus the rows; rows only for old sessions). A
+  database known only from records without an outcome and from no row
+  is listed after it, "Also queried, with no recorded outcome: DBLP."
+  (`AUDIT_STRINGS[lang]["unrecorded"]`, #188; the shortfall tuple's
+  7th count); one
   whose `SearchRecord`s carry errors is marked
   "failed for k of n queries" / "incomplete for k of n queries"
   (localised), and one that failed every query outright is not
