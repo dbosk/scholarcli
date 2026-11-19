@@ -1202,7 +1202,20 @@ Greek *words*: 3+ letters or an accented one; single Greek letters stay
 math) is wrapped in `\scholarnonlatin{...}` by both escapers, never
 dropped (`split_nonlatin`; a run bridges spaces, digits and punctuation
 between such characters, stops at a Latin letter, brace or backslash;
-specials inside are escaped). The `.bib` keeps it the same way.
+specials inside are escaped). Also flagged: the 213 code points in
+U+0080..U+024F that T1+utf8 inputenc does not set up (`T1_UNSET_RANGES`:
+C1 controls, `ĸ`, `ħ`, `ſ`, most of Latin Extended-B; exactly what
+`t1enc/ts1enc/omsenc/utf8enc.dfu` of TeX Live 2025 leave undeclared,
+checked by compiling each code point and by
+`test_t1_ranges_match_the_encoding_files`); a word holding a flagged
+*Latin* letter (Unicode name `LATIN…`, e.g. Vietnamese) is wrapped
+whole. The `.bib` keeps it the same way. A table row's first escaped
+cell goes through `latex_row_cell` (`{}` before a leading `[` or `*`,
+else unchanged), so `\\` before it cannot read `[conference paper]` as
+a length (audit table, provider-specific queries table; the others
+start with `\citetitle` or a number). Still open: the standalone
+report loads no fontenc (OT1), where `« » Ð ð Þ þ Ą ą Ę ę Đ đ Ŋ ŋ Į į
+Ų ų Ǫ ǫ` fail as before; T1 hosts set them.
 `latex_document`/`latex_fragment` add `nonlatin_definition(marker)`
 only when the output uses the macro (`uses_nonlatin` over title,
 abstract, body, appendix and the `bib_text` callers pass), so Latin-only
