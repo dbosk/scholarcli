@@ -99,14 +99,29 @@ Providers self-register via `register_provider()` at module load time.
   None and no error; every search since records its hits) do not show
   that the provider answered (#188: DBLP served only its anti-bot page
   then). Such a provider counts as searched only if a decision's
-  `provider` names it (`decision_provider_names`: `PROVIDER_SEPARATORS`,
-  case-insensitive; pre-#164 merged papers name every merged provider,
-  so there it is not proof, as in the audit rows);
+  `provider` names it (`decision_provider_names`, each decision read
+  through `decision_provider_evidence`, below);
   otherwise it is listed as "Outcome not recorded: dblp"
   (`unrecorded_providers`, in the items and the abstract), not as "Not
   searched", also when another of its searches failed. `record_rank`
   still ranks such a record as answered (the old run may have answered
   with its linked papers), so a failed re-run does not replace it.
+  Provider evidence (#191, review.nw `sec:provider-evidence`):
+  pre-#164 merged searches wrote the merged string (`openalex, dblp`)
+  on every paper, whichever returned it, and since #164 (and the #192
+  repair) a multi-name string can also be honest, so
+  `decision_provider_evidence(decision)` keeps a name of a
+  multi-name `provider` only if a single-provider `found_by` link
+  (no comma in its provider) or `paper.sources` names it
+  (case-insensitive). The string stands unchanged with no such
+  evidence at all, with one name (a merged search wrote two or more),
+  and for names not in `PROVIDER_FULL_NAMES` (`snowball`). Sources only
+  confirm names, never add them (enrichment unions the enriching
+  provider into `sources`; preprint adoption the candidate's); links
+  add their provider at the end. Used by `decision_provider_names`
+  and `collect_audit_rows` (so the caption's rows part); the stored
+  `provider` is never rewritten, and displays (`sessions show`, TUI,
+  CSV, JSON) show it as stored.
 - One record per provider search (#164). `SearchResult.parts` /
   `found_in` (not compared): `merge` keeps the single-provider results
   it was made of and, per merged paper, the indices of the parts that
@@ -1033,7 +1048,8 @@ report body builders (`build_review_provenance_latex`,
   row per *work* (`audit_work_key`: title and first-author surname
   (`author_surname`; a blank author gives an empty surname) reduced to case-folded letters and digits, year ignored; joined
   provider strings like `openalex; dblp` are split, mapped to codes and
-  deduplicated; the best-placed decision wins). The *last* category tag
+  deduplicated, keeping only the names `decision_provider_evidence`
+  supports (#191, see Data Models); the best-placed decision wins). The *last* category tag
   is the decision (`decide -t` appends while the status stays the
   same; a status change replaces the old category, #177); confidence is
   shown for unreviewed and human-confirmed LLM or agent rows, not for
