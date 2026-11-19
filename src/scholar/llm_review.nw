@@ -1180,11 +1180,11 @@ def classification_prompt_version(
         paper_quotes=[[SimpleNamespace(page=1, text="PASSAGE")]],
         extra_tags={"TAG"},
         allow_new_tags=allow_new_tags,
-        category_tags={"CATEGORY"},
+        category_tags=set(AUDIT_CATEGORIES),
     )
     procedure = {
         "template": template,
-        "retry": _retry_reminder({"TAG"}, {"CATEGORY"}),
+        "retry": _retry_reminder({"TAG"}, set(AUDIT_CATEGORIES)),
         "research_context": research_context or "",
         "vocabulary": sorted(vocabulary or ()),
         "allow_new_tags": allow_new_tags,
@@ -2037,8 +2037,20 @@ language of the table they are named for. The audit categories, when
 the session uses any, are presented apart as a choice of exactly one,
 with the theme lists as optional extras. The categories are the audit
 table's own [[AUDIT_CATEGORIES]], so the classifier and the table cannot
-drift apart. A session whose vocabulary holds no category tag is
-classified as before.
+drift apart, and once the session uses any of them, all four are
+offered, whichever the session's records happen to carry so far.  The
+categories are one scale, not a vocabulary a review grows: a session
+whose records carry only [[qualifies-claim]] has no category for a
+discard, and one with only [[adjacent-subtopic]] and
+[[off-topic-false-hit]] none for a paper that supports the claim.
+Offering only those made the model either break the rule that the
+category fits the decision (\cref{sec:category-fits-status}), so the
+paper was withheld after a wasted retry, or file a supporting paper
+under \enquote{adjacent}.  The categories added this way join the
+vocabulary the answers are checked against, so the parser keeps them;
+the themes and motivations stay the session's own, and the examples
+show the tags their records carry.  A session whose vocabulary holds
+no category tag is classified as before.
 
 <<llm review imports>>=
 from scholar.review import AUDIT_CATEGORIES, AUDIT_STRINGS
@@ -2050,7 +2062,11 @@ NOTE_TAGS: frozenset[str] = frozenset(
 themes, motivations = _collect_available_tags(session)
 known = themes | motivations | set(vocabulary or ())
 notes = {t for t in known if t.casefold() in NOTE_TAGS}
-categories = {t for t in known if t in AUDIT_CATEGORIES}
+categories = (
+    set(AUDIT_CATEGORIES) if any(t in AUDIT_CATEGORIES for t in known)
+    else set()
+)
+known |= categories
 set_apart = notes | categories
 known -= notes
 @
@@ -2167,7 +2183,7 @@ if withheld:
 
 Let's check the three shapes from the issue in one batch. The session
 uses three categories, a theme and a note, and [[vocabulary]] seeds the
-fourth category. The model first answers with a theme only, with two
+fourth category (which the classifier would offer anyway). The model first answers with a theme only, with two
 categories, and with a category plus a copied note tag; on the retry it
 fixes the first paper but not the second. The note is never offered,
 not even on an example's tag line; it is dropped from the third paper,
@@ -2417,14 +2433,17 @@ if not problem:
 
 Telling the model only after the fact would waste the first answer, so
 the rule goes into the category section of the prompt and into the
-retry's reminder, with the categories each decision admits among the
-session's own.  The rule also says what to do with a paper that bears
+retry's reminder, with the categories each decision admits.  Since
+the classifier offers all four categories whenever it offers any
+(\cref{sec:classifier-categories}), the rule names the full sets, and
+every decision has a category to take.  The rule also says what to do with a paper that bears
 on the claim but seems excludable: keep it.  Without that, a model
 told only that a discard needs another category could relabel a
 supporting paper as adjacent to discard it, which would be a worse
 answer than the contradiction: one that looks consistent and is not.
 The sentence is fixed whatever the categories, so the prompt version
-(\cref{sec:prompt-version}) moves with the rule.
+(\cref{sec:prompt-version}) moves with the rule; its probe offers the
+four categories, as the classifier does.
 
 <<llm review llm interaction>>=
 def _category_status_rule(categories: set[str] | None) -> str:
@@ -2433,11 +2452,9 @@ def _category_status_rule(categories: set[str] | None) -> str:
         return ""
 
     def fitting(status: str) -> str:
-        names = sorted(
-            (c for c in categories if c in STATUS_CATEGORIES[status]),
-            key=lambda t: AUDIT_CATEGORIES.get(t, 0),
-        )
-        return ", ".join(names) or "none of them"
+        return ", ".join(sorted(
+            STATUS_CATEGORIES[status], key=AUDIT_CATEGORIES.get
+        ))
 
     return (
         "The category must fit the decision: a kept paper takes "
@@ -2502,15 +2519,14 @@ class TestCategoryFitsStatus:
   def test_the_rule_is_in_the_prompt_and_the_retry(self):
     from scholar.llm_review import _category_status_rule, _retry_reminder
 
-    rule = _category_status_rule({"supports-claim", "off-topic-false-hit"})
+    rule = _category_status_rule(self.CATEGORIES)
     assert rule.startswith(
       "The category must fit the decision: a kept paper takes "
-      "supports-claim; a discarded paper takes off-topic-false-hit."
+      "supports-claim, qualifies-claim, adjacent-subtopic; a discarded "
+      "paper takes adjacent-subtopic, off-topic-false-hit."
     )
-    assert "none of them" in _category_status_rule({"supports-claim"})
     assert _category_status_rule(None) == ""
-    assert rule in _retry_reminder(None, {"supports-claim",
-                                          "off-topic-false-hit"})
+    assert rule in _retry_reminder(None, self.CATEGORIES)
 
   def test_retry_mends_one_and_withholds_the_other(self, monkeypatch):
     from scholar.llm_review import _category_status_rule
@@ -2578,6 +2594,80 @@ class TestCategoryFitsStatus:
             for d in result.withheld] == [
       ("New 1", "category off-topic-false-hit does not fit a kept paper"),
     ]
+
+  def _classify_with(self, monkeypatch, decided, answer):
+    """Classify one new paper beside `decided` (status, tags) records."""
+    class FakeResponse:
+      def __init__(self, text):
+        self._text = text
+
+      def text(self):
+        return self._text
+
+    class FakeModel:
+      model_id = "fake"
+
+      def __init__(self):
+        self.prompts = []
+
+      def prompt(self, prompt):
+        self.prompts.append(prompt)
+        decision, tags = answer
+        return FakeResponse(json.dumps({"classifications": [
+          {"paper_index": 0, "decision": decision, "tags": tags,
+           "confidence": 0.8, "reasoning": "r"},
+        ]}))
+
+    fake_model = FakeModel()
+
+    class FakeLLMModule:
+      def get_model(self, _model_id=None):
+        return fake_model
+
+    import scholar.llm_review as llm_review
+
+    monkeypatch.setattr(llm_review, "llm", FakeLLMModule(), raising=False)
+    session = ReviewSession(
+      query="q", providers=["p"], timestamp=datetime.now(),
+      research_context="Does the claim hold?",
+    )
+    session.decisions = [
+      ReviewDecision(paper=Paper(title=f"Old {i}", authors=["A"],
+                                 abstract="a"),
+                     provider="p", status=status, tags=tags)
+      for i, (status, tags) in enumerate(decided)
+    ] + [
+      ReviewDecision(paper=Paper(title="New", authors=["B"],
+                                 abstract="b"), provider="p"),
+    ]
+    result = classify_papers_with_llm(
+      session, count=1, model_id="fake", enrich_missing=False,
+      require_examples=False,
+    )
+    return result, fake_model
+
+  def test_one_category_in_the_session_offers_all_four(self, monkeypatch):
+    result, model = self._classify_with(
+      monkeypatch, [(DecisionStatus.KEPT, ["qualifies-claim"])],
+      ("discarded", ["off-topic-false-hit"]),
+    )
+    assert "## Category (exactly one per paper)\n\nsupports-claim, " \
+      "qualifies-claim, adjacent-subtopic, off-topic-false-hit" \
+      in model.prompts[0]
+    assert len(model.prompts) == 1 and result.withheld == []
+    assert [(d.status, d.tags) for d in result.decisions] \
+      == [("discarded", ["off-topic-false-hit"])]
+
+  def test_a_session_without_bearing_categories_can_keep(self, monkeypatch):
+    result, model = self._classify_with(
+      monkeypatch,
+      [(DecisionStatus.DISCARDED, ["adjacent-subtopic"]),
+       (DecisionStatus.DISCARDED, ["off-topic-false-hit"])],
+      ("kept", ["supports-claim"]),
+    )
+    assert len(model.prompts) == 1 and result.withheld == []
+    assert [(d.status, d.tags) for d in result.decisions] \
+      == [("kept", ["supports-claim"])]
 @
 
 

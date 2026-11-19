@@ -1357,10 +1357,16 @@ paper" (checked only once exactly one category is left), with the same
 retry and withholding. The prompt's category section and the retry
 reminder state the rule (`_category_status_rule`, fixed wording, so the
 prompt version moves) and say to keep a paper that bears on the claim
-and leave its exclusion to a human. Only classifier answers are
-checked: a human's "supports, excluded" (rendered on purpose by the
-audit table, #89) is recorded as given; existing records are not
-rewritten. Sessions without category tags are classified as before.
+and leave its exclusion to a human. Once the session holds any of
+`AUDIT_CATEGORIES`, the classifier offers all four (and adds them to
+the vocabulary answers are checked against; themes and motivations stay
+the session's own), so every decision has a fitting category; the
+prompt-version probe offers the four too. Only classifier verdicts are
+checked: `llm classify` answers, and `sessions decide --source llm`
+(exit 2 before loading, naming the fitting categories). A human's or
+agent's "supports, excluded" (rendered on purpose by the audit table,
+#89) is recorded as given; existing records are not rewritten.
+Sessions without category tags are classified as before.
 
 ### Snowball and Tuxedo Subcommands (lazy)
 
