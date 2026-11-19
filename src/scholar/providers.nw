@@ -2502,7 +2502,18 @@ words in upper case ([[AND]], [[OR]], [[NOT]]), as every provider with
 Boolean operators requires (\cref{ch:syntax-cli}), or anything else
 the relevance search would read as plain text but the bulk search reads
 as syntax: a quoted phrase, parentheses, or the bulk search's own
-operators ([[|]], a leading [[+]] or [[-]], a trailing [[*]]).
+operators ([[|]], a leading [[+]] or [[-]], a trailing [[*]], a
+[[~]] or [[~N]] after a word or a closing quote).
+The description of the bulk search's [[query]] parameter documents
+[[~N]] as the edit distance after a word and the term distance after a
+phrase, and says nothing of it for the relevance search
+(\url{https://api.semanticscholar.org/graph/v1/swagger.json},
+2026-11-19).
+So the [[~]] counts only where it ends the word or phrase (a space, a
+[[|]], a [[)]] or the end follows): in [[p~0.05]], [[foo~bar]] or a
+URL path it is part of the text, and such a query stays on the
+relevance search. ([[10~20]] does read as the word [[10]] with edit
+distance 20, which is what the bulk search's grammar makes of it.)
 Lower-case [[and]] and [[or]] stay words, as on the other providers.
 A hyphen inside a word ([[multi-factor]]) is not an operator here:
 only a [[-]] at the start of a word is.
@@ -2511,6 +2522,7 @@ only a [[-]] at the start of a word is.
 S2_OPERATOR_PATTERN = re.compile(
     r'\b(?:AND|OR|NOT)\b'
     r'|["()|*]'
+    r'|(?<=[\w"])~\d*(?=[\s|)]|$)'
     r'|(?:^|\s)[+-](?=\S)'
 )
 <<semantic scholar helpers>>=
@@ -2543,6 +2555,8 @@ class TestS2EndpointChoice:
     "machine learning privacy",
     "multi-factor authentication",
     "research and development or not",
+    "p~0.05 significance",
+    "foo~bar",
   ])
   def test_plain_words_with_a_limit_stay_on_relevance(self, query):
     assert not s2_uses_bulk(query, 100)
@@ -2557,6 +2571,9 @@ class TestS2EndpointChoice:
     "phishing -mfa",
     "+phishing mfa",
     "authenticat*",
+    "phishing~",
+    "re-exec~2",
+    '"two factor"~3',
   ])
   def test_operators_go_to_bulk(self, query):
     assert s2_uses_bulk(query, 100)
@@ -2592,9 +2609,35 @@ keyed request on 2026-11-18, reported on
 So [[s2_bulk_query]] puts every unquoted word with a hyphen inside it
 in quotes, which makes it a phrase of its parts, the reading the other
 providers give it.
+A \enquote{word} here is everything between two blanks, not a run of
+letters: the first version quoted [[\w+(-\w+)+]] and turned
+[[don't-care]] into [[don'"t-care"]], a quote inside the token.
+So the token is taken whole, and only the characters the translation
+itself puts at its edges stay outside the quotes: a leading [[+]],
+[[-]], [[|]] or [[(]] and a trailing [[|]] or [[)]].
+A trailing [[~]] or [[~N]] stays outside too: after a phrase it is the
+documented proximity operator (\enquote{[["fish ladder"~3]]}), so
+[[re-exec~2]] becomes [["re-exec"~2]], not the single term
+[["re-exec~2"]].
 A [[-]] at the start of a word is left alone, being a negation; a
 negated hyphenated word keeps both: [[-re-execution]] becomes
 [[-"re-execution"]].
+
+A prefix wildcard on a hyphenated word has no safe translation.
+The description says only that \enquote{[[*]] can be used to match a
+prefix}; its one example of a phrase is followed by [[~N]], never by
+[[*]], so [[*]] after a phrase is not defined.
+Quoted ([[pre-print*]] becomes [["pre-print"*]]) the query would
+depend on that undefined reading, and unquoted the inner hyphen is a
+negation again.
+[[s2_hyphen_wildcard]] finds such a token, and [[search]] refuses the
+query with a reason naming it, as for another database's field syntax
+below, so the user can write the whole word, [[pre-print]].
+Nothing in the description says how to match a prefix of a hyphenated
+word, so the reason offers no other spelling.
+(Checked in the description of the [[query]] parameter of
+\url{https://api.semanticscholar.org/graph/v1/swagger.json},
+2026-11-19; not tried against the live service.)
 
 Quoted phrases are left alone, operators and all: an upper-case
 [[AND]] inside quotes is a word of the phrase.
@@ -2609,21 +2652,57 @@ S2_BULK_TRANSLATION = (
     (re.compile(r"(?<![^\s(])NOT\s+"), "-"),
     (re.compile(r"\s+AND\s+"), " + "),
     (re.compile(r"\s+OR\s+"), " | "),
-    (re.compile(r"(?<![\w\"])(\w+(?:-\w+)+)"), r'"\1"'),
+)
+S2_WORD = re.compile(r"\S+")
+S2_WORD_EDGES = re.compile(
+    r"([+|(-]*)(.*?)((?:~\d*)?[|)]*)", re.DOTALL
 )
 <<semantic scholar helpers>>=
+def s2_word_core(word: str) -> tuple[str, str, str]:
+    """Split an unquoted `word` into operator prefix, core and suffix."""
+    return S2_WORD_EDGES.fullmatch(word).groups()
+
+
+def s2_is_hyphenated(core: str) -> bool:
+    """Whether `core` has a hyphen inside it, not only at its edges."""
+    return "-" in core.strip("-")
+
+
+def s2_quote_hyphenated(text: str) -> str:
+    """Put every whitespace-delimited word with an inner hyphen in quotes."""
+    def quote(match):
+        lead, core, trail = s2_word_core(match.group())
+        if s2_is_hyphenated(core):
+            core = f'"{core}"'
+        return lead + core + trail
+
+    return S2_WORD.sub(quote, text)
+
+
+def s2_hyphen_wildcard(query: str) -> str | None:
+    """The first unquoted word with both an inner hyphen and a `*`."""
+    for text in S2_PHRASE.split(query)[::2]:
+        for word in S2_WORD.findall(text):
+            core = s2_word_core(word)[1]
+            if "*" in core and s2_is_hyphenated(core):
+                return core
+    return None
+
+
 def s2_bulk_query(query: str) -> str:
     """Translate scholar's Boolean words into the bulk search's syntax.
 
     `AND` becomes `+`, `OR` becomes `|` and `NOT` a `-` on what
-    follows it; an unquoted hyphenated word is quoted, since the bulk
-    search reads an inner `-` as a negation.  Quoted phrases and
-    everything else are kept as written.
+    follows it; an unquoted hyphenated word (anything between blanks
+    with an inner `-`) is quoted whole, since the bulk search reads an
+    inner `-` as a negation.  Quoted phrases and everything else are
+    kept as written.
     """
     parts = S2_PHRASE.split(query)
     for i in range(0, len(parts), 2):
         for pattern, replacement in S2_BULK_TRANSLATION:
             parts[i] = pattern.sub(replacement, parts[i])
+        parts[i] = s2_quote_hyphenated(parts[i])
     return "".join(parts)
 @
 
@@ -2725,6 +2804,16 @@ class TestS2BulkQuery:
     ("-re-execution", '-"re-execution"'),
     ("(multi-factor-auth)", '("multi-factor-auth")'),
     ('"re-execution" OR x', '"re-execution" | x'),
+    ("don't-care", '"don\'t-care"'),
+    ("-don't-care", '-"don\'t-care"'),
+    ("(re-exec OR x)", '("re-exec" | x)'),
+    ("fish -ladder", "fish -ladder"),
+    ("pre*", "pre*"),
+    ("a-b-c d", '"a-b-c" d'),
+    ("naïve-bayes", '"naïve-bayes"'),
+    ("x AND re-exec~2", 'x + "re-exec"~2'),
+    ("re-exec~", '"re-exec"~'),
+    ("(re-exec~1)", '("re-exec"~1)'),
   ])
   def test_translation(self, query, sent):
     assert s2_bulk_query(query) == sent
@@ -2806,10 +2895,13 @@ def search(
     self.last_total = None
     self.last_total_estimated = False
     start_answer(self)
+    self.last_via = None
+    self._routed = None
+    <<refuse another database's field syntax>>
+    <<refuse a wildcard after a hyphenated word>>
     bulk = s2_uses_bulk(query, limit)
     self.last_via = s2_via(query, limit)
     self._routed = (query, bulk)
-    <<refuse another database's field syntax>>
     if bulk and s2_mixes_and_or(query):
         logger.warning(
             "s2: the bulk search documents no precedence between AND "
@@ -2842,8 +2934,29 @@ if database:
         "not supported by Semantic Scholar"
     )
     logger.warning("s2: %s: %s", self.last_error, query)
+    self._routed = (query, False)
+    return []
+<<refuse a wildcard after a hyphenated word>>=
+token = s2_hyphen_wildcard(query)
+if token:
+    plain = token.replace("*", "").rstrip("-")
+    self.last_error = (
+        f"wildcard after a hyphenated word ({token}) is not supported "
+        "by Semantic Scholar bulk search, which documents no prefix "
+        f"match for it; write the whole word ({plain}) instead"
+    )
+    logger.warning("s2: %s: %s", self.last_error, query)
+    self._routed = (query, False)
     return []
 @
+
+A refused query sends nothing, so it has no endpoint to report:
+[[last_via]] and [[_routed]] are reset first, before either refusal,
+and set to the accepted query's endpoint only afterwards.
+A refusal leaves [[_routed]] as \enquote{not the bulk search}, since
+no request applied an [[--in]]; without it a refused search would
+carry the endpoint of the one before it into its record, or let
+[[applied_filters]] report an [[--in]] that nothing applied.
 
 The provider records which endpoint answered ([[last_via]], below),
 and for the bulk search with a limit also that the answer is the most
@@ -3620,24 +3733,197 @@ A search records the filters its provider applied
 ([[applied_filters]], \cref{sec:providers-search-in}), and for Semantic
 Scholar that depends on the endpoint, which depends on the limit as
 well as the query.
-[[applied_filters(query, filters)]] is not given the limit, so
-[[search]] notes the endpoint it chose for its query ([[_routed]]), and
-[[applied_filters]], which [[Search.execute]] calls right after the
-search, reads it.
-For a query this provider has not just searched, it decides by the
-query alone.
+The endpoint is a function of the query and the limit, and
+[[search_provider]] hands both to [[applied_filters]], so the method
+recomputes it instead of remembering a search: for a search that was
+answered, one that was refused and one that was skipped by the rate
+limiter (which never reaches [[search]] at all) alike.
+A skipped and an answered search of the same query, limit and filters
+therefore record the same filters, hence the same record key, and the
+answered run replaces the skipped record (the record key, in the
+scholar module).
+A refused query applies nothing, and the refusals depend on the query
+alone, so the method checks them too.
+A caller that gives no limit gets the endpoint [[search]] noted for
+that query ([[_routed]]), else a guess from the query's operators.
 
 <<semantic scholar search method>>=
 def applied_filters(
-    self, query: str, filters: SearchFilters | None
+    self,
+    query: str,
+    filters: SearchFilters | None,
+    limit: int | None = None,
 ) -> SearchFilters | None:
     """The filters applied to `query`: `--in` only on the bulk search."""
     if not (filters and filters.search_in):
         return filters
-    routed_query, bulk = getattr(self, "_routed", (None, False))
-    if routed_query != query:
-        bulk = s2_has_operators(query)
+    if limit is not None:
+        refused = s2_foreign_field_syntax(query) or s2_hyphen_wildcard(query)
+        bulk = not refused and s2_uses_bulk(query, limit)
+    else:
+        routed_query, bulk = getattr(self, "_routed", None) or (None, False)
+        if routed_query != query:
+            bulk = s2_has_operators(query)
     return filters if bulk else without_search_in(filters)
+@
+
+\paragraph{Checking a skipped search.}
+A provider whose quota is spent is skipped before its [[search]] runs,
+so the only thing that can make its record right is the query and the
+limit.
+The tests block Semantic Scholar's limiter and run the search through
+[[Search.execute]], in both orders: a bulk search (no limit, [[--in]]
+honoured) and then a skipped relevance search of the same query, and
+the reverse.
+
+<<test functions>>=
+class TestS2SkippedSearchFilters:
+  """A skipped search records what it would have applied."""
+
+  ASKED = SearchFilters(search_in="title-abstract")
+
+  def _run(self, monkeypatch, limit, *, blocked):
+    from scholar.ratelimit import limiter_for
+
+    _replay_s2(monkeypatch, [S2_BULK_SINGLE_PAGE, S2_BULK_SINGLE_PAGE])
+    provider = SemanticScholarProvider(api_key=None)
+    monkeypatch.setitem(PROVIDERS, "s2", provider)
+    if blocked:
+      limiter_for(provider).record_limit_hit(
+        reason="daily quota spent", exhausted_daily=True
+      )
+    [result] = Search("plain words").execute(
+      providers=["s2"], limit=limit, filters=self.ASKED,
+    )
+    return provider, result
+
+  def test_bulk_then_skipped_relevance(self, monkeypatch):
+    provider, answered = self._run(monkeypatch, 0, blocked=False)
+    assert answered.filters == {"search_in": "title-abstract"}
+    from scholar.ratelimit import limiter_for
+    limiter_for(provider).record_limit_hit(
+      reason="daily quota spent", exhausted_daily=True
+    )
+    [skipped] = Search("plain words").execute(
+      providers=["s2"], limit=100, filters=self.ASKED,
+    )
+    assert skipped.error.startswith("skipped: ")
+    assert skipped.filters is None
+
+  def test_relevance_then_skipped_bulk(self, monkeypatch):
+    provider, answered = self._run(monkeypatch, 100, blocked=False)
+    assert answered.filters is None
+    from scholar.ratelimit import limiter_for
+    limiter_for(provider).record_limit_hit(
+      reason="daily quota spent", exhausted_daily=True
+    )
+    [skipped] = Search("plain words").execute(
+      providers=["s2"], limit=0, filters=self.ASKED,
+    )
+    assert skipped.error.startswith("skipped: ")
+    assert skipped.filters == {"search_in": "title-abstract"}
+
+  def test_skipped_and_answered_records_share_a_key(self, monkeypatch):
+    provider, skipped = self._run(monkeypatch, 100, blocked=True)
+    from scholar.ratelimit import reset_state
+    reset_state()
+    [answered] = Search("plain words").execute(
+      providers=["s2"], limit=100, filters=self.ASKED,
+    )
+    assert answered.filters == skipped.filters
+@
+
+\paragraph{Checking the edge cases.}
+The refusals send nothing, so these tests count the requests that
+reach the (replayed) transport instead of asserting on a call, and
+read the cache directly: a refused query must leave neither a request
+nor an entry behind.
+
+<<test functions>>=
+class TestS2BulkEdges:
+  """Hyphen and wildcard edge cases; refused queries; stale routing."""
+
+  @pytest.mark.parametrize("query, token", [
+    ("pre-print*", "pre-print*"),
+    ("foo-*", "foo-*"),
+    ("x AND (pre-print*)", "pre-print*"),
+    ("-pre-print*", "pre-print*"),
+  ])
+  def test_wildcard_after_a_hyphenated_word_is_found(self, query, token):
+    assert s2_hyphen_wildcard(query) == token
+
+  @pytest.mark.parametrize("query", [
+    "preprint*", "pre*print", '"pre-print*"', "pre-print", "a - b*",
+  ])
+  def test_other_wildcards_are_not_refused(self, query):
+    assert s2_hyphen_wildcard(query) is None
+
+  @pytest.mark.parametrize("query", ["pre-print*", "x AND foo-*"])
+  def test_the_wildcard_is_refused_before_any_request(
+    self, monkeypatch, query
+  ):
+    sent = _replay_s2(monkeypatch, [])
+    provider = SemanticScholarProvider(api_key=None)
+    assert provider.search(query, limit=0) == []
+    assert sent == []
+    assert provider.last_error.startswith("wildcard after a hyphenated")
+    assert hits_label(0, provider.last_error).startswith("failed (")
+    assert provider.last_via is None
+    assert len(provider._cache) == 0
+
+  def test_the_reason_names_the_token(self, monkeypatch):
+    _replay_s2(monkeypatch, [])
+    provider = SemanticScholarProvider(api_key=None)
+    provider.search("x AND pre-print*", limit=0)
+    assert "(pre-print*)" in provider.last_error
+
+  def test_foreign_field_syntax_records_no_via(self, monkeypatch):
+    sent = _replay_s2(monkeypatch, [])
+    provider = SemanticScholarProvider(api_key=None)
+    provider.search('TITLE-ABS-KEY("a b")', limit=100)
+    assert sent == [] and provider.last_via is None
+
+  def test_a_refusal_clears_the_via_of_the_search_before(self, monkeypatch):
+    _replay_s2(monkeypatch, [S2_BULK_SINGLE_PAGE])
+    provider = SemanticScholarProvider(api_key=None)
+    provider.search("a AND b", limit=100)
+    assert provider.last_via == "bulk, most cited first"
+    provider.search("pre-print*", limit=100)
+    assert provider.last_via is None
+
+  @pytest.mark.parametrize("query", ["TS=(a AND b)", "x AND pre-print*"])
+  def test_a_refused_query_applies_no_in_with_a_limit(self, query):
+    """With a limit the endpoint is recomputed, and a refused query
+    (bulk by its operators) must still apply nothing."""
+    asked = SearchFilters(search_in="title-abstract")
+    provider = SemanticScholarProvider(api_key=None)
+    assert s2_uses_bulk(query, 100)
+    assert provider.applied_filters(query, asked, limit=100) is None
+    assert provider.applied_filters("a AND b", asked, limit=100) == asked
+
+  def test_a_refused_search_keeps_no_routing(self, monkeypatch):
+    """`--in` was honoured by the earlier bulk search of the same
+    query; the refused one applied nothing, so it must not report it."""
+    _replay_s2(monkeypatch, [S2_BULK_SINGLE_PAGE])
+    asked = SearchFilters(search_in="title-abstract")
+    provider = SemanticScholarProvider(api_key=None)
+    provider.search("a AND b", limit=100, filters=asked)
+    assert provider.applied_filters("a AND b", asked) == asked
+    provider.search('TS=(a AND b)', limit=100, filters=asked)
+    assert provider.applied_filters('TS=(a AND b)', asked) is None
+
+  def test_the_routing_does_not_outlive_its_search(self, monkeypatch):
+    """Same query, first on bulk (a limit-free search), then by
+    relevance: the second answer must not read the first's routing."""
+    _replay_s2(monkeypatch, [
+      S2_BULK_SINGLE_PAGE, {"total": 0, "offset": 0, "data": []},
+    ])
+    asked = SearchFilters(search_in="title-abstract")
+    provider = SemanticScholarProvider(api_key=None)
+    provider.search("plain words", limit=0, filters=asked)
+    assert provider.applied_filters("plain words", asked) == asked
+    provider.search("plain words", limit=100, filters=asked)
+    assert provider.applied_filters("plain words", asked) is None
 @
 
 <<test functions>>=

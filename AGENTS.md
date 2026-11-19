@@ -257,7 +257,18 @@ a limit it stops at `S2_BULK_SAFETY_CAP` = 100,000 papers and records
 quoted phrases and quotes unquoted hyphenated words, since bulk reads
 an inner `-` as negation, #161 comment: `re-execution` 18,149 vs 251;
 `s2_mixes_and_or` → WARNING for ungrouped AND/OR, no documented
-precedence). `s2_foreign_field_syntax` refuses Scopus/WoS/arXiv field
+precedence).
+Hyphen quoting takes the whole blank-delimited token (`don't-care` →
+`"don't-care"`; leading `+ - | (` and trailing `| )` stay outside);
+a hyphenated word with `*` (`pre-print*`) is refused like foreign
+field syntax (`s2_hyphen_wildcard`; the docs define `*` for words
+only). A refused search has `last_via` None and `_routed` reset, so
+`applied_filters` reports no `--in` for it.
+`scholar.applied_filters(provider, query, filters, limit)` passes the
+limit to a provider method that names a `limit` parameter (S2's does,
+and recomputes the endpoint from query and limit), so a search skipped
+by the rate limiter records the same filters, hence key, as an
+answered one. `s2_foreign_field_syntax` refuses Scopus/WoS/arXiv field
 codes before any request: `last_error` "query uses <db> field syntax,
 not supported by Semantic Scholar" (failed, not cached). Plain words
 with a limit stay on `/paper/search` (`_search_uncached`), which never
@@ -278,8 +289,10 @@ fetched_at)`. A test unpickles a written cache with
 "Approximate"), and `last_via` (`"bulk"`, `"bulk, most cited first"`
 or None). `--in title-abstract` is honoured on bulk (it matches
 title+abstract by default): `SemanticScholarProvider.applied_filters`
-reads `_routed` (query, bulk) noted by `search`, so `search_provider`
-re-reads `applied_filters` after the search; only the relevance search
+decides from the query and the limit `search_provider` passes (before
+and after the search, so a skipped search gets it too); `_routed`
+(query, bulk) noted by `search` is read only by a caller without a
+limit; only the relevance search
 warns, once per search. `via` flows `provider_via()` (in
 `search_provider`) → `SearchResult.via` (kept through `merge` as
 `"s2: bulk"` and `deduplicate`) → `result_via(part)` per part in
