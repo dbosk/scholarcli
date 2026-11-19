@@ -99,9 +99,8 @@ Providers self-register via `register_provider()` at module load time.
   None and no error; every search since records its hits) do not show
   that the provider answered (#188: DBLP served only its anti-bot page
   then). Such a provider counts as searched only if a decision's
-  `provider` names it (`decision_provider_names`: `PROVIDER_SEPARATORS`,
-  case-insensitive; pre-#164 merged papers name every merged provider,
-  so there it is not proof, as in the audit rows);
+  `provider` names it (`decision_provider_names`, each decision read
+  through `decision_provider_evidence`, below);
   otherwise it is listed as "Outcome not recorded: dblp"
   (`unrecorded_providers`, in the items and the abstract), not as "Not
   searched", also when another of its searches failed. `record_rank`
@@ -112,8 +111,33 @@ Providers self-register via `register_provider()` at module load time.
   counts), or a decision's `provider` names its provider (as
   `decision_provider_names`, also for decisions with links: records
   without an outcome predate links, #128). Pre-#164 merged decisions
-  name every merged provider, so they keep such records too (not
-  proof, as above). A failed record never counts as searched.
+  name every merged provider, so without evidence they keep such
+  records too; with sources only the providers the sources or
+  single-provider links name (`decision_provider_evidence`, below). A failed record
+  never counts as searched.
+  Provider evidence (#191, review.nw `sec:provider-evidence`):
+  pre-#164 merged searches wrote the merged string (`openalex, dblp`)
+  on every paper, whichever returned it, and since #164 (and the #192
+  repair) a multi-name string can also be honest, so
+  `decision_provider_evidence(decision)`, when the paper has
+  `sources`, keeps a name of `provider` only if a source or a
+  single-provider `found_by` link (its provider splits into one name)
+  names it; without sources nothing is ruled out, since links are
+  younger than the merged strings and miss old runs (#190's argument)
+  (case-insensitive; string, sources and links all split on
+  `PROVIDER_SEPARATORS`, since the notes-module fallback stores a
+  joined provider as a source). The string stands unchanged without
+  sources, when the evidence names none of its providers
+  (`s2` alone, `previous`), with one name (a merged search wrote two
+  or more), and for names not in `PROVIDER_FULL_NAMES` (`snowball`).
+  Two decisions sharing a paper id share one registry `Paper`, so the
+  second is judged by the first's sources. Sources only
+  confirm names, never add them (enrichment unions the enriching
+  provider into `sources`; preprint adoption the candidate's); links
+  add their provider at the end. Used by `decision_provider_names`
+  (so also by #190's record replacement) and `collect_audit_rows` (so the caption's rows part); the stored
+  `provider` is never rewritten, and displays (`sessions show`, TUI,
+  CSV, JSON) show it as stored.
 - One record per provider search (#164). `SearchResult.parts` /
   `found_in` (not compared): `merge` keeps the single-provider results
   it was made of and, per merged paper, the indices of the parts that
@@ -1101,7 +1125,8 @@ report body builders (`build_review_provenance_latex`,
   row per *work* (`audit_work_key`: title and first-author surname
   (`author_surname`; a blank author gives an empty surname) reduced to case-folded letters and digits, year ignored; joined
   provider strings like `openalex; dblp` are split, mapped to codes and
-  deduplicated; the best-placed decision gives the row its reason,
+  deduplicated, keeping only the names `decision_provider_evidence`
+  supports (#191, see Data Models); the best-placed decision gives the row its reason,
   category, confidence, status and order, but the notes of every copy
   are united, #196: `collect_audit_rows` passes the other copies'
   `audit_note_tags` (what each copy's own row shows as notes: note
