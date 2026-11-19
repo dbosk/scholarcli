@@ -813,8 +813,16 @@ tags/source: not folded, merging tags is a judgement) and
 `possible_copies` (DOI-less decisions sharing an `audit_work_key` with a
 DOI decision but in none of those lists) are shown by `sessions show`
 (lines; foldable and possible copies counted, ids in JSON) and counted
-in the report, which
-also states "Unique works" from the audit rows. **Remaining gap**: the
+in the report. The pairs are DOI-less/DOI copy pairs plus two decided
+decisions under one id whose `decision_state` differs (`same_id_pairs`,
+any id, DOI too; #215: a store re-run can leave them, see below);
+conflicting if statuses differ, else alike; same state or a pending
+copy: not listed; `sessions reconcile` never folds them (no other id to
+fold to). Not handled: `sessions decide --paper-id` selects one
+decision per id, and the next append keeps one decision per id
+(`_build_previous_decision_lookup`), so such a pair lasts until then.
+The report also states "Unique works" from the audit rows.
+**Remaining gap**: the
 pairing uses the exact title + surname hash, the audit work key is
 looser (punctuation, case, year), so on the real sessions 2995 DOI-less
 records share a work key with a DOI record and only 403 pair; the rest
@@ -850,7 +858,9 @@ the provider too (#192; before, the decision was rebuilt around the
 returned copy, losing abstracts, sources and providers). Without a
 session file, a decision from the old per-query decision store does
 the same with the record's paper (`paper_from_decision_record`, shared
-with the restore of papers not returned; provider
+with the restore of papers not returned; it drops DBLP homonym numbers
+only from a paper with a DOI, so a DOI-less record keeps the id it is
+stored under and the append's renaming moves its note, #215; provider
 `united_providers(record, search)`; decision fields via
 `decision_from_record`), filling only when
 `stored_paper_fills`: `plausibly_same_work` (left for a record under
