@@ -3770,25 +3770,37 @@ enrichment had supplied, set their sources to [[s2]] alone, and named
 paper is what the review saw; a re-run may add to it, never take away.
 [[merge_with]] is the rule the duplicate branch below already uses:
 the stored value wins where both have one, the other copy fills what is
-missing, sources are united and the higher citation count is kept.  A
-paper that gained a DOI since it was stored (the previous decision is
-found under its legacy hash id) gets that DOI first, so the two are
-equal.  Rebuilding also lost every decision field the constructor call
-did not list; [[replace]] keeps them all.
+missing, sources are united and the higher citation count is kept.  The
+two have the same id here, so [[merge_with]] accepts them.  A paper
+whose previous decision is found under its legacy hash id is the other
+case: the stored copy has no DOI and the returned one has.  They may be
+two versions of the work, a DBLP record of the conference paper and an
+arXiv preprint, say, and giving the stored copy the returned DOI would
+make an arXiv DOI with the conference's venue and year.  So that case
+follows the rule the session already applies to such pairs
+(\cref{sec:doi-less-copies}): the DOI copy keeps its identity and
+version-specific fields and gains the stored abstract, keywords,
+affiliations and sources ([[merge_version_of]]); little else is lost,
+since a paper without a DOI holds no Crossref or Unpaywall results.
+[[replace]] keeps the decision's fields, also those added after this
+code; its lists are copied, so the decision does not share them with the
+previous session's, which may stay in the session beside it.  The
+other branches that meet a paper again (the duplicate, folded, renamed
+and adopted ones) unite the provider too, so the audit rows name every
+provider that returned it.
 
 <<review session functions>>=
 def stored_paper_with(stored: Paper, returned: Paper) -> Paper:
     """The stored paper, its gaps filled from a copy a search returned.
 
-    Stored values win; see `Paper.merge_with`.  A stored paper without
-    a DOI takes the returned copy's DOI first.
+    Stored values win; see `Paper.merge_with`.  When the stored paper
+    has no DOI and the returned copy has one, the two are versions of
+    a work: the returned copy keeps its identity and gains the stored
+    content (`merge_version_of`).
     """
     if not stored.doi and returned.doi:
-        stored = replace(stored, doi=returned.doi)
-    try:
-        return stored.merge_with(returned)
-    except ValueError:
-        return stored
+        return merge_version_of(returned, stored)
+    return stored.merge_with(returned)
 @
 
 The case comes from the real session: an abstract and enrichment from
@@ -3870,8 +3882,82 @@ class TestAppendKeepsStoredPaper:
         with_doi = [d for d in decisions if d.paper.doi == self.DOI]
         assert len(with_doi) == 1
         assert with_doi[0].paper.abstract == "stored abstract"
-        assert with_doi[0].paper.sources == ["dblp", "s2"]
+        assert with_doi[0].paper.sources == ["s2", "dblp"]
         assert with_doi[0].status == DecisionStatus.DISCARDED
+
+    def test_stored_values_win(self):
+        self._save_first_run(Paper(
+            title="A Study", authors=["Ada Lovelace"], year=2014,
+            doi=self.DOI, venue="IPDPS 2014", abstract="stored",
+            sources=["openalex"],
+        ))
+        paper = self._rerun(Paper(
+            title="A Study", authors=["Ada Lovelace"], year=2015,
+            doi=self.DOI, venue="Proc. IPDPS", abstract="returned",
+            sources=["s2"],
+        ))[0].paper
+        assert (paper.year, paper.venue, paper.abstract) == (
+            2014, "IPDPS 2014", "stored",
+        )
+
+    def test_doi_copy_keeps_its_version_fields(self):
+        """A DOI-less conference record and an arXiv copy: no hybrid."""
+        self._save_first_run(Paper(
+            title="A Study", authors=["Ada Lovelace"], year=2014,
+            venue="ICSE", url="https://dblp.org/rec/x",
+            abstract="stored abstract", sources=["dblp"],
+        ))
+        arxiv = "10.48550/arXiv.1301.00001"
+        decisions = self._rerun(Paper(
+            title="A Study", authors=["Ada Lovelace"], year=2013,
+            doi=arxiv, venue="arXiv", url="https://arxiv.org/abs/1301.00001",
+            sources=["s2"],
+        ))
+        paper = [d for d in decisions if d.paper.doi][0].paper
+        assert (paper.year, paper.venue, paper.url) == (
+            2013, "arXiv", "https://arxiv.org/abs/1301.00001",
+        )
+        assert paper.abstract == "stored abstract"
+
+    def test_tags_are_not_shared_with_the_stored_copy(self):
+        self._save_first_run(Paper(
+            title="A Study", authors=["Ada Lovelace"], year=2014,
+            abstract="stored abstract", sources=["dblp"],
+        ))
+        from scholar.scholar import SearchResult, isolated_registry
+        result = SearchResult(
+            query="a AND b", provider="s2", timestamp=datetime.now(),
+            papers=[Paper(title="A Study", authors=["Ada Lovelace"],
+                          year=2014, doi=self.DOI, sources=["s2"])],
+            limit=10,
+        )
+        with isolated_registry():
+            session = create_review_session([result], "a AND b",
+                                            "append-192")
+        first, second = session.decisions
+        assert first.tags == second.tags
+        assert first.tags is not second.tags
+
+    def test_every_provider_that_returns_it_is_named(self):
+        """As `rq` passes them: one result per provider in one run."""
+        self._save_first_run(Paper(
+            title="A Study", authors=["Ada Lovelace"], year=2014,
+            doi=self.DOI, abstract="stored", sources=["openalex"],
+        ))
+        from scholar.scholar import SearchResult, isolated_registry
+        results = [
+            SearchResult(
+                query="q", provider=name, timestamp=datetime.now(),
+                papers=[Paper(title="A Study", authors=["Ada Lovelace"],
+                              year=2014, doi=self.DOI, sources=[name])],
+                limit=10,
+            )
+            for name in ("s2", "arxiv")
+        ]
+        with isolated_registry():
+            session = create_review_session(results, "q", "append-192")
+        assert session.decisions[0].provider == "openalex, s2, arxiv"
+@
 @
 
 Since a paper can appear in multiple providers, we also deduplicate within the
@@ -4071,6 +4157,9 @@ for result in results:
                 target.note_same_id_copy(paper, found_by_provider)
                 continue
             target.paper = merge_version_of(target.paper, paper)
+            target.provider = united_providers(
+                target.provider, found_by_provider
+            )
             for link in links:
                 target.record_search(*link)
             continue
@@ -4084,6 +4173,9 @@ for result in results:
                 existing.paper = existing.paper.merge_with(paper)
             except ValueError:
                 pass
+            existing.provider = united_providers(
+                existing.provider, found_by_provider
+            )
             for link in links:
                 existing.record_search(*link)
             continue
@@ -4095,6 +4187,9 @@ for result in results:
             renamed.paper = replace(
                 renamed.paper, authors=paper.authors
             ).merge_with(paper)
+            renamed.provider = united_providers(
+                renamed.provider, found_by_provider
+            )
             decision_lookup.pop(old_id, None)
             decision_lookup[paper_id] = renamed
             for link in links:
@@ -4104,6 +4199,9 @@ for result in results:
         adopted = provenance_lookup.get(paper_id)
         if adopted is not None:
             adopted.paper = merge_version_of(adopted.paper, paper)
+            adopted.provider = united_providers(
+                adopted.provider, found_by_provider
+            )
             for link in links:
                 adopted.record_search(*link)
             continue
@@ -4154,6 +4252,7 @@ for result in results:
                 paper=stored_paper_with(prev_dec.paper, paper),
                 provider=united_providers(prev_dec.provider,
                                           found_by_provider),
+                tags=list(prev_dec.tags),
                 found_by=list(prev_dec.found_by),
                 same_id_copies=list(prev_dec.same_id_copies),
             )

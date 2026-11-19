@@ -787,11 +787,14 @@ even without `--review`: it creates or appends (same
 prior decisions are preserved, new papers land pending). A paper the
 re-run returns again keeps its stored paper, gaps filled from the new
 copy (`stored_paper_with` → `Paper.merge_with`, stored values win,
-sources united; a DOI-less stored paper takes the new DOI first), and
-the decision is kept whole (`dataclasses.replace`) with
-`united_providers(old, new)` as provider. Before #192 (since Jan 2026)
-the decision was rebuilt around the returned copy: an S2 bulk append
-emptied ~1280 abstracts and set sources/provider to s2. Tests of this
+sources united; a DOI-less stored paper met by a DOI copy, found under
+its legacy hash id, goes `merge_version_of(returned, stored)`: the DOI
+copy keeps identity and venue/year/url, the stored one fills abstract,
+keywords, sources), and the decision is kept whole
+(`dataclasses.replace`, lists copied) with `united_providers(old, new)`
+as provider; the duplicate, folded, renamed and adopted branches unite
+the provider too (#192; before, the decision was rebuilt around the
+returned copy, losing abstracts, sources and providers). Tests of this
 path need `isolated_registry()` between runs, else `Paper.from_dict`
 returns the held object and hides the loss. The save
 confirmation goes to stderr so `-f json`/`-f bibtex` stdout stays pure.
