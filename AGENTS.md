@@ -99,7 +99,9 @@ Providers self-register via `register_provider()` at module load time.
   None and no error; every search since records its hits) do not show
   that the provider answered (#188: DBLP served only its anti-bot page
   then). Such a provider counts as searched only if a decision's
-  `provider` names it (`decision_provider_names`, joined forms split);
+  `provider` names it (`decision_provider_names`: `PROVIDER_SEPARATORS`,
+  case-insensitive; pre-#164 merged papers name every merged provider,
+  so there it is not proof, as in the audit rows);
   otherwise it is listed as "Outcome not recorded: dblp"
   (`unrecorded_providers`, in the items and the abstract), not as "Not
   searched", also when another of its searches failed. `record_rank`
