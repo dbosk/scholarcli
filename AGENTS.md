@@ -1303,7 +1303,7 @@ unescaped paper. An import keeps an existing note's title.
 `_unescape_bib` also drops the `\scholarnonlatin` wrapper (#234). When
 an entry uses that macro, `search -f bibtex`/`bibtex+prov` print one
 `@preamble{ "..." }` line with `review.nonlatin_definition()` before the
-first entry (`_nonlatin_preamble`, `uses_nonlatin`; biber copies it to
+first entry (`review.nonlatin_bib_preamble`; biber copies it to
 the .bbl; checked with pdflatex/xelatex/lualatex); no stderr hint.
 All round-trip code lives in `cli.nw`'s
 `<<formatter classes>>` and `<<prov command>>` chunks.
@@ -1409,7 +1409,14 @@ fixture has a quoted query, a `[`-row, `ĸ`, `CO₂`, a ligature. About
 
 - `scholar sessions export -f latex [--standalone|--no-standalone]` →
   `generate_latex_report(session, path, standalone=True)`. Always writes
-  the sibling `.bib`. Standalone output is byte-identical to before; the
+  the sibling `.bib` (`build_report_bibtex`). Every `.bib` writer (this
+  one, the synthesis's `_build_bibtex_content`, `search -f bibtex`)
+  starts the file with one `@preamble{ "..." }` line defining
+  `\scholarnonlatin` (`nonlatin_bib_preamble`, joined by
+  `bibtex_file_text`) when an entry uses it (#243), so a user's own
+  document can cite it; plain files are unchanged. The report's
+  document then has both definitions (`\providecommand`: first wins,
+  same text). Standalone output is byte-identical to before; the
   fragment wraps its body in a `refsection` so the host's
   `\printbibliography` is not polluted by the report's `\fullcite`s.
 - `scholar llm synthesize -f latex [--standalone|--no-standalone]`: the
