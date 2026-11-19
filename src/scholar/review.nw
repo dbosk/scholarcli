@@ -645,6 +645,9 @@ class ReviewDecision:
             paper's DOI-less id, with years too far apart to be the same
             work (`{"year", "venue", "provider"}` each); see
             `is_same_id_namesake`.
+        relabelled: Each time the source was corrected without changing
+            the decision (`{"from", "to", "at", "note", "by",
+            "is_example"}`), oldest first; see `relabel_source`.
     """
     paper: Paper
     provider: str
@@ -656,6 +659,7 @@ class ReviewDecision:
     <<LLM audit fields of a decision>>
     found_by: list[tuple[str, str, str | None]] = field(default_factory=list)
     same_id_copies: list[dict] = field(default_factory=list)
+    relabelled: list[dict] = field(default_factory=list)
 
     def __post_init__(self):
         """Coerce None list fields to empty lists."""
@@ -665,6 +669,18 @@ class ReviewDecision:
             self.found_by = []
         if self.same_id_copies is None:
             self.same_id_copies = []
+        if self.relabelled is None:
+            self.relabelled = []
+
+    def add_relabel(self, record: dict) -> None:
+        """Note a correction of the source (`relabel_source`), once.
+
+        The records stay in the order of their `at` times; records of
+        the same time keep the order they were added in.
+        """
+        if record not in self.relabelled:
+            self.relabelled.append(record)
+            self.relabelled.sort(key=lambda r: str(r.get("at") or ""))
 
     def add_same_id_copy(self, copy: dict) -> None:
         """Note another work returned under this paper's id, once."""
@@ -1019,6 +1035,351 @@ def test_concurrent_save_keeps_them(self):
     save_session(stale)
     assert llm_audit_of(load_session("audit-race").decisions[0]) \
         == self.AUDIT
+@
+
+
+\subsection{Correcting who decided}
+\label{sec:relabel-source}
+
+A decision's source can be wrong while the decision itself is right.
+Before [[sessions decide]] demanded [[--source]] off a terminal
+(issue~\#162), an AI agent that left the option out was recorded as
+[[human]], and an agent that confirmed an LLM's call the same way
+turned it into [[llm_reviewed]].  Issue~\#216 reports two sessions
+full of such decisions
+(\url{https://github.com/dbosk/scholar/issues/216}), and reports cite
+them as the author's.  The only repair [[sessions decide]] offers
+is to decide again with [[--source agent --force]], and that replaces
+the decision: it clears the classifier's record
+([[clear_machine_audit]], \cref{sec:review-source}) and the confidence,
+which are exactly what an audit of those rows would read.  So a
+correction of the source is an operation of its own,
+[[relabel_source]], which changes the source and leaves the decision
+as it is.
+
+Which sources may it give?  Only the unreviewed ones, [[agent]] and
+[[llm]].  The three others each say that a human decided or confirmed
+the decision: [[human]] by definition, and [[llm_reviewed]] and
+[[agent_reviewed]] because they are what a human's review turns a
+machine decision into (\cref{sec:review-source}).  A command that
+writes one of them asserts a human judgement that nobody made in that
+command, and a human who wants to confirm a row can do so where it is
+recorded as a review, in the TUI or with [[sessions decide --source
+human]].  The issue suggested mapping [[llm_reviewed]] to
+[[agent_reviewed]] when the reviewer was an agent.  That would be wrong
+by the meaning of the values: [[agent_reviewed]] says \enquote{an agent
+proposed it and a human confirmed it}, while these rows say \enquote{an
+LLM proposed it and an agent confirmed it}, which no human has looked
+at.  What an agent records after reading the model's call is the
+agent's own verdict, so the target is [[agent]].  The model's part is
+not lost: the classifier's fields ([[llm_model]], [[llm_reason]], \dots,
+\cref{sec:llm-audit-fields}) and its confidence stay, and they now
+describe the proposal the agent checked.  Once a human confirms such a
+row in the TUI it becomes [[agent_reviewed]], which is then true.
+
+A pending paper is never relabelled.  Its source is the default
+[[human]], which says nothing because nobody decided anything, and
+turning it into [[agent]] would invent an agent decision.  For the same
+reason the source may not stay what it was: a relabel that changes
+nothing would only add a misleading record.
+
+Everything else stays as it is: status, tags, confidence, the
+classifier's fields, [[found_by]] and the provider.  The one exception
+is [[is_example]], which means \enquote{a human changed the machine's
+verdict}: [[mark_as_reviewed]] sets it when a reviewer's decision
+differs from the machine's, and every place that records a fresh
+machine decision clears it ([[apply_llm_decisions]], a machine
+[[sessions decide]]).  On a relabelled decision the flag would be
+wrong.  The decision is an unreviewed machine decision again, so no
+human has changed anything; yet the flag would count it as a training
+example in [[llm status]], in [[ReviewSession.example_papers]] and in
+the TUI's examples filter, sort it ahead of confirmed examples when
+unreviewed ones are let in ([[--include-llm-examples]]), and, once a
+human confirms the row unchanged, make [[machine_review_rows]] and the
+CSV report the agreement as a change.  So the relabel clears the flag
+and keeps its old value in the record, where an auditor can still see
+that a reviewer, human or not, once changed the machine's call.
+
+Each relabel is recorded on the decision, in [[relabelled]], as
+[[{"from", "to", "at", "note", "by", "is_example"}]]: the source before
+and after, the UTC time, the caller's note, the caller's name for who
+made or asked for the correction (both [[None]] when not given;
+Scholar does not guess a user name), and the [[is_example]] flag the
+decision had before.  It is a list because a source can be corrected
+more than once, and each correction is an event an auditor may need to
+see; nothing ever removes one.  The list is kept in time order, so that
+records united from two processes (below) still read oldest first;
+records of the same time keep the order they were added in.  The time
+is taken from [[_utcnow]], the module's clock seam
+(\cref{sec:session-integrity}).
+
+<<review data structures>>=
+RELABEL_TARGETS: tuple[ReviewSource, ...] = tuple(
+    source for source in ReviewSource if source.is_unreviewed
+)
+
+
+def relabel_source(
+    decision: ReviewDecision,
+    target: ReviewSource,
+    at: str,
+    note: str | None = None,
+    by: str | None = None,
+) -> dict:
+    """Set the source of `decision` to `target`, keeping the decision.
+
+    Only the unreviewed sources (`RELABEL_TARGETS`) can be given, since
+    the others claim a human's confirmation, and only to a decided paper
+    whose source differs. `is_example` is cleared, since no human has
+    changed the now unreviewed decision. The change is recorded in
+    `decision.relabelled` as `{"from", "to", "at", "note", "by",
+    "is_example"}` (the old flag) and returned.
+
+    Raises:
+        ValueError: For any other target, a pending paper, or a target
+            equal to the current source.
+    """
+    if target not in RELABEL_TARGETS:
+        raise ValueError(
+            f"{target.value} claims a human's confirmation; only "
+            f"{', '.join(s.value for s in RELABEL_TARGETS)} can be given"
+        )
+    if not decision.is_decided:
+        raise ValueError("a pending paper has no decision to relabel")
+    if decision.source is target:
+        raise ValueError(f"the source is already {target.value}")
+    record = {
+        "from": decision.source.value, "to": target.value,
+        "at": at, "note": note, "by": by,
+        "is_example": decision.is_example,
+    }
+    decision.source = target
+    decision.is_example = False
+    decision.add_relabel(record)
+    return record
+@
+
+[[RELABEL_TARGETS]] is derived from [[is_unreviewed]] rather than
+listing the members, for the reason given with the properties: a
+source added later is a target exactly when it waits for a human.
+Unknown stored values (\cref{sec:review-source}) are unreviewed too,
+but they are not members the enum iterates, so none of them can be a
+target: a relabel should name a source Scholar knows.  As
+\emph{from}, an unknown value is fine: that is how a decision whose
+source is [[manual]] gets a known one.
+
+The record travels like the other lists a decision keeps about its
+history.  It is saved only when non-empty, as [[same_id_copies]] is,
+so the file of a session nobody relabelled is unchanged, and a file
+without the key loads it as empty.  An append of new search results
+copies it with the decision (\cref{sec:review-create-strict}).  A save
+that merges another process's changes unites the two lists
+(\cref{sec:session-integrity}): a relabel is a fact about the decision,
+like a search that returned the paper.  When both processes relabelled
+the same decision, the source follows the usual rule (this process's
+decision is kept, with a warning), but both records stay, so the
+history shows what each did.  It is also part of
+[[decision_state]], so that two copies of a work with different
+histories are not taken for equal decisions when copies are folded.
+A Scholar from before this field loads such a file, since it reads only
+the keys it knows, but drops the list when it next saves the session
+(checked on November 19, 2026, by loading and saving a session with
+the key under commit 528d933); the source itself survives, since
+[[agent]] and [[llm]] are known to every version since
+issue~\#162.
+
+Let's check that a relabel changes the source and leaves the
+decision as it is (the example flag moves into the record), that
+it refuses every target that claims a human's confirmation, and that
+the record survives a save, a load, an append and a concurrent save.
+
+<<test functions>>=
+class TestRelabelSource:
+    """Correcting who decided keeps the decision (#216)."""
+
+    <<relabel source test methods>>
+
+<<relabel source test methods>>=
+AT = "2026-11-19T10:00:00+00:00"
+
+def _reviewed_llm_call(self, doi="10.5555/relabel"):
+    return ReviewDecision(
+        paper=Paper(title="Relabelled", authors=["A"], doi=doi),
+        provider="openalex", status=DecisionStatus.DISCARDED,
+        tags=["off-topic-false-hit"], source=ReviewSource.LLM_REVIEWED,
+        is_example=True, llm_confidence=0.8,
+        llm_model="m-1", llm_decided_at="2026-11-01T09:00:00+00:00",
+        llm_prompt_version="0123456789abcdef", llm_reason="Off topic.",
+        llm_abstract_truncated=False,
+        found_by=[("q", "openalex", "")],
+    )
+
+def test_only_the_source_changes(self):
+    from dataclasses import asdict
+
+    decision = self._reviewed_llm_call()
+    before = asdict(decision)
+    record = relabel_source(
+        decision, ReviewSource.AGENT_UNREVIEWED, self.AT, note="why",
+        by="the author",
+    )
+    assert decision.source is ReviewSource.AGENT_UNREVIEWED
+    assert record == {"from": "llm_reviewed", "to": "agent",
+                      "at": self.AT, "note": "why", "by": "the author",
+                      "is_example": True}
+    assert decision.relabelled == [record]
+    assert decision.is_example is False
+    after = asdict(decision)
+    for name in ("source", "relabelled", "is_example"):
+        del before[name], after[name]
+    assert after == before
+
+def test_a_relabelled_correction_is_no_example(self):
+    from scholar.llm_review import (
+        get_example_decisions, get_review_statistics, mark_as_reviewed,
+    )
+
+    session = ReviewSession(
+        query="q", providers=["openalex"], timestamp=datetime(2026, 11, 19),
+    )
+    relabelled = self._reviewed_llm_call()
+    human = ReviewDecision(
+        paper=Paper(title="Human", authors=["H"], doi="10.5555/human"),
+        provider="openalex", status=DecisionStatus.DISCARDED,
+        tags=["off-topic-false-hit"],
+    )
+    session.decisions = [relabelled, human]
+    relabel_source(relabelled, ReviewSource.AGENT_UNREVIEWED, self.AT)
+    assert session.example_papers() == [human]
+    assert get_review_statistics(session)["examples"] == 0
+    assert session.llm_review_statistics()["examples"] == 1
+    _, discarded = get_example_decisions(session, include_unreviewed=True)
+    assert discarded == [human, relabelled]
+    mark_as_reviewed(relabelled, user_agrees=True)
+    assert relabelled.source is ReviewSource.AGENT_REVIEWED
+    assert relabelled.is_example is False
+    rows = dict(machine_review_rows(session.decisions))
+    assert (rows["Agent confirmed"], rows["Agent changed"]) == (1, 0)
+
+def test_records_are_kept_in_time_order(self):
+    decision = self._reviewed_llm_call()
+    late = {"from": "llm", "to": "agent", "at": "2026-11-19T12:00:00+00:00"}
+    early = {"from": "human", "to": "llm", "at": "2026-11-19T09:00:00+00:00"}
+    tie = {"from": "agent", "to": "llm", "at": "2026-11-19T12:00:00+00:00"}
+    for record in (late, early, tie, early):
+        decision.add_relabel(record)
+    assert decision.relabelled == [early, late, tie]
+
+def test_targets_are_the_unreviewed_sources(self):
+    assert set(RELABEL_TARGETS) == {
+        ReviewSource.AGENT_UNREVIEWED, ReviewSource.LLM_UNREVIEWED,
+    }
+
+@pytest.mark.parametrize("target", [
+    ReviewSource.HUMAN, ReviewSource.LLM_REVIEWED,
+    ReviewSource.AGENT_REVIEWED, ReviewSource("manual"),
+])
+def test_a_confirmed_target_is_refused(self, target):
+    decision = self._reviewed_llm_call()
+    decision.source = ReviewSource.AGENT_UNREVIEWED
+    with pytest.raises(ValueError):
+        relabel_source(decision, target, self.AT)
+    assert decision.source is ReviewSource.AGENT_UNREVIEWED
+    assert decision.relabelled == []
+
+def test_pending_and_unchanged_are_refused(self):
+    pending = ReviewDecision(paper=Paper(title="P", authors=["A"]),
+                             provider="p")
+    with pytest.raises(ValueError, match="pending"):
+        relabel_source(pending, ReviewSource.AGENT_UNREVIEWED, self.AT)
+    decided = self._reviewed_llm_call()
+    decided.source = ReviewSource.AGENT_UNREVIEWED
+    with pytest.raises(ValueError, match="already"):
+        relabel_source(decided, ReviewSource.AGENT_UNREVIEWED, self.AT)
+    assert pending.relabelled == decided.relabelled == []
+
+def test_history_is_part_of_the_decision_state(self):
+    plain, relabelled = self._reviewed_llm_call(), self._reviewed_llm_call()
+    plain.source = ReviewSource.AGENT_UNREVIEWED
+    relabel_source(relabelled, ReviewSource.AGENT_UNREVIEWED, self.AT)
+    assert decision_state(plain) != decision_state(relabelled)
+
+def _session(self, name):
+    session = ReviewSession(
+        query="q", providers=["openalex"], timestamp=datetime(2026, 11, 19),
+        name=name,
+    )
+    session.decisions.append(
+        self._reviewed_llm_call(f"10.5555/relabel-{name}")
+    )
+    return session
+
+def test_saved_only_when_non_empty(self, tmp_path, monkeypatch):
+    import json
+
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+    path = save_session(self._session("relabel-file"))
+    assert "relabelled" not in json.loads(path.read_text())["decisions"][0]
+    session = load_session("relabel-file")
+    assert session.decisions[0].relabelled == []
+    relabel_source(session.decisions[0], ReviewSource.AGENT_UNREVIEWED,
+                   self.AT)
+    save_session(session)
+    assert json.loads(path.read_text())["decisions"][0]["relabelled"] == [
+        {"from": "llm_reviewed", "to": "agent", "at": self.AT,
+         "note": None, "by": None, "is_example": True},
+    ]
+    loaded = load_session("relabel-file").decisions[0]
+    assert loaded.source is ReviewSource.AGENT_UNREVIEWED
+    assert loaded.relabelled == session.decisions[0].relabelled
+
+def test_append_keeps_it(self, tmp_path, monkeypatch):
+    from scholar.scholar import SearchResult
+
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+    session = self._session("relabel-append")
+    relabel_source(session.decisions[0], ReviewSource.AGENT_UNREVIEWED,
+                   self.AT)
+    save_session(session)
+    stored = load_session("relabel-append").decisions[0]
+    paper = Paper(title="Relabelled", authors=["A"],
+                  doi="10.5555/relabel-relabel-append",
+                  sources=["openalex"])
+    appended = create_review_session([SearchResult(
+        query="q", provider="openalex", timestamp="t", papers=[paper],
+    )], "q", session_name="relabel-append")
+    decision = appended.decisions[0]
+    assert decision.source is ReviewSource.AGENT_UNREVIEWED
+    assert decision.relabelled == stored.relabelled != []
+
+def test_concurrent_save_keeps_it(self, tmp_path, monkeypatch):
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+    save_session(self._session("relabel-race"))
+    stale = load_session("relabel-race")
+    relabeller = load_session("relabel-race")
+    relabel_source(relabeller.decisions[0],
+                   ReviewSource.AGENT_UNREVIEWED, self.AT)
+    save_session(relabeller)
+    stale.decisions[0].paper.abstract = "Enriched."
+    save_session(stale)
+    decision = load_session("relabel-race").decisions[0]
+    assert decision.source is ReviewSource.AGENT_UNREVIEWED
+    assert decision.relabelled == relabeller.decisions[0].relabelled
+    assert decision.llm_reason == "Off topic."
+
+def test_concurrent_relabels_are_united(self, tmp_path, monkeypatch):
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+    save_session(self._session("relabel-both"))
+    first, second = load_session("relabel-both"), load_session("relabel-both")
+    relabel_source(first.decisions[0], ReviewSource.AGENT_UNREVIEWED,
+                   "2026-11-19T09:00:00+00:00")
+    save_session(first)
+    relabel_source(second.decisions[0], ReviewSource.LLM_UNREVIEWED,
+                   self.AT, note="second")
+    save_session(second)
+    decision = load_session("relabel-both").decisions[0]
+    assert decision.source is ReviewSource.LLM_UNREVIEWED
+    assert [r["to"] for r in decision.relabelled] == ["agent", "llm"]
 @
 
 
@@ -4700,6 +5061,7 @@ for result in results:
                 tags=list(prev_dec.tags),
                 found_by=list(prev_dec.found_by),
                 same_id_copies=list(prev_dec.same_id_copies),
+                relabelled=list(prev_dec.relabelled),
             )
         elif prev_record:
             <<rebuild the decision from the old decision store>>
@@ -7409,6 +7771,7 @@ def read_session_file(
                     **{name: dec_data.get(name) for name in LLM_AUDIT_FIELDS},
                     found_by=found_by,
                     same_id_copies=list(dec_data.get("same_id_copies") or []),
+                    relabelled=list(dec_data.get("relabelled") or []),
                 )
             )
         
@@ -7537,6 +7900,7 @@ data = {
                 {"same_id_copies": d.same_id_copies}
                 if d.same_id_copies else {}
             ),
+            **({"relabelled": d.relabelled} if d.relabelled else {}),
             "paper": d.paper.to_dict(include_refs_cites=True),
         }
         for d in session.decisions
@@ -7762,7 +8126,12 @@ links to the searches that returned it ([[found_by]],
 a judgement, so the links the file holds for a paper are added to the
 links this process holds, whatever the decision rules decide.  The
 same goes for the other works a search returned under a paper's id
-([[same_id_copies]], \cref{sec:session-copies}).  After the
+([[same_id_copies]], \cref{sec:session-copies}) and for the
+corrections of its source ([[relabelled]], \cref{sec:relabel-source}).
+Those are also part of the decision's state, so this process's state
+is taken before the file's are added: otherwise the union itself would
+look like a change made here, and a process that changed nothing would
+keep its stale source over the file's corrected one.  After the
 decisions are merged, the tombstones of folded copies are united with
 the file's and applied ([[apply_tombstones]], \cref{sec:session-copies}),
 so that a copy that [[sessions reconcile]] folded after this process
@@ -7793,6 +8162,7 @@ def decision_state(decision: ReviewDecision) -> tuple:
         decision.is_example,
         decision.llm_confidence,
         *llm_audit_of(decision).values(),
+        tuple(tuple(sorted(r.items())) for r in decision.relabelled),
     )
 
 
@@ -7987,6 +8357,7 @@ def merge_concurrent_changes(
         paper_id = get_paper_id(decision.paper)
         own_ids.add(paper_id)
         theirs = disk_decisions.get(paper_id)
+        mine = decision_state(decision)
         if theirs is not None:
             decision.paper = paper_merged_from(
                 decision.paper, theirs.paper, base_papers.get(paper_id)
@@ -7995,9 +8366,11 @@ def merge_concurrent_changes(
                 decision.record_search(*replaced.get(link, link))
             for copy in theirs.same_id_copies:
                 decision.add_same_id_copy(copy)
+            for record in theirs.relabelled:
+                decision.add_relabel(record)
         if theirs is None or paper_id not in base_states:
             continue
-        mine, base_state = decision_state(decision), base_states[paper_id]
+        base_state = base_states[paper_id]
         if decision_state(theirs) in (base_state, mine):
             continue
         if mine == base_state:
@@ -12414,11 +12787,10 @@ piece of Unicode punctuation with a \TeX{} equivalent (mapped through
 [[LATEX_UNICODE_PUNCTUATION]]), a Greek letter or a common mathematical
 symbol (set in math mode, since titles like \enquote{$\pi$-ARL} are
 common and pdf\LaTeX{} has no text Greek without extra packages), a
-letter beyond the Latin ranges that [[inputenc]] and the T1 encoding
-cover (dropped: pdf\LaTeX{} cannot set it, and a hard error in the
-middle of an appendix is worse than a gap), or ordinary text. The tables
-are written with [[\u]] escapes because this very file is woven into a
-pdf\LaTeX{} document. A single pass matters: the naive alternative of
+character beyond the Latin ranges that [[inputenc]] and the T1 encoding
+cover (wrapped in a macro, \cref{sec:non-latin-text}), or ordinary
+text. The tables are written with [[\u]] escapes because this very file
+is woven into a pdf\LaTeX{} document. A single pass matters: the naive alternative of
 mapping punctuation first and then escaping specials would re-escape the
 backslash and braces of the [[\dots{}]] the mapping just inserted.
 
@@ -12441,6 +12813,9 @@ LATEX_UNICODE_PUNCTUATION: dict[str, str] = {
     "\u2018": "`",           # left single quotation mark
     "\u2019": "'",           # right single quotation mark
     "\u02bc": "'",           # modifier letter apostrophe
+    "\u02bb": "`",           # modifier letter turned comma (okina)
+    "\u02bd": "`",           # modifier letter reversed comma
+    "\u02b9": "'",           # modifier letter prime
     "\u2032": "'",           # prime
     "\u2013": "--",          # en dash
     "\u2014": "---",         # em dash
@@ -12486,6 +12861,28 @@ LATEX_MATH_SYMBOLS: dict[str, str] = {
     "\u2194": r"\leftrightarrow",
     "\u21d2": r"\Rightarrow", "\u2200": r"\forall", "\u2203": r"\exists",
     "\u2205": r"\emptyset", "\u2212": "-", "\u2217": "*",
+    "\u2113": r"\ell",
+}
+# Superscript and subscript forms, from their compatibility
+# decomposition: "CO\u2082" becomes CO\\textsubscript{2}.
+SCRIPT_BASES = "0123456789+-=()abcdefghijklmnopqrstuvwxyz"
+
+
+def _script_base(char: str) -> str:
+    """Return what a script `char` decomposes to; minus as a hyphen."""
+    return unicodedata.normalize("NFKC", char).replace("\u2212", "-")
+
+
+LATEX_SCRIPT_CHARS: dict[str, str] = {
+    chr(code): (
+        "\\textsuperscript{"
+        if "SUPERSCRIPT" in unicodedata.name(chr(code), "")
+        else "\\textsubscript{"
+    ) + _script_base(chr(code)) + "}"
+    for code in range(0x2070, 0x209D)
+    if unicodedata.name(chr(code), "")
+    and len(_script_base(chr(code))) == 1
+    and _script_base(chr(code)) in SCRIPT_BASES
 }
 
 LATEX_SPECIALS: dict[str, str] = {
@@ -12512,29 +12909,40 @@ BIBTEX_SPECIALS: dict[str, str] = {
 }
 
 
+def _escape_char(char: str, specials: dict[str, str]) -> str:
+    """Escape one character pdfLaTeX can set, using the `specials` map."""
+    if char in specials:
+        return specials[char]
+    if char in LATEX_UNICODE_PUNCTUATION:
+        return LATEX_UNICODE_PUNCTUATION[char]
+    if char in GREEK_LETTER_NAMES:
+        return f"\\ensuremath{{\\{GREEK_LETTER_NAMES[char]}}}"
+    if char in GREEK_LATIN_LOOKALIKES:
+        return GREEK_LATIN_LOOKALIKES[char]
+    if char in LATEX_MATH_SYMBOLS:
+        macro = LATEX_MATH_SYMBOLS[char]
+        return f"\\ensuremath{{{macro}}}" if macro.startswith("\\") else macro
+    if char in LATEX_SCRIPT_CHARS:
+        return LATEX_SCRIPT_CHARS[char]
+    return char
+
+
 def _escape_chars(text: str, specials: dict[str, str]) -> str:
     """Escape `text` for TeX in one pass using the `specials` map."""
     out: list[str] = []
-    text = clean_metadata_text(text)
-    for char in unicodedata.normalize("NFC", text):
-        if char in specials:
-            out.append(specials[char])
-        elif char in LATEX_UNICODE_PUNCTUATION:
-            out.append(LATEX_UNICODE_PUNCTUATION[char])
-        elif char in GREEK_LETTER_NAMES:
-            out.append(f"\\ensuremath{{\\{GREEK_LETTER_NAMES[char]}}}")
-        elif char in GREEK_LATIN_LOOKALIKES:
-            out.append(GREEK_LATIN_LOOKALIKES[char])
-        elif char in LATEX_MATH_SYMBOLS:
-            macro = LATEX_MATH_SYMBOLS[char]
-            out.append(
-                f"\\ensuremath{{{macro}}}" if macro.startswith("\\")
-                else macro
+    for kind, piece, beyond in split_nonlatin(text):
+        if kind == NONLATIN_TEXT:
+            inner = "".join(
+                (char if far else _escape_char(char, specials))
+                for char, far in zip(piece, beyond)
+                if unicodedata.category(char) != "Cc"
             )
-        elif ord(char) > LATEX_LATIN_CUTOFF:
-            continue
+            out.append(f"{NONLATIN_MACRO}{{{inner}}}")
         else:
-            out.append(char)
+            out.extend(
+                _escape_char(char, specials)
+                for char, far in zip(piece, beyond) if not far
+            )
     return "".join(out)
 
 
@@ -12550,7 +12958,8 @@ def escape_latex(text: str) -> str:
 
 Let's verify the single pass: the backslash and braces of an inserted
 [[\dots{}]] must survive, and a symbol beyond the cutoff must vanish
-without taking its neighbours with it.
+without taking its neighbours with it, while a word beyond it is kept
+(\cref{sec:non-latin-text}).
 
 <<test functions>>=
 class TestLatexEscaping:
@@ -12570,7 +12979,8 @@ class TestLatexEscaping:
         result = escape_latex("star \u2606 here")
         assert "\u2606" not in result
         assert result == "star  here"
-        assert escape_latex("\u4e2d\u6587 title") == " title"
+        assert escape_latex("\u4e2d\u6587 title") \
+            == "\\scholarnonlatin{\u4e2d\u6587} title"
 
     def test_escape_latex_sets_greek_and_math_in_math_mode(self):
         assert escape_latex("\u03c0-ARL") == r"\ensuremath{\pi}-ARL"
@@ -12610,6 +13020,470 @@ class TestLatexEscaping:
 
     def test_escape_bibtex_keeps_braces(self):
         assert escape_bibtex("{DNA} & RNA") == r"{DNA} \& RNA"
+@
+
+\paragraph{A cell that starts a table row}
+The escaped text is a cell, and the cell that opens a row follows the
+previous row's [[\\]]. That command looks ahead for a star and for
+a length in brackets, so a title that begins
+\enquote{[conference paper] \ldots} is read as a length (\enquote{Missing
+number}, which stopped a real audit table), and one that begins with a
+star loses it to [[\\*]]. [[latex_row_cell]] puts an empty group in
+front of such a cell: [[{}]] typesets nothing and ends the look-ahead.
+Every other cell is returned unchanged. The two tables whose first
+cell is escaped text, the audit table and the provider-specific
+queries, use it; the others start with a [[\citetitle]] or a number.
+
+<<review report generation>>=
+LATEX_ROW_LOOKAHEAD = ("[", "*")
+
+
+def latex_row_cell(cell: str) -> str:
+    """Protect `cell`, the first of a table row, from the `\\` before it."""
+    if cell.lstrip().startswith(LATEX_ROW_LOOKAHEAD):
+        return "{}" + cell
+    return cell
+@
+
+<<test functions>>=
+class TestLatexRowCell:
+  def test_a_bracket_or_star_gets_an_empty_group(self):
+    assert latex_row_cell("[conference paper] X") \
+      == "{}[conference paper] X"
+    assert latex_row_cell("*Starred") == "{}*Starred"
+    assert latex_row_cell(" [x]") == "{} [x]"
+
+  def test_other_cells_are_unchanged(self):
+    for cell in ["Title [x]", "", r"\scholarnonlatin{x}", "a*b"]:
+      assert latex_row_cell(cell) == cell
+
+  def test_both_tables_protect_their_rows(self):
+    session = ReviewSession(
+      query="a", providers=["openalex", "[odd]"], timestamp=datetime.now(),
+    )
+    session.add_query_provider_pair("a", "openalex")
+    session.add_query_provider_pair("b", "[odd]")
+    session.decisions = [ReviewDecision(
+      paper=Paper(title="[conference paper] X", authors=["A"], year=2020),
+      provider="openalex", status=DecisionStatus.PENDING,
+    )]
+    queries = build_search_parameters_latex(session)
+    assert r"{}[odd] & b \\" in queries
+    table = build_audit_table_latex(session, label="x")
+    assert any(line.startswith("{}[conference paper] X & 2020")
+               for line in table)
+@
+
+\subsubsection{Text in other scripts}
+\label{sec:non-latin-text}
+
+The escapers used to drop every letter beyond the Latin ranges. A title
+wholly in Cyrillic---issue~\#220 met one, a 2018 paper on federated
+authentication in supercomputer centres---then printed as an empty cell
+of the audit table, a mixed title lost words, and nothing warned about
+it. Dropping was the price of one hard constraint: the decks and books
+these exports go into are built with pdf\LaTeX{} and T1 fonts, where a
+raw Cyrillic or CJK character in the body is the error \enquote{Unicode
+character \ldots{} not set up for use with LaTeX}. Xe\LaTeX{} and
+Lua\LaTeX{} documents, on the other hand, set the same characters as
+soon as their font has the script. (This section names such characters
+by their code points for the same reason: it is woven into a
+pdf\LaTeX{} document.)
+
+The escaper cannot know which engine will read its output, so it leaves
+the choice to the document: every run of characters pdf\LaTeX{} cannot
+set is wrapped in one macro, [[\scholarnonlatin{...}]], whatever the
+script. The document defines the macro (\cref{sec:non-latin-definition})
+to print its argument under Xe\LaTeX{} and Lua\LaTeX{} and a short
+visible marker under pdf\LaTeX{}, and an including document can define
+it first to do better. Discarding the argument is safe under
+pdf\LaTeX{}: [[inputenc]] makes each byte of a multi-byte UTF-8
+character an active character, and the error is raised only when such
+a character is executed, which never happens to the argument of a macro
+that does not use it. That is checked by compiling, not assumed
+(\cref{sec:non-latin-compile}).
+
+A run spans a phrase, not a character. It continues over spaces,
+digits and punctuation between two such characters, so the issue's
+title becomes one macro and prints one marker instead of eight; the
+specials inside are escaped as usual, since Xe\LaTeX{} typesets them.
+It stops at a Latin letter, so a mixed title keeps its Latin words
+readable under pdf\LaTeX{} too. A run without any letter or digit
+(\enquote{$\star$}, an emoji) is decoration and is dropped as before: a
+marker saying that text was lost would be false.
+
+The Latin ranges themselves are not all settable. Below the cutoff,
+pdf\LaTeX{} with T1 and [[inputenc]] sets exactly the characters that
+the encoding files declare with [[\DeclareUnicodeCharacter]]:
+[[t1enc.dfu]], [[ts1enc.dfu]], [[omsenc.dfu]] and [[utf8enc.dfu]] in
+[[tex/latex/base]] of TeX Live 2025. We compiled every code point from
+U+0080 to U+024F under T1, one per line, and the 213 that raised
+\enquote{not set up for use with LaTeX} are exactly the ones none of
+those files declares: the C1 controls, and letters such as
+\enquote{kra} (U+0138, which stopped a real 10\,000-row audit table),
+\enquote{h with stroke}, long s, and most of Latin Extended-B (the
+Vietnamese horn letters, African and phonetic letters). They are
+listed as [[T1_UNSET_RANGES]] and flagged like the characters beyond
+the cutoff. Everything else in the range keeps passing through as it
+always did, so a title in French, Polish or Swedish is unchanged. The
+same experiment under OT1 fails on twenty more (the guillemets, eth,
+thorn, ogonek letters, eng), which is one reason the standalone
+document loads T1 too (\cref{sec:standalone-t1}).
+
+None of these letters has a \TeX{} command that would set it in T1
+without further packages, so they are wrapped rather than mapped. One
+such letter inside a Latin word would otherwise cut the word in three,
+\enquote{Ng}, a marker, \enquote{\ldots}, which helps nobody: a word
+holding a flagged \emph{Latin} letter (its Unicode name begins with
+LATIN, which also covers Latin Extended Additional, the Vietnamese tone
+letters) is flagged whole. A word next to a flagged letter of another
+script is left alone, so \enquote{Python} keeps printing between two
+Chinese words without spaces.
+
+Greek needs a rule of its own, because single Greek letters already
+have a good rendering: math mode, for titles like
+\enquote{$\pi$-ARL}. A Greek \emph{word} set that way becomes a string
+of italic variables, and its accented letters, which the math tables
+lack, used to be dropped. So a maximal sequence of Greek letters counts
+as text when it has at least [[GREEK_WORD_MIN]] letters or a letter the
+tables cannot set; shorter sequences such as \enquote{$\alpha\beta$}
+stay in math mode, exactly as before.
+
+Some characters beyond the cutoff are not text in another script at
+all, and wrapping them hid readable words in real sessions (the
+hpc-cli and cli-efficiency audit tables): the Latin ligatures
+\enquote{fi}, \enquote{fl} and \enquote{ff} as single characters
+(U+FB00 to U+FB06) in \enquote{Workflow}, sub- and superscript
+numerals as in \enquote{CO$_2$}, the modifier letters of
+transliterations as in \enquote{Hawai`i}, and the script letter ell.
+They get a rendering of their own before or instead of the split:
+\begin{description}
+\item[Ligatures] are folded to their letters by compatibility
+  normalisation (NFKC). We apply it to these seven characters only: on
+  everything else it would also turn a superscript two into a plain 2
+  and one half into \enquote{1/2} with a fraction slash.
+\item[Sub- and superscripts] (U+2070 to U+209C: numerals, signs,
+  parentheses and letters) become [[\textsubscript]] or
+  [[\textsuperscript]] of the character they decompose to, both
+  defined by the \LaTeX{} kernel, which the compile tests check
+  (\cref{sec:non-latin-compile}). The table [[LATEX_SCRIPT_CHARS]] is
+  built from the Unicode names and decompositions, not typed; a script
+  minus decomposes to the minus sign, which becomes a hyphen, as in
+  the table of mathematical symbols.
+\item[The script ell] is set as math [[\ell]], like the other
+  mathematical symbols.
+\item[Modifier letters] used as apostrophes become the nearest ASCII
+  marks: the turned comma (the Hawaiian okina) and the reversed comma
+  a left quote, the modifier prime an apostrophe. The other spacing
+  modifier letters (U+02B0 to U+02FF) are letters to Unicode but not
+  text on their own; [[_run_kind]] does not count them, so alone they
+  are dropped as before, and inside a run they stay part of it.
+\end{description}
+Control characters (category Cc) are dropped also inside a run. They
+print nothing, and a host that prints the run under pdf\LaTeX{} with
+T2A, as the fragment header suggests, stops at them (we tried a C1
+control after a Cyrillic word).
+
+The split is computed once per text, as a flag per character, and
+[[split_nonlatin]] cuts the text into plain pieces and runs. The
+escapers walk the pieces, and the audit table asks the same split
+whether a title has any letter left outside the runs
+(\cref{sec:audit-nonlatin-fallback}).
+
+<<review report generation>>=
+NONLATIN_MACRO = r"\scholarnonlatin"
+PLAIN_TEXT = "plain"
+NONLATIN_TEXT = "nonlatin"
+NONLATIN_SYMBOLS = "symbols"
+GREEK_RANGES = ((0x0370, 0x03FF), (0x1F00, 0x1FFF))
+GREEK_WORD_MIN = 3
+
+
+def _is_greek_letter(char: str) -> bool:
+    return char.isalpha() and any(
+        low <= ord(char) <= high for low, high in GREEK_RANGES
+    )
+
+
+T1_UNSET_RANGES = (
+    (0x0080, 0x009F), (0x0126, 0x0127), (0x0138, 0x0138),
+    (0x013F, 0x0140), (0x0149, 0x0149), (0x0166, 0x0167),
+    (0x017F, 0x0191), (0x0193, 0x01C3), (0x01D5, 0x01E1),
+    (0x01E4, 0x01E5), (0x01EC, 0x01EF), (0x01F1, 0x01F3),
+    (0x01F6, 0x0217), (0x021C, 0x0231), (0x0234, 0x0236),
+    (0x0238, 0x024F),
+)
+
+
+def _t1_unset(char: str) -> bool:
+    return any(low <= ord(char) <= high for low, high in T1_UNSET_RANGES)
+
+
+def _beyond_latin_flags(chars: str) -> list[bool]:
+    """Flag each character of `chars` that pdfLaTeX cannot set in T1."""
+    flags = [
+        (ord(char) > LATEX_LATIN_CUTOFF or _t1_unset(char))
+        and char not in LATEX_UNICODE_PUNCTUATION
+        and char not in GREEK_LETTER_NAMES
+        and char not in GREEK_LATIN_LOOKALIKES
+        and char not in LATEX_MATH_SYMBOLS
+        and char not in LATEX_SCRIPT_CHARS
+        for char in chars
+    ]
+    <<flag Greek words as text>>
+    <<flag words around an unsettable Latin letter>>
+    return flags
+@
+
+<<flag Greek words as text>>=
+start = 0
+while start < len(chars):
+    if not _is_greek_letter(chars[start]):
+        start += 1
+        continue
+    end = start
+    while end < len(chars) and _is_greek_letter(chars[end]):
+        end += 1
+    if end - start >= GREEK_WORD_MIN or any(flags[start:end]):
+        flags[start:end] = [True] * (end - start)
+    start = end
+<<flag words around an unsettable Latin letter>>=
+start = 0
+while start < len(chars):
+    if not chars[start].isalpha():
+        start += 1
+        continue
+    end = start
+    while end < len(chars) and (
+        chars[end].isalpha() or unicodedata.category(chars[end])[0] == "M"
+    ):
+        end += 1
+    if any(
+        flagged and unicodedata.name(char, "").startswith("LATIN")
+        for char, flagged in zip(chars[start:end], flags[start:end])
+    ):
+        flags[start:end] = [True] * (end - start)
+    start = end
+@
+
+A run starts at a flagged character and ends after the last flagged one
+before the next Latin letter; what lies between flagged characters is a
+bridge. Braces and the backslash never bridge: the BibTeX escaper
+leaves them as they are, since they carry meaning in a field, and a
+closing brace of the text inside the macro's argument would close the
+argument early. Whether a run is text or decoration is decided by its
+own flagged characters, by Unicode category: letters (L) and digits (N)
+are text, marks and symbols are not.
+
+<<review report generation>>=
+NONLATIN_RUN_STOPS = "{}\\"
+LATIN_LIGATURES = "".join(chr(code) for code in range(0xFB00, 0xFB07))
+
+
+def _nonlatin_run_end(chars: str, flags: list[bool], start: int) -> int:
+    end = index = start
+    while index < len(chars):
+        if flags[index]:
+            end = index = index + 1
+        elif chars[index].isalpha() or chars[index] in NONLATIN_RUN_STOPS:
+            break
+        else:
+            index += 1
+    return end
+
+
+SPACING_MODIFIERS = (0x02B0, 0x02FF)
+
+
+def _run_kind(chars: str, flags: list[bool]) -> str:
+    low, high = SPACING_MODIFIERS
+    for char, flagged in zip(chars, flags):
+        if flagged and unicodedata.category(char)[0] in "LN" \
+                and not low <= ord(char) <= high:
+            return NONLATIN_TEXT
+    return NONLATIN_SYMBOLS
+
+
+def split_nonlatin(text: str) -> list[tuple[str, str, list[bool]]]:
+    """Split `text` into plain pieces and runs pdfLaTeX cannot set.
+
+    The text is cleaned and composed first, as the escapers see it.
+    Each piece is a `(kind, piece, flags)` triple: `kind` is
+    `PLAIN_TEXT`, `NONLATIN_TEXT` (a run with letters or digits) or
+    `NONLATIN_SYMBOLS` (a run of symbols only), and `flags` marks the
+    piece's characters beyond what pdfLaTeX can set.
+    """
+    chars = unicodedata.normalize("NFC", clean_metadata_text(text))
+    chars = "".join(
+        unicodedata.normalize("NFKC", char) if char in LATIN_LIGATURES
+        else char
+        for char in chars
+    )
+    flags = _beyond_latin_flags(chars)
+    pieces: list[tuple[str, str, list[bool]]] = []
+    start = index = 0
+    while index < len(chars):
+        if not flags[index]:
+            index += 1
+            continue
+        end = _nonlatin_run_end(chars, flags, index)
+        if start < index:
+            pieces.append((PLAIN_TEXT, chars[start:index], flags[start:index]))
+        pieces.append(
+            (_run_kind(chars[index:end], flags[index:end]),
+             chars[index:end], flags[index:end])
+        )
+        start = index = end
+    if start < len(chars):
+        pieces.append((PLAIN_TEXT, chars[start:], flags[start:]))
+    return pieces
+
+
+def only_nonlatin_letters(text: str) -> bool:
+    """Whether `text` has letters and all of them are beyond pdfLaTeX.
+
+    Such a text prints no letter under pdfLaTeX, only the marker of
+    `\\scholarnonlatin`, so whatever shows it needs another identifier.
+    """
+    pieces = split_nonlatin(text)
+    return any(kind == NONLATIN_TEXT for kind, _, _ in pieces) and not any(
+        char.isalpha()
+        for kind, piece, _ in pieces if kind == PLAIN_TEXT
+        for char in piece
+    )
+@
+
+Let's verify with the issue's title, CJK with full-width punctuation,
+Greek words against Greek symbols, and a mixed title. The samples are
+spelled with [[\u]] escapes, the transliteration in a comment. Text
+without such characters must come out exactly as before, which the
+samples of the last test pin.
+
+<<test functions>>=
+# Federativnaya autentifikatsiya (federated authentication)
+CYRILLIC_PHRASE = (
+  "\u0424\u0435\u0434\u0435\u0440\u0430\u0442\u0438\u0432\u043d\u0430\u044f"
+  " \u0430\u0443\u0442\u0435\u043d\u0442\u0438\u0444\u0438\u043a\u0430\u0446"
+  "\u0438\u044f"
+)
+# ... v raspredelennoy infrastrukture superkomp'yuternykh tsentrov
+ISSUE_220_TITLE = CYRILLIC_PHRASE + (
+  " \u0432 \u0440\u0430\u0441\u043f\u0440\u0435\u0434\u0435\u043b\u0435"
+  "\u043d\u043d\u043e\u0439 \u0438\u043d\u0444\u0440\u0430\u0441\u0442"
+  "\u0440\u0443\u043a\u0442\u0443\u0440\u0435 \u0441\u0443\u043f\u0435"
+  "\u0440\u043a\u043e\u043c\u043f\u044c\u044e\u0442\u0435\u0440\u043d"
+  "\u044b\u0445 \u0446\u0435\u043d\u0442\u0440\u043e\u0432"
+)
+# Test, proverka (check)
+TEST_WORD = "\u0422\u0435\u0441\u0442"
+CHECK_WORD = "\u043f\u0440\u043e\u0432\u0435\u0440\u043a\u0430"
+# Chinese: blockchain authentication, full-width colon, survey
+CJK_TITLE = "\u533a\u5757\u94fe\u8ba4\u8bc1\uff1a\u7efc\u8ff0"
+# Ellinika keimena (Greek texts), with accented letters
+GREEK_WORDS = (
+  "\u0395\u03bb\u03bb\u03b7\u03bd\u03b9\u03ba\u03ac "
+  "\u03ba\u03b5\u03af\u03bc\u03b5\u03bd\u03b1"
+)
+
+
+def wrapped(text):
+  return "\\scholarnonlatin{" + text + "}"
+
+
+class TestNonLatinText:
+  """Runs pdfLaTeX cannot set are wrapped, not dropped (#220)."""
+
+  def test_cyrillic_title_is_one_run(self):
+    assert escape_latex(ISSUE_220_TITLE) == wrapped(ISSUE_220_TITLE)
+
+  def test_cjk_with_full_width_punctuation(self):
+    assert escape_latex(CJK_TITLE) == wrapped(CJK_TITLE)
+
+  def test_greek_words_are_text_but_symbols_stay_math(self):
+    assert escape_latex(GREEK_WORDS) == wrapped(GREEK_WORDS)
+    assert escape_latex("\u03b1\u03b2-pruning") \
+      == r"\ensuremath{\alpha}\ensuremath{\beta}-pruning"
+    assert escape_latex("\u03c0-ARL") == r"\ensuremath{\pi}-ARL"
+
+  def test_mixed_title_keeps_latin_words_outside(self):
+    title = f"Federated login ({CYRILLIC_PHRASE}), 2018"
+    assert escape_latex(title) \
+      == f"Federated login ({wrapped(CYRILLIC_PHRASE)}), 2018"
+
+  def test_specials_inside_a_run_are_escaped(self):
+    assert escape_latex(f"{TEST_WORD} & 100% {CHECK_WORD}") \
+      == wrapped(f"{TEST_WORD} \\& 100\\% {CHECK_WORD}")
+
+  def test_braces_end_a_run(self):
+    text = "{" + TEST_WORD + "} & \u4e2d\u6587"
+    assert escape_bibtex(text) \
+      == "{" + wrapped(TEST_WORD) + "} \\& " + wrapped("\u4e2d\u6587")
+    assert escape_latex("{" + TEST_WORD + "}") \
+      == "\\{" + wrapped(TEST_WORD) + "\\}"
+
+  def test_bibtex_keeps_the_text(self):
+    assert escape_bibtex(ISSUE_220_TITLE) == wrapped(ISSUE_220_TITLE)
+
+  def test_only_nonlatin_letters(self):
+    assert only_nonlatin_letters(ISSUE_220_TITLE)
+    assert only_nonlatin_letters(f"{TEST_WORD} 2018")
+    assert not only_nonlatin_letters("\u4e2d\u6587 title")
+    assert not only_nonlatin_letters("\u03c0-ARL")
+    assert not only_nonlatin_letters("star \u2606")
+    assert not only_nonlatin_letters("")
+
+  def test_latin_letters_t1_cannot_set_are_wrapped(self):
+    assert escape_latex("A \u0138 B") == "A " + wrapped("\u0138") + " B"
+    assert escape_latex("\u0126al Far") == wrapped("\u0126al") + " Far"
+    nghien_cuu = "Nghi\u00ean c\u1ee9u v\u1ec1"
+    assert escape_latex(nghien_cuu) \
+      == "Nghi\u00ean " + wrapped("c\u1ee9u v\u1ec1")
+    assert escape_latex("a\u0085b") == "ab"
+
+  def test_readable_characters_get_their_own_rendering(self):
+    samples = {
+      "A Secure Work\ufb02ow": "A Secure Workflow",
+      "\ufb01nite e\ufb00ort": "finite effort",
+      "CO\u2082 and x\u207b\u00b9": r"CO\textsubscript{2} and "
+        r"x\textsuperscript{-}" + "\u00b9",
+      "\u03ba\u2081": r"\ensuremath{\kappa}\textsubscript{1}",
+      "Hawai\u02bbi": "Hawai`i",
+      "Il\u02b9ich": "Il'ich",
+      "\u2113-norm": r"\ensuremath{\ell}-norm",
+      "a\u02b0 b": "a b",
+    }
+    for text, expected in samples.items():
+      assert escape_latex(text) == expected
+
+  def test_controls_are_dropped_inside_a_run(self):
+    assert escape_latex(TEST_WORD + "\u0085") == wrapped(TEST_WORD)
+    assert escape_latex(TEST_WORD + "\u0085 " + CHECK_WORD) \
+      == wrapped(TEST_WORD + " " + CHECK_WORD)
+
+  def test_unaccented_greek_words_from_three_letters(self):
+    logos = "\u03bb\u03bf\u03b3\u03bf\u03c2"
+    assert escape_latex(logos) == wrapped(logos)
+    assert escape_latex("\u03b1\u03b2\u03b3") == wrapped("\u03b1\u03b2\u03b3")
+
+  def test_a_latin_word_beside_cjk_stays_plain(self):
+    assert escape_latex("\u57fa\u4e8ePython\u7684") \
+      == wrapped("\u57fa\u4e8e") + "Python" + wrapped("\u7684")
+
+  def test_text_without_such_characters_is_unchanged(self):
+    samples = {
+      "\u0141\u00f3d\u017a \u0160\u010c\u017d \u0151\u0171 "
+      "\u0219\u021b \u0192 \u01c5":
+        "\u0141\u00f3d\u017a \u0160\u010c\u017d \u0151\u0171 "
+        "\u0219\u021b \u0192 \u01c5",
+      "Plain & simple_title 100%": r"Plain \& simple\_title 100\%",
+      "Caf\u00e9 \u201cna\u00efve\u201d \u2013 x\u2026":
+        "Caf\u00e9 ``na\u00efve'' -- x\\dots{}",
+      "\u03a9(n) \u2264 x": r"\ensuremath{\Omega}(n) \ensuremath{\le} x",
+      "star \u2606 here \U0001f600!": "star  here !",
+      "x\u0303": "x",
+    }
+    for text, expected in samples.items():
+      assert escape_latex(text) == expected
 @
 
 \subsection{Markdown and heading levels}
@@ -13625,6 +14499,7 @@ def build_search_parameters_latex(
                 cells.append(escape_latex(label))
             if with_dates:
                 cells.append(escape_latex(date))
+            cells[0] = latex_row_cell(cells[0])
             lines.append(" & ".join(cells) + r" \\")
         lines.extend(
             [
@@ -13773,6 +14648,43 @@ LATEX_PACKAGES: list[str] = [
 ]
 @
 
+\paragraph{Defining the macro for text in other scripts}
+\label{sec:non-latin-definition}
+
+Text the escapers wrap in [[\scholarnonlatin]] (\cref{sec:non-latin-text})
+needs a definition wherever it is typeset, and the definition must
+choose by engine: the argument under Xe\LaTeX{} and Lua\LaTeX{}, a
+marker under pdf\LaTeX{}. The test is whether the engine's own
+primitives exist, [[\XeTeXversion]] and [[\directlua]], which needs no
+package. Each candidate is a [[\providecommand]], so the first
+definition wins: a host document that defined the macro before
+including our output keeps its own, and of our three lines only the
+first that applies takes effect. The choice is made once, at
+definition time, so the macro itself is a plain one-argument macro that
+behaves the same in a table cell, a heading or a [[\write]].
+
+The marker is localised by the caller (the audit table has Swedish);
+the definition is written only when the output uses the macro, so a
+document without such text is byte for byte what it was before.
+
+<<review report generation>>=
+NONLATIN_MARKER = "[non-Latin text]"
+
+
+def nonlatin_definition(marker: str = NONLATIN_MARKER) -> list[str]:
+    """Return the lines that define `\\scholarnonlatin` unless defined."""
+    return [
+        r"\ifdefined\XeTeXversion\providecommand{\scholarnonlatin}[1]{#1}\fi",
+        r"\ifdefined\directlua\providecommand{\scholarnonlatin}[1]{#1}\fi",
+        f"\\providecommand{{\\scholarnonlatin}}[1]{{{marker}}}",
+    ]
+
+
+def uses_nonlatin(texts: Sequence[str | None]) -> bool:
+    """Whether any of `texts` calls `\\scholarnonlatin`."""
+    return any(text and NONLATIN_MACRO + "{" in text for text in texts)
+@
+
 A standalone document wraps a body in the skeleton a reader expects from a
 report: title page, abstract, table of contents, the body, an optional
 bibliography command and an optional appendix. The title is escaped here
@@ -13780,9 +14692,28 @@ because session names are free text (an ampersand in a session name used
 to be a hard \LaTeX{} error). The bibliography command is passed as a
 literal string rather than a flag so a caller can choose its options; the
 review report passes none, since it cites everything with [[\fullcite]]
-and has no reference list of its own.
+and has no reference list of its own. The definition of
+[[\scholarnonlatin]] goes into the preamble, after the packages, when
+the title, abstract, body, appendix or the cited [[.bib]] ([[bib_text]],
+whose fields biblatex typesets through [[\fullcite]]) uses it.
+
+\label{sec:standalone-t1}
+The standalone document loads the T1 font encoding before the other
+packages. Without it pdf\LaTeX{} sets the report in OT1, which has no
+[[\textquotedbl]]: every session with a quoted query, the normal case
+for a phrase search, gave a report that stopped with
+\enquote{Command \textbackslash textquotedbl unavailable in encoding
+OT1}. OT1 also lacks the guillemets, eth, thorn and the ogonek
+letters, and T1 is what the decks and books use, so a title that
+compiles in one compiles in the other. This one line is the only
+change to standalone output for Latin text; fragments are unchanged,
+since the font encoding is the including document's choice, like
+[[inputenc]].
 
 <<review report generation>>=
+STANDALONE_FONTENC = r"\usepackage[T1]{fontenc}"
+
+
 def latex_document(
     body: list[str],
     *,
@@ -13792,15 +14723,25 @@ def latex_document(
     abstract: str | None = None,
     bibliography: str | None = None,
     appendix: list[str] | None = None,
+    bib_text: str = "",
 ) -> list[str]:
-    """Wrap `body` in a compilable LaTeX document."""
-    lines: list[str] = [r"\documentclass{article}"]
+    """Wrap `body` in a compilable LaTeX document.
+
+    `bib_text` is the content of the `.bib` the document cites, read
+    only to decide whether `\\scholarnonlatin` needs a definition.
+    """
+    title = escape_latex(title)
+    lines: list[str] = [r"\documentclass{article}", STANDALONE_FONTENC]
     lines.extend(LATEX_PACKAGES)
+    if uses_nonlatin(
+        [title, abstract, *body, *(appendix or []), bib_text]
+    ):
+        lines.extend(nonlatin_definition())
     lines.extend(
         [
             f"\\addbibresource{{{bib_resource}}}",
             "",
-            f"\\title{{{escape_latex(title)}}}",
+            f"\\title{{{title}}}",
             f"\\date{{{date}}}",
             "",
             r"\begin{document}",
@@ -13837,8 +14778,32 @@ by an LLM is not silently lost. Callers may add further comment lines
 for facts that must reach the author but never the compiled page, such
 as the session a table was made from.
 
+The one thing a fragment does define is [[\scholarnonlatin]], when its
+body or its [[.bib]] uses it: in the body, right after the header and
+so before the first use, since a fragment has no preamble. Being a
+[[\providecommand]], it yields to a definition the host made before the
+[[\input]], and the header says so and how, because the marker is a
+poor rendering of a title the host could print: under pdf\LaTeX{}
+Cyrillic needs only the T2A encoding, which we checked by compiling
+the suggested definition with the issue's title. The abstract does not
+count, since in a fragment it is only a comment.
+
 <<review report generation>>=
 FRAGMENT_COMMENT_WIDTH = 76
+
+
+def nonlatin_fragment_header(marker: str) -> list[str]:
+    """Return the header comment that explains `\\scholarnonlatin`."""
+    return [
+        "% Text that pdfLaTeX cannot set in T1 (Cyrillic, CJK, ...) is",
+        r"% wrapped in \scholarnonlatin{...}. The \providecommand lines",
+        "% below print the text under XeLaTeX and LuaLaTeX (load a font",
+        f"% that has the script) and print {marker} under pdfLaTeX.",
+        "% To print it under pdfLaTeX too, define the command before the",
+        r"% \input, e.g. for Cyrillic with \usepackage[T2A,T1]{fontenc}:",
+        r"%   \newcommand{\scholarnonlatin}[1]{{\fontencoding{T2A}"
+        r"\selectfont #1}}",
+    ]
 
 
 def latex_fragment(
@@ -13849,8 +14814,16 @@ def latex_fragment(
     abstract: str | None = None,
     generator: str = "",
     comments: list[str] | None = None,
+    bib_text: str = "",
+    nonlatin_marker: str = NONLATIN_MARKER,
 ) -> list[str]:
-    """Wrap `body` in an input-able fragment with an instructional header."""
+    """Wrap `body` in an input-able fragment with an instructional header.
+
+    `bib_text` is the content of the `.bib` the fragment cites, read
+    only to decide whether `\\scholarnonlatin` needs a definition;
+    `nonlatin_marker` is what that definition prints under pdfLaTeX.
+    """
+    nonlatin = uses_nonlatin([*body, bib_text])
     lines: list[str] = [r"% --- scholar LaTeX fragment " + "-" * 44]
     if generator:
         lines.append(f"% Generated by: {generator}")
@@ -13879,8 +14852,12 @@ def latex_fragment(
         lines.append("% including document):")
         for wrapped in textwrap.wrap(abstract, FRAGMENT_COMMENT_WIDTH):
             lines.append(f"%   {wrapped}")
+    if nonlatin:
+        lines.extend(nonlatin_fragment_header(nonlatin_marker))
     lines.append("% " + "-" * 70)
     lines.append("")
+    if nonlatin:
+        lines.extend(nonlatin_definition(nonlatin_marker))
     lines.extend(body)
     return lines
 @
@@ -13944,6 +14921,66 @@ class TestLatexSkeleton:
         assert lines[-3:] == [
             r"\begin{refsection}", r"\section{Body}", r"\end{refsection}",
         ]
+@
+
+The definition appears exactly when something uses the macro---the
+body, the title or only the [[.bib]]---and in the right place: after
+the packages in a document, before the body in a fragment, whose header
+then explains it in the caller's language.
+
+<<test functions>>=
+class TestNonLatinDefinition:
+  BODY = [r"\section{Body}", "\\scholarnonlatin{x} text"]
+
+  def _document(self, body, **kwargs):
+    return latex_document(
+      body, title="T", date="2026-01-01", bib_resource="x.bib", **kwargs
+    )
+
+  def test_document_without_the_macro_is_unchanged(self):
+    lines = self._document([r"\section{Body}"], bib_text="@article{a,}")
+    assert not any("scholarnonlatin" in line for line in lines)
+    assert lines[1:len(LATEX_PACKAGES) + 3] == [STANDALONE_FONTENC] \
+      + LATEX_PACKAGES + [r"\addbibresource{x.bib}"]
+    assert STANDALONE_FONTENC == r"\usepackage[T1]{fontenc}"
+
+  def test_document_defines_it_in_the_preamble(self):
+    lines = self._document(self.BODY)
+    after_packages = len(LATEX_PACKAGES) + 2
+    assert lines[after_packages:after_packages + 3] == nonlatin_definition()
+    assert lines[after_packages + 3] == r"\addbibresource{x.bib}"
+    assert nonlatin_definition()[-1] \
+      == r"\providecommand{\scholarnonlatin}[1]{[non-Latin text]}"
+
+  def test_title_or_bib_alone_need_it_too(self):
+    titled = latex_document(
+      [], title="\u0422\u0435\u0441\u0442", date="d", bib_resource="x.bib"
+    )
+    assert nonlatin_definition()[0] in titled
+    assert "\\title{\\scholarnonlatin{\u0422\u0435\u0441\u0442}}" in titled
+    cited = self._document([], bib_text="title = {\\scholarnonlatin{y}}")
+    assert nonlatin_definition()[0] in cited
+
+  def test_fragment_defines_it_before_the_body(self):
+    lines = latex_fragment(
+      self.BODY, packages=LATEX_PACKAGES, nonlatin_marker="[icke-latinsk]"
+    )
+    start = lines.index(nonlatin_definition("[icke-latinsk]")[0])
+    assert lines[start:start + 3] == nonlatin_definition("[icke-latinsk]")
+    assert lines[start + 3:] == self.BODY
+    assert all(line.startswith("%") or not line for line in lines[:start])
+    header = "\n".join(lines[:start])
+    assert "print [icke-latinsk] under pdfLaTeX" in header
+    assert r"\fontencoding{T2A}\selectfont #1}}" in header
+
+  def test_fragment_without_the_macro_is_unchanged(self):
+    plain = latex_fragment([r"\section{Body}"], packages=LATEX_PACKAGES)
+    assert not any("scholarnonlatin" in line for line in plain)
+    cited = latex_fragment(
+      [r"\section{Body}"], packages=LATEX_PACKAGES,
+      bib_text="\\scholarnonlatin{y}",
+    )
+    assert nonlatin_definition()[0] in cited
 @
 
 \subsection{Citation keys}
@@ -14765,6 +15802,10 @@ modes interchangeable. The fragment's body sits in a [[refsection]] so an
 including document's bibliography is unaffected by the [[\fullcite]]s; the
 standalone report has no bibliography command, so it needs no such
 protection and its output is unchanged from before fragments existed.
+The [[.bib]] text goes to the skeleton as well: a title in another
+script is typeset only through [[\fullcite]], so the [[.bib]] alone may
+be what needs [[\scholarnonlatin]] defined
+(\cref{sec:non-latin-definition}).
 
 <<review report generation>>=
 def generate_latex_report(
@@ -14795,7 +15836,8 @@ def generate_latex_report(
         return keys[id(decision)]
 
     bib_path = output_path.with_suffix(".bib")
-    bib_path.write_text(build_report_bibtex(decisions, cite_key))
+    bib_text = build_report_bibtex(decisions, cite_key)
+    bib_path.write_text(bib_text)
 
     body = build_review_provenance_latex(session)
     body.extend(build_review_decisions_latex(session, cite_key))
@@ -14808,6 +15850,7 @@ def generate_latex_report(
             date=session.timestamp.strftime("%Y-%m-%d"),
             bib_resource=bib_path.name,
             abstract=abstract,
+            bib_text=bib_text,
         )
     else:
         lines = latex_fragment(
@@ -14816,6 +15859,7 @@ def generate_latex_report(
             bib_resource=bib_path.name,
             abstract=abstract,
             generator="scholar sessions export --no-standalone",
+            bib_text=bib_text,
         )
 
     output_path.write_text("\n".join(lines))
@@ -14995,6 +16039,7 @@ AUDIT_STRINGS: dict[str, dict] = {
             "no-abstract": ", {count} excluded for lack of an abstract",
         },
         "extra_rest": ", {rest} other hits",
+        "extra_uncited": ", {uncited} kept but not cited in the text",
         "extra_excluded": (
             ", {excluded} excluded although classified as bearing on the "
             "claim"
@@ -15038,7 +16083,14 @@ AUDIT_STRINGS: dict[str, dict] = {
         "off-topic-false-hit": "other topic (false hit)",
         "pending": "pending, unclassified",
         "excluded": "excluded",
+        "cited_in_text": "cited in the text",
+        "kept_uncited": "kept, not cited in the text",
+        "cited_rule": (
+            "A row is cited when the text cites the work, whoever "
+            "decided on its records."
+        ),
         "no_confidence": "n/a",
+        "nonlatin": "[non-Latin text]",
         "continued": "(cont.)",
         "continued_next": "continued on next page",
         "notes": {
@@ -15086,6 +16138,9 @@ AUDIT_STRINGS: dict[str, dict] = {
             "no-abstract": ", {count} uteslutna i brist på sammanfattning",
         },
         "extra_rest": ", {rest} övriga träffar",
+        "extra_uncited": (
+            ", {uncited} behållna men inte citerade i texten"
+        ),
         "extra_excluded": (
             ", {excluded} uteslutna trots att de klassats som relevanta "
             "för påståendet"
@@ -15132,7 +16187,14 @@ AUDIT_STRINGS: dict[str, dict] = {
         "off-topic-false-hit": "annat ämne (felträff)",
         "pending": "ej klassad",
         "excluded": "utesluten",
+        "cited_in_text": "citerad i texten",
+        "kept_uncited": "behållen, inte citerad i texten",
+        "cited_rule": (
+            "En rad är citerad när texten citerar verket, oavsett vem "
+            "som beslutade om dess poster."
+        ),
         "no_confidence": "saknas",
+        "nonlatin": "[icke-latinsk text]",
         "continued": "(forts.)",
         "continued_next": "forts.\\ på nästa sida",
         "notes": {
@@ -15207,6 +16269,9 @@ class AuditRow:
     excluded: bool = False   # discarded despite a bearing category
     criterion: str | None = None   # the exclusion criterion of a discard
     version: bool = False    # noted as another record of a cited source
+    work: tuple[str, str] | None = None   # its `audit_work_key`
+    uncited: bool = False    # a keep the text does not cite
+    nonlatin_title: bool = False   # title has no Latin letter: id added
 @
 
 Three facts about how decisions are recorded shape the cited rule.
@@ -15271,7 +16336,7 @@ reviewer replaced.  The notes lent by other copies reach
 [[audit_reason]] as [[also_notes]].
 
 <<review imports>>=
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 <<review report generation>>=
 def audit_category(tags: list[str]) -> str | None:
     """Return the deciding (last) audit category among `tags`, if any."""
@@ -15331,11 +16396,14 @@ def audit_reason(
     theme_names: dict[str, str],
     strings: dict,
     also_notes: Sequence[str] = (),
+    cited: bool | None = None,
 ) -> tuple[str, int]:
     """Return the reason label and sort order for `decision`.
 
     `also_notes` are note tags of the work's other copies; they are
     added to the label's notes, after the decision's own, each once.
+    `cited` says whether the text cites the work (`--cited-from`); with
+    None a keep is cited when a human made or confirmed it.
     """
     tags = list(decision.tags)
     notes = strings["notes"]
@@ -15365,17 +16433,19 @@ def audit_reason(
     criterion = audit_exclusion_criterion(
         decision, theme_names=theme_names, notes=notes
     )
+    by_screening = cited is None
 
+    <<label a work by whether the text cites it>>
     if decision.status == DecisionStatus.PENDING:
         return audit_with_notes(strings["pending"], note_texts), \
             AUDIT_ORDER_PENDING
-    if kept and human_decision and theme_tags:
+    if kept and human_decision and by_screening and theme_tags:
         theme = theme_names.get(theme_tags[0], theme_tags[0])
         label = f"\\emph{{{strings['cited']}}}"
         if theme.casefold() != strings["cited"].casefold():
             label += ": " + escape_latex(theme)
         order = AUDIT_ORDER_CITED
-    elif kept and human_decision and not tags:
+    elif kept and human_decision and by_screening and not tags:
         label, order = f"\\emph{{{strings['cited']}}}", AUDIT_ORDER_CITED
     elif audit_excluded(decision):
         label = f"{strings[category]}{confidence}, {strings['excluded']}"
@@ -15383,6 +16453,8 @@ def audit_reason(
     elif category is not None:
         label = strings[category] + confidence
         order = AUDIT_CATEGORIES[category]
+    elif audit_uncited_keep(decision, cited):
+        <<label a keep the text does not cite>>
     elif criterion is not None:
         label = escape_latex(criterion) + confidence
         return audit_with_notes(label, note_texts), AUDIT_ORDER_OTHER
@@ -15736,6 +16808,199 @@ class TestAuditReasonAgentSource:
         ) == ("supports the claim", 1)
 @
 
+\paragraph{When the text says what is cited.}
+\label{sec:audit-cited-from}
+The rule above reads \enquote{cited} off the screening: a keep is
+cited when a human made or confirmed it.  That is the right reading of
+a review a human screened, and the wrong one of a review screened by
+an agent or a model and written up by a human
+(\url{https://github.com/dbosk/scholarcli/issues/218}).  The appendix
+chapters that issue is about say in their précis that the author has
+not reviewed the screening, and once their agents' keeps carry the
+agent source, every such table reads \enquote{0 cited} beside a chapter
+that cites dozens of the listed works.  The only workaround was to
+record the agents' keeps as [[human]], which forges a human decision.
+Whether the text cites a work and whether a human screened its record
+are two facts; the reason column needs the first, and the second is
+already in it, as the confidence of a machine's row.
+
+So [[sessions export --cited-from refs.bib]] hands the export the
+works the text cites (\cref{sec:audit-cited-entries} says how a
+bibliography entry finds its row), and [[audit_reason]] takes the
+answer as [[cited]] for each copy of the work.  Without the option
+[[cited]] is [[None]] and every rule above stands unchanged.  With it,
+the text decides, whoever decided on the record:
+\begin{description}
+\item[A cited work that is kept or pending] is cited, order~0.  The
+  label names the theme, else the category, and a pending record says
+  it is unclassified, so a reader sees that the text cites a work the
+  screening never judged.  A machine's row keeps its confidence, so
+  who decided stays visible: the caption promises a confidence for
+  every machine-classified row, and an agent's keep cited by the text
+  is still the agent's classification.  A pending record has no
+  classification, so it has no confidence to show either.
+\item[A cited work that is discarded] keeps its place and its reason,
+  and gets the note \enquote{cited in the text}, after its other notes.
+  The text and the screening disagree there, and only the author can
+  say which is wrong: making the row cited would hide the exclusion,
+  and dropping the citation would hide what the text relies on.  The
+  export also lists such works on standard error.
+\item[A work the text does not cite] is not cited, even when a human
+  kept it.  A kept record with a category falls to the category's
+  order, as a machine's keep always did; any other keep, whoever made
+  it, reads \enquote{kept, not cited in the text}, under its theme and
+  with a machine's confidence, among the other rows
+  ([[audit_uncited_keep]]), and the caption counts these rows on their
+  own.  The two branches of the rule above that read a human keep as a
+  citation are what [[by_screening]] turns off.
+\end{description}
+
+Without the option an unreviewed keep without a category is a
+candidate, filed by its tags; with it, that reading would leave the
+reason column saying less about an agent's keep than about a human's,
+although the text treats both alike.  So the label is the same for
+both, and the confidence shows who decided.  The rule is a predicate
+of its own because the caption needs it as well: it counts the rows the
+label is written on.
+
+<<review report generation>>=
+def audit_uncited_keep(decision: ReviewDecision, cited: bool | None) -> bool:
+    """Tell whether `decision` is a keep the text does not cite.
+
+    Only with `--cited-from` (`cited` is False), and only for a keep
+    without an audit category, which keeps its category's place.
+    """
+    return (
+        cited is False
+        and decision.status == DecisionStatus.KEPT
+        and audit_category(decision.tags) is None
+    )
+<<label a work by whether the text cites it>>=
+if cited and decision.status != DecisionStatus.DISCARDED:
+    label = f"\\emph{{{strings['cited']}}}"
+    if decision.status == DecisionStatus.PENDING:
+        label += f", {strings['pending']}"
+        confidence = ""
+    elif theme_tags:
+        theme = theme_names.get(theme_tags[0], theme_tags[0])
+        if theme.casefold() != strings["cited"].casefold():
+            label += ": " + escape_latex(theme)
+    elif category is not None:
+        label += ": " + strings[category]
+    return audit_with_notes(label + confidence, note_texts), \
+        AUDIT_ORDER_CITED
+if cited:
+    note_texts.append(strings["cited_in_text"])
+<<label a keep the text does not cite>>=
+label = strings["kept_uncited"]
+if theme_tags:
+    theme = theme_names.get(theme_tags[0], theme_tags[0])
+    label += ": " + escape_latex(theme)
+label += confidence
+order = AUDIT_ORDER_OTHER
+@
+
+Each case of the list is checked, for an agent's keep, a human's keep
+and a discard, uncited as well as cited, together with the Swedish
+strings and the predicate on its own (a category row's place is its
+category's, so only the predicate shows that it is no uncited keep);
+the last test pins that [[cited=None]] is the rule above and not some
+third reading.
+
+<<test functions>>=
+class TestAuditReasonCitedByText:
+  """`cited` from `--cited-from` decides what is cited (#218)."""
+
+  def _reason(self, status, tags, cited, source=ReviewSource.HUMAN,
+              conf=None, theme_names=None, lang="en"):
+    decision = ReviewDecision(
+      paper=Paper(title="P", authors=["A"], year=2024),
+      provider="p", status=status, tags=tags, source=source,
+      llm_confidence=conf,
+    )
+    return audit_reason(
+      decision, theme_names=theme_names or {},
+      strings=AUDIT_STRINGS[lang], cited=cited,
+    )
+
+  def test_an_agents_cited_keep_is_cited_with_its_confidence(self):
+    agent = ReviewSource.AGENT_UNREVIEWED
+    assert self._reason(DecisionStatus.KEPT, ["ml"], True, agent, 0.7) \
+      == (r"\emph{cited}: ml (0.70)", AUDIT_ORDER_CITED)
+    assert self._reason(
+      DecisionStatus.KEPT, ["supports-claim"], True, agent,
+    ) == (r"\emph{cited}: supports the claim (n/a)", AUDIT_ORDER_CITED)
+
+  def test_a_cited_pending_record_says_it_is_unclassified(self):
+    assert self._reason(
+      DecisionStatus.PENDING, [], True, ReviewSource.LLM_UNREVIEWED,
+    ) == (r"\emph{cited}, pending, unclassified", AUDIT_ORDER_CITED)
+
+  def test_a_human_keep_the_text_does_not_cite_is_not_cited(self):
+    kept = DecisionStatus.KEPT
+    assert self._reason(kept, ["ml"], False, theme_names={"ml": "ML"}) \
+      == ("kept, not cited in the text: ML", AUDIT_ORDER_OTHER)
+    assert self._reason(kept, [], False) \
+      == ("kept, not cited in the text", AUDIT_ORDER_OTHER)
+    assert self._reason(kept, ["supports-claim", "ml"], False) \
+      == ("supports the claim", 1)
+
+  def test_a_cited_discard_keeps_its_reason_with_a_note(self):
+    discarded = DecisionStatus.DISCARDED
+    assert self._reason(discarded, ["off-topic-false-hit"], True) \
+      == ("other topic (false hit) (cited in the text)", 4)
+    assert self._reason(discarded, ["no-abstract"], True) \
+      == ("no-abstract (cited in the text)", AUDIT_ORDER_OTHER)
+    assert self._reason(discarded, ["supports-claim"], True) == (
+      "supports the claim, excluded (cited in the text)",
+      AUDIT_ORDER_OTHER,
+    )
+
+  def test_swedish_strings(self):
+    assert self._reason(DecisionStatus.KEPT, [], True, lang="sv") \
+      == (r"\emph{citerad}", AUDIT_ORDER_CITED)
+    assert self._reason(DecisionStatus.KEPT, [], False, lang="sv") \
+      == ("behållen, inte citerad i texten", AUDIT_ORDER_OTHER)
+    assert self._reason(
+      DecisionStatus.DISCARDED, ["off-topic-false-hit"], True, lang="sv",
+    ) == ("annat ämne (felträff) (citerad i texten)", 4)
+
+  def test_an_agents_keep_the_text_does_not_cite_is_not_cited(self):
+    agent = ReviewSource.AGENT_UNREVIEWED
+    assert self._reason(DecisionStatus.KEPT, ["ml"], False, agent, 0.7) \
+      == ("kept, not cited in the text: ml (0.70)", AUDIT_ORDER_OTHER)
+
+  def test_only_a_keep_without_a_category_is_an_uncited_keep(self):
+    def keep(tags, status=DecisionStatus.KEPT):
+      return ReviewDecision(
+        paper=Paper(title="P", authors=["A"], year=2024), provider="p",
+        status=status, tags=tags,
+      )
+
+    assert audit_uncited_keep(keep(["ml"]), False)
+    assert not audit_uncited_keep(keep(["supports-claim", "ml"]), False)
+    assert not audit_uncited_keep(keep(["ml"]), None)
+    assert not audit_uncited_keep(keep(["ml"]), True)
+    assert not audit_uncited_keep(
+      keep(["ml"], DecisionStatus.PENDING), False
+    )
+
+  def test_without_the_option_the_screening_decides(self):
+    agent = ReviewSource.AGENT_UNREVIEWED
+    for tags, source in ((["ml"], ReviewSource.HUMAN), (["ml"], agent),
+                         ([], ReviewSource.HUMAN)):
+      decision = ReviewDecision(
+        paper=Paper(title="P", authors=["A"], year=2024), provider="p",
+        status=DecisionStatus.KEPT, tags=tags, source=source,
+        llm_confidence=0.7,
+      )
+      assert audit_reason(
+        decision, theme_names={}, strings=AUDIT_STRINGS["en"], cited=None,
+      ) == audit_reason(
+        decision, theme_names={}, strings=AUDIT_STRINGS["en"],
+      )
+@
+
 Because the category is read from the tags, a decision that overturns
 an earlier one must not leave the earlier category behind
 (\url{https://github.com/dbosk/scholar/issues/177}).  When a record's
@@ -15922,31 +17187,135 @@ def shorten_title(title: str, limit: int | None) -> str:
         return title
     cut = title[:limit].rsplit(" ", 1)[0] or title[:limit]
     return cut.rstrip() + "\u2026"
+@
 
+\paragraph{Titles without a Latin letter}
+\label{sec:audit-nonlatin-fallback}
 
+A title in another script is kept in [[\scholarnonlatin]]
+(\cref{sec:non-latin-text}), which a pdf\LaTeX{} host prints as a
+marker. When that leaves the title without a single letter, every such
+row reads \enquote{[non-Latin text]} and the reader cannot tell them
+apart or look one up, so the cell also gives the paper's id: the DOI
+as [[doi:...]] when there is one, else the hash id, which is also the
+value [[sessions decide --paper-id]] takes. A title that keeps a Latin
+word, or a Greek symbol, already identifies its row and gets nothing
+added. The row remembers the fallback, so that [[build_audit_table_latex]]
+can warn once per table, on standard error, how many listed rows
+needed it: the author should know that the appendix shows markers
+where titles were, and can define the macro to print them.
+
+<<review report generation>>=
+def audit_title_cell(
+    paper: Paper, title_limit: int | None
+) -> tuple[str, bool]:
+    """Return the escaped title cell and whether it needed the id."""
+    title = paper.title or ""
+    cell = escape_latex(shorten_title(title, title_limit))
+    if not only_nonlatin_letters(title):
+        return cell, False
+    return f"{cell} ({escape_latex(paper.id)})", True
+@
+
+Let's verify the fallback on four rows: the issue's record, a
+Cyrillic title without a DOI, a mixed title and a Latin one. Only the
+first two get the id, and the export warns once, counting them, in the
+table's language:
+
+<<test functions>>=
+class TestAuditNonLatinTitles:
+  def _session(self):
+    def kept(title, **paper):
+      return ReviewDecision(
+        paper=Paper(title=title, authors=["A. Author"], year=2018, **paper),
+        provider="openalex", status=DecisionStatus.KEPT,
+      )
+    session = ReviewSession(
+      query="q", providers=["openalex"], timestamp=datetime.now(),
+      name="nonlatin",
+    )
+    session.decisions = [
+      kept(ISSUE_220_TITLE, doi="10.25682/niisi.2018.6.0011"),
+      kept(f"{TEST_WORD} 2018"),
+      kept(f"Federated login ({CYRILLIC_PHRASE})"),
+      kept("Plain title"),
+    ]
+    return session
+
+  def test_rows_without_latin_letters_show_the_paper_id(self, caplog):
+    session = self._session()
+    with caplog.at_level(logging.WARNING, logger="scholar.review"):
+      text = "\n".join(build_audit_table_latex(session, label="x"))
+    hash_id = session.decisions[1].paper.id
+    assert wrapped(ISSUE_220_TITLE) \
+      + " (doi:10.25682/niisi.2018.6.0011) & 2018" in text
+    assert wrapped(TEST_WORD) + " 2018 (" + escape_latex(hash_id) \
+      + ") & 2018" in text
+    assert "Federated login (" + wrapped(CYRILLIC_PHRASE) + ") & 2018" \
+      in text
+    assert "Plain title & 2018" in text
+    warnings = [r.getMessage() for r in caplog.records
+                if "without Latin letters" in r.getMessage()]
+    assert warnings == [
+      "audit table for nonlatin: 2 row(s) have a title without Latin "
+      "letters, printed as [non-Latin text] under pdfLaTeX; the row "
+      "shows the paper id too"
+    ]
+
+  def test_fragment_defines_the_marker_in_the_table_language(
+      self, tmp_path):
+    path = tmp_path / "table.tex"
+    generate_audit_table(self._session(), path, label="x", lang="sv")
+    lines = path.read_text().splitlines()
+    assert nonlatin_definition("[icke-latinsk text]") \
+      == lines[lines.index(nonlatin_definition()[0]):][:3]
+    assert lines.index(nonlatin_definition()[0]) \
+      < lines.index(r"\begingroup\footnotesize")
+
+  def test_latin_table_has_no_definition_and_no_warning(self, caplog):
+    session = self._session()
+    session.decisions = session.decisions[3:]
+    with caplog.at_level(logging.WARNING, logger="scholar.review"):
+      lines = build_audit_table_latex(session, label="x")
+    assert "without Latin letters" not in caplog.text
+    assert not any("scholarnonlatin" in line for line in lines)
+@
+
+<<review report generation>>=
 def collect_audit_rows(
     session: ReviewSession,
     *,
     theme_names: dict[str, str],
     strings: dict[str, str],
     title_limit: int | None = None,
+    cited_works: Collection[tuple[str, str]] | None = None,
 ) -> list[AuditRow]:
-    """Merge the session's decisions into sorted audit rows."""
+    """Merge the session's decisions into sorted audit rows.
+
+    `cited_works` are the `audit_work_key`s of the works the text cites
+    (`--cited-from`); given, they decide which rows are cited.
+    """
+    def cited(key: tuple[str, str]) -> bool | None:
+        return None if cited_works is None else key in cited_works
+
     rows: dict[tuple[str, str], AuditRow] = {}
     copies: dict[tuple[str, str], list[ReviewDecision]] = {}
     best: dict[tuple[str, str], ReviewDecision] = {}
+    best_rank: dict[tuple[str, str], tuple[int, int, int]] = {}
     rank_rules = {"theme_names": theme_names, "notes": strings["notes"]}
     for decision in session.decisions:
         paper = decision.paper
-        title = paper.title or ""
         year = str(paper.year) if paper.year else ""
         key = audit_work_key(paper)
         providers = provider_short_names(
             ", ".join(decision_provider_evidence(decision))
         )
         reason, order = audit_reason(
-            decision, theme_names=theme_names, strings=strings
+            decision, theme_names=theme_names, strings=strings,
+            cited=cited(key),
         )
+        <<rank the copy on the screening's order>>
+        uncited = audit_uncited_keep(decision, cited(key))
         excluded = audit_excluded(decision)
         criterion = audit_exclusion_criterion(
             decision, theme_names=theme_names, notes=strings["notes"]
@@ -15955,9 +17324,10 @@ def collect_audit_rows(
         copies.setdefault(key, []).append(decision)
         row = rows.get(key)
         if row is None:
-            best[key] = decision
+            best[key], best_rank[key] = decision, rank
+            title, nonlatin_title = audit_title_cell(paper, title_limit)
             rows[key] = AuditRow(
-                title=escape_latex(shorten_title(title, title_limit)),
+                title=title,
                 year=year,
                 providers=providers,
                 status=decision.status,
@@ -15966,6 +17336,9 @@ def collect_audit_rows(
                 excluded=excluded,
                 criterion=criterion,
                 version=version,
+                work=key,
+                uncited=uncited,
+                nonlatin_title=nonlatin_title,
             )
             continue
         for provider in providers:
@@ -15973,15 +17346,35 @@ def collect_audit_rows(
                 row.providers.append(provider)
         if not row.year:
             row.year = year
-        if audit_copy_rank(decision, order, **rank_rules) \
-                < audit_copy_rank(best[key], row.order, **rank_rules):
+        if rank < best_rank[key]:
             row.status, row.reason, row.order = decision.status, reason, order
             row.excluded, row.criterion = excluded, criterion
-            row.version = version
-            best[key] = decision
+            row.version, row.uncited = version, uncited
+            best[key], best_rank[key] = decision, rank
     for key, row in rows.items():
         <<unite the notes of the row's copies>>
     return sorted(rows.values(), key=lambda r: (r.order, r.title.lower()))
+@
+
+With [[--cited-from]] (\cref{sec:audit-cited-from}) the citation
+changes how a row reads, never which copy gives it: each copy is ranked
+on the order the screening gave it, as without the option.  Ranked on
+the cited order instead, every kept or pending copy of a cited work
+would be order~0 and beat a discard of the same work, so a pending
+record could give the row of a work an agent had discarded as off
+topic; the row read \enquote{cited, pending, unclassified}, and the
+export's warning about a cited work the session excludes never came.
+The screening's choice is the one that says what the session decided
+about the work, and the text's citation is then written on it.
+
+<<rank the copy on the screening's order>>=
+if cited_works is None:
+    screening_order = order
+else:
+    _, screening_order = audit_reason(
+        decision, theme_names=theme_names, strings=strings
+    )
+rank = audit_copy_rank(decision, screening_order, **rank_rules)
 @
 
 The fixture holds a duplicate across two providers (one copy kept), a
@@ -16262,7 +17655,7 @@ lent = [
 if lent:
     row.reason, _ = audit_reason(
         best[key], theme_names=theme_names, strings=strings,
-        also_notes=lent,
+        also_notes=lent, cited=cited(key),
     )
     <<count a lent version note>>
 <<add the notes of the work's other copies>>=
@@ -17519,6 +18912,25 @@ calling them duplicates would misreport the review. What remains is
 counted as other hits. The four counts are taken from the merged rows,
 so a work is counted once, under the decision its row shows.
 
+With [[cited_works]] (\cref{sec:audit-cited-from}) the counts follow
+the text's citations: \enquote{$n$ cited} counts the rows the text
+cites, and [[--bearing-only]] lists those with the supporting and
+qualifying ones, as before.  The caption then says which rule it used,
+in one localised sentence before the databases, because the same
+words, \enquote{12 cited}, mean \enquote{a human kept 12} in one table
+and \enquote{the text cites 12} in another, and a reader of the
+appendix cannot tell them apart otherwise.  The other sentences hold
+under either rule: \enquote{other versions of cited sources} are
+versions of what the text cites, and an excluded row stays excluded.
+The keeps the text does not cite get a count of their own, ahead of
+the duplicates: their reason column leads with \enquote{kept, not
+cited in the text}, and the caption counts a row by what that column
+leads with, so such a keep is neither one of the other hits nor, when
+a copy of it lends a version note, a duplicate.
+A table exported without the option has no such sentence, and so is
+byte for byte what it was.
+
+
 <<review imports>>=
 from collections import Counter
 <<review report generation>>=
@@ -17531,14 +18943,20 @@ def build_audit_table_latex(
     theme_names: dict[str, str] | None = None,
     bearing_only: bool = False,
     truncate_titles: bool = False,
+    cited_works: Collection[tuple[str, str]] | None = None,
 ) -> list[str]:
-    """Build the audit longtable as LaTeX lines."""
+    """Build the audit longtable as LaTeX lines.
+
+    With `cited_works` (`--cited-from`) the text decides what is cited,
+    and the caption says so.
+    """
     if lang not in AUDIT_STRINGS:
         raise ValueError(f"Unsupported language: {lang}")
     strings = AUDIT_STRINGS[lang]
     rows = collect_audit_rows(
         session, theme_names=theme_names or {}, strings=strings,
         title_limit=AUDIT_TITLE_LENGTH if truncate_titles else None,
+        cited_works=cited_works,
     )
     counts = {
         order: sum(1 for r in rows if r.order == order) for order in range(7)
@@ -17547,10 +18965,13 @@ def build_audit_table_latex(
     other_rows = [
         r for r in rows if r.order == AUDIT_ORDER_OTHER and not r.excluded
     ]
+    uncited = sum(1 for r in other_rows if r.uncited)
+    other_rows = [r for r in other_rows if not r.uncited]
     criteria = Counter(r.criterion for r in other_rows if r.criterion)
     versions = sum(1 for r in other_rows if r.version and not r.criterion)
     rest = len(other_rows) - sum(criteria.values()) - versions
     databases = " ".join(filter(None, [
+        strings["cited_rule"] if cited_works is not None else "",
         audit_databases_sentence(rows, strings, session.search_records),
         audit_semantic_sentence(rows, strings, session.search_records),
         audit_dates_sentence(strings, session.search_records),
@@ -17566,11 +18987,22 @@ def build_audit_table_latex(
             session.name or session.query,
             " (no row bears on the claim)" if bearing_only else "",
         )
+    nonlatin_rows = sum(1 for r in rows if r.nonlatin_title)
+    if nonlatin_rows:
+        logger.warning(
+            "audit table for %s: %d row(s) have a title without Latin "
+            "letters, printed as %s under pdfLaTeX; the row shows the "
+            "paper id too",
+            session.name or session.query, nonlatin_rows,
+            strings["nonlatin"],
+        )
     extra = ""
     if counts[AUDIT_ORDER_PENDING]:
         extra += strings["extra_pending"].format(
             pending=counts[AUDIT_ORDER_PENDING]
         )
+    if uncited:
+        extra += strings["extra_uncited"].format(uncited=uncited)
     if versions:
         extra += strings["extra_other"].format(other=versions)
     for criterion, count in sorted(
@@ -17623,7 +19055,8 @@ def build_audit_table_latex(
     for row in rows:
         providers = ", ".join(row.providers)
         lines.append(
-            f"{row.title} & {row.year} & {providers} & {row.reason} \\\\"
+            f"{latex_row_cell(row.title)} & {row.year} & {providers} & "
+            f"{row.reason} \\\\"
         )
     lines.extend([r"\end{longtable}", r"\endgroup"])
     return lines
@@ -17646,18 +19079,20 @@ def generate_audit_table(
     theme_names: dict[str, str] | None = None,
     bearing_only: bool = False,
     truncate_titles: bool = False,
+    cited_works: Collection[tuple[str, str]] | None = None,
 ) -> None:
     """Write the audit table for `session` as a LaTeX fragment."""
     body = build_audit_table_latex(
         session, label=label, lang=lang, track=track,
         theme_names=theme_names, bearing_only=bearing_only,
-        truncate_titles=truncate_titles,
+        truncate_titles=truncate_titles, cited_works=cited_works,
     )
     lines = latex_fragment(
         body,
         packages=AUDIT_TABLE_PACKAGES,
         generator="scholar sessions export -f table",
         comments=[f"Session: {session.name or session.query}"],
+        nonlatin_marker=AUDIT_STRINGS[lang]["nonlatin"],
     )
     output_path.write_text("\n".join(lines) + "\n")
 @
@@ -17827,6 +19262,188 @@ class TestAuditCaptionOtherRows:
     text = "\n".join(build_audit_table_latex(session, label="x"))
     assert r"1 excluded by the criterion before\_2000)" in text
     assert "duplicates" not in text
+@
+
+\subsection{Compiling text in other scripts}
+\label{sec:non-latin-compile}
+
+The safety of [[\scholarnonlatin]] under pdf\LaTeX{} rests on a claim
+about \TeX{}: that UTF-8 characters in an argument the macro discards
+are never executed (\cref{sec:non-latin-text}). A string comparison
+cannot test that, so these tests compile real output with the issue's
+title: the standalone report, and the report and audit-table fragments
+included in a minimal host with pdf\LaTeX{} and T1, the setting of the
+decks and books. The fixture also carries what broke real tables: a
+quoted query (OT1 has no [[\textquotedbl]]), a title that starts with
+an opening bracket, a letter T1 cannot set, a subscript and a
+ligature. A third test includes the audit table in a Xe\LaTeX{} and
+in a Lua\LaTeX{} host with a font that has Cyrillic and checks,
+through [[pdftotext]], that the title is printed and not the marker;
+one run per engine, since each engine has its own line in the
+definition.
+
+These tests run external programs and take seconds rather than
+milliseconds, so they carry the [[latex]] marker (registered in
+[[pyproject.toml]]), and [[-m "not latex"]] leaves them out. They skip
+themselves when [[latexmk]], [[biber]], the engine or [[pdftotext]] is
+not installed, and the Xe\LaTeX{} one when the TeX tree has no DejaVu
+Serif. [[latexmk]] runs non-interactively, so an error ends the run
+instead of waiting at \TeX's prompt.
+
+<<test functions>>=
+import shutil
+import subprocess
+
+
+def _missing_tools(*tools):
+  return [tool for tool in tools if shutil.which(tool) is None]
+
+
+def _compile(directory, main, engine="-pdf"):
+  """Compile `main` with latexmk; return (succeeded, log, text)."""
+  run = subprocess.run(
+    ["latexmk", engine, "-interaction=nonstopmode", "-halt-on-error",
+     main],
+    cwd=directory, capture_output=True, text=True, timeout=300,
+  )
+  stem = Path(main).stem
+  log_path = directory / f"{stem}.log"
+  log = log_path.read_text(errors="replace") if log_path.exists() else ""
+  text = ""
+  if run.returncode == 0:
+    text = subprocess.run(
+      ["pdftotext", f"{stem}.pdf", "-"], cwd=directory,
+      capture_output=True, text=True, check=True,
+    ).stdout
+  return run.returncode == 0, log, text
+
+
+def _nonlatin_session():
+  session = ReviewSession(
+    query='"federated authentication" AND cli', providers=["openalex"],
+    timestamp=datetime(2026, 11, 19), name="nonlatin",
+  )
+  session.decisions = [
+    ReviewDecision(
+      paper=Paper(title=ISSUE_220_TITLE, authors=["A. Author"],
+                  year=2018, doi="10.25682/niisi.2018.6.0011"),
+      provider="openalex", status=DecisionStatus.KEPT, tags=["ml"],
+    ),
+    ReviewDecision(
+      paper=Paper(title="A Latin title", authors=["B. Writer"], year=2020),
+      provider="openalex", status=DecisionStatus.KEPT, tags=["ml"],
+    ),
+    ReviewDecision(
+      paper=Paper(title="[conference paper] Bracketed", authors=["C. D"],
+                  year=2021),
+      provider="openalex", status=DecisionStatus.KEPT, tags=["ml"],
+    ),
+    ReviewDecision(
+      paper=Paper(title="CO\u2082 Work\ufb02ow in \u2113 x\u207b\u00b9",
+                  authors=["I. J"], year=2023),
+      provider="openalex", status=DecisionStatus.KEPT, tags=["ml"],
+    ),
+    ReviewDecision(  # sorts before the bracket, so a row break precedes it
+      paper=Paper(title="2021 overview", authors=["G. H"], year=2021),
+      provider="openalex", status=DecisionStatus.KEPT, tags=["ml"],
+    ),
+    ReviewDecision(
+      paper=Paper(title="Locus 6q23 A\u0138 and \u0126al", authors=["E. F"],
+                  year=2022),
+      provider="openalex", status=DecisionStatus.KEPT, tags=["ml"],
+    ),
+  ]
+  return session
+
+
+T1_HOST = "\n".join([
+  r"\documentclass{article}",
+  r"\usepackage[T1]{fontenc}",
+  r"\usepackage[utf8]{inputenc}",
+  *[p for p in LATEX_PACKAGES if "inputenc" not in p],
+  r"\addbibresource{report.bib}",
+  r"\begin{document}",
+  r"\input{table}",
+  r"\input{report}",
+  r"\end{document}",
+])
+
+XELATEX_HOST = "\n".join([
+  r"\documentclass{article}",
+  r"\usepackage{fontspec}",
+  r"\setmainfont{DejaVuSerif}[Extension=.ttf]",
+  *AUDIT_TABLE_PACKAGES,
+  r"\begin{document}",
+  r"\input{table}",
+  r"\end{document}",
+])
+
+
+@pytest.mark.latex
+class TestNonLatinCompiles:
+  """Output with text in other scripts compiles (#220)."""
+
+  def test_standalone_report_compiles_with_pdflatex(self, tmp_path):
+    missing = _missing_tools("latexmk", "pdflatex", "biber", "pdftotext")
+    if missing:
+      pytest.skip(f"not installed: {', '.join(missing)}")
+    generate_latex_report(_nonlatin_session(), tmp_path / "report.tex")
+    ok, log, text = _compile(tmp_path, "report.tex")
+    assert ok, log[-3000:]
+    assert "[non-Latin text]" in text
+    assert "A Latin title" in text
+    assert "federated authentication" in text
+    assert "CO2 Workflow in" in " ".join(text.split())
+
+  def test_fragments_compile_in_a_t1_host(self, tmp_path):
+    missing = _missing_tools("latexmk", "pdflatex", "biber", "pdftotext")
+    if missing:
+      pytest.skip(f"not installed: {', '.join(missing)}")
+    session = _nonlatin_session()
+    generate_latex_report(session, tmp_path / "report.tex", standalone=False)
+    generate_audit_table(session, tmp_path / "table.tex", label="x")
+    (tmp_path / "host.tex").write_text(T1_HOST)
+    ok, log, text = _compile(tmp_path, "host.tex")
+    assert ok, log[-3000:]
+    assert "[non-Latin text]" in text
+    assert "doi:10.25682/niisi.2018.6.0011" in text
+    assert "[conference paper] Bracketed" in text
+    assert "CO2 Workflow in" in " ".join(text.split())
+
+  def test_t1_ranges_match_the_encoding_files(self):
+    """T1_UNSET_RANGES is what the installed .dfu files leave out."""
+    if _missing_tools("kpsewhich"):
+      pytest.skip("not installed: kpsewhich")
+    declared = set()
+    for name in ["t1enc.dfu", "ts1enc.dfu", "omsenc.dfu", "utf8enc.dfu"]:
+      path = subprocess.run(["kpsewhich", name], capture_output=True,
+                            text=True).stdout.strip()
+      if not path:
+        pytest.skip(f"{name} is not in the TeX tree")
+      text = Path(path).read_text(encoding="latin-1")
+      declared |= {int(code, 16) for code in re.findall(
+        r"DeclareUnicodeCharacter\{([0-9A-Fa-f]+)\}", text)}
+    unset = {code for code in range(0x80, LATEX_LATIN_CUTOFF + 1)
+             if any(low <= code <= high for low, high in T1_UNSET_RANGES)}
+    assert unset == set(range(0x80, LATEX_LATIN_CUTOFF + 1)) - declared
+
+  @pytest.mark.parametrize("engine", ["xelatex", "lualatex"])
+  def test_unicode_engines_print_the_text(self, tmp_path, engine):
+    missing = _missing_tools("latexmk", engine, "kpsewhich", "pdftotext")
+    if missing:
+      pytest.skip(f"not installed: {', '.join(missing)}")
+    font = subprocess.run(
+      ["kpsewhich", "DejaVuSerif.ttf"], capture_output=True, text=True,
+    ).stdout.strip()
+    if not font:
+      pytest.skip("DejaVu Serif is not in the TeX tree")
+    generate_audit_table(_nonlatin_session(), tmp_path / "table.tex",
+                         label="x")
+    (tmp_path / "host.tex").write_text(XELATEX_HOST)
+    ok, log, text = _compile(tmp_path, "host.tex", engine=f"-{engine}")
+    assert ok, log[-3000:]
+    assert CYRILLIC_PHRASE in " ".join(text.split())
+    assert "[non-Latin text]" not in text
 @
 
 \subsection{Checking a semantic search against sessions}
@@ -18084,20 +19701,35 @@ def _session_matches(
     ]
 
 
-def match_work(
+def matching_entries(
     paper: Paper, index: dict[str, list[tuple[str, ReviewDecision, str]]]
-) -> list[SessionMatch]:
-    """Look `paper` up in a `session_match_index`."""
+) -> list[tuple[str, ReviewDecision, str]]:
+    """The `session_match_index` entries that `paper` matches.
+
+    A DOI match stands; a title match only if `plausibly_same_work`.
+    """
     keys = [_identity_key(paper), _work_index_key(paper),
             _title_index_key(paper)]
     keys += version_link_dois(paper)
-    entries = [
+    return [
         entry for key in keys if key for entry in index.get(key, [])
         if entry[2] == CHECK_BY_DOI
         or plausibly_same_work(paper, entry[1].paper)
     ]
-    return _session_matches(entries)
+
+
+def match_work(
+    paper: Paper, index: dict[str, list[tuple[str, ReviewDecision, str]]]
+) -> list[SessionMatch]:
+    """Look `paper` up in a `session_match_index`."""
+    return _session_matches(matching_entries(paper, index))
 @
+
+The lookup is split in two, [[matching_entries]] and
+[[match_work]], because the audit table asks the same question of a
+bibliography (\cref{sec:audit-cited-entries}) and needs the decisions
+themselves, where the check needs only how each session classified
+them.
 
 \paragraph{Known studies.}
 A check is often run because one study is known to be relevant---the
@@ -18422,6 +20054,427 @@ class TestCheckAuthorlessMatch:
     assert guards._matched_by(found, held) == ["title"]
 @
 
+\subsection{Works the text cites}
+\label{sec:audit-cited-entries}
+
+[[sessions export --cited-from refs.bib]] lets the text decide which
+rows of the audit table are cited (\cref{sec:audit-cited-from}).  The
+command reads each bibliography entry into a [[Paper]]
+(\cref{sec:export-cited-from} in the CLI chapter); this subsection
+finds the entry's work among the session's decisions and tells the
+author where
+the text and the screening disagree.
+
+\paragraph{Finding an entry's work.}
+A bibliography entry is a work returned from outside the session, the
+same question the semantic check asks of a search
+(\cref{sec:semantic-check}), so it is answered by the same lookup,
+[[matching_entries]] over a [[session_match_index]] of the one
+session.  An entry matches by DOI, the decisions' version-link DOIs
+included, so a text citing the published version finds the preprint
+the session adopted in its place; otherwise by title and first author,
+[[audit_work_key]], and then only if [[plausibly_same_work]] lets the
+match stand: two DOIs that differ without a version link, or years
+more than one apart, are two works.  A third matcher would have been
+easy to write and would have drifted from the check: the same entry
+could then be \enquote{in the session} for one command and not for
+the other.
+
+A matched decision names its row by its [[audit_work_key]], the key
+[[collect_audit_rows]] merges copies on, so every copy of the work is
+told that the text cites it, and the row is the one the screening's
+best copy gives (\cref{sec:audit-row-copy}): a human's discard of the
+work still represents its row, and is then the disagreement listed
+below.  One entry can name more than one row, when the session holds
+copies of the work whose titles differ and that the audit table
+therefore does not merge; each of them is cited.  [[matched_by]] says
+how the entry was found, [[doi]] if any of its matches was by DOI,
+since that is the stronger evidence, which is what the export's count
+of DOI and title matches reports.
+
+An entry may be read in more than one way, and then it matches what
+any of its readings matches.  The case that needs it is a surname of
+several words.  [[audit_work_key]] reads the surname of
+[[Natacha Muriel Lopez Gallucci]] as its last word, [[Gallucci]], and
+that of [[Lopez Gallucci, Natacha Muriel]] as what precedes the comma,
+[[Lopez Gallucci]], so a session that stored one form does not match an
+entry read in the other.  The command therefore passes the entry
+given name first and, when that names another surname, surname first
+(\cref{sec:export-cited-from} in the CLI chapter).  This was not
+hypothetical: a bibliography exported from a real session missed two
+of its own 1\,041 works on exactly this, both stored surname first.
+
+<<review report generation>>=
+@dataclass
+class CitedEntry:
+    """A bibliography entry the text cites, and the works it matched."""
+
+    key: str
+    title: str
+    matched_by: str | None
+    works: list[tuple[str, str]]
+
+
+def match_cited_entries(
+    entries: Sequence[tuple[str, Sequence[Paper]]], session: ReviewSession,
+) -> list[CitedEntry]:
+    """Find the session's works that the bibliography `entries` cite.
+
+    `entries` are `(key, readings)` pairs, `readings` one or more papers
+    read from the same entry.  Each `CitedEntry` lists the
+    `audit_work_key`s of the decisions a reading matches, by DOI
+    (version links included) or by title and first author.
+    """
+    index = session_match_index([session])
+    cited = []
+    for key, readings in entries:
+        paper = readings[0]
+        found = [
+            entry for reading in readings
+            for entry in matching_entries(reading, index)
+        ]
+        if any(entry[2] == CHECK_BY_DOI for entry in found):
+            matched_by = CHECK_BY_DOI
+        else:
+            matched_by = found[0][2] if found else None
+        works = list(dict.fromkeys(
+            audit_work_key(entry[1].paper) for entry in found
+        ))
+        cited.append(CitedEntry(key, paper.title or "", matched_by, works))
+    return cited
+@
+
+\paragraph{Where the text and the screening disagree.}
+Two kinds of entry need the author's attention, and the table alone
+does not show either clearly enough.  The text may cite a work whose
+row the session excludes, whatever the reason: the row then carries
+the note \enquote{cited in the text}, but in a table of a thousand rows
+a note is easily missed, and the author should decide whether the
+exclusion or the citation is wrong.  And the text may cite a work the
+session does not hold at all: it has no row, so the table cannot show
+it.  [[cited_text_disagreements]] returns both lists, from the same
+rows the table is built from; the command prints them on standard
+error.  They are not counted in the caption, which counts only what
+the table shows.
+
+<<review report generation>>=
+def cited_text_disagreements(
+    session: ReviewSession,
+    entries: Sequence[CitedEntry],
+    *,
+    theme_names: dict[str, str],
+    strings: dict,
+) -> tuple[list[CitedEntry], list[CitedEntry]]:
+    """Split off the cited entries the session excludes or lacks.
+
+    Returns `(excluded, not_held)`: entries one of whose rows is
+    discarded, and entries that matched no decision.
+    """
+    rows = collect_audit_rows(
+        session, theme_names=theme_names, strings=strings,
+        cited_works={work for entry in entries for work in entry.works},
+    )
+    status = {row.work: row.status for row in rows}
+    excluded = [
+        entry for entry in entries
+        if any(status.get(work) == DecisionStatus.DISCARDED
+               for work in entry.works)
+    ]
+    not_held = [entry for entry in entries if not entry.works]
+    return excluded, not_held
+@
+
+The session holds the cases of the issue and of the matching rules:
+an agent's keep of a work cited by DOI, a human's keep of a work cited
+by title, a human's keep the text does not cite, a human's discard of a
+cited work, a preprint the session adopted for a published version the
+text cites, a namesake of a cited work ten years older, and a work with
+a DOI other than the entry's.  The bibliography also cites one work the
+session does not hold.
+
+<<test functions>>=
+def _cited_session():
+  session = ReviewSession(
+    query="q", providers=["openalex"], timestamp=datetime.now(),
+    name="cited",
+  )
+  agent, human = ReviewSource.AGENT_UNREVIEWED, ReviewSource.HUMAN
+  kept, discarded = DecisionStatus.KEPT, DecisionStatus.DISCARDED
+
+  def decision(title, author, year, status, tags, source=human,
+               conf=None, **paper):
+    return ReviewDecision(
+      paper=Paper(title=title, authors=[author], year=year, **paper),
+      provider="openalex", status=status, tags=tags, source=source,
+      llm_confidence=conf,
+    )
+
+  session.decisions = [
+    decision("Agent kept", "Ann Ash", 2020, kept, ["ml"], agent, 0.8,
+             doi="10.1/agent"),
+    decision("Human kept, cited", "Bo Berg", 2021, kept, ["ml"]),
+    decision("Human kept, not cited", "Cy Cole", 2022, kept, ["ml"]),
+    decision("Human discarded", "Di Dahl", 2019, discarded,
+             ["off-topic-false-hit"], doi="10.1/disc"),
+    decision("A preprint", "Ed Ek", 2023, kept, ["supports-claim"],
+             agent, 0.9, doi="10.48550/arXiv.2301.00001",
+             published_versions=[{"doi": "10.1/pub",
+                                   "relation": "preprint-of"}]),
+    decision("Editorial", "Fy Fors", 2000, kept, ["ml"]),
+    decision("Other DOI", "Gu Gran", 2020, kept, ["ml"], doi="10.1/held"),
+  ]
+  return session
+
+
+def _cited_entries():
+  return [(key, [paper]) for key, paper in _cited_papers()]
+
+
+def _cited_papers():
+  return [
+    ("ash2020", Paper(title="Something else", authors=["Ann Ash"],
+                      year=2020, doi="https://doi.org/10.1/AGENT")),
+    ("berg2021", Paper(title="Human Kept, Cited", authors=["Berg, Bo"],
+                       year=2021)),
+    ("dahl2019", Paper(title="Human discarded", authors=["Di Dahl"],
+                       year=2019, doi="10.1/disc")),
+    ("ek2024", Paper(title="The published version", authors=["Ed Ek"],
+                     year=2024, doi="10.1/pub")),
+    ("fors2010", Paper(title="Editorial", authors=["Fy Fors"],
+                       year=2010)),
+    ("gran2020", Paper(title="Other DOI", authors=["Gu Gran"],
+                       year=2020, doi="10.1/cited")),
+  ]
+
+
+class TestMatchCitedEntries:
+  """Bibliography entries find their works as the check does (#218)."""
+
+  def test_doi_title_and_version_link_matches(self):
+    found = {e.key: e for e in match_cited_entries(
+      _cited_entries(), _cited_session()
+    )}
+    assert (found["ash2020"].matched_by, found["ash2020"].works) \
+      == ("doi", [("agentkept", "ash")])
+    assert (found["berg2021"].matched_by, found["berg2021"].works) \
+      == ("title+author", [("humankeptcited", "berg")])
+    assert (found["ek2024"].matched_by, found["ek2024"].works) \
+      == ("doi", [("apreprint", "ek")])
+
+  def test_namesakes_and_other_dois_are_not_matched(self):
+    found = {e.key: e for e in match_cited_entries(
+      _cited_entries(), _cited_session()
+    )}
+    assert (found["fors2010"].matched_by, found["fors2010"].works) \
+      == (None, [])
+    assert (found["gran2020"].matched_by, found["gran2020"].works) \
+      == (None, [])
+    near = match_cited_entries(
+      [("fors2001", [Paper(title="Editorial", authors=["Fy Fors"],
+                           year=2001)])],
+      _cited_session(),
+    )
+    assert near[0].works == [("editorial", "fors")]
+
+  def test_any_reading_of_an_entry_matches(self):
+    session = _cited_session()
+    session.decisions.append(ReviewDecision(
+      paper=Paper(title="Proust in Maceio",
+                  authors=["Lopez Gallucci, Natacha"], year=2026),
+      provider="wos", status=DecisionStatus.KEPT, tags=["ml"],
+    ))
+    readings = [
+      Paper(title="Proust in Maceio", authors=["Natacha Lopez Gallucci"],
+            year=2026),
+      Paper(title="Proust in Maceio", authors=["Lopez Gallucci, Natacha"],
+            year=2026),
+    ]
+    assert match_cited_entries([("lg", readings[:1])], session)[0].works \
+      == []
+    found = match_cited_entries([("lg", readings)], session)[0]
+    assert (found.matched_by, found.works) \
+      == ("title+author", [("proustinmaceio", "lopezgallucci")])
+
+  def test_disagreements(self):
+    session = _cited_session()
+    entries = match_cited_entries(_cited_entries(), session)
+    excluded, not_held = cited_text_disagreements(
+      session, entries, theme_names={}, strings=AUDIT_STRINGS["en"],
+    )
+    assert [e.key for e in excluded] == ["dahl2019"]
+    assert [e.key for e in not_held] == ["fors2010", "gran2020"]
+@
+
+The citation changes how a row reads, never which copy gives it.  A
+work cited by the text whose copies are a pending record and an agent's
+off-topic discard must still be represented by the discard, so the row
+reads as excluded and the export warns; ranked on the cited order, the
+pending copy (order~0) won and the disagreement went unseen.  A
+confirmed keep's row lends its notes as without the option, and the
+lent notes keep the citation: the row's reason is computed again with
+the same [[cited]].  An uncited keep is counted under its own phrase,
+not as a duplicate when a copy of it is noted as one, and the caption
+states the rule even when the text cites none of the works.  An entry
+that matches a kept row by DOI and a discarded copy by title is a
+disagreement, since one of its rows is excluded.
+
+<<test functions>>=
+class TestAuditRowsCitedFromText:
+  """Copies, notes and counts when the text decides (#218)."""
+
+  def _session(self, *decisions):
+    session = ReviewSession(
+      query="q", providers=["openalex"], timestamp=datetime.now(),
+    )
+    session.decisions = list(decisions)
+    return session
+
+  def _copy(self, status, tags, source=ReviewSource.HUMAN, conf=None,
+            doi=None, title="Recovery by Email"):
+    return ReviewDecision(
+      paper=Paper(title=title, authors=["Ada Lovelace"], year=2024,
+                  doi=doi),
+      provider="openalex", status=status, tags=tags, source=source,
+      llm_confidence=conf,
+    )
+
+  def _keep_and_duplicate(self):
+    return self._session(
+      self._copy(DecisionStatus.KEPT, ["ml"], doi="10.1/keep"),
+      self._copy(DecisionStatus.DISCARDED,
+                 ["duplicate-record-of-cited-source"]),
+    )
+
+  def test_a_pending_copy_does_not_hide_a_discard(self):
+    pending = self._copy(DecisionStatus.PENDING, [])
+    discard = self._copy(DecisionStatus.DISCARDED, ["off-topic-false-hit"],
+                         source=ReviewSource.AGENT_UNREVIEWED, conf=0.9,
+                         doi="10.1/r")
+    work = audit_work_key(pending.paper)
+    for decisions in ((pending, discard), (discard, pending)):
+      session = self._session(*decisions)
+      rows = collect_audit_rows(
+        session, theme_names={}, strings=AUDIT_STRINGS["en"],
+        cited_works={work},
+      )
+      assert (rows[0].status, rows[0].reason) == (
+        DecisionStatus.DISCARDED,
+        "other topic (false hit) (0.90) (cited in the text)",
+      )
+      excluded, _ = cited_text_disagreements(
+        session, [CitedEntry("k", "Recovery by Email", "doi", [work])],
+        theme_names={}, strings=AUDIT_STRINGS["en"],
+      )
+      assert [e.key for e in excluded] == ["k"]
+
+  def test_lent_notes_keep_the_citation(self):
+    session = self._keep_and_duplicate()
+    work = audit_work_key(session.decisions[0].paper)
+    rows = collect_audit_rows(
+      session, theme_names={}, strings=AUDIT_STRINGS["en"],
+      cited_works=set(),
+    )
+    assert rows[0].reason == "kept, not cited in the text: ml " \
+      "(duplicate record of a cited source)"
+    rows = collect_audit_rows(
+      session, theme_names={}, strings=AUDIT_STRINGS["en"],
+      cited_works={work},
+    )
+    assert rows[0].reason \
+      == r"\emph{cited}: ml (duplicate record of a cited source)"
+
+  def test_uncited_keeps_have_their_own_count(self):
+    for lang, count, rule in (
+      ("en", "0 false hits, 1 kept but not cited in the text)",
+       "A row is cited when the text cites the work"),
+      ("sv", "0 felträffar, 1 behållna men inte citerade i texten)",
+       "En rad är citerad när texten citerar verket"),
+    ):
+      text = " ".join("\n".join(build_audit_table_latex(
+        self._keep_and_duplicate(), label="x", lang=lang,
+        cited_works=set(),
+      )).split())
+      assert count in text
+      assert rule in text
+    assert "duplicates" not in text and "dubbletter" not in text
+
+  def test_an_entry_matching_a_discarded_copy_is_listed(self):
+    session = self._session(
+      self._copy(DecisionStatus.KEPT, ["ml"], doi="10.1/x", title="Alpha"),
+      self._copy(DecisionStatus.DISCARDED, ["off-topic-false-hit"],
+                 title="Alpha, extended"),
+    )
+    entries = match_cited_entries(
+      [("lovelace2024", [Paper(title="Alpha, extended",
+                               authors=["Ada Lovelace"], year=2024,
+                               doi="10.1/x")])],
+      session,
+    )
+    assert sorted(entries[0].works) \
+      == [("alpha", "lovelace"), ("alphaextended", "lovelace")]
+    excluded, not_held = cited_text_disagreements(
+      session, entries, theme_names={}, strings=AUDIT_STRINGS["en"],
+    )
+    assert ([e.key for e in excluded], not_held) == (["lovelace2024"], [])
+@
+
+The table built from those matches shows each rule of
+\cref{sec:audit-cited-from} on a row of its own: the agent's keep
+cited with its confidence, the human's uncited keep among the other
+rows, the discard with its note, and a caption whose cited count and
+rule sentence follow the text, in both languages.  Without
+[[cited_works]] the same session gives the screening's table, which has
+no rule sentence.
+
+<<test functions>>=
+class TestAuditTableCitedFromText:
+  """The audit table when the text decides what is cited (#218)."""
+
+  def _text(self, lang="en", **options):
+    session = _cited_session()
+    entries = match_cited_entries(_cited_entries(), session)
+    works = {work for entry in entries for work in entry.works}
+    return "\n".join(build_audit_table_latex(
+      session, label="x", lang=lang, cited_works=works, **options,
+    ))
+
+  def test_rows_follow_the_text(self):
+    text = self._text()
+    assert r"Agent kept & 2020 & OA & \emph{cited}: ml (0.80) \\" in text
+    assert r"Human kept, cited & 2021 & OA & \emph{cited}: ml \\" in text
+    assert "Human kept, not cited & 2022 & OA & " \
+      "kept, not cited in the text: ml" in text
+    assert "Human discarded & 2019 & OA & " \
+      "other topic (false hit) (cited in the text)" in text
+    assert r"A preprint & 2023 & OA & \emph{cited}: supports the claim " \
+      "(0.90)" in text
+
+  def test_caption_counts_and_states_the_rule(self):
+    text = " ".join(self._text().split())
+    assert "(7 unique hits: 3 cited, 0 supporting the claim" in text
+    assert "A row is cited when the text cites the work, whoever " \
+      "decided on its records. Databases:" in text
+    sv = " ".join(self._text(lang="sv").split())
+    assert "(7 unika träffar: 3 citerade" in sv
+    assert "En rad är citerad när texten citerar verket, oavsett vem " \
+      "som beslutade om dess poster." in sv
+
+  def test_bearing_only_lists_the_cited_rows(self):
+    text = self._text(bearing_only=True)
+    assert "Agent kept & 2020" in text
+    assert "Human kept, cited & 2021" in text
+    assert "Human kept, not cited" not in text
+    assert "Human discarded" not in text
+
+  def test_without_the_option_the_screening_decides(self):
+    text = " ".join("\n".join(build_audit_table_latex(
+      _cited_session(), label="x",
+    )).split())
+    assert "(7 unique hits: 4 cited," in text
+    assert "whoever decided" not in text
+    assert "in the text" not in text
+@
+
 \subsection{CSV report}
 
 The CSV carries every field the other artefacts summarise, including the
@@ -18433,6 +20486,11 @@ The review columns ([[llm_review_outcome]], [[llm_change_direction]])
 describe how a human handled a machine decision and apply to the agent's
 decisions as much as to the LLM's; their names predate the agent source,
 and [[decision_source]] says which machine it was.
+[[source_relabelled]] lists the corrections of the source
+(\cref{sec:relabel-source}) as [[from->to time]] (with
+[[by NAME]] when the record names who), separated by
+semicolons, so that a spreadsheet that counts sources can see which of
+them were set after the decision, and from what.
 
 <<review report generation>>=
 def generate_csv_report(session: ReviewSession, output_path: Path) -> None:
@@ -18450,6 +20508,8 @@ def generate_csv_report(session: ReviewSession, output_path: Path) -> None:
     - llm_review_outcome: human/unreviewed/confirmed/changed (for LLM
       and agent decisions alike; `decision_source` tells them apart)
     - llm_change_direction: kept->discarded or discarded->kept (only for changed)
+    - source_relabelled: each correction of the source, as
+      `from->to time [by NAME]`
 
     Args:
         session: The ReviewSession to report on.
@@ -18494,6 +20554,7 @@ def generate_csv_report(session: ReviewSession, output_path: Path) -> None:
                 "llm_confidence",
                 "llm_review_outcome",
                 "llm_change_direction",
+                "source_relabelled",
                 "paper_id",
             ]
         )
@@ -18521,6 +20582,11 @@ def generate_csv_report(session: ReviewSession, output_path: Path) -> None:
                     ),
                     llm_review_outcome(decision),
                     llm_change_direction(decision),
+                    "; ".join(
+                        f"{r.get('from')}->{r.get('to')} {r.get('at')}"
+                        + (f" by {r['by']}" if r.get("by") else "")
+                        for r in decision.relabelled
+                    ),
                     get_paper_id(paper),
                 ]
             )
@@ -18562,6 +20628,44 @@ class TestCsvReportAgentSource:
             "Changed": ("agent_reviewed", "changed", "discarded->kept"),
             "Confirmed": ("agent_reviewed", "confirmed", ""),
         }
+@
+
+A relabelled decision names its corrections, and the paper id stays the
+last column:
+
+<<test functions>>=
+class TestCsvReportRelabelled:
+    def test_corrections_are_listed(self, tmp_path):
+        import csv
+
+        decision = ReviewDecision(
+            paper=Paper(title="Relabelled", authors=["A"], year=2024),
+            provider="p", status=DecisionStatus.KEPT, tags=["t"],
+        )
+        relabel_source(decision, ReviewSource.LLM_UNREVIEWED,
+                       "2026-11-19T10:00:00+00:00")
+        relabel_source(decision, ReviewSource.AGENT_UNREVIEWED,
+                       "2026-11-19T11:00:00+00:00", by="the author")
+        plain = ReviewDecision(
+            paper=Paper(title="Plain", authors=["B"], year=2024),
+            provider="p", status=DecisionStatus.KEPT, tags=["t"],
+        )
+        session = ReviewSession(
+            query="q", providers=["p"], timestamp=datetime(2026, 11, 19),
+        )
+        session.decisions = [decision, plain]
+        path = tmp_path / "r.csv"
+        generate_csv_report(session, path)
+        with path.open() as f:
+            rows = list(csv.reader(f))
+        assert rows[0][-2:] == ["source_relabelled", "paper_id"]
+        records = [dict(zip(rows[0], row)) for row in rows[1:]]
+        assert records[0]["source_relabelled"] == (
+            "human->llm 2026-11-19T10:00:00+00:00; "
+            "llm->agent 2026-11-19T11:00:00+00:00 by the author"
+        )
+        assert records[0]["decision_source"] == "agent"
+        assert records[1]["source_relabelled"] == ""
 @
 
 \subsection{Testing Report Generation}
