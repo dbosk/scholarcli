@@ -1055,7 +1055,8 @@ context (#107). `review.save_session` now:
   session of query `foo` both list as "foo"), so code that lists
   sessions reads each by its path, `load_listed_session(meta)` (#221:
   `list_all_themes`, `list_papers_for_theme`,
-  `complete_session_paper_id`), never `load_session(meta["name"])`.
+  `complete_session_paper_id`), never `load_session(meta["name"])`;
+  pooled LLM sample sessions likewise by recorded file (#231).
   The loaded `_baseline` goes with `_loaded_from` (#207): an append
   that saves into another file takes `SessionBaseline.of(session)` at
   the end of `create_review_session` instead (no baseline would let
@@ -1428,6 +1429,14 @@ A human review leaves them untouched (they are the model's record).
   x* = 2 for n <= 50 else 3), because plain Wilson coverage dips near
   p = 0, where disagreement rates live. The sentence says the rate
   covers only the reviewed part while some is unreviewed.
+  `LLMSample.sessions` are labels (`session_label`: name or query);
+  since #231 `session_files` (same order, `session_file_path(s).name`,
+  saved only when present; old samples load with None) records each
+  pooled session's file. `pooled_sample_sessions(sessions, load=)`
+  (used by `--report` and the report's screening section) reads the
+  other sessions from those files (`load_listed_session`; a file gone
+  -> its papers not found), old samples by label via `load`, each file
+  once. The population digest still hashes labels (unchanged).
 - **Report.** `build_review_provenance_latex` calls
   `llm_review.build_llm_screening_latex` (one local import + call): an
   "LLM screening" section with models, prompt versions, dates, the
