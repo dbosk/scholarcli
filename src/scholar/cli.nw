@@ -510,16 +510,21 @@ def complete_providers_action(incomplete: str) -> list[str]:
 
 \paragraph{Session name completion}
 For commands that operate on saved sessions, we complete from the stored
-session names.
+session names, or, where a name would open another session or fit two,
+the session's file name, which is what such a command needs
+([[argument]] in the listing, \cref{sec:cli-session-arguments}).
 This requires dynamically loading the session list:
 
 <<completion functions>>=
 def complete_session_name(incomplete: str) -> list[str]:
-    """Provide shell completion for session names."""
+    """Complete a session argument: a name, or a file name where needed."""
     from scholar.review import list_sessions
     try:
         sessions = list_sessions()
-        return [s["name"] for s in sessions if s["name"].startswith(incomplete)]
+        return [
+            s["argument"] for s in sessions
+            if s["argument"].startswith(incomplete)
+        ]
     except Exception:
         return []
 
@@ -2890,7 +2895,7 @@ from scholar.review import load_session
 console = Console()
 enrich_fields = parse_enrich_fields(fields)
 
-session_data = load_session(session)
+session_data = open_session_argument(session)
 if session_data is None:
     console.print(f"Session not found: {escape(session)}")
     raise typer.Exit(1)
@@ -3248,7 +3253,7 @@ from rich.progress import Progress
 console = Console()
 err_console = Console(stderr=True)
 
-session_data = load_session(session)
+session_data = open_session_argument(session)
 if session_data is None:
     err_console.print(f"[red]Session not found:[/red] {escape(session)}")
     raise typer.Exit(1)
@@ -6824,6 +6829,177 @@ def test_sessions_list_warns_about_unscreened_sessions(
     assert _json.loads(result.stdout)[0]["needs_check"] is True
 @
 
+\paragraph{Session arguments.}
+\label{sec:cli-session-arguments}
+Every command that takes a saved session as an argument opens it with
+[[open_session_argument]], which applies the review module's rule
+(\cref{sec:session-arguments}): a file name ([[foo.json]]) picks that
+file, a name or query opens the one file it fits, and an argument that
+fits two files (a named session [[foo]] beside the unnamed session of
+the query [[foo]]) is refused with exit status~2 and a message naming
+both files, before anything is read or written
+(\url{https://github.com/dbosk/scholarcli/issues/237}).  The commands
+keep their own message and status for a session that is not found, so
+the helper returns [[None]] then, like [[load_session]].  It calls the
+review module's function through the module, so that tests which
+replace [[review.load_session]] by a stub still reach it.
+
+<<session error helpers>>=
+def open_session_argument(argument: str, *, strict: bool = False):
+    """Load the session a user-typed argument names, or None if none.
+
+    An argument that fits two session files is reported on stderr and
+    ends the command with exit status 2.
+    """
+    from scholar import review
+
+    try:
+        return review.load_session_argument(argument, strict=strict)
+    except review.AmbiguousSessionError as error:
+        Console(stderr=True).print(f"[red]{escape(str(error))}[/red]")
+        raise typer.Exit(2)
+@
+
+The lists that tell the user which session to act on next---[[sessions
+list]] (its JSON carries [[argument]]), the papers [[llm sample]] drew
+and the ones its [[--report]] finds not yet reviewed---give the
+argument that opens the session ([[session_argument]]): its label, or
+its file name when the label opens another file or fits two.  Shell
+completion offers the same arguments, so a namesake pair completes to
+its two file names.
+
+Let's check the commands on a named session [[foo]] beside the unnamed
+session of the query [[foo]]: each refuses the bare label with exit
+status~2, names both files and changes nothing, while each file name
+opens its own session; and on a session without a namesake, the label
+works in [[show]], [[decide]], [[export]] and [[relabel]] as before.
+
+<<test functions>>=
+class TestSessionArgumentCommands:
+  """Commands take a file name and refuse an ambiguous label (#237)."""
+
+  <<session argument command test methods>>
+
+<<session argument command test methods>>=
+def _save(self, name, query, doi):
+  from scholar.review import (
+    DecisionStatus, ReviewDecision, ReviewSession, ReviewSource,
+    save_session,
+  )
+
+  session = ReviewSession(
+    query=query, providers=["p"], timestamp=datetime(2026, 11, 19),
+    name=name,
+  )
+  session.decisions.append(ReviewDecision(
+    paper=Paper(title=f"T {doi}", authors=["A"], doi=doi),
+    provider="p", status=DecisionStatus.KEPT, tags=["ml"],
+    source=ReviewSource.LLM_UNREVIEWED, llm_confidence=0.9,
+  ))
+  return save_session(session)
+
+def _pair(self, tmp_path, monkeypatch):
+  monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+  return (self._save("foo", "bar", "10.1/named"),
+          self._save(None, "foo", "10.1/unnamed"))
+
+@pytest.mark.parametrize("args", [
+  ["sessions", "show", "foo"],
+  ["sessions", "export", "foo", "-f", "csv"],
+  ["sessions", "decide", "foo", "--keep", "--doi", "10.1/named",
+   "--source", "human"],
+  ["sessions", "relabel", "foo", "--from", "llm", "--to", "agent", "--all"],
+  ["sessions", "reconcile", "foo"],
+  ["llm", "status", "foo"],
+  ["llm", "sample", "foo", "--report"],
+  ["verify", "foo"],
+  ["enrich", "foo"],
+  ["sessions", "resume", "foo"],
+  ["sessions", "check", "foo", "-s", "a question"],
+  ["llm", "classify", "foo"],
+  ["llm", "context", "foo", "a context"],
+  ["llm", "synthesize", "foo"],
+])
+def test_an_ambiguous_label_is_refused(
+  self, tmp_path, monkeypatch, args
+):
+  named, unnamed = self._pair(tmp_path, monkeypatch)
+  before = (named.read_bytes(), unnamed.read_bytes())
+  monkeypatch.chdir(tmp_path)
+  result = runner.invoke(app, args)
+  assert result.exit_code == 2, result.output
+  flat = " ".join(result.output.split())
+  assert "Session 'foo' is ambiguous" in flat
+  assert f"foo.json or {unnamed.name}" in flat
+  assert (named.read_bytes(), unnamed.read_bytes()) == before
+
+def test_file_names_open_each(self, tmp_path, monkeypatch):
+  import json
+
+  named, unnamed = self._pair(tmp_path, monkeypatch)
+  for argument, query in (("foo.json", "bar"), (unnamed.name, "foo")):
+    result = runner.invoke(
+      app, ["sessions", "show", argument, "-f", "json"]
+    )
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output)["query"] == query
+  result = runner.invoke(app, [
+    "sessions", "decide", unnamed.name, "--discard", "--doi",
+    "10.1/unnamed", "--tag", "off-topic", "--source", "human",
+  ])
+  assert result.exit_code == 0, result.output
+  assert json.loads(unnamed.read_text())["decisions"][0]["status"] \
+    == "discarded"
+  assert json.loads(named.read_text())["decisions"][0]["status"] == "kept"
+
+def test_a_label_without_namesake_works_as_before(
+  self, tmp_path, monkeypatch
+):
+  monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+  monkeypatch.chdir(tmp_path)
+  self._save("solo", "q", "10.1/solo")
+  for args in (
+    ["sessions", "show", "solo"],
+    ["sessions", "export", "solo", "-f", "csv", "-o", "out"],
+    ["sessions", "relabel", "solo", "--from", "llm", "--to", "agent",
+     "--all"],
+    ["sessions", "decide", "solo", "--keep", "--doi", "10.1/solo",
+     "--source", "human"],
+  ):
+    result = runner.invoke(app, args)
+    assert result.exit_code == 0, (args, result.output)
+  self._save(None, "unnamed query", "10.1/q")
+  assert runner.invoke(
+    app, ["sessions", "show", "unnamed query"]
+  ).exit_code == 0
+
+def test_lists_name_the_file_when_the_label_is_ambiguous(
+  self, tmp_path, monkeypatch
+):
+  import json
+
+  named, unnamed = self._pair(tmp_path, monkeypatch)
+  self._save("x", "x", "10.1/x")
+  drawn = runner.invoke(app, [
+    "llm", "sample", "x", unnamed.name, "--kept", "-n", "2",
+    "--seed", "1",
+  ])
+  assert drawn.exit_code == 0, drawn.output
+  assert f"  {unnamed.name}  doi:10.1/unnamed" in drawn.output
+  assert "  x  doi:10.1/x" in drawn.output
+  report = runner.invoke(app, ["llm", "sample", "x", "--report"])
+  assert f"not yet reviewed: {unnamed.name}  doi:10.1/unnamed" \
+    in report.output
+  assert "not yet reviewed: x  doi:10.1/x" in report.output
+  listed = json.loads(
+    runner.invoke(app, ["sessions", "list", "-f", "json"]).output
+  )
+  assert {s["argument"] for s in listed} == {"foo.json", unnamed.name, "x"}
+  assert set(complete_session_name("")) == {
+    "foo.json", unnamed.name, "x",
+  }
+@
+
 \paragraph{The [[sessions show]] command}
 
 The [[sessions show]] command displays detailed information about a specific
@@ -6993,7 +7169,7 @@ def sessions_show(
     from scholar.review import foldable_copies
 
     console = Console()
-    session = load_session(name)
+    session = open_session_argument(name)
 
     if session is None:
         console.print(f"[red]Session not found: {escape(name)}[/red]")
@@ -7303,7 +7479,7 @@ def sessions_export(
     <<refuse [[--cited-from]] without the audit table>>
 
     console = Console()
-    session = load_session(name)
+    session = open_session_argument(name)
 
     if session is None:
         console.print(f"[red]Session not found: {escape(name)}[/red]")
@@ -8258,7 +8434,7 @@ def sessions_resume(
     from scholar.tui import PaperReviewApp, prompt_for_report
 
     console = Console()
-    session = load_session(name)
+    session = open_session_argument(name)
 
     if session is None:
         console.print(f"[red]Session not found: {escape(name)}[/red]")
@@ -8463,7 +8639,7 @@ def sessions_decide(
     console = Console()
     <<validate decide options>>
 
-    session = load_session(name)
+    session = open_session_argument(name)
     if session is None:
         console.print(f"[red]Session not found: {escape(name)}[/red]")
         raise typer.Exit(1)
@@ -9876,7 +10052,7 @@ def sessions_relabel(
     console = Console()
     <<validate relabel options>>
     try:
-        session = load_session(name, strict=True)
+        session = open_session_argument(name, strict=True)
     except SessionFileError as error:
         exit_on_unreadable_session(error)
     if session is None:
@@ -10284,11 +10460,16 @@ def sessions_reconcile(
     equal decisions become one; copies decided differently are left for
     `sessions show` to list. Notes move to the folded entry's id.
     """
-    from scholar.review import SessionFileError, reconcile_session
+    from scholar.review import (
+        AmbiguousSessionError, SessionFileError, reconcile_session,
+    )
 
     console = Console()
     try:
         folds = reconcile_session(name, dry_run=dry_run)
+    except AmbiguousSessionError as error:
+        Console(stderr=True).print(f"[red]{escape(str(error))}[/red]")
+        raise typer.Exit(2)
     except FileNotFoundError:
         console.print(f"[red]Session not found: {escape(name)}[/red]")
         raise typer.Exit(1)
@@ -10579,7 +10760,7 @@ from scholar.review import load_session, SessionFileError
 sessions = []
 for session_name in names:
     try:
-        loaded = load_session(session_name, strict=True)
+        loaded = open_session_argument(session_name, strict=True)
     except SessionFileError as error:
         err.print(f"[red]{escape(str(error))}[/red]")
         raise typer.Exit(1)
@@ -12288,7 +12469,7 @@ def llm_classify(
     )
 
     console = Console()
-    session = review.load_session(session_name)
+    session = open_session_argument(session_name)
 
     if session is None:
         console.print(f"[red]Session not found: {escape(session_name)}[/red]")
@@ -12370,7 +12551,7 @@ def llm_status(
     from scholar.llm_review import get_review_statistics
 
     console = Console()
-    session = load_session(session_name)
+    session = open_session_argument(session_name)
 
     if session is None:
         console.print(f"[red]Session not found: {escape(session_name)}[/red]")
@@ -12430,7 +12611,7 @@ def llm_context(
     from scholar.review import load_session, save_session
 
     console = Console()
-    session = load_session(session_name)
+    session = open_session_argument(session_name)
 
     if session is None:
         console.print(f"[red]Session not found: {escape(session_name)}[/red]")
@@ -12868,7 +13049,7 @@ def llm_synthesize(
     )
 
     console = Console()
-    session = review.load_session(session_name)
+    session = open_session_argument(session_name)
 
     if session is None:
         console.print(f"[red]Session not found: {escape(session_name)}[/red]")
@@ -13216,7 +13397,7 @@ def llm_sample(
 <<load the sessions to sample>>=
 sessions = []
 for name in session_names:
-    session = load_session(name)
+    session = open_session_argument(name)
     if session is None:
         console.print(f"[red]Session not found: {escape(name)}[/red]")
         raise typer.Exit(1)
@@ -13258,7 +13439,13 @@ console.print(
     f"[green]Sample {escape(draw.sample_id)}: drew {len(draw.drawn)} of "
     f"{draw.population} eligible decisions[/green]"
 )
+from scholar.review import session_argument
+
+held_by = {id(d): s for s in sessions for d in s.decisions}
 for name, decision in draw.drawn:
+    session_of = held_by.get(id(decision))
+    if session_of is not None:
+        name = session_argument(session_of)
     console.print(
         f"  {escape(name)}  {escape(get_paper_id(decision.paper))}  "
         f"{decision.status.value}  {escape(decision.paper.title)}"

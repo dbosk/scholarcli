@@ -1008,6 +1008,26 @@ next save (checked under 528d933).
 Together these let scripted/agent-driven systematic reviews produce the same
 session record and `sessions export` audit trail as TUI reviews.
 
+### Session Arguments
+
+Every command that takes a saved session (`sessions show/export/decide/
+relabel/resume/reconcile/check`, `llm classify/status/context/
+synthesize/sample`, `enrich`, `verify`) opens it with
+`cli.open_session_argument` → `review.load_session_argument` →
+`resolve_session_argument` (#237, review.nw `sec:session-arguments`):
+an argument ending in `.json` names that file in the sessions dir (base
+name only); any argument is also tried as `<arg>.json` and as its
+query's hash file. More than one existing file → `AmbiguousSessionError`
+(message names each file and what it holds, `describe_session_file`)
+→ exit 2, nothing read or written. One file → the same file as the old
+`load_session` lookup (labels still go through `load_session`, so
+stubs of it keep working). `session_argument(session)` /
+`session_argument_for(label, path)` give what to type: the label, or
+the file name when the label opens another file or fits two; used by
+`list_sessions` (`argument` key), shell completion, `llm sample`'s drawn
+list and `--report`'s "not yet reviewed" list (`SampleReport.unreviewed`
+holds arguments). Never call `load_session` on a user-typed argument.
+
 ### Session Integrity
 
 Commands that load a session and save it much later (`scholar enrich`,

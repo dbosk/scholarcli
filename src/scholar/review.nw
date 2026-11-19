@@ -6102,15 +6102,19 @@ def reconcile_session(
     Runs under the session file's lock: loads the file, folds, saves,
     and then moves the notes of the folded copies to their new ids.
     With `dry_run`, lists the folds without writing anything. Returns
-    the `(old id, new id)` of each fold (to be) made.
+    the `(old id, new id)` of each fold (to be) made. `name` is a
+    session argument (`resolve_session_argument`).
+
+    Raises:
+        AmbiguousSessionError: `name` fits more than one session file.
     """
-    session = load_session(name, strict=True)
+    session = load_session_argument(name, strict=True)
     if session is None:
         raise FileNotFoundError(f"Session not found: {name}")
     if dry_run:
         return reconcile_copies(session)
     with file_lock(session_file_path(session)):
-        session = load_session(name, strict=True)
+        session = read_session_file(session_file_path(session))
         folds = reconcile_copies(session)
         if folds:
             save_session(session)
@@ -11235,6 +11239,239 @@ class TestBuiltBaselineRecordKeys:
         assert ("foo", "openalex", None) in self._records(path)
 @
 
+\paragraph{Session arguments typed by the user.}
+\label{sec:session-arguments}
+Every command that works on a saved session ([[sessions show]],
+[[decide]], [[export]], [[relabel]], [[llm classify]], [[enrich]], and
+the others) takes the session as an argument the user typed, and that
+argument used to go straight to [[load_session]], which tries
+[[<arg>.json]] and then the file of the query's hash.  An argument can
+fit two files: the named session [[foo]] lives in [[foo.json]], the
+unnamed session of the query [[foo]] in the hash file, and
+[[load_session("foo")]] opens [[foo.json]] whenever it exists.  The
+unnamed session could not be addressed at all, and a list that named
+it by its label (\enquote{foo}) sent the user to the other file
+(\url{https://github.com/dbosk/scholarcli/issues/237}).  The appends,
+listings and pooled samples were freed of the lookup earlier (issues
+\#213, \#221 and \#231); the commands' arguments are what remains.
+
+[[resolve_session_argument]] is the one rule for those arguments.
+\begin{description}
+\item[A file name.]  An argument ending in [[.json]] names a file in the
+  sessions directory, so [[foo.json]] and [[2c26….json]] each pick
+  their file.  Only the base name is used, as for the files a sample
+  records (\cref{sec:llm-sample-record}): an argument must not reach a
+  file outside the sessions directory.
+\item[A label.]  Otherwise the argument is a session's name or query,
+  tried as before: [[<arg>.json]], then the query's hash file.
+\item[Never a silent choice.]  Every file the argument can mean is
+  looked at, and when more than one exists the argument is refused
+  with [[AmbiguousSessionError]], whose message names each file, says
+  what it holds (the stored name, or the query of an unnamed session)
+  and how to pick it.  The commands turn it into exit status~2, the
+  status of a usage error: the command was not wrong about the
+  session, only unclear.
+\end{description}
+An argument that fits one file opens the same file as before, so every
+session that has no namesake (on the user's machine, all of them in
+November 2026) works exactly as it did.  A query that is too long to be
+a file name makes [[exists]] raise [[OSError]]; such a file cannot
+exist, so the error reads as absent, as in [[load_own_session]].
+
+<<review session functions>>=
+class AmbiguousSessionError(ValueError):
+    """A session argument fits more than one session file."""
+
+    def __init__(self, argument: str, paths: list[Path]):
+        self.argument = argument
+        self.paths = paths
+        described = " and ".join(
+            f"{path.name} ({describe_session_file(path)})" for path in paths
+        )
+        choices = " or ".join(path.name for path in paths)
+        super().__init__(
+            f"Session {argument!r} is ambiguous: it fits {described}. "
+            f"Give the file name to pick one: {choices}."
+        )
+
+
+def describe_session_file(path: Path) -> str:
+    """Say what a session file holds: its stored name or unnamed query."""
+    stored = _stored_identity(path)
+    if stored is None:
+        return "unreadable"
+    name, query = stored
+    if name:
+        return f"session {name!r}"
+    return f"unnamed session of query {query!r}"
+
+
+def _session_file_exists(path: Path) -> bool:
+    try:
+        return path.exists()
+    except (OSError, ValueError):
+        return False
+
+
+def resolve_session_argument(argument: str) -> Path | None:
+    """Return the session file a user-typed argument names, or None.
+
+    `foo.json` names that file in the sessions directory (base name
+    only); any argument is also tried as a session name (`<arg>.json`)
+    and as a query (its hash file).
+
+    Raises:
+        AmbiguousSessionError: More than one of those files exists.
+    """
+    sessions_dir = _get_sessions_dir()
+    candidates = []
+    if argument.endswith(".json"):
+        candidates.append(sessions_dir / Path(argument).name)
+    candidates.append(sessions_dir / f"{argument}.json")
+    candidates.append(sessions_dir / f"{get_query_hash(argument)}.json")
+    found = list(dict.fromkeys(
+        path for path in candidates if _session_file_exists(path)
+    ))
+    if len(found) > 1:
+        raise AmbiguousSessionError(argument, found)
+    return found[0] if found else None
+@
+
+Loading by argument resolves it first, so that an ambiguous argument
+is refused before anything is read.  A file argument is then read
+directly; a label still goes through [[load_session]], which opens the
+same file by the old lookup now that it is known to fit only one (and
+which tests of the commands replace by a stub taking only the
+argument, so [[strict]] is passed only when set).
+
+<<review session functions>>=
+def load_session_argument(
+    argument: str, *, strict: bool = False
+) -> ReviewSession | None:
+    """Load the session a user-typed argument names (`resolve_session_argument`).
+
+    Returns None when no file fits; `strict` as for `load_session`.
+
+    Raises:
+        AmbiguousSessionError: The argument fits more than one file.
+    """
+    path = resolve_session_argument(argument)
+    if path is None or path.name != Path(argument).name:
+        if strict:
+            return load_session(argument, strict=True)
+        return load_session(argument)
+    try:
+        return read_session_file(path)
+    except SessionFileError as error:
+        if strict:
+            raise
+        logger.warning("%s", error)
+        return None
+@
+
+A list that tells the user which session to act on next must give an
+argument that opens that session.  The label (name, else query) does so
+unless the session has a namesake or sits in a file its label does not
+lead to (a copy, \cref{sec:session-own-file}); then the file name is
+the argument.  [[session_argument_for]] gives it for a label and a
+file, [[session_argument]] for a loaded session.  A session that has no
+file yet is named by its label, since there is nothing to tell apart.
+
+<<review session functions>>=
+def session_argument_for(label: str, path: Path) -> str:
+    """The argument that opens the session file `path` labelled `label`."""
+    if not _session_file_exists(path):
+        return label
+    try:
+        resolved = resolve_session_argument(label)
+    except AmbiguousSessionError:
+        resolved = None
+    if resolved is not None and resolved.resolve() == path.resolve():
+        return label
+    return path.name
+
+
+def session_argument(session: ReviewSession) -> str:
+    """The argument that opens `session`: its label, else its file name."""
+    return session_argument_for(
+        session.name or session.query, session_file_path(session)
+    )
+@
+
+Let's check the rule on a named session [[foo]] beside the unnamed
+session of the query [[foo]]: the label is refused naming both files,
+each file name picks its file, and each session's argument is its file
+name.  Alone, either session is still found by its label, and its
+argument is that label.
+
+<<test functions>>=
+class TestSessionArguments:
+    """Session arguments are files or labels, never a silent pick (#237)."""
+
+    <<session argument test methods>>
+
+<<session argument test methods>>=
+def _save(self, name, query):
+    session = ReviewSession(
+        query=query, providers=["p"], timestamp=datetime(2026, 11, 19),
+        name=name,
+    )
+    return save_session(session)
+
+def test_a_namesake_pair_is_refused_naming_both(self, tmp_path, monkeypatch):
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+    named = self._save("foo", "bar")
+    unnamed = self._save(None, "foo")
+    with pytest.raises(AmbiguousSessionError) as caught:
+        resolve_session_argument("foo")
+    message = str(caught.value)
+    assert f"foo.json (session 'foo')" in message
+    assert f"{unnamed.name} (unnamed session of query 'foo')" in message
+    assert f"foo.json or {unnamed.name}" in message
+    assert caught.value.paths == [named, unnamed]
+    with pytest.raises(AmbiguousSessionError):
+        load_session_argument("foo")
+
+def test_file_names_pick_each(self, tmp_path, monkeypatch):
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+    named = self._save("foo", "bar")
+    unnamed = self._save(None, "foo")
+    assert resolve_session_argument("foo.json") == named
+    assert resolve_session_argument(unnamed.name) == unnamed
+    assert resolve_session_argument("../elsewhere/foo.json") == named
+    assert load_session_argument("foo.json").query == "bar"
+    loaded = load_session_argument(unnamed.name)
+    assert (loaded.name, loaded.query) == (None, "foo")
+    assert session_argument(loaded) == unnamed.name
+    assert session_argument(load_session_argument("foo.json")) == "foo.json"
+    assert resolve_session_argument("missing.json") is None
+
+def test_alone_each_is_found_by_its_label(self, tmp_path, monkeypatch):
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path / "a"))
+    named = self._save("foo", "bar")
+    assert resolve_session_argument("foo") == named
+    assert load_session_argument("foo").query == "bar"
+    assert session_argument(load_session_argument("foo")) == "foo"
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path / "b"))
+    unnamed = self._save(None, "foo")
+    assert resolve_session_argument("foo") == unnamed
+    assert session_argument(load_session_argument("foo")) == "foo"
+    assert resolve_session_argument("missing") is None
+    assert load_session_argument("missing") is None
+    assert resolve_session_argument("x" * 400) is None
+
+def test_listing_carries_the_argument(self, tmp_path, monkeypatch):
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+    self._save("alone", "q")
+    named = self._save("foo", "bar")
+    unnamed = self._save(None, "foo")
+    arguments = {s["path"].name: s["argument"] for s in list_sessions()}
+    assert arguments == {
+        "alone.json": "alone", "foo.json": "foo.json",
+        unnamed.name: unnamed.name,
+    }
+@
+
 \subsubsection{Persisting Query-Provider Pairs}
 
 Query-provider pairs are serialized to JSON along with the rest of the session
@@ -11560,7 +11797,10 @@ a warning instead of being left out silently: a session that quietly
 disappears from the list is a loss nobody notices.
 It also flags a file whose name is not the one its stored name maps to
 ([[name_mismatch]], \cref{sec:session-own-file}): the list shows the
-stored name, and that name opens another file, or none.
+stored name, and that name opens another file, or none.  And it says
+what to type to open each session ([[argument]],
+\cref{sec:session-arguments}): the name, or the file name when the
+name would open another file or fit two.
 
 <<review session functions>>=
 def list_sessions() -> list[dict[str, Any]]:
@@ -11584,6 +11824,9 @@ def list_sessions() -> list[dict[str, Any]]:
           decisions and no research context (unscreened, or reset)
         - name_mismatch: True if the file's name is not the one the
           stored name (or, unnamed, the query) maps to
+        - argument: What to type to open the session: the name, or the
+          file name when the name opens another file or fits two
+          (`session_argument_for`)
     """
     sessions_dir = _get_sessions_dir()
     logger.debug("Listing sessions from %s", sessions_dir)
@@ -11610,8 +11853,9 @@ def list_sessions() -> list[dict[str, Any]]:
                        or data.get("query_provider_pairs") or [])
             context = (data.get("research_context") or "").strip()
 
+            label = data.get("name") or data.get("query")
             sessions.append({
-                "name": data.get("name") or data.get("query"),
+                "name": label,
                 "query": data.get("query"),
                 "timestamp": timestamp,
                 "kept": kept,
@@ -11623,6 +11867,7 @@ def list_sessions() -> list[dict[str, Any]]:
                 "name_mismatch": session_file.name != own_session_file_name(
                     data.get("name"), data.get("query")
                 ),
+                "argument": session_argument_for(label or "", session_file),
             })
         except (json.JSONDecodeError, OSError) as e:
             logger.warning("Cannot read session file %s: %s", session_file, e)
