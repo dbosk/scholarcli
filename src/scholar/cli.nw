@@ -7820,6 +7820,15 @@ def sessions_decide(
                  "made or reviewed (refused otherwise).",
         ),
     ] = False,
+    all_copies: Annotated[
+        bool,
+        typer.Option(
+            "--all-copies",
+            help="Decide every copy of a work the session holds twice "
+                 "under one id (or DOI), decided apart (refused "
+                 "otherwise).",
+        ),
+    ] = False,
 ) -> None:
     """
     Record keep/discard decisions in a saved session, without the TUI.
@@ -7846,6 +7855,11 @@ def sessions_decide(
     clears the confidence (pass -c again), and a human untag of an
     unreviewed agent or LLM decision counts as reviewing it.
 
+    An id or DOI selects every decision under it. A session can hold a
+    work twice under one id, decided apart (`sessions show` lists such
+    copies); deciding them is refused (exit 2) unless --all-copies is
+    given, which gives every copy this decision.
+
     Examples:
         scholar sessions decide my-review --source human --keep \\
             --doi 10.1145/3568813 --tag misconceptions
@@ -7853,8 +7867,9 @@ def sessions_decide(
             --doi 10.1145/3568813 --tag off-topic-false-hit -c 0.9
     """
     from scholar.review import (
-        AUDIT_CATEGORIES, DecisionStatus, ReviewSource, clear_machine_audit,
-        load_session, save_session, tags_after_decision,
+        AUDIT_CATEGORIES, CopyConflict, DecisionStatus, ReviewSource,
+        clear_machine_audit, copy_conflict_line, load_session,
+        same_id_pairs, save_session, tags_after_decision,
     )
     from scholar.llm_review import mark_as_reviewed
 
@@ -7867,6 +7882,7 @@ def sessions_decide(
         raise typer.Exit(1)
 
     <<select decisions by doi and paper id>>
+    <<refuse to decide copies decided apart>>
     <<refuse to let a machine replace a human decision>>
 
     status = DecisionStatus.KEPT if keep else DecisionStatus.DISCARDED
@@ -8099,39 +8115,178 @@ if confidence is not None and source not in MACHINE_DECISION_SOURCES:
     )
 @
 
-Selection collects matches into a dict keyed by paper id, which both
-deduplicates (the same paper may be named by DOI \emph{and} id) and gives a
-stable count for the summary.  Unmatched selectors are gathered rather than
-failing fast so one run reports \emph{all} typos:
+Selection collects matches into a dict keyed by the decision object,
+which both deduplicates (the same paper may be named by DOI \emph{and}
+id) and gives a stable count for the summary.  A DOI or an id selects
+every decision under it: a session can hold one work twice under one id
+(\cref{sec:session-copies} in the review module), and a lookup of one
+decision per id reached only the last of them
+(\url{https://github.com/dbosk/scholarcli/issues/228}).  Unmatched
+selectors are gathered rather than failing fast so one run reports
+\emph{all} typos:
 
 <<select decisions by doi and paper id>>=
-by_doi = {
-    d.paper.doi.strip().lower(): d
-    for d in session.decisions
-    if d.paper.doi
-}
-by_id = {d.paper.id: d for d in session.decisions}
+by_doi: dict[str, list] = {}
+by_id: dict[str, list] = {}
+for d in session.decisions:
+    if d.paper.doi:
+        by_doi.setdefault(d.paper.doi.strip().lower(), []).append(d)
+    by_id.setdefault(d.paper.id, []).append(d)
 
 selected = {}
 missing = []
 for value in doi or []:
-    decision = by_doi.get(value.strip().lower())
-    if decision is None:
+    matches = by_doi.get(value.strip().lower())
+    if not matches:
         missing.append(f"DOI {value}")
-    else:
-        selected[decision.paper.id] = decision
+    for decision in matches or []:
+        selected[id(decision)] = decision
 for value in paper_id or []:
-    decision = by_id.get(value)
-    if decision is None:
+    matches = by_id.get(value)
+    if not matches:
         missing.append(f"paper id {value}")
-    else:
-        selected[decision.paper.id] = decision
+    for decision in matches or []:
+        selected[id(decision)] = decision
 
 if missing:
     for entry in missing:
         console.print(f"[red]Not in session: {escape(entry)}[/red]")
     console.print("[yellow]No changes saved.[/yellow]")
     raise typer.Exit(1)
+@
+
+Selecting every copy raises the question what a decision does to two
+copies decided apart, one discarded and one kept, say.  Giving both the
+new decision settles the disagreement that the copy lists show, but
+also erases it: whoever named the id need not know there were two
+copies, a script or an agent least of all, and the other copy's verdict
+and motivation would be gone without a word.  So a batch that selects
+such copies ([[same_id_pairs]], the pairs the lists show as conflicting
+or alike) is refused, unsaved, with exit code 2 and each pair named as
+the lists name it, like the refusal of a machine decision over a human
+one below.  [[--all-copies]] says that the decision is meant for every
+copy, which is how a user who has seen the pair settles it.  Copies
+that already agree, or a pending copy beside a decided one, have no
+disagreement to lose and are decided together without the flag.
+
+<<refuse to decide copies decided apart>>=
+if not all_copies:
+    apart = [
+        pair for pair in same_id_pairs(session)
+        if any(id(d) in selected for d in pair)
+    ]
+    for pair in apart:
+        console.print(
+            f"[red]{escape(copy_conflict_line(CopyConflict(list(pair))))}"
+            "[/red]",
+            soft_wrap=True,
+        )
+    if apart:
+        console.print(
+            "[red]These copies of one work are decided apart; pass "
+            "--all-copies to give every copy this decision.[/red]\n"
+            "[yellow]No changes saved.[/yellow]"
+        )
+        raise typer.Exit(2)
+@
+
+Let's verify it on a session holding a work twice under one id, decided
+apart, as the copy lists show it
+(\url{https://github.com/dbosk/scholarcli/issues/228}): a decision by
+that id is refused, with both copies named and nothing saved, unless
+[[--all-copies]] says the decision is for every copy; two copies that
+agree are both decided without it; and a DOI selects every copy of its
+DOI the same way.
+
+<<test functions>>=
+class TestSessionsDecideSameIdCopies:
+    """`sessions decide` on an id that names several decisions."""
+
+    def _make_session(self, tmp_path, monkeypatch, second, doi=None):
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        from scholar.review import (
+            DecisionStatus, ReviewDecision, ReviewSession, save_session,
+        )
+        from scholar.scholar import isolated_registry
+
+        with isolated_registry():
+            session = ReviewSession(
+                query="q", providers=["mock"],
+                timestamp=datetime(2026, 11, 19, 12, 0), name="pair",
+            )
+            session.decisions = [
+                ReviewDecision(
+                    paper=Paper(title="A Study", authors=["Ada Lovelace"],
+                                year=2014, doi=doi),
+                    provider="openalex", status=DecisionStatus.DISCARDED,
+                    tags=["off-topic"],
+                ),
+                ReviewDecision(
+                    paper=Paper(title="A Study", authors=["A. Lovelace"],
+                                year=2014, doi=doi),
+                    provider="scopus", status=second[0], tags=second[1],
+                ),
+            ]
+            save_session(session)
+            return session.decisions[0].paper.id
+
+    @staticmethod
+    def _states():
+        from scholar.review import load_session
+        from scholar.scholar import isolated_registry
+
+        with isolated_registry():
+            return [(d.status.value, d.tags)
+                    for d in load_session("pair").decisions]
+
+    @staticmethod
+    def _decide(*args):
+        return runner.invoke(app, [
+            "sessions", "decide", "pair", "--source", "human", "--keep",
+            "--tag", "ml", *args,
+        ])
+
+    def test_copies_decided_apart_are_refused(self, tmp_path, monkeypatch):
+        from scholar.review import DecisionStatus
+
+        paper_id = self._make_session(
+            tmp_path, monkeypatch, (DecisionStatus.KEPT, ["theme"]))
+        before = self._states()
+        result = self._decide("--paper-id", paper_id)
+        assert result.exit_code == 2, result.output
+        assert "discarded (openalex) [off-topic]" in result.output
+        assert "kept (scopus) [theme]" in result.output
+        assert self._states() == before
+
+    def test_all_copies_decides_every_copy(self, tmp_path, monkeypatch):
+        from scholar.review import DecisionStatus
+
+        paper_id = self._make_session(
+            tmp_path, monkeypatch, (DecisionStatus.KEPT, ["theme"]))
+        result = self._decide("--paper-id", paper_id, "--all-copies")
+        assert result.exit_code == 0, result.output
+        assert self._states() == [
+            ("kept", ["off-topic", "ml"]), ("kept", ["theme", "ml"])]
+
+    def test_copies_that_agree_are_both_decided(self, tmp_path, monkeypatch):
+        from scholar.review import DecisionStatus
+
+        paper_id = self._make_session(
+            tmp_path, monkeypatch, (DecisionStatus.DISCARDED, ["off-topic"]))
+        result = self._decide("--paper-id", paper_id)
+        assert result.exit_code == 0, result.output
+        assert self._states() == [("kept", ["off-topic", "ml"])] * 2
+
+    def test_a_doi_selects_every_copy(self, tmp_path, monkeypatch):
+        from scholar.review import DecisionStatus
+
+        self._make_session(tmp_path, monkeypatch,
+                           (DecisionStatus.KEPT, ["theme"]), doi="10.1/pair")
+        assert self._decide("--doi", "10.1/PAIR").exit_code == 2
+        result = self._decide("--doi", "10.1/PAIR", "--all-copies")
+        assert result.exit_code == 0, result.output
+        assert self._states() == [
+            ("kept", ["off-topic", "ml"]), ("kept", ["theme", "ml"])]
 @
 
 Let's verify the loop closes headlessly: decisions land in the saved
