@@ -784,7 +784,16 @@ saved only when non-empty, unioned by the concurrent merge), which
 `scholar search -n <name>` persists the search to the named review session
 even without `--review`: it creates or appends (same
 `create_review_session()` merge the TUI uses — search records accumulate,
-prior decisions are preserved, new papers land pending). The save
+prior decisions are preserved, new papers land pending). A paper the
+re-run returns again keeps its stored paper, gaps filled from the new
+copy (`stored_paper_with` → `Paper.merge_with`, stored values win,
+sources united; a DOI-less stored paper takes the new DOI first), and
+the decision is kept whole (`dataclasses.replace`) with
+`united_providers(old, new)` as provider. Before #192 (since Jan 2026)
+the decision was rebuilt around the returned copy: an S2 bulk append
+emptied ~1280 abstracts and set sources/provider to s2. Tests of this
+path need `isolated_registry()` between runs, else `Paper.from_dict`
+returns the held object and hides the loss. The save
 confirmation goes to stderr so `-f json`/`-f bibtex` stdout stays pure.
 `scholar sessions decide <name> --keep|--discard --doi ...|--paper-id ...
 --tag ...` records decisions non-interactively; discarding requires a tag

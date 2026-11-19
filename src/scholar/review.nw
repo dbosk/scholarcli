@@ -3754,9 +3754,125 @@ elif previous_decisions:
 
 For papers in the current search results, we merge with any existing decision
 data.
-If the paper was previously reviewed, we preserve the decision status, tags,
-and LLM metadata while using the fresh paper data from the search (which may
-have updated abstracts or other fields from enrichment).
+If the paper was previously reviewed, the decision is kept whole and its
+stored paper is kept too, with its gaps filled from the copy the search
+returned ([[stored_paper_with]]); the decision's provider gains the
+search's provider ([[united_providers]]).
+Until November 2026 the decision was instead rebuilt around the
+returned copy, as \enquote{fresh paper data}
+(\url{https://github.com/dbosk/scholarcli/issues/192}).  That copy is
+only what one provider returned this time: Semantic Scholar's bulk
+search returns many works without an abstract, so adding it to a
+session emptied about 1280 stored abstracts that earlier providers and
+enrichment had supplied, set their sources to [[s2]] alone, and named
+[[s2]] as the only provider.  Screening criteria such as
+\enquote{no abstract} then judged records that had had one.  The stored
+paper is what the review saw; a re-run may add to it, never take away.
+[[merge_with]] is the rule the duplicate branch below already uses:
+the stored value wins where both have one, the other copy fills what is
+missing, sources are united and the higher citation count is kept.  A
+paper that gained a DOI since it was stored (the previous decision is
+found under its legacy hash id) gets that DOI first, so the two are
+equal.  Rebuilding also lost every decision field the constructor call
+did not list; [[replace]] keeps them all.
+
+<<review session functions>>=
+def stored_paper_with(stored: Paper, returned: Paper) -> Paper:
+    """The stored paper, its gaps filled from a copy a search returned.
+
+    Stored values win; see `Paper.merge_with`.  A stored paper without
+    a DOI takes the returned copy's DOI first.
+    """
+    if not stored.doi and returned.doi:
+        stored = replace(stored, doi=returned.doi)
+    try:
+        return stored.merge_with(returned)
+    except ValueError:
+        return stored
+@
+
+The case comes from the real session: an abstract and enrichment from
+OpenAlex, then a Semantic Scholar bulk copy without them.  Each run gets
+its own paper registry, as two command-line runs would: in one process
+the registry hands [[Paper.from_dict]] the object already held, which
+hid the loss from a test that saved and reloaded in one registry.  The
+DOI-less stored entry stays beside the new DOI copy, as every append
+leaves such copies for [[sessions reconcile]] (\cref{sec:session-copies}).
+
+<<test functions>>=
+class TestAppendKeepsStoredPaper:
+    """A re-run adds to the stored paper, never replaces it (#192)."""
+
+    DOI = "10.1109/ipdps.2014.73"
+
+    def _save_first_run(self, paper):
+        from scholar.scholar import isolated_registry
+        with isolated_registry():
+            session = ReviewSession(
+                query="q1", providers=["openalex"],
+                timestamp=datetime.now(), name="append-192",
+            )
+            session.decisions = [ReviewDecision(
+                paper=paper, provider="openalex",
+                status=DecisionStatus.DISCARDED, tags=["off-topic"],
+                source=ReviewSource.HUMAN,
+            )]
+            save_session(session)
+
+    def _rerun(self, returned):
+        from scholar.scholar import SearchResult, isolated_registry
+        result = SearchResult(
+            query="a AND b", provider="s2", timestamp=datetime.now(),
+            papers=[returned], limit=10,
+        )
+        with isolated_registry():
+            session = create_review_session([result], "a AND b",
+                                            "append-192")
+            save_session(session)
+        with isolated_registry():
+            return load_session("append-192").decisions
+
+    def test_s2_copy_keeps_abstract_and_sources(self):
+        self._save_first_run(Paper(
+            title="A Study", authors=["Ada Lovelace"], year=2014,
+            doi=self.DOI, abstract="x" * 1141, sources=["openalex"],
+            keywords=["hpc"], pdf_url="https://example.org/a.pdf",
+            updated_by=[],
+        ))
+        decisions = self._rerun(Paper(
+            title="A Study", authors=["Ada Lovelace"], year=2014,
+            doi=self.DOI, abstract=None, sources=["s2"],
+            citation_count=7,
+        ))
+        assert len(decisions) == 1
+        decision = decisions[0]
+        paper = decision.paper
+        assert len(paper.abstract) == 1141
+        assert paper.sources == ["openalex", "s2"]
+        assert paper.keywords == ["hpc"]
+        assert paper.pdf_url == "https://example.org/a.pdf"
+        assert paper.updated_by == []
+        assert paper.citation_count == 7
+        assert decision.provider == "openalex, s2"
+        assert decision.status == DecisionStatus.DISCARDED
+        assert decision.tags == ["off-topic"]
+        assert decision.source == ReviewSource.HUMAN
+
+    def test_paper_that_gained_a_doi_keeps_its_abstract(self):
+        self._save_first_run(Paper(
+            title="A Study", authors=["Ada Lovelace"], year=2014,
+            abstract="stored abstract", sources=["dblp"],
+        ))
+        decisions = self._rerun(Paper(
+            title="A Study", authors=["Ada Lovelace"], year=2014,
+            doi=self.DOI, sources=["s2"],
+        ))
+        with_doi = [d for d in decisions if d.paper.doi == self.DOI]
+        assert len(with_doi) == 1
+        assert with_doi[0].paper.abstract == "stored abstract"
+        assert with_doi[0].paper.sources == ["dblp", "s2"]
+        assert with_doi[0].status == DecisionStatus.DISCARDED
+@
 
 Since a paper can appear in multiple providers, we also deduplicate within the
 current result set.
@@ -4033,16 +4149,11 @@ for result in results:
             decision_lookup[paper_id] = prev_dec
             continue
         if prev_dec:
-            # Use previous decision but with fresh paper data
-            decision = ReviewDecision(
-                paper=paper,  # Fresh paper data from search
-                provider=found_by_provider,
-                status=prev_dec.status,
-                tags=prev_dec.tags,
-                source=prev_dec.source,
-                is_example=prev_dec.is_example,
-                llm_confidence=prev_dec.llm_confidence,
-                **llm_audit_of(prev_dec),
+            decision = replace(
+                prev_dec,
+                paper=stored_paper_with(prev_dec.paper, paper),
+                provider=united_providers(prev_dec.provider,
+                                          found_by_provider),
                 found_by=list(prev_dec.found_by),
                 same_id_copies=list(prev_dec.same_id_copies),
             )
