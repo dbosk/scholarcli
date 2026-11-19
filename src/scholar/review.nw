@@ -646,8 +646,8 @@ class ReviewDecision:
             work (`{"year", "venue", "provider"}` each); see
             `is_same_id_namesake`.
         relabelled: Each time the source was corrected without changing
-            the decision (`{"from", "to", "at", "note"}`), oldest first;
-            see `relabel_source`.
+            the decision (`{"from", "to", "at", "note", "by",
+            "is_example"}`), oldest first; see `relabel_source`.
     """
     paper: Paper
     provider: str
@@ -673,9 +673,14 @@ class ReviewDecision:
             self.relabelled = []
 
     def add_relabel(self, record: dict) -> None:
-        """Note a correction of the source (`relabel_source`), once."""
+        """Note a correction of the source (`relabel_source`), once.
+
+        The records stay in the order of their `at` times; records of
+        the same time keep the order they were added in.
+        """
         if record not in self.relabelled:
             self.relabelled.append(record)
+            self.relabelled.sort(key=lambda r: str(r.get("at") or ""))
 
     def add_same_id_copy(self, copy: dict) -> None:
         """Note another work returned under this paper's id, once."""
@@ -1049,7 +1054,8 @@ the decision: it clears the classifier's record
 ([[clear_machine_audit]], \cref{sec:review-source}) and the confidence,
 which are exactly what an audit of those rows would read.  So a
 correction of the source is an operation of its own,
-[[relabel_source]], which changes the source and nothing else.
+[[relabel_source]], which changes the source and leaves the decision
+as it is.
 
 Which sources may it give?  Only the unreviewed ones, [[agent]] and
 [[llm]].  The three others each say that a human decided or confirmed
@@ -1078,20 +1084,34 @@ reason the source may not stay what it was: a relabel that changes
 nothing would only add a misleading record.
 
 Everything else stays as it is: status, tags, confidence, the
-classifier's fields, [[found_by]], the provider, and [[is_example]].
-The flag is left alone even though it was set because a human (or the
-agent, as a human) corrected the machine: the classifier draws its
-examples only from confirmed sources ([[CONFIRMED_SOURCES]] in the LLM
-review module), so a relabelled correction stops being an example
-without the flag being touched, and the flag still says that the
-decision differs from what the machine first proposed.
+classifier's fields, [[found_by]] and the provider.  The one exception
+is [[is_example]], which means \enquote{a human changed the machine's
+verdict}: [[mark_as_reviewed]] sets it when a reviewer's decision
+differs from the machine's, and every place that records a fresh
+machine decision clears it ([[apply_llm_decisions]], a machine
+[[sessions decide]]).  On a relabelled decision the flag would be
+wrong.  The decision is an unreviewed machine decision again, so no
+human has changed anything; yet the flag would count it as a training
+example in [[llm status]], in [[ReviewSession.example_papers]] and in
+the TUI's examples filter, sort it ahead of confirmed examples when
+unreviewed ones are let in ([[--include-llm-examples]]), and, once a
+human confirms the row unchanged, make [[machine_review_rows]] and the
+CSV report the agreement as a change.  So the relabel clears the flag
+and keeps its old value in the record, where an auditor can still see
+that a reviewer, human or not, once changed the machine's call.
 
 Each relabel is recorded on the decision, in [[relabelled]], as
-[[{"from", "to", "at", "note"}]]: the source before and after, the UTC
-time and the caller's note, if any.  It is a list because a source can
-be corrected more than once, and each correction is an event an
-auditor may need to see; nothing ever removes one.  The time is taken
-from [[_utcnow]], the module's clock seam (\cref{sec:session-integrity}).
+[[{"from", "to", "at", "note", "by", "is_example"}]]: the source before
+and after, the UTC time, the caller's note, the caller's name for who
+made or asked for the correction (both [[None]] when not given;
+Scholar does not guess a user name), and the [[is_example]] flag the
+decision had before.  It is a list because a source can be corrected
+more than once, and each correction is an event an auditor may need to
+see; nothing ever removes one.  The list is kept in time order, so that
+records united from two processes (below) still read oldest first;
+records of the same time keep the order they were added in.  The time
+is taken from [[_utcnow]], the module's clock seam
+(\cref{sec:session-integrity}).
 
 <<review data structures>>=
 RELABEL_TARGETS: tuple[ReviewSource, ...] = tuple(
@@ -1104,13 +1124,16 @@ def relabel_source(
     target: ReviewSource,
     at: str,
     note: str | None = None,
+    by: str | None = None,
 ) -> dict:
-    """Set the source of `decision` to `target`, changing nothing else.
+    """Set the source of `decision` to `target`, keeping the decision.
 
     Only the unreviewed sources (`RELABEL_TARGETS`) can be given, since
     the others claim a human's confirmation, and only to a decided paper
-    whose source differs. The change is recorded in
-    `decision.relabelled` as `{"from", "to", "at", "note"}` and returned.
+    whose source differs. `is_example` is cleared, since no human has
+    changed the now unreviewed decision. The change is recorded in
+    `decision.relabelled` as `{"from", "to", "at", "note", "by",
+    "is_example"}` (the old flag) and returned.
 
     Raises:
         ValueError: For any other target, a pending paper, or a target
@@ -1127,9 +1150,11 @@ def relabel_source(
         raise ValueError(f"the source is already {target.value}")
     record = {
         "from": decision.source.value, "to": target.value,
-        "at": at, "note": note,
+        "at": at, "note": note, "by": by,
+        "is_example": decision.is_example,
     }
     decision.source = target
+    decision.is_example = False
     decision.add_relabel(record)
     return record
 @
@@ -1163,7 +1188,8 @@ the key under commit 528d933); the source itself survives, since
 [[agent]] and [[llm]] are known to every version since
 issue~\#162.
 
-Let's check that a relabel changes the source and nothing else, that
+Let's check that a relabel changes the source and leaves the
+decision as it is (the example flag moves into the record), that
 it refuses every target that claims a human's confirmation, and that
 the record survives a save, a load, an append and a concurrent save.
 
@@ -1194,16 +1220,55 @@ def test_only_the_source_changes(self):
     decision = self._reviewed_llm_call()
     before = asdict(decision)
     record = relabel_source(
-        decision, ReviewSource.AGENT_UNREVIEWED, self.AT, note="by agent",
+        decision, ReviewSource.AGENT_UNREVIEWED, self.AT, note="why",
+        by="the author",
     )
     assert decision.source is ReviewSource.AGENT_UNREVIEWED
     assert record == {"from": "llm_reviewed", "to": "agent",
-                      "at": self.AT, "note": "by agent"}
+                      "at": self.AT, "note": "why", "by": "the author",
+                      "is_example": True}
     assert decision.relabelled == [record]
+    assert decision.is_example is False
     after = asdict(decision)
-    for name in ("source", "relabelled"):
+    for name in ("source", "relabelled", "is_example"):
         del before[name], after[name]
     assert after == before
+
+def test_a_relabelled_correction_is_no_example(self):
+    from scholar.llm_review import (
+        get_example_decisions, get_review_statistics, mark_as_reviewed,
+    )
+
+    session = ReviewSession(
+        query="q", providers=["openalex"], timestamp=datetime(2026, 11, 19),
+    )
+    relabelled = self._reviewed_llm_call()
+    human = ReviewDecision(
+        paper=Paper(title="Human", authors=["H"], doi="10.5555/human"),
+        provider="openalex", status=DecisionStatus.DISCARDED,
+        tags=["off-topic-false-hit"],
+    )
+    session.decisions = [relabelled, human]
+    relabel_source(relabelled, ReviewSource.AGENT_UNREVIEWED, self.AT)
+    assert session.example_papers() == [human]
+    assert get_review_statistics(session)["examples"] == 0
+    assert session.llm_review_statistics()["examples"] == 1
+    _, discarded = get_example_decisions(session, include_unreviewed=True)
+    assert discarded == [human, relabelled]
+    mark_as_reviewed(relabelled, user_agrees=True)
+    assert relabelled.source is ReviewSource.AGENT_REVIEWED
+    assert relabelled.is_example is False
+    rows = dict(machine_review_rows(session.decisions))
+    assert (rows["Agent confirmed"], rows["Agent changed"]) == (1, 0)
+
+def test_records_are_kept_in_time_order(self):
+    decision = self._reviewed_llm_call()
+    late = {"from": "llm", "to": "agent", "at": "2026-11-19T12:00:00+00:00"}
+    early = {"from": "human", "to": "llm", "at": "2026-11-19T09:00:00+00:00"}
+    tie = {"from": "agent", "to": "llm", "at": "2026-11-19T12:00:00+00:00"}
+    for record in (late, early, tie, early):
+        decision.add_relabel(record)
+    assert decision.relabelled == [early, late, tie]
 
 def test_targets_are_the_unreviewed_sources(self):
     assert set(RELABEL_TARGETS) == {
@@ -1262,7 +1327,7 @@ def test_saved_only_when_non_empty(self, tmp_path, monkeypatch):
     save_session(session)
     assert json.loads(path.read_text())["decisions"][0]["relabelled"] == [
         {"from": "llm_reviewed", "to": "agent", "at": self.AT,
-         "note": None},
+         "note": None, "by": None, "is_example": True},
     ]
     loaded = load_session("relabel-file").decisions[0]
     assert loaded.source is ReviewSource.AGENT_UNREVIEWED
@@ -1307,14 +1372,14 @@ def test_concurrent_relabels_are_united(self, tmp_path, monkeypatch):
     save_session(self._session("relabel-both"))
     first, second = load_session("relabel-both"), load_session("relabel-both")
     relabel_source(first.decisions[0], ReviewSource.AGENT_UNREVIEWED,
-                   self.AT)
+                   "2026-11-19T09:00:00+00:00")
     save_session(first)
     relabel_source(second.decisions[0], ReviewSource.LLM_UNREVIEWED,
                    self.AT, note="second")
     save_session(second)
     decision = load_session("relabel-both").decisions[0]
     assert decision.source is ReviewSource.LLM_UNREVIEWED
-    assert [r["to"] for r in decision.relabelled] == ["llm", "agent"]
+    assert [r["to"] for r in decision.relabelled] == ["agent", "llm"]
 @
 
 
@@ -17659,7 +17724,8 @@ describe how a human handled a machine decision and apply to the agent's
 decisions as much as to the LLM's; their names predate the agent source,
 and [[decision_source]] says which machine it was.
 [[source_relabelled]] lists the corrections of the source
-(\cref{sec:relabel-source}) as [[from->to time]], separated by
+(\cref{sec:relabel-source}) as [[from->to time]] (with
+[[by NAME]] when the record names who), separated by
 semicolons, so that a spreadsheet that counts sources can see which of
 them were set after the decision, and from what.
 
@@ -17679,7 +17745,8 @@ def generate_csv_report(session: ReviewSession, output_path: Path) -> None:
     - llm_review_outcome: human/unreviewed/confirmed/changed (for LLM
       and agent decisions alike; `decision_source` tells them apart)
     - llm_change_direction: kept->discarded or discarded->kept (only for changed)
-    - source_relabelled: each correction of the source, as `from->to time`
+    - source_relabelled: each correction of the source, as
+      `from->to time [by NAME]`
 
     Args:
         session: The ReviewSession to report on.
@@ -17754,6 +17821,7 @@ def generate_csv_report(session: ReviewSession, output_path: Path) -> None:
                     llm_change_direction(decision),
                     "; ".join(
                         f"{r.get('from')}->{r.get('to')} {r.get('at')}"
+                        + (f" by {r['by']}" if r.get("by") else "")
                         for r in decision.relabelled
                     ),
                     get_paper_id(paper),
@@ -17814,7 +17882,7 @@ class TestCsvReportRelabelled:
         relabel_source(decision, ReviewSource.LLM_UNREVIEWED,
                        "2026-11-19T10:00:00+00:00")
         relabel_source(decision, ReviewSource.AGENT_UNREVIEWED,
-                       "2026-11-19T11:00:00+00:00")
+                       "2026-11-19T11:00:00+00:00", by="the author")
         plain = ReviewDecision(
             paper=Paper(title="Plain", authors=["B"], year=2024),
             provider="p", status=DecisionStatus.KEPT, tags=["t"],
@@ -17831,7 +17899,7 @@ class TestCsvReportRelabelled:
         records = [dict(zip(rows[0], row)) for row in rows[1:]]
         assert records[0]["source_relabelled"] == (
             "human->llm 2026-11-19T10:00:00+00:00; "
-            "llm->agent 2026-11-19T11:00:00+00:00"
+            "llm->agent 2026-11-19T11:00:00+00:00 by the author"
         )
         assert records[0]["decision_source"] == "agent"
         assert records[1]["source_relabelled"] == ""
