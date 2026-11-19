@@ -4071,6 +4071,7 @@ def paper_from_decision_record(record: Any) -> Paper:
 @
 
 <<restore papers not in current results>>=
+deferred_store_keys: set[str] = set()
 if prev_decision_lookup:
     # Use session data (preserves all fields)
     for paper_id, prev_dec in prev_decision_lookup.items():
@@ -4078,17 +4079,23 @@ if prev_decision_lookup:
             session.decisions.append(prev_dec)
 elif previous_decisions:
     # Fallback to notes module (older format, no LLM fields)
-    taken = store_keys_taken(results, previous_decisions)
+    deferred_store_keys = store_keys_sought(results, previous_decisions)
     for paper_id, prev in previous_decisions.decisions.items():
-        if paper_id not in current_paper_ids and paper_id not in taken:
+        if (paper_id not in current_paper_ids
+                and paper_id not in deferred_store_keys):
             session.decisions.append(restored_decision(prev))
 @
 
 A record restored this way gets the decision the record holds
 ([[decision_from_record]], \cref{sec:decision-store-fallback}), its
-paper rebuilt from the record and the record's provider, empty for a
-record that names none.  The same decision is kept when a returned
-namesake meets the record (\cref{sec:decision-store-fallback}).
+paper rebuilt from the record and the record's provider.  A record that
+names no provider gets the placeholder [[previous]], as its paper's
+sources do ([[paper_from_decision_record]]); until November 2026 the
+restore gave such a decision an empty provider, since the record's
+field defaults to an empty string and the default of [[getattr]] never
+applied.  The same decision is kept when a returned namesake meets the
+record, and for a record whose restore waits for the conversion
+(\cref{sec:decision-store-fallback}).
 
 <<review session functions>>=
 def restored_decision(record: Any) -> ReviewDecision:
@@ -4100,7 +4107,7 @@ def restored_decision(record: Any) -> ReviewDecision:
     return decision_from_record(
         record,
         paper_from_decision_record(record),
-        getattr(record, "provider", "previous"),
+        getattr(record, "provider", None) or "previous",
     )
 @
 
@@ -4476,6 +4483,7 @@ def paper_search_links(result) -> list[list[tuple[str, str, str]]]:
 @
 
 <<convert search results to decisions>>=
+used_store_keys: set[str] = set()
 decision_lookup: dict[str, ReviewDecision] = {
     get_paper_id(d.paper): d for d in session.decisions
 }
@@ -4586,9 +4594,11 @@ for result in results:
             prev_dec = prev_decision_lookup.get(legacy_id)
             if prev_dec and not plausibly_same_work(paper, prev_dec.paper):
                 prev_dec = None
-        prev_record = None
+        prev_record_key, prev_record = None, None
         if prev_dec is None:
-            _, prev_record = store_record_of(paper, previous_decisions)
+            prev_record_key, prev_record = store_record_of(
+                paper, previous_decisions
+            )
 
         if prev_dec and is_same_id_namesake(paper, prev_dec.paper):
             prev_dec.note_same_id_copy(paper, found_by_provider)
@@ -4623,6 +4633,8 @@ for result in results:
             decision.record_search(*link)
         session.decisions.append(decision)
         decision_lookup[paper_id] = decision
+
+<<restore the deferred store records no paper took>>
 @
 
 \paragraph{A paper found again in the old decision store.}
@@ -4697,6 +4709,13 @@ class TestDecisionFromRecord:
     assert source("manual").is_unknown
     assert source("manual").value == "manual"
     assert source(None) == ReviewSource.HUMAN
+
+  def test_restored_provider_matches_the_paper_sources(self):
+    from scholar.notes import ReviewDecisionRecord
+    decision = restored_decision(
+      ReviewDecisionRecord(status="kept", title="T", authors=["A"]))
+    assert decision.provider == "previous"
+    assert decision.paper.sources == ["previous"]
 @
 
 \paragraph{A namesake's record.}
@@ -4783,21 +4802,40 @@ A record under a legacy hash id that a returned paper takes over must
 not be restored as well.  Its key is not among the returned ids, so the
 restore added it beside the DOI copy that took its decision, two
 decided copies of one work
-(\url{https://github.com/dbosk/scholarcli/issues/211}).  The restore
-runs before the results are converted, so it asks the same lookup
-beforehand which keys the returned papers will take
-([[store_keys_taken]]), normalising each paper as the conversion does.
-A record under a returned paper's own id is among the returned ids
-anyway.
+(\url{https://github.com/dbosk/scholarcli/issues/211}).  But whether a
+returned paper takes the record is known only once it is converted:
+the branches before the store lookup can catch it first, when another
+decision of the session is the same work (a restored record whose
+rebuilt paper has the returned id, a published version the returned
+preprint names, an adopted preprint).  A first fix decided beforehand
+that every record the lookup would find was taken, and a record whose
+paper such a branch caught was then neither used nor restored: a
+decided record vanished.  So the restore leaves these records out only
+for now.  It asks the lookup which keys the returned papers seek
+([[store_keys_sought]], each paper normalised as the conversion does
+it, since the homonym number would change its legacy hash), the
+conversion notes each key the store branch uses, and after the
+conversion every sought key no paper used is restored as usual.
+
+A record left over this way stands as its own copy beside the decision
+that caught its paper.  Folding it into that decision would have to
+choose between two decisions of one work, which may disagree, and that
+choice is not the append's to make: the session lists such copies, and
+[[sessions reconcile]] folds those it may (\cref{sec:session-copies}),
+as for every other pair of copies an append leaves.  A record under a
+returned paper's own id, which the restore before the conversion skips
+as returned, is sought as well: it too is restored after the loop when
+an earlier branch caught its paper, rather than lost.
 
 <<review session functions>>=
-def store_keys_taken(results: list[Any], store: Any) -> set[str]:
-    """The keys of the store records that papers in `results` take over.
+def store_keys_sought(results: list[Any], store: Any) -> set[str]:
+    """The keys of the store records that papers in `results` look up.
 
-    Each paper is looked up as `create_review_session` converts it
-    (`store_record_of`).
+    Each paper is normalised and looked up as `create_review_session`
+    converts it (`store_record_of`); whether it takes the record is
+    decided by the conversion.
     """
-    taken = set()
+    sought = set()
     for result in results:
         for paper in result.papers:
             paper = without_homonym_numbers(
@@ -4805,8 +4843,13 @@ def store_keys_taken(results: list[Any], store: Any) -> set[str]:
             )
             key, _ = store_record_of(paper, store)
             if key is not None:
-                taken.add(key)
-    return taken
+                sought.add(key)
+    return sought
+<<restore the deferred store records no paper took>>=
+if previous_decisions:
+    for key, record in previous_decisions.decisions.items():
+        if key in deferred_store_keys and key not in used_store_keys:
+            session.decisions.append(restored_decision(record))
 @
 
 The namesake under its own id is the remaining case.
@@ -4825,6 +4868,7 @@ def is_record_namesake(paper: Paper, record: Any) -> bool:
         and not plausibly_same_work(paper, paper_from_decision_record(record))
     )
 <<keep the record's decision beside its namesake>>=
+used_store_keys.add(prev_record_key)
 kept = restored_decision(prev_record)
 kept.note_same_id_copy(paper, found_by_provider)
 session.decisions.append(kept)
@@ -4863,6 +4907,7 @@ def stored_paper_fills(returned: Paper, stored: Paper) -> bool:
     )
     return mergeable and plausibly_same_work(returned, stored)
 <<rebuild the decision from the old decision store>>=
+used_store_keys.add(prev_record_key)
 stored = paper_from_decision_record(prev_record)
 if stored_paper_fills(paper, stored):
     paper = stored_paper_with(stored, paper)
@@ -5108,6 +5153,94 @@ class TestDecisionStoreNamesake:
     assert [link[:2] for link in decision.found_by] == [
       ("old query", "s2")]
     assert (decision.paper.year, decision.paper.abstract) == (2014, None)
+@
+
+A record a returned paper would take over under its legacy hash id is
+restored only after the conversion, and only if no paper took it.  The
+tests hold the store record [[H]] of a work, discarded, beside a second
+record of it that reaches the returned paper first, through one of the
+branches that come before the store lookup.  In the first, a DBLP
+record from before the homonym numbers were stripped
+(\url{https://github.com/dbosk/scholar/issues/120}) is kept under the
+hash of [[Ada Lovelace 0001]], and its arXiv URL rebuilds it with the
+arXiv DOI the search returns; the returned paper merges into it
+([[existing]]).  In the second, the published version's record is kept
+under its DOI, and the search returns the preprint with the
+published DOI among its versions, as an adopted preprint has it
+([[replaced]]).  In both, [[H]] must stand beside, with its decision.
+The third test is the lookup's own normalisation: a returned paper
+whose author still carries the homonym number takes the record under
+the plain hash, and is the only decision.
+
+<<test functions>>=
+class TestDecisionStoreRecordsKept:
+  """No decided store record vanishes from a re-run."""
+
+  ARXIV = "10.48550/arXiv.1301.00001"
+  PUBLISHED = "10.1109/ipdps.2014.73"
+  HASH = legacy_hash_paper_id("A Study", ["Ada Lovelace"])
+
+  @staticmethod
+  def _store(records):
+    from scholar.notes import ReviewDecisionRecord, save_search_decisions
+    save_search_decisions("old query", {
+      key: ReviewDecisionRecord(title="A Study", year=2014, **fields)
+      for key, fields in records.items()
+    })
+
+  def _discarded(self):
+    return {"status": "discarded", "tags": ["off-topic"],
+            "authors": ["Ada Lovelace"], "provider": "openalex"}
+
+  @staticmethod
+  def _states(session):
+    return sorted((d.status.value, d.paper.doi or "", tuple(d.tags))
+                  for d in session.decisions)
+
+  def test_record_beside_a_merged_copy(self):
+    self._store({
+      self.HASH: self._discarded(),
+      legacy_hash_paper_id("A Study", ["Ada Lovelace 0001"]): {
+        "status": "kept", "tags": ["theme"],
+        "authors": ["Ada Lovelace 0001"], "provider": "dblp",
+        "url": "https://arxiv.org/abs/1301.00001"},
+    })
+    session = TestDecisionStoreNamesake._rerun(Paper(
+      title="A Study", authors=["Ada Lovelace"], year=2014,
+      doi=self.ARXIV, sources=["s2"],
+    ))
+    assert self._states(session) == [
+      ("discarded", "", ("off-topic",)),
+      ("kept", self.ARXIV, ("theme",)),
+    ]
+
+  def test_record_beside_a_replaced_version(self):
+    self._store({
+      self.HASH: self._discarded(),
+      f"doi:{self.PUBLISHED}": {
+        "status": "kept", "tags": ["theme"], "authors": ["Ada Lovelace"],
+        "provider": "openalex", "doi": self.PUBLISHED},
+    })
+    session = TestDecisionStoreNamesake._rerun(Paper(
+      title="A Study", authors=["Ada Lovelace"], year=2014,
+      doi=self.ARXIV, sources=["s2"],
+      published_versions=[{"doi": self.PUBLISHED,
+                           "relation": "preprint-of"}],
+    ))
+    assert self._states(session) == [
+      ("discarded", "", ("off-topic",)),
+      ("kept", self.ARXIV, ("theme",)),
+    ]
+
+  def test_homonym_number_is_dropped_before_the_lookup(self):
+    self._store({self.HASH: self._discarded()})
+    session = TestDecisionStoreNamesake._rerun(Paper(
+      title="A Study", authors=["Ada Lovelace 0001"], year=2014,
+      doi=self.PUBLISHED, sources=["dblp"],
+    ))
+    assert self._states(session) == [
+      ("discarded", self.PUBLISHED, ("off-topic",)),
+    ]
 @
 
 Let's verify the links against the situation of

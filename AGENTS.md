@@ -861,15 +861,22 @@ DOI-less; a derived arXiv DOI must not make a preprint's record
 another work than its published version). One that does not is
 skipped (the DOI paper is new and pending, with the links; the
 restore brings the record back under its own id, no links); one that
-does is taken over and not restored again (`store_keys_taken`, asked
-before the restore, #211). A DOI-less paper whose own-id record is
+does is taken over and not restored again (#211): the restore defers
+the keys the returned papers seek (`store_keys_sought`, papers
+normalised as in the conversion), the store branch notes the keys it
+uses (`used_store_keys`), and after the loop every deferred key not
+used is restored, so a record whose paper an earlier branch caught
+(`existing`, `replaced`, ...) stands beside as its own copy for
+`sessions reconcile`, never lost. A DOI-less paper whose own-id record is
 not plausibly its work (`is_record_namesake`; no id comparison, since
 a record can rebuild with a DOI) leaves the record's decision as the
 restore makes it (`restored_decision`, added by that branch since the
 restore skips returned ids) and is noted in its `same_id_copies`, no
 search link. A DOI paper under its own DOI is never a namesake.
 Record fields → decision: `decision_from_record` (restore too; an
-unknown source string stays an `is_unknown` pseudo-member).
+unknown source string stays an `is_unknown` pseudo-member); a record
+without a provider gets provider `previous`, like its paper's sources
+(the restore gave `""` before).
 Tests of this
 path need `isolated_registry()` between runs, else `Paper.from_dict`
 returns the held object and hides the loss. The save
