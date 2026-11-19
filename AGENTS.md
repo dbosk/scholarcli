@@ -984,7 +984,10 @@ context (#107). `review.save_session` now:
   `record_keys` and the context stay as loaded. A session that loaded
   nothing (brand new, or rebuilt from the decision store) takes the
   built state too (#214: two processes creating one session at once);
-  only sessions constructed in code have no baseline. Known gap (#213): a
+  only sessions constructed in code have no baseline. Whenever the
+  session does not continue a loaded file, the built baseline's
+  `record_keys` are empty: nothing was loaded from the target, so the
+  legacy-record rule must not drop one of our legacy records. Known gap (#213): a
   renamed id leaves the target the work twice (old id: its own
   decision; new id: the loaded file's), reported by no copy list.
 
