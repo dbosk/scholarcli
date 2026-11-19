@@ -835,9 +835,37 @@ decisions under one id whose `decision_state` differs (`same_id_pairs`,
 any id, DOI too; #215: a store re-run can leave them, see below);
 conflicting if statuses differ, else alike; same state or a pending
 copy: not listed; `sessions reconcile` never folds them (no other id to
-fold to). Not handled: `sessions decide --paper-id` selects one
-decision per id, and the next append keeps one decision per id
-(`_build_previous_decision_lookup`), so such a pair lasts until then.
+fold to). Such a pair lasts (#228): `_build_previous_decision_lookup`
+holds the *first* decision of an id (the returned paper attaches to
+it; in #208's pairs that is the copy a search reached), the other
+copies are carried through unchanged after the conversion (before it
+they would be in `decision_lookup` and catch the returned paper); the
+baseline keys decisions by occurrence when taken (`decision_keys`:
+paper id, then `id#2`, `id#3` in session order; one decision per id =
+plain ids; `decision_ids` maps key → paper id; paper states stay by
+id, the registry gives copies one `Paper`). Places move, so each
+decision carries its key (`ReviewDecision.baseline_key`, not saved,
+`compare=False`, kept by `replace`), set by `assign_baseline_keys` at
+load, after a save and for a built baseline of a session that loaded
+nothing; `base_key_of(d, base)` = that key while `decision_ids[key]`
+is still d's paper id, else the paper id (decisions made since,
+renamed ones, a fold's survivor, which so meets the DOI copy's
+baseline as before). The merge pairs via `pair_with_file` per paper
+id: first our keyed copies with a free file copy in their loaded state
+(among several: same `found_by` set, then same provider, then order),
+then the rest by order; links, notes, paper fields and
+decision changes pass only within pairs. Unpaired file copies: the
+baseline's entries of the id no copy of ours carries were loaded and
+are gone here (renamed/folded/dropped), matched by state first, then
+by order; the rest are added. `apply_tombstones(session, base,
+paired)` judges each decision under a folded id, "no longer in the
+file" = unpaired; `warn_if_decisions_dropped` uses `base_key_of`.
+`sessions decide` selects every decision of a `--doi`/`--paper-id`;
+if any selected copies are a `same_id_pairs` pair it refuses (exit 2,
+each pair named by `copy_conflict_line`, unsaved) unless
+`--all-copies`; agreeing copies or a pending copy are decided together
+without it. Its summary counts papers ("1 paper(s) marked kept (2
+decisions)").
 The report also states "Unique works" from the audit rows.
 **Remaining gap**: the
 pairing uses the exact title + surname hash, the audit work key is
