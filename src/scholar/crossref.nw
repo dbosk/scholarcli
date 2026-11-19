@@ -131,6 +131,19 @@ with a [[mailto]].  We take it from the shared [[contact_email]] resolver
 Crossref, OpenAlex, and Unpaywall alike, while a dedicated [[CROSSREF_MAILTO]]
 override is still honoured.
 
+The address is read each time a request is built ([[mailto]]), not
+kept from the constructor.  The module builds its one client when it is
+imported (\cref{sec:crossref-module-interface}), and a value read then
+stays for the life of the process, whatever the environment says
+later.  In the test suite that was the developer's own address: pytest
+imports the module while collecting, before the conftest has unset
+[[SCHOLAR_EMAIL]] for a test (\cref{sec:test-configuration} in the
+cache chapter), so a test's lookup carried the real address in its
+[[mailto]] parameter, and only the network guard kept it from being
+sent (\url{https://github.com/dbosk/scholarcli/issues/241}).  Reading
+the variable per request costs a dictionary lookup next to an HTTP
+request, and it is how the Unpaywall client already does it.
+
 <<the crossref client>>=
 class CrossrefClient:
     """Looks up retraction/currency metadata for DOIs via Crossref."""
@@ -143,7 +156,11 @@ class CrossrefClient:
         register_cache(self.name, self._cache)
         self._limiter = limiter_for(self)
         self._session = self._create_session()
-        self._mailto = contact_email("CROSSREF_MAILTO")
+
+    @property
+    def mailto(self) -> str | None:
+        """The polite-pool address, read from the environment now."""
+        return contact_email("CROSSREF_MAILTO")
 
     <<crossref client methods>>
 @
@@ -238,7 +255,8 @@ def fetch_currency(self, doi: str | None) -> dict | None:
     try:
         self._limiter.acquire()
         url = f"{CROSSREF_WORKS_URL}/{quote(doi, safe='')}"
-        params = {"mailto": self._mailto} if self._mailto else {}
+        mailto = self.mailto
+        params = {"mailto": mailto} if mailto else {}
         response = self._session.get(
             url,
             params=params,
@@ -380,6 +398,88 @@ class TestFetchCurrency:
             fetch_currency("10.1/cached")
             fetch_currency("10.1/cached")
         assert mock_get.call_count == 1
+@
+
+The address must be the one the environment holds when the request is
+sent, not the one it held when the module was imported
+(\url{https://github.com/dbosk/scholarcli/issues/241}).  A test cannot
+see the import of the module it tests, since pytest imported it while
+collecting, so this one runs a separate Python process: it imports
+[[scholar.crossref]] with a dummy [[SCHOLAR_EMAIL]] set, unsets the
+variable, and looks a DOI up; then sets [[CROSSREF_MAILTO]] and looks
+another one up.  The lookups go to a loopback HTTP server (the real
+client, its session and its parameters, only the endpoint moved), which
+records each request's path.  The first must carry no [[mailto]], the
+second the dummy address.  The process prints only a verdict per
+request, never an address, so a leak of a real one would not be shown
+either.
+
+<<test functions>>=
+class TestCrossrefAddressAtRequestTime:
+    """The polite-pool address is read per request (#241)."""
+
+    DUMMY = "test@example.org"
+    SCRIPT = """
+import http.server, os, threading
+
+seen = []
+
+class Recorder(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        seen.append(self.path)
+        body = b'{"message": {}}'
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass
+
+server = http.server.HTTPServer(("127.0.0.1", 0), Recorder)
+threading.Thread(target=server.serve_forever, daemon=True).start()
+
+import scholar.crossref as crossref
+
+crossref.CROSSREF_WORKS_URL = f"http://127.0.0.1:{server.server_port}/works"
+del os.environ["SCHOLAR_EMAIL"]
+crossref.fetch_currency("10.1/no-address")
+os.environ["CROSSREF_MAILTO"] = "test@example.org"
+crossref.fetch_currency("10.1/with-address")
+for path in seen:
+    if "mailto=test%40example.org" in path:
+        print("dummy")
+    elif "mailto" in path:
+        print("other")
+    else:
+        print("none")
+"""
+
+    def test_address_follows_the_environment(self, tmp_path):
+        import os
+        import subprocess
+        import sys
+
+        dropped = {
+            "SCHOLAR_EMAIL", "CROSSREF_MAILTO", "SCHOLAR_PROXY",
+            "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+        }
+        env = {
+            var: value for var, value in os.environ.items()
+            if var.upper() not in dropped
+        }
+        env.update(
+            SCHOLAR_EMAIL=self.DUMMY,
+            SCHOLAR_CACHE_DIR=str(tmp_path / "cache"),
+            SCHOLAR_DATA_DIR=str(tmp_path / "data"),
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", self.SCRIPT], env=env,
+            capture_output=True, text=True, timeout=120,
+        )
+        assert result.returncode == 0, result.stderr[-2000:]
+        assert result.stdout.split() == ["none", "dummy"]
 @
 
 
@@ -591,6 +691,7 @@ class TestNormalizePreprints:
 
 
 \section{The module-level interface}
+\label{sec:crossref-module-interface}
 
 Callers want four convenient verbs over a single shared client: look up
 one DOI, list a published work's preprint DOIs, annotate a batch of

@@ -622,6 +622,18 @@ one: OpenAlex and Crossref (polite pools, optional) and Unpaywall
 (mandatory). `scholar.utils.contact_email(*override_vars)` resolves it;
 `OPENALEX_EMAIL` / `CROSSREF_MAILTO` still work as per-service overrides.
 The test `conftest.py` unsets all three so unit tests never make live calls.
+Read the address when a request is built, never at construction or
+import (#241): the Crossref and Unpaywall clients are built at import
+(`_client`), which pytest does while collecting, before the conftest
+unsets anything, so a stored value was the developer's real address.
+`CrossrefClient.mailto` and `UnpaywallClient.email` are properties
+calling `contact_email` per request; subprocess tests
+(`TestCrossrefAddressAtRequestTime`, `TestUnpaywallAddressAtRequestTime`)
+import with a dummy set, unset it, and check the requests a loopback
+server records. The OpenAlex providers still write the address into
+`pyalex.config` at construction; the conftest resets it per test
+(#160, `TestPyalexConfigIsolation`). Keys held by registered providers
+are reset the same way (#174).
 
 OpenAlex additionally reads `OPENALEX_API_KEY` (free key from
 openalex.org/settings/api; ten times the metered daily budget). The
