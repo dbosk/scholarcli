@@ -1054,7 +1054,16 @@ report body builders (`build_review_provenance_latex`,
   row per *work* (`audit_work_key`: title and first-author surname
   (`author_surname`; a blank author gives an empty surname) reduced to case-folded letters and digits, year ignored; joined
   provider strings like `openalex; dblp` are split, mapped to codes and
-  deduplicated; the best-placed decision wins). The *last* category tag
+  deduplicated; the best-placed decision gives the row its reason,
+  category, confidence, status and order, but the notes of every copy
+  are united, #196: `collect_audit_rows` passes the other copies'
+  `audit_note_tags` (what each copy's own row shows as notes: note
+  tags, plus stray tags under `--theme`; pending copies included, after
+  the pending label; none for criterion discards, whose other tags are
+  earlier criteria) to `audit_reason(..., also_notes=)`, best copy's
+  first, then in decision order, each once; themes are not united; a
+  lent version note makes the row a version row for the caption). The
+  per-decision CSV is unaffected. The *last* category tag
   is the decision (`decide -t` appends while the status stays the
   same; a status change replaces the old category, #177); confidence is
   shown for unreviewed and human-confirmed LLM or agent rows, not for
