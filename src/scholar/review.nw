@@ -3004,9 +3004,13 @@ also LLM-related fields like [[source]], [[is_example]], and [[llm_confidence]].
 Papers that appear in both the previous session and the new search results must
 retain their full decision history.
 
-We use the saved session file ([[load_session]]) as the primary source of
+We use the saved session file as the primary source of
 previous decisions because it contains complete [[ReviewDecision]] objects with
-all fields. The notes module ([[load_search_decisions]]) serves as a fallback
+all fields.  That is the file the new session will be saved to and no
+other ([[load_own_session]], \cref{sec:append-own-file}): a lookup that
+also tried the name as a query, or the query as a name, built one
+review from another review's decisions.
+The notes module ([[load_search_decisions]]) serves as a fallback
 for older sessions that predate the session persistence feature.
 Nothing writes that store any more (the session file is the record), so the
 fallback only ever finds decisions made before session files existed.
@@ -3015,19 +3019,23 @@ That fallback is only right when there is \emph{no} session file.  A
 session file that exists but cannot be read (truncated by a crash, say)
 used to look exactly like a missing one: [[load_session]] returned
 [[None]], the append built a session from the new results alone, and
-saving it replaced the unreadable file and every decision in it.  We
-therefore load with [[strict=True]], which raises [[SessionFileError]]
-naming the file instead (\cref{sec:session-integrity}); the command fails
+saving it replaced the unreadable file and every decision in it.  So
+[[load_own_session]] lets [[SessionFileError]] from [[read_session_file]]
+through, as [[load_session(..., strict=True)]] does, naming the file
+instead (\cref{sec:session-integrity}); the command fails
 and the file stays as it is, to be repaired or restored from its
 [[.bak]].  When the new session is the loaded one, it also inherits the
 file it was loaded from, so that it is saved back there, and the loaded
 session's baseline, so that saving it merges what other processes saved
 in the meantime just as saving the loaded session itself would
-([[appends_to_loaded_file]], \cref{sec:session-own-file}).  When it is
-another session, saved into another file, it takes neither: its
-baseline is then the state it is built with (at the end of the
-function), since the loaded baseline describes another file.  So is
-the baseline of a session that loaded nothing.
+([[appends_to_loaded_file]], \cref{sec:session-own-file}).  Since the
+append loads only the file it is saved to (\cref{sec:append-own-file}),
+it always is the loaded one; a named search that continues the unnamed
+session of its query does so without a name, so that it stays the
+session of that file.  A session that loaded nothing takes the state it
+is built with as its baseline (at the end of the function), and so did
+an append into another file, since the loaded baseline describes
+another file.
 
 <<review session functions>>=
 def _normalize_paper_identifiers(paper: Paper) -> Paper:
@@ -3076,8 +3084,10 @@ def create_review_session(
     # Use session_name for persistence, fall back to query
     persistence_key = session_name if session_name else query
     
-    # Load previous session (primary source - has complete decision data)
-    previous_session = load_session(persistence_key, strict=True)
+    # Load previous session (primary source - has complete decision data):
+    # the file this session is saved to, never another session's
+    previous_session = load_own_session(session_name, query)
+    <<continue an unnamed session without a name>>
 
     # Build lookup for efficient merging
     prev_decision_lookup = _build_previous_decision_lookup(previous_session)
@@ -7971,15 +7981,16 @@ apart, so the merge must not take the file's value for a change.
 Without a paper state the gap fill decides ([[paper_filled_from]]):
 the file's copy fills what ours lacks, and where both hold a value,
 ours is kept, as for a decision changed on both sides, the file's
-value staying in the [[.bak]].  This holds in the three cases a built
-baseline covers.
+value staying in the [[.bak]].  The Crossref notices are the
+exception: both copies' notices are kept (\cref{sec:united-notices}),
+since a retraction lost costs more than a withdrawn notice kept.  This
+holds in the three cases a built baseline covers.
 \begin{description}
 \item[An append into another file] (\cref{sec:session-own-file}).
   The target's copy and ours were gathered by different runs, often
-  for different questions, so neither is the newer.  The cost of the
-  rule: a retraction the target holds is not taken over our
-  \enquote{checked, clean} from the loaded file; [[scholar verify]] on
-  the target finds it again.
+  for different questions, so neither is the newer.  A retraction
+  the target holds survives our \enquote{checked, clean} from the
+  loaded file only through the union of notices.
 \item[A paper new in a same-file append.]  Another process that
   appended to the same file may have found the same paper first; its
   copy came from its own search, so it is a second gathering, not a
@@ -8616,7 +8627,9 @@ def paper_merged_from(
     a whole, by its first field. The accumulated fields
     (`ACCUMULATED_PAPER_FIELDS`) are never taken: version links are
     united (`united_version_links`), the others left to
-    `Paper.merge_with`. Gaps are then filled (`paper_filled_from`),
+    `Paper.merge_with`. The Crossref notices (`CROSSREF_NOTICE_FIELDS`)
+    are united (`united_crossref_notices`) when there is no baseline or
+    both copies changed them. Gaps are then filled (`paper_filled_from`),
     except in a group that ours holds. Without a baseline no field is
     taken. Returns `ours` itself when nothing changes, or when `theirs`
     is another work. Neither argument is modified.
@@ -8627,6 +8640,7 @@ def paper_merged_from(
     changed_there, ours_whole = {}, {}
     <<decide each group of paper fields whole>>
     <<take the single paper fields only the file changed>>
+    <<unite the Crossref notices both copies found>>
     for name in VERSION_LINK_FIELDS:
         links = united_version_links(getattr(ours, name), getattr(theirs, name))
         if frozen_value(links) != frozen_value(getattr(ours, name)):
@@ -8703,6 +8717,26 @@ A link without a DOI (a preprint deduplication found only as a PDF) is
 one with another only when they are equal.
 
 <<review session functions>>=
+def united_entries(
+    ours: list[dict] | None, theirs: list[dict] | None, key
+) -> list[dict] | None:
+    """Return the entries of `ours`, then those of `theirs` it lacks.
+
+    Two entries are one when `key` maps them to the same value. Returns
+    `ours` itself when `theirs` adds nothing; two None stay None, and
+    an empty list with None stays an empty list.
+    """
+    if not theirs:
+        return ours if ours is not None else theirs
+    entries = list(ours or [])
+    seen = {key(entry) for entry in entries}
+    for entry in theirs:
+        if key(entry) not in seen:
+            entries.append(entry)
+            seen.add(key(entry))
+    return entries if ours is None or len(entries) > len(ours) else ours
+
+
 def united_version_links(
     ours: list[dict] | None, theirs: list[dict] | None
 ) -> list[dict] | None:
@@ -8711,16 +8745,7 @@ def united_version_links(
     Links are matched by normalised DOI, links without a DOI by
     equality. Returns `ours` itself when `theirs` adds nothing.
     """
-    if not theirs:
-        return ours if ours is not None else theirs
-    links = list(ours or [])
-    seen = {version_link_key(link) for link in links}
-    for link in theirs:
-        key = version_link_key(link)
-        if key not in seen:
-            links.append(link)
-            seen.add(key)
-    return links if ours is None or len(links) > len(ours) else ours
+    return united_entries(ours, theirs, version_link_key)
 
 
 def version_link_key(link: dict):
@@ -8731,15 +8756,87 @@ def version_link_key(link: dict):
     return ("link", frozen_value(link))
 @
 
+\paragraph{Crossref notices both copies found.}
+\label{sec:united-notices}
+The gap fill keeps our value wherever both copies hold one, which
+for the Crossref notices ([[updated_by]], [[newer_versions]]) can
+lose a retraction.  An append into another file loads a session in
+which the paper was checked clean (an empty [[updated_by]]), saves
+into a target whose copy holds a retraction, and the gap fill kept our empty
+list (\url{https://github.com/dbosk/scholarcli/issues/219}); a paper
+new in a same-file append and the new-session race
+(\cref{sec:paper-baseline}) are in the same position.  Without a
+paper state nothing tells which list is the newer, but the two errors
+are not alike: keeping a notice that Crossref has since withdrawn
+misleads until the next [[scholar verify]], which replaces the whole
+list, while dropping a retraction lets the paper be cited as sound.
+So without a paper state the two lists are united
+([[united_crossref_notices]]).
+
+With a paper state the three-way rule mostly decides.  A list only
+the file changed is taken (a list we left as loaded), and a list only
+we changed is ours: our own check replaced the loaded list, and the
+file still holding that loaded list is no evidence for its notices,
+which our check no longer saw.  When both changed, both processes
+checked Crossref after the load, and neither knows which check came
+later; the same asymmetry applies, so their lists are united too,
+where other fields keep ours.
+
+<<unite the Crossref notices both copies found>>=
+for name in CROSSREF_NOTICE_FIELDS:
+    mine, their = getattr(ours, name), getattr(theirs, name)
+    if base and base[name] in (frozen_value(mine), frozen_value(their)):
+        continue
+    notices = united_crossref_notices(mine, their)
+    if frozen_value(notices) != frozen_value(mine):
+        changed_there[name] = notices
+@
+
+A notice is identified by its DOI, normalised as for version links,
+and its kind: the [[type]] of an [[updated_by]] notice (a correction
+and a retraction may name one notice DOI, \enquote{retraction} and
+\enquote{correction} being different findings) and the [[relation]]
+of a [[newer_versions]] entry, the only fields besides the DOI that
+[[_normalize_updated_by]] and [[_normalize_newer_versions]] write as
+identity (\cref{crossref-module}; the others are a label, a date and a
+source).  [[_normalize_updated_by]] keeps a notice whose DOI Crossref
+left out, as [[None]]; such a notice is one with another only when
+they are equal.  Each notice stays whole, ours first, as the version
+links do.
+
+<<review session functions>>=
+CROSSREF_NOTICE_FIELDS = ("updated_by", "newer_versions")
+
+
+def united_crossref_notices(
+    ours: list[dict] | None, theirs: list[dict] | None
+) -> list[dict] | None:
+    """Return the Crossref notices of `ours`, then those of `theirs` it
+    lacks, matched by normalised DOI and kind (`crossref_notice_key`)."""
+    return united_entries(ours, theirs, crossref_notice_key)
+
+
+def crossref_notice_key(notice: dict):
+    """Return what identifies a notice: its DOI and kind, else itself."""
+    doi = notice.get("doi")
+    if doi:
+        kind = notice.get("type", notice.get("relation"))
+        return ("doi", Paper._normalize_doi(doi), kind)
+    return ("notice", frozen_value(notice))
+@
+
 Let's verify the race of
 \url{https://github.com/dbosk/scholarcli/issues/206} in real
 processes: A loads a session whose paper was checked clean
 (an empty [[updated_by]]), B finds a retraction and saves, A decides the
 paper and saves.  The file keeps A's decision and B's retraction.  The
 other cases run in one process, with B's save in its own registry as
-above: our own change of a field wins over B's (the change is an
-[[append]] to the loaded list, which a baseline holding references
-would follow and miss), and Unpaywall's [[oa_status]] behaves alike.
+above.  When both change the notices, the two lists are united
+(\cref{sec:united-notices}; our change is an [[append]] to the loaded
+list, which a baseline holding references would follow and miss, and
+then take B's list alone), and a list only we changed is ours.  Our
+own change of Unpaywall's [[oa_status]] wins over B's, and B's alone is
+taken.
 
 <<test functions>>=
 class TestConcurrentSaveTakesTheirUpdates:
@@ -8832,13 +8929,21 @@ class TestConcurrentSaveTakesTheirUpdates:
     assert saved["paper"]["updated_by"] == self.RETRACTION
     assert saved["paper"]["newer_versions"] == []
 
-  def test_our_own_change_wins(self):
+  def test_notices_both_processes_found_are_united(self):
     self._first_save(updated_by=[])
     session = load_session(self.NAME)
     self._other_process_sets(updated_by=self.RETRACTION)
     session.decisions[0].paper.updated_by.append(self.CORRECTION)
     self._decide_and_save(session)
-    assert self._saved()["paper"]["updated_by"] == [self.CORRECTION]
+    assert self._saved()["paper"]["updated_by"] == [
+      self.CORRECTION, *self.RETRACTION]
+
+  def test_our_own_check_replaces_the_loaded_notices(self):
+    self._first_save(updated_by=self.RETRACTION)
+    session = load_session(self.NAME)
+    session.decisions[0].paper.updated_by = []
+    self._decide_and_save(session)
+    assert self._saved()["paper"]["updated_by"] == []
 
   def test_an_open_access_result_found_meanwhile_survives(self):
     self._first_save(oa_status="closed")
@@ -8876,9 +8981,10 @@ values, so a second save takes another process's later update as well.
 The other rules stay as they were.  Sources and keywords are united
 whoever changed them.  A session that was never loaded, and a paper the
 file has but our baseline has not, have no baseline to compare with,
-so ours wins where both hold a value.  And a paper this process held
-before it loaded the session (the registry hands that copy to the
-session) differs from the file's copy from the start: its values are
+so ours wins where both hold a value, except for the Crossref
+notices, which are united (\cref{sec:united-notices}).  And a paper
+this process held before it loaded the session (the registry hands
+that copy to the session) differs from the file's copy from the start: its values are
 our changes, not values the file can take back.
 
 <<test methods for concurrent paper updates>>=
@@ -8893,17 +8999,19 @@ our changes, not values the file can take back.
 
   def test_without_a_baseline_ours_wins(self):
     from scholar.scholar import isolated_registry
-    self._first_save(updated_by=self.RETRACTION)
+    self._first_save(venue="file venue", updated_by=self.RETRACTION)
     with isolated_registry():
       session = ReviewSession(query="q", providers=["openalex"],
                               timestamp=datetime.now(), name=self.NAME)
       session.decisions = [ReviewDecision(
         paper=Paper(title="A Study", authors=["Ada Lovelace"],
-                    doi=self.DOI, updated_by=[]),
+                    doi=self.DOI, venue="our venue", updated_by=[]),
         provider="openalex", status=DecisionStatus.KEPT, tags=["ml"],
       )]
       save_session(session)
-    assert self._saved()["paper"]["updated_by"] == []
+    paper = self._saved()["paper"]
+    assert paper["venue"] == "our venue"
+    assert paper["updated_by"] == self.RETRACTION
 
   def test_a_paper_held_before_loading_keeps_its_values(self):
     self._first_save()
@@ -9037,10 +9145,13 @@ fill the link it cleared from the file) nor ours.
 A built baseline has no paper states (\cref{sec:paper-baseline}), so
 the papers it covers keep the gap fill.  Let's verify its three cases
 with a value that the file's copy holds differently from ours and one
-that only the file's copy holds: an append into another file (with
-the Unpaywall pair, which stays ours whole), a paper new in a
-same-file append, and two processes creating one new session, in real
-processes as in \cref{sec:session-own-file}.
+that only the file's copy holds: an append saved into a file it did not
+load (with the Unpaywall pair, which stays ours whole), a paper new in
+a same-file append, and two processes creating one new session, in real
+processes as in \cref{sec:session-own-file}.  Since an append loads only
+its own file (\cref{sec:append-own-file}), the first case is a named
+append that loaded nothing and finds its file written by another
+process before it saves.
 
 <<test functions>>=
 class TestBuiltPapersHaveNoBaseline:
@@ -9068,15 +9179,13 @@ class TestBuiltPapersHaveNoBaseline:
       self, tmp_path, monkeypatch):
     helper = TestAppendBaselineFollowsTheFile
     monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
-    save_session(helper._session("foo", "bar", [helper._decision(
-      Paper(title="P", authors=["A"], doi=self.DOI, oa_status="closed"),
-      DecisionStatus.KEPT, ["t1"])]))
-    target = save_session(helper._session(None, "foo", [helper._decision(
+    session = create_review_session(
+      [self._result("bar", Paper(title="P", authors=["A"], doi=self.DOI,
+                                 oa_status="closed"))],
+      "bar", "foo")
+    target = save_session(helper._session("foo", "bar", [helper._decision(
       Paper(title="P", authors=["A"], doi=self.DOI, oa_status="green",
             oa_url="https://repo.example/p", abstract="target abstract"))]))
-    session = create_review_session(
-      [self._result("foo", Paper(title="P", authors=["A"], doi=self.DOI))],
-      "foo")
     assert save_session(session) == target
     paper = self._saved_paper(target, self.DOI)
     assert (paper["oa_status"], paper["oa_url"]) == ("closed", None)
@@ -9143,6 +9252,72 @@ class TestBuiltPapersHaveNoBaseline:
       tmp_path / "review_sessions" / "fresh.json", self.DOI)
     assert paper["venue"] == "V"
     assert (paper["abstract"], paper["updated_by"]) == ("from B", [])
+@
+
+Without a paper state the Crossref notices of both copies are united
+(\cref{sec:united-notices}).  Let's verify it with the probe of
+\url{https://github.com/dbosk/scholarcli/issues/219}: [[search foo
+--review]] while a named session [[foo]] exists loads that session and
+saves into the hash file of query [[foo]]; the loaded session has the
+paper checked clean, the target holds a retraction and a newer
+version.  The target keeps both.
+
+<<test methods for built papers>>=
+  def test_an_append_into_another_file_keeps_the_targets_notices(
+      self, tmp_path, monkeypatch):
+    helper = TestAppendBaselineFollowsTheFile
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+    retraction = TestConcurrentSaveTakesTheirUpdates.RETRACTION
+    newer = [{"doi": "10.1/newer-219", "relation": "is-version-of"}]
+    save_session(helper._session("foo", "bar", [helper._decision(
+      Paper(title="P", authors=["A"], doi=self.DOI, updated_by=[],
+            newer_versions=[]),
+      DecisionStatus.KEPT, ["t1"])]))
+    target = save_session(helper._session(None, "foo", [helper._decision(
+      Paper(title="P", authors=["A"], doi=self.DOI,
+            updated_by=retraction, newer_versions=newer))]))
+    session = create_review_session(
+      [self._result("foo", Paper(title="P", authors=["A"], doi=self.DOI))],
+      "foo")
+    assert save_session(session) == target
+    paper = self._saved_paper(target, self.DOI)
+    assert paper["updated_by"] == retraction
+    assert paper["newer_versions"] == newer
+@
+
+A notice is one with another when it names the same DOI, compared
+normalised, with the same kind; each stays whole, ours first.  Two
+copies that were never checked stay unchecked, and a check with
+nothing found stays one.
+
+<<test functions>>=
+class TestUnitedCrossrefNotices:
+  RETRACTION = {"doi": "10.1/notice-219", "type": "retraction",
+                "label": "Retraction", "date": "2026-11-01",
+                "source": "retraction-watch"}
+
+  def test_ours_first_each_notice_whole(self):
+    ours = [dict(self.RETRACTION, label="ours")]
+    theirs = [dict(self.RETRACTION, doi="https://doi.org/10.1/NOTICE-219"),
+              dict(self.RETRACTION, type="correction")]
+    assert united_crossref_notices(ours, theirs) == [ours[0], theirs[1]]
+
+  def test_a_newer_version_is_keyed_by_its_relation(self):
+    preprint = {"doi": "10.1/v", "relation": "is-preprint-of"}
+    version = {"doi": "10.1/V", "relation": "is-version-of"}
+    assert united_crossref_notices([preprint], [version, preprint]) == [
+      preprint, version]
+
+  def test_a_notice_without_a_doi_is_one_only_when_equal(self):
+    bare = {"doi": None, "type": "correction", "label": None,
+            "date": None, "source": "publisher"}
+    other = dict(bare, source="crossref")
+    assert united_crossref_notices([bare], [bare, other]) == [bare, other]
+
+  def test_unchecked_and_clean_stay_apart(self):
+    assert united_crossref_notices(None, None) is None
+    assert united_crossref_notices([], None) == []
+    assert united_crossref_notices(None, []) == []
 @
 
 A save can also fail for want of space.  A review that ran with a full
@@ -9493,26 +9668,37 @@ A session that was never read from a file still gets the file its name
 maps to.
 
 [[create_review_session]] builds a new session object around the loaded
-one, and there the loaded file is not always the new session's.  The
-append looks its predecessor up by one key, the [[-n]] name or else the
-query, and [[load_session]] tries that key as a file name before the
-query's hash.  So [[search foo --review]] (no name) loads [[foo.json]]
-even when that file holds the session named [[foo]] for another query,
-and [[search foo -n foo]] loads the unnamed session of query [[foo]]
-from its hash file when there is no [[foo.json]].  In both the new
-session is not the loaded one: it has another name, and before
-\url{https://github.com/dbosk/scholar/issues/181} it went to its own
-file and left the loaded one alone.  Carrying the path over would save
-it into the other session's file, the very mixing we set out to stop.
-The path is therefore carried over only when the new session is the
-loaded one: its identity (name, or query when unnamed) maps to the same
-file as the loaded session's.  We compare the file names that the
-identities map to rather than the names themselves, because two unnamed
-sessions have equal names ([[None]]) whatever their queries.
-The other way the two can belong together needs no rule: when
-[[-n a]] opens the renamed copy [[a.json]] holding [[b]], the new
-session is named [[a]], and the file its name maps to is [[a.json]]
-already.
+one, and there the loaded file was not always the new session's.  The
+append used to look its predecessor up by one key, the [[-n]] name or
+else the query, and [[load_session]] tries that key as a file name
+before the query's hash.  So an unnamed append for query [[foo]] loaded
+[[foo.json]] even when that file held the session named [[foo]] for
+another query, and [[search bar -n foo]] loaded the unnamed session of
+query [[foo]] from its hash file when there was no [[foo.json]].  In
+both the new session is not the loaded one: it has another name, and
+before \url{https://github.com/dbosk/scholar/issues/181} it went to its
+own file and left the loaded one alone.  Carrying the path over would
+save it into the other session's file, the very mixing we set out to
+stop.  The path is therefore carried over only when the new session is
+the loaded one.
+
+What decides that is the file, not the names.  The append now loads
+only the file it will be saved to (\cref{sec:append-own-file}), so the
+new session continues the loaded file exactly when the file its
+identity (name, or query when unnamed) maps to is that file.  Comparing
+the identities instead, the loaded session's with the new one's, gets
+the copies made by hand wrong: [[-n a]] on [[a.json]] holding [[b]],
+or [[-n q]] on [[q.json]] holding the unnamed session of [[q]], loads
+and saves one file, yet the two identities map to different files.
+Such an append counted as another file's and took the built baseline
+(\cref{sec:append-baseline}), which does not hold the loaded ids: a
+paper whose id the append changed (a homonym number dropped) came back
+from the file under its old id beside the new one.  Comparing file
+names, not names, also keeps two unnamed sessions apart, which have
+equal names ([[None]]) whatever their queries.  With the own-file
+lookup the test holds for every append [[create_review_session]] makes;
+it stays as the statement of the rule, and guards a caller that loads a
+session some other way.
 
 <<review session functions>>=
 def appends_to_loaded_file(
@@ -9521,11 +9707,10 @@ def appends_to_loaded_file(
     """Tell whether a session `name` (or `query`) continues `previous`.
 
     True when the new session should be saved into the file `previous`
-    was loaded from: both identities map to the same file name.
+    was loaded from: the new identity maps to that file's name.
     """
     return previous._loaded_from is not None and (
-        own_session_file_name(previous.name, previous.query)
-        == own_session_file_name(name, query)
+        previous._loaded_from.name == own_session_file_name(name, query)
     )
 @
 
@@ -9561,11 +9746,12 @@ Let's verify it with a renamed copy: [[a.json]] holds a session named
 copy and saving it changes [[a.json]] and leaves [[b.json]] byte for
 byte as it was; so does a concurrent save, whose merge must re-read
 [[a.json]]; the copy before a run is a copy of [[a.json]]; an append
-through [[create_review_session]] saves into the file it loaded, but
-only when it continues that session (an unnamed append whose query is
-another session's name, a named one that found an unnamed session's
-hash file, and an unnamed one that found a file holding another query
-leave the loaded file byte for byte alone); and the warning comes once.
+through [[create_review_session]] saves into the file it loaded (a
+renamed copy, continued under its file name with [[-n]]) and leaves the
+files that are not its own byte for byte alone (another session's file
+named like its query, an unnamed session's hash file named like its
+name, a file named like its query holding another query); and the
+warning comes once.
 
 <<test functions>>=
 class TestSaveToLoadedFile:
@@ -9679,7 +9865,7 @@ class TestSaveToLoadedFile:
         result.limit = None
         result.papers = [Paper(title="New", authors=["B"],
                                doi="10.5555/wp181-new")]
-        session = create_review_session([result], "q")
+        session = create_review_session([result], "q", "q")
         assert save_session(session) == by_query
         assert not stored.exists()
         dois = {d["paper"]["doi"] for d in
@@ -9715,14 +9901,14 @@ class TestSaveToLoadedFile:
     def test_named_append_leaves_the_query_file_alone(
         self, tmp_path, monkeypatch
     ):
-        """`search foo -n foo` on an unnamed foo session gets foo.json."""
+        """`search bar -n foo` beside the unnamed foo session: foo.json."""
         monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
         unnamed = save_session(self._session(None, "10.5555/wp181-hash",
                                              query="foo"))
         before = unnamed.read_bytes()
 
         session = create_review_session(
-            [self._result("foo", "10.5555/wp181-hash-new")], "foo", "foo"
+            [self._result("bar", "10.5555/wp181-hash-new")], "bar", "foo"
         )
         path = save_session(session)
         assert path == tmp_path / "review_sessions" / "foo.json"
@@ -9764,7 +9950,455 @@ class TestSaveToLoadedFile:
         assert flags == {"a.json": True, "b.json": False}
 @
 
+\paragraph{An append loads only its own file.}
+\label{sec:append-own-file}
+Not carrying the path kept the other session's \emph{file} intact, but
+not its decisions.  The append was still built from the session it had
+loaded, and saved that session's decisions into its own file, which
+then listed papers its searches never returned, kept or discarded by
+another review, and nothing said so
+(\url{https://github.com/dbosk/scholar/issues/213}).  Called without a
+name for query [[foo]], [[create_review_session]] took over the named
+session [[foo]], whatever its query.  The command line never makes that
+call: [[search --review]] names the session after its query when [[-n]]
+is not given, and [[search -n]] and [[rq]] always pass a name.  Its
+form there is the other one: [[search bar -n foo]] without a
+[[foo.json]] took over the unnamed session of the query [[foo]].
+
+The cause is that [[load_session]] answers another question than the
+append asks.  It finds the session a \emph{user} means by a name or a
+query, as [[sessions show X]] does, so it tries [[X]] both ways.  An
+append needs the session it continues, which is the one it will be saved
+into: the file [[own_session_file_name]] gives for the new session's
+name, or for its query when it has no name.  [[load_own_session]] loads
+that file.  It finds every session Scholar wrote under that identity,
+since Scholar has named the files this way since session files exist:
+[[save_session]] wrote [[<name>.json]] or the query's hash from the
+first version of this module on.  A file that only a hand rename made,
+such as an unnamed session of query [[q]] moved to [[q.json]], is the
+session named [[q]] to the append: [[-n q]] continues it.
+
+One file of the other kind is still the append's.  Since
+[[search foo --review]] names its session [[foo]], an unnamed session
+of the query [[foo]] (saved by code that passed no name, or by hand)
+has always been continued by that very command: [[foo.json]] did not
+exist, so [[load_session("foo")]] fell back to the query's hash.  The
+search and the session are the same, only the name is a default.  So
+when a named append has no file of its own, its name is its query, and
+the hash file of that query holds an unnamed session of the same query,
+the append continues it.  Each condition keeps out a session that only
+shares the file name: a [[foo.json]] that exists is the session
+[[foo]]; a search [[bar -n foo]] is not a run of the query [[foo]]; a
+hash file holding a named session, or another query, is a copy.
+
+The other candidate is not ignored in silence.  A user whose append
+until now took over the other file would otherwise see an empty review
+and believe the decisions lost, so when the file the old lookup would
+have tried exists and is not continued, one line names it, says what
+it holds (the stored name, or the query of an unnamed session; we read
+the file's two fields, since its file name alone does not say), and
+how to continue it: [[-n]] with the file's stem, which loads that file
+as its own, whatever it holds.  The level depends on what the append
+does.  When its own file does not exist, the append starts a new
+session where the old lookup would have continued the other one, so the
+user most likely meant that one: a warning, which the command prints.
+When its own file exists, the append continues its own session, as the
+user asked, and the other file is only a pointer, logged at INFO
+([[--verbose]] shows it), so that a session's every append does not
+repeat it.
+
+The hint looks for [[<query>.json]], and a query is not always a valid
+file name: one longer than the file system allows makes [[exists]] raise
+[[OSError]] (\enquote{File name too long}), which made [[load_session]]
+fail the whole unnamed search.  Such a file cannot exist, so the error
+reads as absent.
+
+<<review session functions>>=
+def load_own_session(name: str | None, query: str) -> ReviewSession | None:
+    """Load the session file a session `name` (or `query`) is saved to.
+
+    Unlike `load_session`, the name is never tried as a query nor the
+    query as a name, with one exception: a named search whose name is
+    its query (the `--review` default) continues the unnamed session of
+    that query when it has no file of its own. When the file the old
+    lookup would also have tried exists, one log line names it and how
+    to continue it.
+
+    Returns None when the file does not exist.
+
+    Raises:
+        SessionFileError: The file exists but cannot be read.
+    """
+    sessions_dir = _get_sessions_dir()
+    own = sessions_dir / own_session_file_name(name, query)
+    <<find the file the old lookup also tried>>
+    <<continue the unnamed session of the query>>
+    <<point at the session file the append does not load>>
+    if not own.exists():
+        logger.debug("Session not found: %s", own.name)
+        return None
+    return read_session_file(own)
+
+
+def _stored_identity(path: Path) -> tuple[str | None, str | None] | None:
+    """Return the `(name, query)` a session file stores, None if unreadable."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data.get("name") or None, data.get("query")
+    except (OSError, ValueError, AttributeError):
+        return None
+@
+
+<<find the file the old lookup also tried>>=
+if name:
+    other = sessions_dir / own_session_file_name(None, name)
+else:
+    other = sessions_dir / f"{query}.json"
+try:
+    other_exists = other != own and other.exists()
+except (OSError, ValueError):
+    other_exists = False
+stored = _stored_identity(other) if other_exists else None
+@
+
+<<continue the unnamed session of the query>>=
+if (
+    name
+    and stored is not None
+    and stored[0] is None
+    and not own.exists()
+    and own_session_file_name(None, stored[1]) == other.name
+    and own_session_file_name(None, query) == other.name
+):
+    logger.info("Continuing %s, the unnamed session of the query %r",
+                other.name, query)
+    return read_session_file(other)
+@
+
+<<point at the session file the append does not load>>=
+if other_exists:
+    if stored is None:
+        what = "a file that cannot be read"
+    elif stored[0]:
+        what = f"the session named {stored[0]!r}"
+    else:
+        what = f"the unnamed session of the query {stored[1]!r}"
+    starts = not own.exists()
+    logger.log(
+        logging.WARNING if starts else logging.INFO,
+        "%s %s; %s, %s, is not loaded: pass -n %r to append to it",
+        "Starting a new session in" if starts else "Appending to",
+        own.name, other.name, what, other.stem,
+    )
+@
+
+A session continued from the unnamed file stays unnamed.  Built under
+the name [[foo]], it would be saved into [[foo.json]] (and the hash
+file left behind as a stale second copy of the review), or, carrying
+the loaded path, saved back into the hash file with the name [[foo]]
+stored in it, which the next [[search foo --review]] would no longer
+recognise as an unnamed session.  Unnamed, its own file is the file it
+loaded, so it carries that path and the loaded baseline like every
+same-file append ([[appends_to_loaded_file]]), and every later run
+finds it again.  [[load_own_session]] loads no other file than the
+own one for a name, so a loaded file that is not the name's own is
+this unnamed one.
+
+<<continue an unnamed session without a name>>=
+if (
+    previous_session is not None
+    and session_name
+    and previous_session._loaded_from.name
+    != own_session_file_name(session_name, query)
+):
+    session_name = None
+@
+
+Let's verify it with the scenarios of the issue: the named session
+[[foo]] of query [[bar]] has a kept paper, and an unnamed append for
+query [[foo]] must neither hold nor save that paper; symmetrically, a
+named append [[search bar -n foo]] must not take over the unnamed
+session of query [[foo]].  Both name the other file and what it holds
+in a warning, and following the hint continues that file.  An append
+whose own file exists continues it, named and unnamed, even while the
+other file exists, and says so only at INFO.  The [[--review]] default
+([[create_review_session]] named after its query, as [[run_review]] is
+called) continues the unnamed session of its query, twice in a row,
+saving it unnamed into its hash file; it does not when [[foo.json]]
+exists, nor when the hash file holds a named session or another query.
+Two renamed copies appended under their file names
+(\cref{sec:session-own-file}), whose search drops a homonym number,
+hold the work once afterwards: the append keeps the loaded baseline.  And an unnamed
+search of a query too long for a file name still runs.
+
+<<test functions>>=
+class TestAppendLoadsItsOwnFile:
+    """An append loads the file it is saved to, nothing else (#213)."""
+
+    @staticmethod
+    def _session(name, query, doi):
+        session = ReviewSession(
+            query=query, providers=["openalex"],
+            timestamp=datetime(2026, 11, 19), name=name,
+        )
+        session.add_query_provider_pair(query, "openalex")
+        session.decisions = [ReviewDecision(
+            paper=Paper(title=f"Paper {doi}", authors=["A"], doi=doi),
+            provider="openalex", status=DecisionStatus.KEPT, tags=["t1"],
+        )]
+        return session
+
+    @staticmethod
+    def _result(query, doi):
+        result = Mock()
+        result.provider = "openalex"
+        result.query = query
+        result.filters = None
+        result.limit = None
+        result.papers = [Paper(title=f"Paper {doi}", authors=["B"], doi=doi)]
+        return result
+
+    @staticmethod
+    def _dois(session):
+        return {d.paper.doi for d in session.decisions}
+
+    @staticmethod
+    def _saved_dois(path):
+        return {d["paper"]["doi"]
+                for d in json.loads(path.read_text())["decisions"]}
+
+    @staticmethod
+    def _messages(caplog, level):
+        return [r.getMessage() for r in caplog.records
+                if r.name == "scholar.review" and r.levelname == level]
+
+    def test_unnamed_append_does_not_take_a_named_sessions_paper(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        named = save_session(self._session("foo", "bar", "10.5555/r213-named"))
+        before = named.read_bytes()
+
+        with caplog.at_level("INFO", logger="scholar.review"):
+            session = create_review_session(
+                [self._result("foo", "10.5555/r213-q")], "foo"
+            )
+        assert self._dois(session) == {"10.5555/r213-q"}
+        path = save_session(session)
+        assert path.name == own_session_file_name(None, "foo")
+        assert self._saved_dois(path) == {"10.5555/r213-q"}
+        assert named.read_bytes() == before
+        [warning] = [m for m in self._messages(caplog, "WARNING")
+                     if "foo.json" in m]
+        assert "-n 'foo'" in warning and path.name in warning
+        assert "the session named 'foo'" in warning
+
+    def test_named_append_does_not_take_the_unnamed_sessions_paper(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        unnamed = save_session(self._session(None, "foo",
+                                             "10.5555/r213-hash"))
+        before = unnamed.read_bytes()
+
+        with caplog.at_level("INFO", logger="scholar.review"):
+            session = create_review_session(
+                [self._result("bar", "10.5555/r213-new")], "bar", "foo"
+            )
+        assert self._dois(session) == {"10.5555/r213-new"}
+        path = save_session(session)
+        assert path == tmp_path / "review_sessions" / "foo.json"
+        assert self._saved_dois(path) == {"10.5555/r213-new"}
+        assert unnamed.read_bytes() == before
+        [warning] = [m for m in self._messages(caplog, "WARNING")
+                     if unnamed.name in m]
+        assert f"-n '{unnamed.stem}'" in warning and "foo.json" in warning
+        assert "the unnamed session of the query 'foo'" in warning
+
+        followed = create_review_session(
+            [self._result("bar", "10.5555/r213-new")], "bar", unnamed.stem
+        )
+        assert self._dois(followed) == {"10.5555/r213-hash",
+                                        "10.5555/r213-new"}
+        assert save_session(followed) == unnamed
+
+    def test_unnamed_append_continues_its_hash_file(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """Its own file wins over foo.json, which the old lookup took."""
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        save_session(self._session("foo", "bar", "10.5555/r213-named"))
+        own = save_session(self._session(None, "foo", "10.5555/r213-own"))
+
+        with caplog.at_level("INFO", logger="scholar.review"):
+            session = create_review_session(
+                [self._result("foo", "10.5555/r213-q")], "foo"
+            )
+        assert self._dois(session) == {"10.5555/r213-own", "10.5555/r213-q"}
+        [restored] = [d for d in session.decisions
+                      if d.paper.doi == "10.5555/r213-own"]
+        assert restored.status == DecisionStatus.KEPT
+        assert save_session(session) == own
+        assert not self._messages(caplog, "WARNING")
+        assert any("foo.json" in m and "-n 'foo'" in m
+                   for m in self._messages(caplog, "INFO"))
+
+    def test_named_append_continues_its_file(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        save_session(self._session(None, "foo", "10.5555/r213-hash"))
+        own = save_session(self._session("foo", "bar", "10.5555/r213-own"))
+
+        with caplog.at_level("INFO", logger="scholar.review"):
+            session = create_review_session(
+                [self._result("bar", "10.5555/r213-new")], "bar", "foo"
+            )
+        assert self._dois(session) == {"10.5555/r213-own",
+                                       "10.5555/r213-new"}
+        assert save_session(session) == own
+        assert not self._messages(caplog, "WARNING")
+
+    def test_no_line_without_another_file(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        save_session(self._session(None, "foo", "10.5555/r213-own"))
+        with caplog.at_level("INFO", logger="scholar.review"):
+            create_review_session(
+                [self._result("foo", "10.5555/r213-q")], "foo"
+            )
+        assert not [m for m in self._messages(caplog, "INFO")
+                    + self._messages(caplog, "WARNING")
+                    if "is not loaded" in m]
+
+    def test_review_default_continues_an_unnamed_session(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """`search foo --review` names the session foo, yet it continues
+        the unnamed session of query foo when there is no foo.json."""
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        unnamed = save_session(self._session(None, "foo",
+                                             "10.5555/r213-hash"))
+        for doi in ("10.5555/r213-run1", "10.5555/r213-run2"):
+            with caplog.at_level("INFO", logger="scholar.review"):
+                session = create_review_session(
+                    [self._result("foo", doi)], "foo", "foo"
+                )
+            assert "10.5555/r213-hash" in self._dois(session)
+            assert session.name is None
+            assert save_session(session) == unnamed
+        assert self._saved_dois(unnamed) == {
+            "10.5555/r213-hash", "10.5555/r213-run1", "10.5555/r213-run2"}
+        assert json.loads(unnamed.read_text())["name"] is None
+        assert not (tmp_path / "review_sessions" / "foo.json").exists()
+        assert not self._messages(caplog, "WARNING")
+
+    def test_review_default_does_not_continue_a_named_hash_file(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """A hash file holding a named session is not the legacy one."""
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        copy = save_session(self._session("bar", "foo", "10.5555/r213-bar"))
+        hash_file = copy.rename(
+            copy.with_name(own_session_file_name(None, "foo")))
+
+        with caplog.at_level("INFO", logger="scholar.review"):
+            session = create_review_session(
+                [self._result("foo", "10.5555/r213-q")], "foo", "foo"
+            )
+        assert self._dois(session) == {"10.5555/r213-q"}
+        assert save_session(session).name == "foo.json"
+        [warning] = [m for m in self._messages(caplog, "WARNING")
+                     if hash_file.name in m]
+        assert "the session named 'bar'" in warning
+
+    def test_review_default_prefers_its_named_file(
+        self, tmp_path, monkeypatch
+    ):
+        """With foo.json there, the unnamed foo session stays apart."""
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        save_session(self._session(None, "foo", "10.5555/r213-hash"))
+        own = save_session(self._session("foo", "foo", "10.5555/r213-own"))
+        session = create_review_session(
+            [self._result("foo", "10.5555/r213-q")], "foo", "foo"
+        )
+        assert self._dois(session) == {"10.5555/r213-own", "10.5555/r213-q"}
+        assert save_session(session) == own
+
+    def test_review_default_does_not_continue_another_querys_file(
+        self, tmp_path, monkeypatch
+    ):
+        """The hash file of foo holding unnamed query bar (a hand copy)."""
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        copy = save_session(self._session(None, "bar", "10.5555/r213-bar"))
+        copy.rename(copy.with_name(own_session_file_name(None, "foo")))
+        session = create_review_session(
+            [self._result("foo", "10.5555/r213-q")], "foo", "foo"
+        )
+        assert self._dois(session) == {"10.5555/r213-q"}
+
+    def test_unnamed_hint_names_what_the_file_holds(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        stored = save_session(self._session(None, "q", "10.5555/r213-qq"))
+        stored.rename(stored.with_name("q.json"))
+        with caplog.at_level("INFO", logger="scholar.review"):
+            create_review_session([self._result("q", "10.5555/r213-q")], "q")
+        [warning] = [m for m in self._messages(caplog, "WARNING")
+                     if "q.json" in m]
+        assert "the unnamed session of the query 'q'" in warning
+
+    @staticmethod
+    def _homonym(number=" 0001"):
+        return Paper(title="Homonym paper", authors=[f"Wei Wang{number}"],
+                     year=2020)
+
+    def _append_renaming_the_homonym(self, path, name):
+        """Append a search that drops the homonym number, save, list ids."""
+        result = self._result("q", "unused")
+        result.papers = [self._homonym(number="")]
+        session = create_review_session([result], "q", name)
+        assert save_session(session) == path
+        return [d["paper_id"] for d in json.loads(path.read_text())["decisions"]]
+
+    def test_renamed_copy_append_keeps_the_loaded_baseline(
+        self, tmp_path, monkeypatch
+    ):
+        """`-n a` on a.json holding "b": a renamed id does not come back."""
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        session = self._session("b", "q", "unused")
+        session.decisions[0].paper = self._homonym()
+        stored = save_session(session)
+        a_path = stored.rename(stored.with_name("a.json"))
+        assert self._append_renaming_the_homonym(a_path, "a") == [
+            get_paper_id(self._homonym(number=""))]
+
+    def test_unnamed_copy_append_keeps_the_loaded_baseline(
+        self, tmp_path, monkeypatch
+    ):
+        """`-n q` on q.json holding unnamed q: the same."""
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        session = self._session(None, "q", "unused")
+        session.decisions[0].paper = self._homonym()
+        stored = save_session(session)
+        q_path = stored.rename(stored.with_name("q.json"))
+        assert self._append_renaming_the_homonym(q_path, "q") == [
+            get_paper_id(self._homonym(number=""))]
+
+    def test_a_query_too_long_for_a_file_name(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        query = "word " * 100
+        session = create_review_session(
+            [self._result(query, "10.5555/r213-long")], query
+        )
+        assert save_session(session).name == own_session_file_name(
+            None, query)
+@
+
 \paragraph{The baseline belongs to the file.}
+\label{sec:append-baseline}
 The merge of a save (\cref{sec:session-integrity}) judges each decision
 against the session's baseline: a decision that is still as it was
 loaded is not this process's, so the file's value wins.  A baseline
@@ -9772,10 +10406,11 @@ therefore describes one file, the one it was taken from.
 [[create_review_session]] used to hand the loaded session's baseline to
 the new session whether or not the new session continues that file
 (\url{https://github.com/dbosk/scholar/issues/207}).  In the appends
-above that save into another file than the one they loaded,
-the merge then judged the other file against the loaded file's
-baseline.  Say [[search foo --review]] loads [[foo.json]] (session
-[[foo]] of query [[bar]]) and saves into the hash file of query
+above that saved into another file than the one they loaded (before
+\cref{sec:append-own-file}), the merge then judged the other file
+against the loaded file's baseline.  Say [[search foo --review]] loaded
+[[foo.json]] (session [[foo]] of query [[bar]]) and saved into the hash
+file of query
 [[foo]], which holds decisions of its own.  Two things went wrong.
 \begin{itemize}
 \item A paper that the target file has decided and the search returned
@@ -9809,17 +10444,23 @@ follows the same rule: an existing target without a context keeps its
 empty one, while a target that does not exist yet gets the loaded
 file's context, since there is nothing to merge.
 
-That the append carries the loaded file's other decisions into the
-target at all comes from the lookup that found the loaded file
-(\url{https://github.com/dbosk/scholar/issues/213}), which this does
-not change, and it leaves one case unmended.  After the renamed id the
-target holds the work twice: its own decision under the old id and the
-loaded file's under the new one, possibly opposite (discarded and
+That the append carried the loaded file's other decisions into the
+target at all came from the lookup that found the loaded file
+(\url{https://github.com/dbosk/scholar/issues/213}), which this baseline
+does not change, and it left one case unmended.  After the renamed id
+the target held the work twice: its own decision under the old id and
+the loaded file's under the new one, possibly opposite (discarded and
 kept).  Nothing reports the pair: [[foldable_copies]],
 [[conflicting_copies]], [[alike_copies]] and [[possible_copies]] all
 pair a DOI-less copy with a DOI copy, and here both copies are DOI-less,
 their ids differing in the surname that the homonym number made.  Only
-the lookup fix can keep the loaded decision out of the target.
+the lookup fix could keep the loaded decision out of the target, and
+it does: an append now loads only the file it is saved to
+(\cref{sec:append-own-file}), so no append from
+[[create_review_session]] saves into another file than it loaded, and
+every append that loaded a file continues it, copies made by hand
+included (\cref{sec:session-own-file}).  The built baseline now serves
+the sessions that loaded nothing (below).
 
 A session that continues the file it loaded keeps the loaded baseline
 instead.  It records what was loaded, so a decision another process
@@ -9840,10 +10481,14 @@ elif session._baseline is not None:
 
 Let's verify it with the scenarios of the issue.  Each test fills the
 target file with decisions of its own and checks that the append's save
-keeps them: the unnamed append that loads a named session's file, the
-named append that loads an unnamed session's hash file while the named
-file is created by another process before the save, and the append
-that drops a homonym number.  The last test is the same-file append,
+keeps them: the unnamed append while a named session's file is named
+like its query, the named append while an unnamed session's hash file
+is named like its name and the named file is created by another process
+before the save, and the append that drops a homonym number.  Since
+\cref{sec:append-own-file} the first and the third load the target
+itself and the second loads nothing, so the third now checks that the
+other file's kept decision stays out and the work is held once, under
+its new id.  The last test is the same-file append,
 which must keep the loaded baseline: another process's decision wins,
 and the renamed paper's old id does not come back.
 
@@ -9914,7 +10559,7 @@ class TestAppendBaselineFollowsTheFile:
     def test_unnamed_append_keeps_the_hash_files_decisions(
         self, tmp_path, monkeypatch
     ):
-        """`search foo --review` loads foo.json, saves the hash file."""
+        """`search foo --review` beside foo.json saves the hash file."""
         monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
         save_session(self._session("foo", "bar", [
             self._decision(self._paper("10.5555/wp207-shared"),
@@ -9932,14 +10577,14 @@ class TestAppendBaselineFollowsTheFile:
     def test_named_append_keeps_a_file_created_meanwhile(
         self, tmp_path, monkeypatch
     ):
-        """`search foo -n foo` loads the hash file; foo.json appears."""
+        """`search bar -n foo` beside the hash file; foo.json appears."""
         monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
         save_session(self._session(None, "foo", [
             self._decision(self._paper("10.5555/wp207-shared"),
                            DecisionStatus.KEPT, ["t1"]),
         ], context="loaded context"))
 
-        session = create_review_session([self._search()], "foo", "foo")
+        session = create_review_session([self._search()], "bar", "foo")
         target = save_session(self._session(
             "foo", "bar", self._target_decisions(),
             context="target context",
@@ -9955,7 +10600,7 @@ class TestAppendBaselineFollowsTheFile:
     def test_renamed_id_keeps_the_target_files_decision(
         self, tmp_path, monkeypatch
     ):
-        """The loaded id the append renamed is the target's id too."""
+        """The target's decision moves to the new id, alone (#213)."""
         monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
         old_id = get_paper_id(self._homonym())
         save_session(self._session("foo", "bar", [
@@ -9973,7 +10618,10 @@ class TestAppendBaselineFollowsTheFile:
                               for d in session.decisions}
         assert save_session(session) == target
         statuses, _ = self._saved(target)
-        assert statuses[old_id] == ("discarded", ["off-topic"])
+        assert statuses == {
+            get_paper_id(self._homonym(number="")): (
+                "discarded", ["off-topic"]),
+        }
 
     def test_same_file_append_keeps_the_loaded_baseline(
         self, tmp_path, monkeypatch
@@ -11007,7 +11655,9 @@ class TestSessionFunctions:
                 )
             ]
 
-            merged = create_review_session([result], "test query")
+            merged = create_review_session(
+                [result], "test query", "test query"
+            )
 
             assert len(merged.decisions) == 1
             entry = merged.decisions[0].paper
@@ -11058,7 +11708,9 @@ class TestSessionFunctions:
                       sources=["scopus"]),
             ]
 
-            merged = create_review_session([result], "test query")
+            merged = create_review_session(
+                [result], "test query", "test query"
+            )
 
             assert len(merged.decisions) == 1
             decision = merged.decisions[0]
@@ -11112,7 +11764,9 @@ class TestSessionFunctions:
                 sources=["dblp"],
             )]
 
-            merged = create_review_session([result], "test query")
+            merged = create_review_session(
+                [result], "test query", "test query"
+            )
 
             assert len(merged.decisions) == 1
             decision = merged.decisions[0]
@@ -11156,7 +11810,9 @@ class TestSessionFunctions:
                 sources=["dblp"],
             )]
 
-            merged = create_review_session([result], "test query")
+            merged = create_review_session(
+                [result], "test query", "test query"
+            )
 
             assert len(merged.decisions) == 1
             assert merged.decisions[0].status == DecisionStatus.KEPT
@@ -11230,7 +11886,9 @@ class TestSessionFunctions:
                 )
             ]
 
-            merged = create_review_session([result], "test query")
+            merged = create_review_session(
+                [result], "test query", "test query"
+            )
 
             assert len(merged.decisions) == 1
             decision = merged.decisions[0]
