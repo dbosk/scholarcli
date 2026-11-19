@@ -1209,7 +1209,29 @@ report body builders (`build_review_provenance_latex`,
   tags; otherwise the last category tag (`audit_category`), with the
   confidence for unreviewed LLM or agent rows; notes are appended in
   parentheses, note-only rows are "other". An LLM's or an agent's keep
-  is a candidate, not a citation. Order: cited (0), `supports-claim` (1),
+  is a candidate, not a citation. That is the rule *without*
+  `--cited-from FILE.bib` (repeatable, `-f table` only, else exit 2;
+  #218, review.nw `sec:audit-cited-from`/`sec:audit-cited-entries`).
+  With it, *cited* = the text cites the work, whoever decided: the CLI
+  reads each entry as `prov import` does (`_parse_bib_entries` +
+  `_paper_from_entry`; year from `date` if no `year`; a second reading
+  with authors as written, so `Lopez Gallucci, N.` keeps its surname),
+  skips entries without title and DOI (named on stderr), and
+  `match_cited_entries(entries, session)` reuses the sessions check's
+  lookup (`matching_entries` over `session_match_index`: DOI incl.
+  version-link DOIs, else `audit_work_key` under `plausibly_same_work`)
+  → `CitedEntry.works` (work keys) → `collect_audit_rows(...,
+  cited_works=)` → `audit_reason(..., cited=True/False)` per copy
+  (None = old rule). Kept/pending + cited → order 0 (`\emph{cited}` +
+  theme/category, machine confidence kept; pending: ", pending,
+  unclassified"); discarded + cited → own reason + note "cited in the
+  text"; a confirmed keep not cited → category order, else "kept, not
+  cited in the text" (other). Caption gets `cited_rule` before the
+  databases (en/sv); counts follow the rows. stderr: match counts (DOI
+  / title / not in session), then `cited_text_disagreements` lists the
+  excluded and the not-held entries (key: short title); not in the
+  caption. Without the option the output is byte-identical (checked on
+  real-session copies). Order: cited (0), `supports-claim` (1),
   `qualifies-claim` (2), `adjacent-subtopic` (3),
   `off-topic-false-hit` (4), pending (5), other (6). The status wins
   over the category (#89): a *discarded* row whose category is

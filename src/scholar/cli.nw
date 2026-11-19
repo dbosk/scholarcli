@@ -7185,6 +7185,16 @@ def sessions_export(
                  "180 characters) with an ellipsis; off by default.",
         ),
     ] = False,
+    cited_from: Annotated[
+        Optional[list[Path]],
+        typer.Option(
+            "--cited-from",
+            help="Audit table: a .bib of the works the text cites "
+                 "(repeatable); a row is then cited when the text cites "
+                 "its work, whoever decided.",
+            exists=True, dir_okay=False, readable=True,
+        ),
+    ] = None,
 ) -> None:
     """
     Export a saved session to file(s).
@@ -7198,7 +7208,9 @@ def sessions_export(
     always a fragment and takes --lang, --label, --track and --theme;
     --bearing-only keeps only the rows that bear on the claim and states
     the other counts in the caption; --truncate-titles shortens long
-    titles, which are otherwise printed whole.
+    titles, which are otherwise printed whole. With --cited-from refs.bib
+    a row is cited when the text cites its work, whoever decided, and
+    the works the session excludes or lacks are listed on stderr.
 
     Examples:
         scholar sessions export "my review" -f all
@@ -7237,6 +7249,7 @@ def sessions_export(
             )
             raise typer.Exit(1)
         theme_names[tag] = readable
+    <<refuse [[--cited-from]] without the audit table>>
 
     console = Console()
     session = load_session(name)
@@ -7244,6 +7257,7 @@ def sessions_export(
     if session is None:
         console.print(f"[red]Session not found: {escape(name)}[/red]")
         raise typer.Exit(1)
+    <<match the works the text cites>>
 
     # Use session query as default output name (sanitized)
     if output is None:
@@ -7262,6 +7276,10 @@ def sessions_export(
 
     if format_type in ("latex", "all") and not standalone:
         _print_fragment_hint(console, tex_path.with_suffix(".bib").name)
+    if cited_entries is not None:
+        _warn_cited_disagreements(
+            session, cited_entries, theme_names=theme_names, lang=lang
+        )
 
     # If an LLM or an agent decided, report agreement/change counts.
     review_rows = machine_review_rows(session.decisions)
@@ -7364,6 +7382,344 @@ def _print_fragment_hint(console: Console, bib_name: str) -> None:
     )
 @
 
+\paragraph{The works the text cites.}
+\label{sec:export-cited-from}
+[[--cited-from refs.bib]] (repeatable) makes the audit table's
+\enquote{cited} mean what the text cites rather than what a human kept
+(\cref{sec:audit-cited-from} in the review module,
+\url{https://github.com/dbosk/scholarcli/issues/218}).  It applies to
+the audit table only: the report and the CSV list decisions, not
+citations, and [[-f all]] does not include the table.  Silently
+ignoring it there, as the other table options are, would let an author
+believe a report followed the text when it did not, so another format
+is refused before the session is read.
+
+<<refuse [[--cited-from]] without the audit table>>=
+if cited_from and format_type != "table":
+    Console(stderr=True).print(
+        "[red]--cited-from applies to the audit table only "
+        "(-f table).[/red]"
+    )
+    raise typer.Exit(2)
+@
+
+The entries are read as [[prov import]] reads them
+([[_parse_bib_entries]], [[_paper_from_entry]],
+\cref{sec:prov-roundtrip}), so a [[.bib]] that round-trips through
+the notes is read the same way here.  That reader takes one field per
+line, as Scholar writes them; a field wrapped over several lines is
+not seen.  Two additions.  An entry that gives its year only as
+[[date = {2024-05-01}]] gets the year from the date: without a year
+the namesake guard, which compares years, could not tell a 2010
+\enquote{Editorial} from a 2020 one.  And an entry whose authors are
+written surname first ([[Lopez Gallucci, Natacha Muriel]]) is also
+read with the names as written, since only that form keeps a surname
+of several words whole (\cref{sec:audit-cited-entries} in the review
+module); the matcher tries both readings.  An entry with neither a
+title nor a DOI cannot match a work and is skipped, by key, on
+standard error, and so is one whose only title is wrapped over several
+lines and has no DOI.  An entry that two files share (same key and
+work) is matched once.  The summary line counts the matches by DOI and
+by title, so the author sees how much of the match rests on the weaker
+key.
+
+<<match the works the text cites>>=
+cited_entries = None
+cited_works = None
+if cited_from:
+    cited_entries = _match_cited_bibs(cited_from, session)
+    cited_works = {work for entry in cited_entries for work in entry.works}
+<<sessions command>>=
+def _cited_bib_papers(paths: list[Path]) -> tuple[list, list[str]]:
+    """Read the `.bib` files as `(key, readings)` pairs, plus skipped keys.
+
+    `readings` are the entry's papers: authors as `First Last`, and
+    as written when that differs.  An entry with neither title nor DOI
+    is skipped; one with the same key and work in two files is read once.
+    """
+    from dataclasses import replace
+
+    entries: list = []
+    skipped: list[str] = []
+    seen: set = set()
+    for path in paths:
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as error:
+            Console(stderr=True).print(
+                f"[red]Cannot read {escape(str(path))}: "
+                f"{escape(str(error))}[/red]"
+            )
+            raise typer.Exit(1)
+        for entry in _parse_bib_entries(text):
+            fields = dict(entry.fields)
+            date = fields.get("date", "")
+            if not fields.get("year", "").isdigit() and date[:4].isdigit():
+                fields["year"] = date[:4]
+            paper = _paper_from_entry(fields)
+            if not (paper.title or "").strip() and not paper.doi:
+                skipped.append(entry.key)
+                continue
+            if (entry.key, paper.id) in seen:
+                continue
+            seen.add((entry.key, paper.id))
+            readings = [paper]
+            as_written = [
+                name.strip() for name in fields.get("author", "").split(" and ")
+                if name.strip()
+            ]
+            if as_written and as_written != paper.authors:
+                readings.append(replace(paper, authors=as_written))
+            entries.append((entry.key, readings))
+    return entries, skipped
+
+
+def _match_cited_bibs(paths: list[Path], session) -> list:
+    """Match the `.bib` entries to the session's works; report the count."""
+    from scholar.review import CHECK_BY_DOI, match_cited_entries
+
+    entries, skipped = _cited_bib_papers(paths)
+    cited = match_cited_entries(entries, session)
+    by_doi = sum(1 for e in cited if e.matched_by == CHECK_BY_DOI)
+    by_title = sum(
+        1 for e in cited if e.matched_by not in (None, CHECK_BY_DOI)
+    )
+    err = Console(stderr=True)
+    err.print(
+        f"Cited in {escape(', '.join(p.name for p in paths))}: "
+        f"{len(cited)} entries, {by_doi} matched by DOI, {by_title} by "
+        f"title, {len(cited) - by_doi - by_title} not in the session."
+    )
+    if skipped:
+        err.print(
+            f"Skipped {len(skipped)} entries without title or DOI: "
+            f"{escape(', '.join(skipped))}"
+        )
+    return cited
+@
+
+After the export, the entries where the text and the screening
+disagree are listed on standard error, one line per entry with its key
+and a shortened title, the excluded works first: those are the ones
+the table shows and the author must settle, the others have no row.
+
+<<sessions command>>=
+CITED_TITLE_LENGTH = 60
+
+
+def _warn_cited_disagreements(
+    session, entries: list, *, theme_names: dict[str, str], lang: str,
+) -> None:
+    """List the cited works the session excludes or does not hold."""
+    from scholar.review import (
+        AUDIT_STRINGS, cited_text_disagreements, shorten_title,
+    )
+
+    excluded, not_held = cited_text_disagreements(
+        session, entries, theme_names=theme_names,
+        strings=AUDIT_STRINGS[lang],
+    )
+    err = Console(stderr=True)
+    for entries_, what in ((excluded, "the session excludes"),
+                           (not_held, "the session does not hold")):
+        if not entries_:
+            continue
+        works = "work" if len(entries_) == 1 else "works"
+        err.print(
+            f"[yellow]Warning: the text cites {len(entries_)} {works} "
+            f"that {what}:[/yellow]"
+        )
+        for entry in entries_:
+            title = shorten_title(entry.title, CITED_TITLE_LENGTH)
+            err.print(f"  {escape(entry.key)}: {escape(title)}")
+@
+
+The command is checked end to end with two [[.bib]] files built in the
+test's directory: one cites an agent's keep by DOI and a human's
+discard, the other a human's keep by its title (with a [[date]] field),
+a work the session lacks, a namesake ten years older than the session's
+work, which only its [[date]] tells apart, the first file's DOI entry
+again, and an entry with neither title nor DOI.  A further session
+work is cited by a surname of two words.  Without the option the
+export must be exactly what the audit table generator writes without
+it, which has no rule sentence; and the option is refused for another
+format.
+
+<<test functions>>=
+class TestSessionsExportCitedFrom:
+  """sessions export --cited-from (#218)."""
+
+  def _save(self, monkeypatch, tmp_path):
+    from datetime import datetime
+    from scholar import review
+    from scholar.scholar import Paper
+
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+    session = review.ReviewSession(
+      query="q", providers=["openalex"], timestamp=datetime(2026, 1, 1),
+      name="cit",
+    )
+    kept, discarded = review.DecisionStatus.KEPT, \
+      review.DecisionStatus.DISCARDED
+    session.decisions = [
+      review.ReviewDecision(
+        paper=Paper(title="Agent kept", authors=["Ann Ash"], year=2020,
+                    doi="10.1/cit-agent"),
+        provider="openalex", status=kept, tags=["ml"],
+        source=review.ReviewSource.AGENT_UNREVIEWED, llm_confidence=0.8,
+      ),
+      review.ReviewDecision(
+        paper=Paper(title="Human kept", authors=["Bo Berg"], year=2021),
+        provider="openalex", status=kept, tags=["ml"],
+      ),
+      review.ReviewDecision(
+        paper=Paper(title="Not cited", authors=["Cy Cole"], year=2022,
+                    doi="10.1/cit-uncited"),
+        provider="openalex", status=kept, tags=["ml"],
+      ),
+      review.ReviewDecision(
+        paper=Paper(title="Human discarded", authors=["Di Dahl"],
+                    year=2019, doi="10.1/cit-disc"),
+        provider="openalex", status=discarded,
+        tags=["off-topic-false-hit"],
+      ),
+    ]
+    review.save_session(session)
+    return session
+
+  def _bibs(self, tmp_path):
+    one = tmp_path / "one.bib"
+    one.write_text(
+      "@article{ash2020,\n"
+      "  title = {Some {Other} Title},\n"
+      "  author = {Ash, Ann},\n"
+      "  doi = {10.1/CIT-AGENT},\n"
+      "}\n\n"
+      "@article{dahl2019,\n"
+      "  title = {Human discarded},\n"
+      "  author = {Dahl, Di},\n"
+      "  year = {2019},\n"
+      "  doi = {10.1/cit-disc},\n"
+      "}\n"
+    )
+    two = tmp_path / "two.bib"
+    two.write_text(
+      "@article{berg2021,\n"
+      "  title = {Human Kept},\n"
+      "  author = {Bo Berg},\n"
+      "  date = {2021-03-01},\n"
+      "}\n\n"
+      "@book{absent2018,\n"
+      "  title = {A Work the Session Lacks},\n"
+      "  author = {Ek, Ed},\n"
+      "  year = {2018},\n"
+      "}\n\n"
+      "@misc{empty,\n"
+      "  note = {nothing to match on},\n"
+      "}\n\n"
+      "@article{cole2012,\n"
+      "  title = {Not cited},\n"
+      "  author = {Cole, Cy},\n"
+      "  date = {2012-05-01},\n"
+      "}\n\n"
+      "@article{ash2020,\n"
+      "  title = {Some {Other} Title},\n"
+      "  author = {Ash, Ann},\n"
+      "  doi = {10.1/CIT-AGENT},\n"
+      "}\n"
+    )
+    return one, two
+
+  def test_rows_warnings_and_counts(self, monkeypatch, tmp_path):
+    self._save(monkeypatch, tmp_path)
+    one, two = self._bibs(tmp_path)
+    out = tmp_path / "tab"
+    result = runner.invoke(
+      app, ["sessions", "export", "cit", "-f", "table", "--cited-from",
+            str(one), "--cited-from", str(two), "-o", str(out)],
+    )
+    assert result.exit_code == 0, result.output
+    content = out.with_suffix(".tex").read_text()
+    assert r"Agent kept & 2020 & OA & \emph{cited}: ml (0.80) \\" \
+      in content
+    assert r"Human kept & 2021 & OA & \emph{cited}: ml \\" in content
+    assert "Not cited & 2022 & OA & kept, not cited in the text: ml" \
+      in content
+    assert "other topic (false hit) (cited in the text)" in content
+    assert "(4 unique hits: 2 cited," in " ".join(content.split())
+    stderr = " ".join(result.stderr.split())
+    assert "Cited in one.bib, two.bib: 5 entries, 2 matched by DOI, " \
+      "1 by title, 2 not in the session." in stderr
+    assert "Skipped 1 entries without title or DOI: empty" in stderr
+    assert "Warning: the text cites 1 work that the session excludes: " \
+      "dahl2019: Human discarded" in stderr
+    assert "Warning: the text cites 2 works that the session does not " \
+      "hold: absent2018: A Work the Session Lacks cole2012: Not cited" \
+      in stderr
+    assert stderr.index("excludes") < stderr.index("does not hold")
+
+  def test_without_the_option_nothing_changes(self, monkeypatch, tmp_path):
+    from scholar import review
+
+    self._save(monkeypatch, tmp_path)
+    out = tmp_path / "tab"
+    result = runner.invoke(
+      app, ["sessions", "export", "cit", "-f", "table", "-o", str(out)],
+    )
+    assert result.exit_code == 0, result.output
+    expected = tmp_path / "expected.tex"
+    review.generate_audit_table(
+      review.load_session("cit"), expected, label="cit",
+    )
+    content = out.with_suffix(".tex").read_bytes()
+    assert content == expected.read_bytes()
+    assert b"whoever decided" not in content
+    assert r"Not cited & 2022 & OA & \emph{cited}: ml" in content.decode()
+    assert "Cited in" not in result.stderr
+
+  def test_a_surname_of_several_words(self, monkeypatch, tmp_path):
+    from scholar import review
+    from scholar.scholar import Paper
+
+    session = self._save(monkeypatch, tmp_path)
+    session.decisions.append(review.ReviewDecision(
+      paper=Paper(title="Proust in Maceio",
+                  authors=["Lopez Gallucci, Natacha Muriel"], year=2026),
+      provider="wos", status=review.DecisionStatus.KEPT, tags=["ml"],
+      source=review.ReviewSource.AGENT_UNREVIEWED, llm_confidence=0.6,
+    ))
+    review.save_session(session)
+    bib = tmp_path / "lg.bib"
+    bib.write_text(
+      "@inproceedings{lopezgallucci2026,\n"
+      "  title = {Proust in Maceio},\n"
+      "  author = {Lopez Gallucci, Natacha Muriel},\n"
+      "  year = {2026},\n"
+      "}\n"
+    )
+    out = tmp_path / "tab"
+    result = runner.invoke(
+      app, ["sessions", "export", "cit", "-f", "table", "--cited-from",
+            str(bib), "-o", str(out)],
+    )
+    assert result.exit_code == 0, result.output
+    assert r"Proust in Maceio & 2026 & WoS & \emph{cited}: ml (0.60)" \
+      in out.with_suffix(".tex").read_text()
+    assert "1 by title, 0 not in the session" \
+      in " ".join(result.stderr.split())
+
+  def test_refused_without_the_table(self, monkeypatch, tmp_path):
+    self._save(monkeypatch, tmp_path)
+    one, _ = self._bibs(tmp_path)
+    result = runner.invoke(
+      app, ["sessions", "export", "cit", "-f", "csv", "--cited-from",
+            str(one), "-o", str(tmp_path / "rep")],
+    )
+    assert result.exit_code == 2
+    assert "--cited-from applies to the audit table only" in result.stderr
+    assert not (tmp_path / "rep.csv").exists()
+@
+
 \paragraph{Writing the export all or nothing.}
 \label{sec:sessions-export-atomic}
 An export of several files is only useful as a set: the [[.tex]] cites
@@ -7420,6 +7776,7 @@ try:
                 theme_names=theme_names,
                 bearing_only=bearing_only,
                 truncate_titles=truncate_titles,
+                cited_works=cited_works,
             )
             files_created.append(tex_path)
 except Exception as error:
