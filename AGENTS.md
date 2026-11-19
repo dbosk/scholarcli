@@ -1230,8 +1230,12 @@ spelling of the first author's surname give (`_unescaped_spellings`
 over `LATEX_UNICODE_PUNCTUATION`, `MAX_SPELLINGS`; `_noted_titles` is
 built lazily, once per command), then the id of the text as written
 (notes imported from hand-escaped files before #230); else the
-unescaped paper. An import keeps an existing note's title. Non-Latin
-text is dropped by the escaper on main (PR #234 takes it on).
+unescaped paper. An import keeps an existing note's title.
+`_unescape_bib` also drops the `\scholarnonlatin` wrapper (#234). When
+an entry uses that macro, `search -f bibtex`/`bibtex+prov` print one
+`@preamble{ "..." }` line with `review.nonlatin_definition()` before the
+first entry (`_nonlatin_preamble`, `uses_nonlatin`; biber copies it to
+the .bbl; checked with pdflatex/xelatex/lualatex); no stderr hint.
 All round-trip code lives in `cli.nw`'s
 `<<formatter classes>>` and `<<prov command>>` chunks.
 
