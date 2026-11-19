@@ -12771,19 +12771,47 @@ class BibTeXFormatter:
 
     def _format_paper(self, paper, key: str) -> str:
         """Return `paper` rendered as a BibTeX entry with citation `key`."""
+        from scholar.review import escape_bibtex
+
+        authors = " and ".join(paper.authors)
         lines = [
             f"@article{{{key},",
-            f"  title = {{{paper.title}}},",
-            f"  author = {{{' and '.join(paper.authors)}}},",
+            f"  title = {{{escape_bibtex(paper.title)}}},",
+            f"  author = {{{escape_bibtex(authors)}}},",
         ]
         if paper.year:
             lines.append(f"  year = {{{paper.year}}},")
         if paper.doi:
             lines.append(f"  doi = {{{paper.doi}}},")
         if paper.venue:
-            lines.append(f"  journal = {{{paper.venue}}},")
+            lines.append(f"  journal = {{{escape_bibtex(paper.venue)}}},")
         lines.append("}")
         return "\n".join(lines)
+@
+
+\label{sec:bibtex-escaping}
+The free-text fields go through [[escape_bibtex]], the escaper of the
+session export's [[.bib]] (\cref{sec:latex-escaping} in the review
+module), so one paper is written one way whichever command wrote it.
+The formatter used to copy them as the provider wrote them
+(\url{https://github.com/dbosk/scholar/issues/230}), but a title is
+ordinary text, not \LaTeX.  A [[.bib]] of raw titles passed biber, and
+then pdfLaTeX stopped on each of these (checked 2026-11-19 with \TeX{}
+Live 2025, biblatex, one title per document): [[R&D]]
+(\enquote{Misplaced alignment tab character}), [[100% sure]] (the
+[[%]] comments out the rest of the entry in the [[.bbl]]: \enquote{File
+ended while scanning use of [[\field]]}), [[$5 cost]] and
+[[snake_case]] (\enquote{Missing [[$]] inserted}), [[C# code]]
+(\enquote{Illegal parameter number}), and a symbol such as U+2606
+(white star) or a Greek letter (\enquote{Unicode character \dots{} not
+set up for use with LaTeX}).  Curly quotes, dashes and the straight
+double quote compiled; the escaper maps them anyway, as it does for
+the export.  The DOI and the year are left alone: biblatex's data
+model declares [[doi]] a verbatim field ([[blx-dm.def]]), and
+escaping its [[_]] would change the link.  The escaped text no longer
+hashes to the paper's id when the paper has no DOI;
+\cref{sec:bib-escape-round-trip} explains how the provenance commands
+still find its note.
 @
 
 Let's verify the BibTeX formatter produces valid entries with the correct
@@ -13585,8 +13613,7 @@ def _extract_bib_fields(entry_text: str) -> dict:
     for line in entry_text.split("\n"):
         match = brace.match(line) or quote.match(line)
         if match:
-            value = match.group(2).replace("{", "").replace("}", "")
-            fields[match.group(1).lower()] = value
+            fields[match.group(1).lower()] = _bib_field_text(match.group(2))
     return fields
 @
 
@@ -13614,19 +13641,82 @@ From the fields we build a minimal [[Paper]] --- enough for the notes layer to
 derive its id.  We import [[Paper]] lazily so this module keeps its existing
 import graph.
 
+A paper with a DOI is identified by it, and the DOI is written verbatim.
+A paper without one is identified by a hash of its title and first
+author as the provider wrote them, but our own formatters write those
+fields escaped (\cref{sec:bibtex-escaping}), as most [[.bib]] files
+do: [[R&D]] is [[R\&D]] in the entry, and hashes to another id.  Two
+steps bring the entry back to the paper's id.  First we undo the escapes
+that have one meaning, those of [[BIBTEX_SPECIALS]] ([[\&]] is [[&]],
+[[\textquotedbl{}]] is the double quote; the braces are gone by now).
+That is enough for a first [[prov import]] of most stubs, when no note
+exists yet.  The other mappings of the escaper cannot be undone: a
+curly apostrophe and a straight one are both written [[']], a dash
+becomes [[--]], and a symbol is dropped.  For those the second step
+compares the other way: an existing note of a DOI-less paper
+([[_noted_titles]]) whose title, escaped as the formatter escapes it,
+is the entry's title, and whose id that title and the entry's authors
+give, is the note of the paper the entry was written from.  Escaping
+the note's title rather than inverting the entry's works for any
+escaper, also one that later maps more characters.  So [[prov export]]
+finds a note taken in the TUI, and [[prov import]] adds to it.  What
+stays out of reach is a first import, before any note exists, of a
+title whose escapes cannot be inverted: its note is keyed by the
+escaped text, so the entry and the note still find each other, but not
+the paper in the session.
+
 <<formatter classes>>=
-def _paper_from_entry(fields: dict):
-    """Build a minimal Paper from entry fields, for note keying only."""
+def _bib_field_text(value: str) -> str:
+    """Return a field value as the `.bib` parser keeps it: no braces."""
+    return value.replace("{", "").replace("}", "")
+
+
+def _unescape_bib(text: str) -> str:
+    """Undo the escapes of `BIBTEX_SPECIALS` in a brace-free field."""
+    from scholar.review import BIBTEX_SPECIALS
+
+    for char, escaped in BIBTEX_SPECIALS.items():
+        text = text.replace(_bib_field_text(escaped), char)
+    return text
+
+
+def _noted_titles() -> dict:
+    """Map the escaped title of each DOI-less noted paper to its notes."""
+    from scholar.notes import list_papers_with_notes
+    from scholar.review import escape_bibtex
+
+    index: dict = {}
+    for note in list_papers_with_notes():
+        if note.paper_id.startswith("hash:") and note.title:
+            key = _bib_field_text(escape_bibtex(note.title))
+            index.setdefault(key, []).append(note)
+    return index
+
+
+def _paper_from_entry(fields: dict, noted: dict | None = None):
+    """Build a minimal Paper from entry fields, for note keying only.
+
+    `noted` (from `_noted_titles`) lets a DOI-less entry whose title was
+    escaped meet the note of the paper it was written from.
+    """
     from scholar.scholar import Paper
 
     year_raw = fields.get("year", "")
     year = int(year_raw) if year_raw.isdigit() else None
-    return Paper(
-        title=fields.get("title", ""),
-        authors=_split_bib_authors(fields.get("author", "")),
+    paper = Paper(
+        title=_unescape_bib(fields.get("title", "")),
+        authors=_split_bib_authors(_unescape_bib(fields.get("author", ""))),
         year=year,
         doi=fields.get("doi"),
     )
+    if paper.doi or not noted:
+        return paper
+    for note in noted.get(fields.get("title", ""), []):
+        written_from = Paper(title=note.title, authors=paper.authors,
+                             year=year)
+        if written_from.id == note.paper_id:
+            return written_from
+    return paper
 @
 
 A comment region may stack several blocks.  We strip the comment markers and
@@ -13917,11 +14007,12 @@ def prov_import(
         raise typer.Exit(1)
 
     entries = _parse_bib_entries(bib_file.read_text(encoding="utf-8"))
+    noted = _noted_titles()
     count = 0
     for entry in entries:
         if not entry.prov_blocks:
             continue
-        paper = _paper_from_entry(entry.fields)
+        paper = _paper_from_entry(entry.fields, noted)
         existing = get_note(paper)
         segments = (
             _split_note_segments(existing.note) if existing else []
@@ -14009,9 +14100,10 @@ def prov_export(
 
     text = bib_file.read_text(encoding="utf-8")
     entries = _parse_bib_entries(text)
+    noted = _noted_titles()
 
     def blocks_for(entry):
-        note = get_note(_paper_from_entry(entry.fields))
+        note = get_note(_paper_from_entry(entry.fields, noted))
         if note is None:
             return []
         return [
@@ -14120,6 +14212,180 @@ block arrives, headed by the new key:
         assert "% === provenance: smith2024 ===" in result.output
         assert "% CLAIM: keys may change" in result.output
         assert "john2024" not in result.output
+@
+
+\subsection{Escaped entries}
+\label{sec:bib-escape-round-trip}
+
+Let's verify the escaping of \cref{sec:bibtex-escaping} and what it
+means for the round trip.  Every special that [[escape_bibtex]] handles
+comes out as the session export writes it: the title, author and
+journal lines of [[search -f bibtex]] equal those of
+[[format_bibtex_entry]], and none of the characters that broke a
+document is left.  A symbol or a Greek letter is only compared with the
+export: how the escaper writes one is the escaper's business, and the
+exact text and the compiled document should not depend on it.  A plain
+entry is byte for byte what the formatter wrote before.  A document citing such entries compiles with biber and
+pdfLaTeX; that test runs the real tools when they are installed, since
+only they can tell whether an entry is safe, and is skipped otherwise.
+
+The round trip has three cases, all for papers without a DOI, whose id
+hashes the title as the provider wrote it.  A note taken on the paper
+elsewhere (here [[save_note]], as the TUI does) is found by
+[[prov export]] from the escaped entry; a first [[prov import]] of a
+stub for a title with a BibTeX special keys the new note by the
+paper's id; and a title that the escaper changes beyond inversion (a
+curly apostrophe) still meets an existing note.  Of two notes whose
+titles escape alike, the entry's authors pick the right one, a
+namesake by another author never.
+
+<<test functions>>=
+class TestBibtexFormatterEscaping:
+    """search -f bibtex escapes like the session export (#230)."""
+
+    SPECIALS = [
+        "R&D", "100% sure", "$5 cost", "C# code", "snake_case",
+        'a "quoted" word', "\u201cCurly\u201d \u2013 dash\u2026",
+        "Developers\u2019 view",
+    ]
+    SYMBOLS = ["star \u2606 here", "\u03c0-calculus"]
+
+    @staticmethod
+    def _entry(title, **fields):
+        from scholar import Paper
+        paper = Paper(title=title, authors=fields.pop("authors", ["A B"]),
+                      year=2024, **fields)
+        return BibTeXFormatter()._format_paper(paper, "b2024"), paper
+
+    @staticmethod
+    def _line(entry, field):
+        [line] = [l for l in entry.splitlines()
+                  if l.startswith(f"  {field} = ")]
+        return line
+
+    def test_fields_are_escaped_as_the_export_escapes_them(self):
+        from scholar.review import format_bibtex_entry
+        for title in self.SPECIALS + self.SYMBOLS:
+            entry, paper = self._entry(
+                title, authors=[f"Ann {title}"], venue=f"J {title}")
+            export = format_bibtex_entry(paper, "b2024")
+            for field in ("title", "author", "journal"):
+                assert self._line(entry, field) == self._line(export, field)
+        entry, _ = self._entry("R&D 100% $5 C# a_b \"q\"", venue="J & K")
+        title = self._line(entry, "title")
+        assert title == (r'  title = {R\&D 100\% \$5 C\# a\_b '
+                         r'\textquotedbl{}q\textquotedbl{}},')
+        assert self._line(entry, "journal") == r"  journal = {J \& K},"
+
+    def test_a_plain_entry_is_unchanged(self):
+        entry, _ = self._entry("Plain Title", authors=["Ann Smith", "Bo Li"],
+                               doi="10.1/plain_x", venue="Venue")
+        assert entry == (
+            "@article{b2024,\n"
+            "  title = {Plain Title},\n"
+            "  author = {Ann Smith and Bo Li},\n"
+            "  year = {2024},\n"
+            "  doi = {10.1/plain_x},\n"
+            "  journal = {Venue},\n"
+            "}"
+        )
+
+    def test_a_document_citing_the_entries_compiles(self, tmp_path):
+        import shutil
+        import subprocess
+        if not (shutil.which("pdflatex") and shutil.which("biber")):
+            pytest.skip("pdflatex and biber are needed to compile")
+        entries = [
+            self._entry(title, authors=["Ann Smith"], venue=f"J {title}")[0]
+            .replace("b2024", f"k{i}")
+            for i, title in enumerate(self.SPECIALS)
+        ]
+        (tmp_path / "refs.bib").write_text("\n\n".join(entries) + "\n",
+                                          encoding="utf-8")
+        (tmp_path / "doc.tex").write_text(
+            "\\documentclass{article}\n\\usepackage[T1]{fontenc}\n"
+            "\\usepackage[backend=biber]{biblatex}\n"
+            "\\addbibresource{refs.bib}\n\\begin{document}\n"
+            "\\nocite{*}\\printbibliography\n\\end{document}\n",
+            encoding="utf-8",
+        )
+        def run(*command):
+            return subprocess.run(
+                command, cwd=tmp_path, capture_output=True, text=True,
+                timeout=120,
+            )
+        latex = ("pdflatex", "-interaction=nonstopmode", "-halt-on-error",
+                 "doc.tex")
+        assert run(*latex).returncode == 0
+        biber = run("biber", "doc")
+        assert biber.returncode == 0, biber.stdout[-2000:]
+        assert "ERROR" not in biber.stdout
+        final = run(*latex)
+        assert final.returncode == 0, final.stdout[-2000:]
+        assert (tmp_path / "doc.pdf").exists()
+
+    @staticmethod
+    def _bib(tmp_path, entry, block=None):
+        bib = tmp_path / "refs.bib"
+        lines = []
+        if block:
+            lines += ["% === provenance: b2024 ===", f"% CLAIM: {block}"]
+        bib.write_text("\n".join(lines + [entry, ""]), encoding="utf-8")
+        return bib
+
+    def test_export_finds_a_note_taken_on_the_paper(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        from scholar.notes import save_note
+        entry, paper = self._entry("R&D: Developers\u2019 \u201cview\u201d")
+        save_note(paper, "=== provenance: b2024 ===\nCLAIM: from the TUI")
+        result = CliRunner().invoke(
+            app, ["prov", "export", str(self._bib(tmp_path, entry))])
+        assert result.exit_code == 0
+        assert "% CLAIM: from the TUI" in result.output
+
+    def test_first_import_keys_the_note_by_the_papers_id(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        from scholar.notes import get_note
+        entry, paper = self._entry('R&D of a_b at 100% "now"')
+        bib = self._bib(tmp_path, entry, block="imported")
+        assert CliRunner().invoke(
+            app, ["prov", "import", str(bib)]).exit_code == 0
+        note = get_note(paper)
+        assert note is not None and "CLAIM: imported" in note.note
+
+    def test_export_ignores_a_namesake_by_another_author(
+        self, tmp_path, monkeypatch
+    ):
+        """Two notes share the escaped title; the authors pick the one."""
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        from scholar.notes import save_note
+        _, other = self._entry("Developers’ view", authors=["Cy Other"])
+        save_note(other, "=== provenance: b2024 ===\nCLAIM: not this one")
+        entry, paper = self._entry("Developers' view")
+        save_note(paper, "=== provenance: b2024 ===\nCLAIM: this one")
+        result = CliRunner().invoke(
+            app, ["prov", "export", str(self._bib(tmp_path, entry))])
+        assert result.exit_code == 0
+        assert "not this one" not in result.output
+        assert "% CLAIM: this one" in result.output
+
+    def test_import_meets_an_existing_note_despite_lossy_escapes(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        from scholar.notes import get_note, list_papers_with_notes, save_note
+        entry, paper = self._entry("Developers\u2019 \u201cview\u201d")
+        save_note(paper, "personal prose")
+        bib = self._bib(tmp_path, entry, block="merged")
+        assert CliRunner().invoke(
+            app, ["prov", "import", str(bib)]).exit_code == 0
+        assert [n.paper_id for n in list_papers_with_notes()] == [paper.id]
+        note = get_note(paper)
+        assert "personal prose" in note.note and "CLAIM: merged" in note.note
 @
 
 
