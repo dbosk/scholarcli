@@ -964,20 +964,21 @@ listing members. A machine `decide` also calls
 `review.MACHINE_AUDIT_FIELDS` to None (empty here; classifier audit
 fields register there so a replaced decision does not keep the old
 run's model/prompt/reason). `--keep-trace` (#245) skips that call for
-a machine source, so an agent's correction of a (relabelled) classifier
+`--source agent`, so an agent's correction of a (relabelled) classifier
 call keeps `LLM_AUDIT_FIELDS` and the report's LLM screening section
 (`first_made_by_llm`) still counts it with its model and prompt; all
 other decide rules are unchanged. It needs `-c` (exit 2 before loading
 otherwise: the confidence column is the current decider's, never a
-kept classifier number); with `--source human` it is only noted (a
+kept classifier number); with `--source llm` it is refused (exit 2
+before loading: a relayed verdict is a new run, and the kept trace
+would be read as its); with `--source human` it is only noted (a
 human never clears the trace). Nothing new is stored: `sessions show`
 marks a decision whose `llm_model` is set but whose source is not
 `llm`/`llm_reviewed` (`cli.earlier_classifier_trace`;
 `CLASSIFIER_SOURCES` duplicates `llm_review.LLM_SOURCES` so `show`
 does not import llm_review and its caches, a test keeps them equal)
 with "(llm trace: earlier classifier call)" and JSON `"llm_trace":
-"earlier classifier call"` (key absent otherwise). A `--source llm
---keep-trace` record cannot be told apart from the run itself. The CSV
+"earlier classifier call"` (key absent otherwise). The CSV
 has no classifier-field columns, so it is unchanged. A machine
 `decide` never replaces a decided
 paper whose source is `human`, `llm_reviewed` or `agent_reviewed`:
