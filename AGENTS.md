@@ -112,10 +112,15 @@ Providers self-register via `register_provider()` at module load time.
   repair) a multi-name string can also be honest, so
   `decision_provider_evidence(decision)` keeps a name of a
   multi-name `provider` only if a single-provider `found_by` link
-  (no comma in its provider) or `paper.sources` names it
-  (case-insensitive). The string stands unchanged with no such
-  evidence at all, with one name (a merged search wrote two or more),
-  and for names not in `PROVIDER_FULL_NAMES` (`snowball`). Sources only
+  (its provider splits into one name) or `paper.sources` names it
+  (case-insensitive; string, sources and links all split on
+  `PROVIDER_SEPARATORS`, since the notes-module fallback stores a
+  joined provider as a source). The string stands unchanged with no
+  such evidence at all, when the evidence names none of its providers
+  (`s2` alone, `previous`), with one name (a merged search wrote two
+  or more), and for names not in `PROVIDER_FULL_NAMES` (`snowball`).
+  Two decisions sharing a paper id share one registry `Paper`, so the
+  second is judged by the first's sources. Sources only
   confirm names, never add them (enrichment unions the enriching
   provider into `sources`; preprint adoption the candidate's); links
   add their provider at the end. Used by `decision_provider_names`
