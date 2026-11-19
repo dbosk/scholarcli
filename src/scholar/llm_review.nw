@@ -3359,7 +3359,7 @@ def draw_llm_sample(
     Raises:
         ValueError: `size` is not positive, or no decision is eligible.
     """
-    from scholar.review import LLMSample
+    from scholar.review import LLMSample, session_file_path
 
     if size < 1:
         raise ValueError("The sample size must be at least 1")
@@ -3394,10 +3394,12 @@ criteria = {
     "population_sources": sorted({source_value(d) for _, _, d in pool}),
 }
 names = [session_label(s) for s in sessions]
+files = [session_file_path(s).name for s in sessions]
 for session in sessions:
     session.llm_samples.append(LLMSample(
         sample_id=sample_id, seed=seed, drawn_at=drawn_at,
         criteria=dict(criteria), sessions=list(names),
+        session_files=list(files),
         population=len(pool), population_digest=digest, size=len(drawn),
         papers=[
             {"paper_id": pid, "status": d.status.value,
@@ -3852,6 +3854,71 @@ counted = report.reviewed + len(report.unreviewed) + report.not_found
 report.not_found += max(0, report.size - counted)
 @
 
+\paragraph{The other pooled sessions.}
+\label{sec:llm-sample-report}
+A report on one session of a sample pooled over several needs the
+others too, read-only: [[llm sample --report]] and the report's LLM
+screening section both read them with [[pooled_sample_sessions]].  A
+sample names its sessions by label, which is not a key: the unnamed
+session of query [[foo]] and a named session [[foo]] share the label,
+and [[load_session]] opens [[foo.json]] first, so a sample pooled over
+the unnamed session before a named [[foo]] was created counted the
+named session's decisions, and its own sampled papers as not found
+(\url{https://github.com/dbosk/scholarcli/issues/231}).  A sample
+therefore keeps the file of each session ([[session_files]],
+\cref{sec:llm-sample-record} in the review module), and the other
+sessions are read from those files.  A file that is gone is a session
+that no longer exists, and its papers are counted as not found; one
+that cannot be read is skipped with the warning a listing gives
+([[load_listed_session]]).  A sample drawn before the files were kept
+has only the labels, which are looked up as before ([[load]], by
+default [[load_session]]); then a session already read is not read
+again, so a label that resolves to a given session's file adds nothing.
+
+<<llm review sampling>>=
+def pooled_sample_sessions(
+    sessions: list[ReviewSession],
+    *,
+    load: Callable[[str], ReviewSession | None] | None = None,
+) -> list[ReviewSession]:
+    """Return `sessions`, then the other sessions their samples pooled.
+
+    The others are read from the files the samples record, or, for a
+    sample drawn before files were recorded, looked up by label with
+    `load` (default `load_session`). A session whose file is gone is
+    left out, so its sampled papers count as not found.
+    """
+    from scholar.review import (
+        _get_sessions_dir, load_listed_session, load_session,
+        session_file_path,
+    )
+
+    load = load or load_session
+    pooled = list(sessions)
+    files = {session_file_path(s).name for s in sessions}
+    labels = {session_label(s) for s in sessions}
+    wanted_files: set[str] = set()
+    wanted_labels: set[str] = set()
+    for session in sessions:
+        for sample in session.llm_samples:
+            if sample.session_files is not None:
+                wanted_files.update(sample.session_files)
+            else:
+                wanted_labels.update(sample.sessions)
+    for file_name in sorted(wanted_files - files):
+        path = _get_sessions_dir() / file_name
+        other = load_listed_session({"path": path}) if path.exists() else None
+        if other is not None:
+            pooled.append(other)
+            files.add(file_name)
+    for label in sorted(wanted_labels - labels):
+        other = load(label)
+        if other is not None and session_file_path(other).name not in files:
+            pooled.append(other)
+            files.add(session_file_path(other).name)
+    return pooled
+@
+
 The TUI queues a sample for review through [[sampled_for_review]]:
 the session's sampled decisions that still wait for a human, in the
 order they were drawn, each once even when two samples drew it.
@@ -4111,22 +4178,14 @@ def build_llm_screening_latex(
     load: Callable[[str], ReviewSession | None] | None = None,
 ) -> list[str]:
     """Build the report's paragraphs on the LLM screening and its samples."""
-    from scholar.review import escape_latex, load_session
+    from scholar.review import escape_latex
 
     sentences = []
     screening = llm_screening_sentence(session)
     if screening:
         sentences.append(screening)
     if session.llm_samples:
-        load = load or load_session
-        own = session_label(session)
-        others = {
-            name for sample in session.llm_samples for name in sample.sessions
-        } - {own}
-        pooled = [session] + [
-            loaded for loaded in (load(name) for name in sorted(others))
-            if loaded is not None
-        ]
+        pooled = pooled_sample_sessions([session], load=load)
         own_ids = {sample.sample_id for sample in session.llm_samples}
         sentences.extend(
             sample_sentence(report) for report in sample_reports(pooled)
@@ -4207,6 +4266,94 @@ class TestLLMScreeningLatex:
         sample = next(line for line in lines if "random sample" in line)
         assert "changed 1" in sample
         assert "1 sampled decisions were not found" in sample
+@
+
+A sample names its sessions by label, and a label is not a key: the
+unnamed session of query [[foo]] and a named session [[foo]] share
+it (\url{https://github.com/dbosk/scholarcli/issues/231}).  Here the
+unnamed session is pooled with [[x]] while no named [[foo]] exists; a
+reviewer then changes its sampled decision, and only then is the named
+session [[foo]] created.  The report on [[x]] must count the review
+from the unnamed session's file, not look the label up and find the
+named one.
+
+<<test functions>>=
+class TestPooledSessionsByFile:
+    """The other pooled sessions are read by their files (#231)."""
+
+    @staticmethod
+    def _save(name, query, doi):
+        from scholar.review import save_session
+        session = ReviewSession(
+            query=query, providers=["p"], timestamp=datetime(2026, 11, 19),
+            name=name,
+        )
+        session.decisions = [ReviewDecision(
+            paper=Paper(title=doi, authors=["A"], doi=doi),
+            provider="p", status=DecisionStatus.DISCARDED, tags=["t"],
+            source=ReviewSource.LLM_UNREVIEWED, llm_confidence=0.9,
+        )]
+        save_session(session)
+
+    def _pool_beside_a_namesake(self, tmp_path, monkeypatch):
+        from scholar.review import (
+            load_session, read_session_file, save_session,
+            session_file_path,
+        )
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        self._save(None, "foo", "10.5555/wp231-unnamed")
+        self._save("x", "x", "10.5555/wp231-x")
+        unnamed, x = load_session("foo"), load_session("x")
+        draw_llm_sample([unnamed, x], statuses={"discarded"}, size=2,
+                        seed=1)
+        [decision] = unnamed.decisions
+        decision.status, decision.source = (
+            DecisionStatus.KEPT, ReviewSource.LLM_REVIEWED)
+        save_session(unnamed)
+        save_session(x)
+        self._save("foo", "bar", "10.5555/wp231-named")
+        return read_session_file(session_file_path(x)), unnamed
+
+    def test_the_report_reads_the_pooled_file(self, tmp_path, monkeypatch):
+        x, unnamed = self._pool_beside_a_namesake(tmp_path, monkeypatch)
+        [sample] = x.llm_samples
+        assert sample.sessions == ["foo", "x"]
+        pooled = pooled_sample_sessions([x])
+        assert [s.query for s in pooled] == ["x", "foo"]
+        [report] = sample_reports(pooled)
+        assert (report.reviewed, report.changed, report.not_found) == (
+            1, 1, 0)
+
+    def test_the_screening_section_reads_the_pooled_file(
+        self, tmp_path, monkeypatch
+    ):
+        x, _ = self._pool_beside_a_namesake(tmp_path, monkeypatch)
+        sentence = next(line for line in build_llm_screening_latex(x)
+                        if "random sample" in line)
+        assert "changed 1" in sentence
+        assert "not found" not in sentence
+
+    def test_a_pooled_file_gone_is_not_found(self, tmp_path, monkeypatch):
+        from scholar.review import session_file_path
+        x, unnamed = self._pool_beside_a_namesake(tmp_path, monkeypatch)
+        session_file_path(unnamed).unlink()
+        [report] = sample_reports(pooled_sample_sessions([x]))
+        assert (report.reviewed, report.not_found) == (0, 1)
+
+    def test_each_session_is_read_once(self, tmp_path, monkeypatch):
+        """Old and new samples, and the given session, read once each."""
+        from dataclasses import replace
+        from scholar.review import load_session
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        self._save("a", "a", "10.5555/wp231-a")
+        self._save("x", "x", "10.5555/wp231-x")
+        a, x = load_session("a"), load_session("x")
+        draw_llm_sample([a, x], statuses={"discarded"}, size=2, seed=1)
+        [sample] = a.llm_samples
+        assert sample.session_files == ["a.json", "x.json"]
+        a.llm_samples.append(
+            replace(sample, sample_id="old", session_files=None))
+        assert [s.name for s in pooled_sample_sessions([a])] == ["a", "x"]
 @
 
 
