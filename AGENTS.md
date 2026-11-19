@@ -930,15 +930,25 @@ context (#107). `review.save_session` now:
   and after each save). Decision fields and `research_context` this
   process did not change take the on-disk value. Papers, search records
   and snowball rounds that only the file has are added. Paper metadata
-  of a paper both hold is merged ours first (#194, `paper_filled_from`
-  = `ours.merge_with(theirs)`): the file's copy fills our empty
-  fields (gaps another process filled survive), sources/keywords
-  united; a field both hold keeps ours, even if the other process
-  updated it after our load (a newer Crossref `updated_by`/
-  `newer_versions` or Unpaywall `oa_status`/`oa_url` is lost: no
-  per-paper baseline yet). Nothing is filled from a namesake
-  (`plausibly_same_work`; DOI-less hash ids collide). The decision
-  keeps its very `Paper` object when nothing was filled. The file is
+  of a paper both hold is merged three ways too (#206,
+  `paper_merged_from(ours, theirs, base_state)`): the baseline keeps
+  each paper's stored fields (`SessionBaseline.papers`: id →
+  `paper_state(paper)`, the `Paper.to_dict()` fields frozen into
+  immutable copies, lists → tuples, dicts → sorted item tuples, so
+  in-place changes are seen; `None` ≠ `()`). A field ours still has
+  as in the baseline takes the file's value if that differs (a
+  retraction `verify` saved, an Unpaywall `oa_status`); a field we
+  changed keeps ours (also when both changed); then gaps are filled
+  (#194, `paper_filled_from` = `ours.merge_with(theirs)`).
+  `ACCUMULATED_PAPER_FIELDS` (sources, keywords, tags united,
+  `citation_count` max) are never judged three ways. No baseline for
+  the paper (session never loaded, paper new here) → gaps only, ours
+  wins. `read_session_file` takes the baseline from the file's copy
+  (`as_stored`), not from the registry's held object, else the
+  file's older values would overwrite ours. Cost on an 11,162-paper
+  session copy: ~5 MB, load ~+10%. Nothing is taken or filled from a
+  namesake (`plausibly_same_work`; DOI-less hash ids collide). The
+  decision keeps its very `Paper` object when nothing changed. The file is
   read with `read_session_file(path, use_registry=False)`, else the
   registry would hand back our own objects and hide the file's copies;
   a paper new on disk is registered (`register`), and if this process
