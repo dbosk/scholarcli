@@ -2790,7 +2790,7 @@ def create_review_session(
     <<convert search results to decisions>>
     <<point links at the records that replaced theirs>>
     supersede_merged_records(session)
-    <<take the session as built as the baseline of another file>>
+    <<take the session as built as the baseline>>
     
     logger.info("Created session with %d papers (%d kept, %d discarded, %d pending)",
                len(session.decisions), len(session.kept_papers()),
@@ -8260,13 +8260,18 @@ A session that continues the file it loaded keeps the loaded baseline
 instead.  It records what was loaded, so a decision another process
 saved meanwhile still wins over a decision this process only loaded,
 and a paper that this append renamed is not brought back from the file
-under its old id.  A baseline taken after the build would know neither.
-A session that loaded nothing still has no baseline; this concerns only
-the appends that loaded one file and save into another.
+under its old id.  A baseline taken after the build would know neither,
+though the loaded one lacks the papers new in this run; the built state
+fills that gap (below).  A session that loaded nothing still has no
+baseline.
 
-<<take the session as built as the baseline of another file>>=
-if previous_session and session._loaded_from is None:
-    session._baseline = SessionBaseline.of(session)
+<<take the session as built as the baseline>>=
+if previous_session:
+    built = SessionBaseline.of(session)
+    if session._loaded_from is None:
+        session._baseline = built
+    elif session._baseline is not None:
+        <<fill the gaps of the loaded baseline from [[built]]>>
 @
 
 Let's verify it with the scenarios of the issue.  Each test fills the
@@ -8434,6 +8439,112 @@ class TestAppendBaselineFollowsTheFile:
         assert old_id not in statuses
         assert statuses[get_paper_id(self._homonym(number=""))] == (
             "kept", ["t1"])
+@
+
+\paragraph{Papers new in a same-file append.}
+The loaded baseline has a gap of its own: it knows only the papers that
+were loaded.  A paper that this run's search adds is pending in the
+session and absent from the baseline, so the merge counted the pending
+decision as this process's own.  When another process appended to the
+same file, found the same paper and decided it before we saved, our
+pending decision replaced its decision
+(\url{https://github.com/dbosk/scholar/issues/214}).  That is the first
+of the wrongs of the other-file case above, and the mend is the same:
+a paper the loaded baseline lacks gets the state it was built with, so
+an untouched pending decision yields to the file's.
+
+Only the missing entries are added.  The loaded ones stay, so an id
+that this append renamed away keeps its loaded entry, and the merge
+still reads its absence from the session as a rename and does not bring
+it back from the file.  The search-record keys and the research context
+stay as loaded too: the keys tell the merge which legacy records it
+loaded from the file (\cref{sec:legacy-records}), which a record of
+this run never is, and the context is a single value that the loaded
+baseline already holds.
+
+<<fill the gaps of the loaded baseline from [[built]]>>=
+session._baseline = replace(
+    session._baseline,
+    decisions={**built.decisions, **session._baseline.decisions},
+)
+@
+
+Let's verify it with real processes, as the issue describes the race:
+both build the append from the same file and find the same new paper;
+the second decides it and saves; then the first saves, without having
+touched the paper.  The file must keep the second process's decision.
+Separate processes also keep the paper registry, which one process
+shares between its session objects, out of the test.
+
+<<test functions>>=
+class TestNewPaperOfASameFileAppend:
+    """A paper new in a same-file append yields to the file (#214)."""
+
+    BUILD = """
+        import sys
+        from scholar.scholar import Paper, SearchResult
+        from scholar.review import (
+            DecisionStatus, create_review_session, save_session,
+        )
+        result = SearchResult(
+            query="foo", provider="openalex", timestamp="t",
+            papers=[Paper(title="New", authors=["B"],
+                          doi="10.5555/wp214-new")],
+        )
+        session = create_review_session([result], "foo", "foo")
+        [new] = [d for d in session.decisions
+                 if d.paper.doi == "10.5555/wp214-new"]
+    """
+
+    def test_another_processs_decision_on_a_new_paper_wins(
+        self, tmp_path, monkeypatch
+    ):
+        import subprocess
+        import sys
+        import textwrap
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        session = ReviewSession(
+            query="foo", providers=["openalex"],
+            timestamp=datetime(2026, 11, 19), name="foo",
+        )
+        session.decisions = [ReviewDecision(
+            paper=Paper(title="Old", authors=["A"], doi="10.5555/wp214-old"),
+            provider="openalex",
+        )]
+        path = save_session(session)
+
+        first = subprocess.Popen(
+            [sys.executable, "-c", textwrap.dedent(self.BUILD)
+             + textwrap.dedent("""
+                print("built", flush=True)
+                sys.stdin.readline()
+                save_session(session)
+             """)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+        )
+        try:
+            assert first.stdout.readline().strip() == "built"
+            subprocess.run(
+                [sys.executable, "-c", textwrap.dedent(self.BUILD)
+                 + textwrap.dedent("""
+                    new.status, new.tags = DecisionStatus.KEPT, ["t1"]
+                    save_session(session)
+                 """)],
+                check=True, timeout=120,
+            )
+            first.communicate("go\n", timeout=120)
+        finally:
+            if first.poll() is None:
+                first.kill()
+        assert first.returncode == 0
+        saved = {
+            d["paper"]["doi"]: (d["status"], d["tags"])
+            for d in json.loads(path.read_text())["decisions"]
+        }
+        assert saved == {
+            "10.5555/wp214-old": ("pending", []),
+            "10.5555/wp214-new": ("kept", ["t1"]),
+        }
 @
 
 \subsubsection{Persisting Query-Provider Pairs}

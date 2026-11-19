@@ -978,7 +978,12 @@ context (#107). `review.save_session` now:
   the loaded file's decisions and context replace the target's; the
   loaded one reset the target's decisions of papers it lacked and
   dropped those under ids the append renamed). Same-file appends keep
-  the loaded baseline (a renamed id must not come back from the file).
+  the loaded baseline (a renamed id must not come back from the file)
+  and add the built state only for ids it lacks (#214: a paper new in
+  this run, untouched, yields to another process's decision);
+  `record_keys` and the context stay as loaded. Known gap (#213): a
+  renamed id leaves the target the work twice (old id: its own
+  decision; new id: the loaded file's), reported by no copy list.
 
 `scholar enrich` saves after every `ENRICH_SAVE_EVERY` (50) papers
 (`cli.nw`, `sec:enrich-chunks`): enrich → Crossref check → assign →
