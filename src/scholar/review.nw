@@ -648,6 +648,10 @@ class ReviewDecision:
         relabelled: Each time the source was corrected without changing
             the decision (`{"from", "to", "at", "note", "by",
             "is_example"}`), oldest first; see `relabel_source`.
+        baseline_key: The decision's key in its session's baseline,
+            given when the session was loaded or saved (not saved
+            itself); `None` for a decision made since. See
+            `pair_with_file`.
     """
     paper: Paper
     provider: str
@@ -660,6 +664,7 @@ class ReviewDecision:
     found_by: list[tuple[str, str, str | None]] = field(default_factory=list)
     same_id_copies: list[dict] = field(default_factory=list)
     relabelled: list[dict] = field(default_factory=list)
+    baseline_key: str | None = field(default=None, compare=False, repr=False)
 
     def __post_init__(self):
         """Coerce None list fields to empty lists."""
@@ -3088,19 +3093,45 @@ def _normalize_paper_identifiers(paper: Paper) -> Paper:
     if derived:
         return replace(paper, doi=derived)
     return paper
+@
 
+The append looks a returned paper's previous decision up by id, one
+decision per id.  A session can hold two under one id, though: a work
+decided apart as two copies, which a re-run of a session without a
+session file leaves (\cref{sec:decision-store-fallback}) and the copy
+lists show (\cref{sec:session-copies}).  The lookup kept the last of
+them, the restore below added only what the lookup held, and so the
+next append dropped the other copy, with only the save's warning that
+the decided papers had become fewer
+(\url{https://github.com/dbosk/scholarcli/issues/228}).  Now the
+lookup holds the first decision of each id, and the other copies are
+carried through as they are, after the conversion
+([[<<carry the other copies of an id through>>]]).  The returned paper
+attaches to the first copy only.  The first, because the order of a
+session's decisions is kept through an append, and with it which copy
+is which (the save matches copies by their order,
+\cref{sec:session-integrity}); and in the pairs the re-run leaves, the
+first copy is the one a search reached, the one beside it a record
+restored after the conversion, so the returned paper goes to the copy
+it went to before.  Nothing in the two decisions would name a better
+choice: they differ, and which is right is the user's to say.
 
+<<review session functions>>=
 def _build_previous_decision_lookup(
     previous_session: ReviewSession | None,
 ) -> dict[str, ReviewDecision]:
     """
     Build a lookup dict from paper_id to ReviewDecision from previous session.
-    
+
     This preserves ALL decision fields including LLM-related metadata.
+    Of several decisions under one id, the first is held.
     """
     if not previous_session:
         return {}
-    return {get_paper_id(d.paper): d for d in previous_session.decisions}
+    lookup: dict[str, ReviewDecision] = {}
+    for decision in previous_session.decisions:
+        lookup.setdefault(get_paper_id(decision.paper), decision)
+    return lookup
 
 
 def create_review_session(
@@ -5080,6 +5111,30 @@ for result in results:
         decision_lookup[paper_id] = decision
 
 <<restore the deferred store records no paper took>>
+<<carry the other copies of an id through>>
+@
+
+The copies of an id beyond the first, which the lookup does not hold
+(\cref{sec:review-create-strict}), join the session after the
+conversion, unchanged.  Added before it, they would be in the
+conversion's [[decision_lookup]], and a returned paper of their id
+would merge into one of them through the branch for papers already in
+the session, while the first copy, its id returned, would be neither
+restored nor met.  After it, no returned paper meets them: it was
+attached to the first copy.  They keep their order, so the save still
+tells the copies apart by it.  A copy is told from the first by being
+none of the decisions the lookup holds, not by its paper's id: the
+conversion renames the papers of some decisions it meets (a name
+written surname first, a homonym number), and a renamed first copy
+looked up by its new id would be taken for one of the others and
+added twice.
+
+<<carry the other copies of an id through>>=
+if previous_session:
+    held = {id(d) for d in prev_decision_lookup.values()}
+    for decision in previous_session.decisions:
+        if id(decision) not in held:
+            session.decisions.append(decision)
 @
 
 \paragraph{A paper found again in the old decision store.}
@@ -6165,7 +6220,11 @@ drops what this process did not touch:
 \item[Untouched] The copy is unscreened, its state is what this
   process loaded (or, for a copy this process created, it is
   unscreened all the same), it has no note, and the file no longer
-  holds it: the reconcile removed it there.  Nobody has screened it, so
+  holds it: the reconcile removed it there.  With copies of one work
+  under the folded-away id, each copy is judged apart, and a copy the
+  file no longer holds is one the merge paired with no copy in the
+  file (\cref{sec:copies-in-the-merge}), since the file can still hold
+  the other copies of that id.  Nobody has screened it, so
   it holds no decision to lose.  It is dropped, and its search links,
   other-work notes, provider and metadata go to the target, the
   metadata filling gaps only ([[merge_version_of]]) as in a fold, so an
@@ -6229,22 +6288,25 @@ def repoint_folded_ids(session: ReviewSession) -> None:
 
 def apply_tombstones(
     session: ReviewSession,
-    base_states: dict[str, tuple],
-    disk_decisions: dict[str, ReviewDecision],
+    base: "SessionBaseline | None",
+    paired: dict[int, ReviewDecision],
 ) -> None:
     """Drop the untouched copies `session` holds under folded-away ids.
 
     A copy is untouched when it is unscreened, unchanged since it was
-    loaded, has no note and is no longer in the file; its links and
+    loaded (`base`), has no note and is no longer in the file (`paired`,
+    from `pair_with_file`, has no file copy for it); its links and
     metadata go to the target. Every other copy stays. Never changes or
     drops a decision.
     """
     if not session.folded:
         return
+    base_states = base.decisions if base else {}
     by_id = {get_paper_id(d.paper): d for d in session.decisions}
     folded_held = [
-        paper_id for paper_id in by_id
-        if resolve_folded_id(session.folded, paper_id) != paper_id
+        d for d in session.decisions
+        if resolve_folded_id(session.folded, get_paper_id(d.paper))
+        != get_paper_id(d.paper)
     ]
     if not folded_held:
         return
@@ -6253,15 +6315,16 @@ def apply_tombstones(
     except NotesFileError:
         return
     dropped: set[int] = set()
-    for paper_id in folded_held:
-        decision = by_id[paper_id]
+    for decision in folded_held:
+        paper_id = get_paper_id(decision.paper)
         target = by_id.get(resolve_folded_id(session.folded, paper_id))
         untouched = (
             is_unscreened(decision)
-            and base_states.get(paper_id, decision_state(decision))
+            and base_states.get(base_key_of(decision, base),
+                                decision_state(decision))
             == decision_state(decision)
             and paper_id not in noted
-            and paper_id not in disk_decisions
+            and id(decision) not in paired
         )
         if target is None or not untouched:
             continue
@@ -6332,12 +6395,12 @@ session, whatever made it.
 DOI-less id onto its DOI copy's id and leaves a tombstone from the one
 to the other; two copies under one id have no other id to move to, and
 since their decisions differ, keeping one means choosing between them,
-which is the user's to do.  Two things limit what the listing achieves
-so far.  [[sessions decide --paper-id]] looks decisions up by id and
-reaches one of the two.  And the next append keeps one decision per id
-of the session it continues ([[_build_previous_decision_lookup]]), so
-the other copy is dropped there, with the warning about fewer decided
-papers that the save gives; the listing shows the pair until then.
+which is the user's to do.  The pair lasts until then: an append
+carries every copy of an id through (\cref{sec:review-create-strict}),
+a save tells the copies apart by their order
+(\cref{sec:session-integrity}), and [[sessions decide]] refuses to
+decide copies decided apart unless told [[--all-copies]], which is how
+the user settles them (the command chapter's [[sessions decide]]).
 
 <<review session functions>>=
 def same_id_pairs(
@@ -7393,6 +7456,356 @@ class TestCopiesOfStoreRecords:
       assert get_note(decision.paper).note == "read it"
 @
 
+Two decisions under one id must also outlast what comes after them
+(\url{https://github.com/dbosk/scholarcli/issues/228}).  The session
+file holds the pair of the renamed Scopus probe above: the work
+discarded as found by OpenAlex, and kept as found by Scopus, the
+latter with the link of its search.  An append that does not return the
+work keeps both, and so does one that returns it, which attaches the
+returned paper to the first copy only: its provider and link, none of
+them on the second.  Then the save: two session objects loaded from the
+file, one changes a copy and saves, the other saves untouched; the
+file must keep that change, on that copy, whichever of the two it is,
+and the links of one copy must not pass to the other.  Last, the save's
+guard against lost decisions: resetting the second copy to pending,
+beside a first copy that is pending already, is this process's own
+reset and no loss to warn about.
+
+<<test functions>>=
+class TestSameIdDecisions:
+  """Two decisions under one id survive appends and saves (#228)."""
+
+  HASH = legacy_hash_paper_id("A Study", ["Ada Lovelace"])
+  LINK = ("q", "scopus", "")
+
+  def _save_pair(self):
+    from scholar.scholar import isolated_registry
+    with isolated_registry():
+      session = ReviewSession(query="q", providers=["openalex", "scopus"],
+                              timestamp=datetime.now(), name="pair")
+      session.decisions = [
+        ReviewDecision(
+          paper=Paper(title="A Study", authors=["Ada Lovelace"], year=2014),
+          provider="openalex", status=DecisionStatus.DISCARDED,
+          tags=["off-topic"]),
+        ReviewDecision(
+          paper=Paper(title="A Study", authors=["A. Lovelace"], year=2014),
+          provider="scopus", status=DecisionStatus.KEPT, tags=["theme"],
+          found_by=[self.LINK]),
+      ]
+      save_session(session)
+
+  def _copies(self):
+    from scholar.scholar import isolated_registry
+    with isolated_registry():
+      session = load_session("pair")
+    return session, [
+      (d.status.value, d.provider, d.tags, d.found_by)
+      for d in session.decisions if d.paper.id == self.HASH
+    ]
+
+  def _append(self, paper):
+    from scholar.scholar import SearchResult, isolated_registry
+    result = SearchResult(query="q", provider="s2", timestamp=datetime.now(),
+                          papers=[paper], limit=10)
+    with isolated_registry():
+      save_session(create_review_session([result], "q", session_name="pair"))
+
+  def test_an_append_keeps_both_copies(self):
+    self._save_pair()
+    self._append(Paper(title="Another Study", authors=["Bo Ek"], year=2020))
+    session, copies = self._copies()
+    assert copies == [
+      ("discarded", "openalex", ["off-topic"], []),
+      ("kept", "scopus", ["theme"], [self.LINK]),
+    ]
+    [conflict] = conflicting_copies(session)
+    assert len(conflict.decisions) == 2
+
+  def test_the_returned_paper_attaches_to_the_first_copy(self):
+    self._save_pair()
+    self._append(Paper(title="A Study", authors=["Ada Lovelace"], year=2014))
+    _, copies = self._copies()
+    assert copies == [
+      ("discarded", "openalex, s2", ["off-topic"], [("q", "s2", "")]),
+      ("kept", "scopus", ["theme"], [self.LINK]),
+    ]
+
+  @pytest.mark.parametrize("changed", [0, 1])
+  def test_a_concurrent_save_keeps_each_copys_change(self, changed):
+    self._save_pair()
+    mine = load_session("pair")
+    other = load_session("pair")
+    copy = other.decisions[changed]
+    copy.status, copy.tags = DecisionStatus.KEPT, ["changed"]
+    save_session(other)
+    save_session(mine)
+    _, copies = self._copies()
+    expected = [
+      ("discarded", "openalex", ["off-topic"], []),
+      ("kept", "scopus", ["theme"], [self.LINK]),
+    ]
+    expected[changed] = ("kept",) + expected[changed][1:2] + (
+      ["changed"], expected[changed][3])
+    assert copies == expected
+
+  def test_resetting_a_copy_is_not_taken_for_a_loss(self, caplog):
+    self._save_pair()
+    session = load_session("pair")
+    session.decisions[0].status = DecisionStatus.PENDING
+    session.decisions[0].tags = []
+    save_session(session)
+    session = load_session("pair")
+    session.decisions[1].status = DecisionStatus.PENDING
+    with caplog.at_level("WARNING"):
+      save_session(session)
+    assert "reduces the decided papers" not in caplog.text
+@
+
+The order of the copies is not a safe guide on its own: it changes
+under the save's feet.  This process can rename a copy, so that the
+copy after it becomes the first of its id; another process can drop a
+copy (a Scholar from before this change does, at its next append),
+swap two, put a new copy first, or fold one away
+(\url{https://github.com/dbosk/scholarcli/pull/238}, review).  Each
+time, pairing the copies by their places paired each with the wrong
+one, and statuses, providers and links passed between them.  The tests
+play each case with the pair of a Scopus name written surname first, so
+that a re-run renames the first copy, and check every copy by its
+provider: each keeps its own status, tags and links, a change the other
+process made reaches the copy it was made on, and a fold is not undone.
+Three more pin the keys: a copy renamed away stays away also when the
+other process changed it in the file; the keys follow the order a save
+wrote, not the order loaded; and a pair that a session without a file
+built from the decision store (\cref{sec:decision-store-fallback})
+has its keys from the build.  For that one, the other process is a
+copy of the built session, since the build migrates the store's ids
+and a second build would see another store.  Copies in one state that
+another process swapped keep their own links, whether the copies differ
+in provider and links, in links only, or in provider only once this
+process has added a link to both, so that neither copy's links are as
+the file holds them.
+
+<<test functions>>=
+class TestSameIdDecisionsPaired:
+  """Copies under one id pair with their own copy in the file (#228)."""
+
+  SCOPUS = legacy_hash_paper_id("A Study", ["Lovelace A."])
+
+  def _save(self, *extra):
+    from scholar.scholar import isolated_registry
+    with isolated_registry():
+      session = ReviewSession(query="q", providers=["scopus", "openalex"],
+                              timestamp=datetime.now(), name="pair")
+      session.decisions = [
+        ReviewDecision(
+          paper=Paper(title="A Study", authors=["Lovelace A."], year=2014),
+          provider="scopus", status=DecisionStatus.DISCARDED,
+          tags=["off-topic"], found_by=[("q", "scopus", "")]),
+        ReviewDecision(
+          paper=Paper(title="A Study", authors=["Lovelace A."], year=2014),
+          provider="openalex", status=DecisionStatus.KEPT, tags=["theme"],
+          found_by=[("q", "openalex", "")]),
+        *extra,
+      ]
+      save_session(session)
+
+  @staticmethod
+  def _by_provider():
+    from scholar.scholar import isolated_registry
+    with isolated_registry():
+      session = load_session("pair")
+    return {
+      d.provider: (d.paper.id, d.status.value, d.tags, sorted(d.found_by))
+      for d in session.decisions
+    }
+
+  def _untouched(self):
+    return {
+      "scopus": (self.SCOPUS, "discarded", ["off-topic"],
+                 [("q", "scopus", "")]),
+      "openalex": (self.SCOPUS, "kept", ["theme"], [("q", "openalex", "")]),
+    }
+
+  def test_a_renamed_copy_keeps_its_own_links(self):
+    from scholar.scholar import SearchResult, isolated_registry
+    self._save()
+    result = SearchResult(query="q", provider="s2", timestamp=datetime.now(),
+                          papers=[Paper(title="A Study",
+                                        authors=["A. Lovelace"], year=2014)],
+                          limit=10)
+    with isolated_registry():
+      save_session(create_review_session([result], "q", session_name="pair"))
+    renamed = legacy_hash_paper_id("A Study", ["A. Lovelace"])
+    assert self._by_provider() == {
+      "scopus, s2": (renamed, "discarded", ["off-topic"],
+                     [("q", "s2", ""), ("q", "scopus", "")]),
+      "openalex": (self.SCOPUS, "kept", ["theme"], [("q", "openalex", "")]),
+    }
+
+  def test_a_copy_another_process_dropped(self):
+    self._save()
+    mine = load_session("pair")
+    other = load_session("pair")
+    del other.decisions[0]
+    save_session(other)
+    save_session(mine)
+    assert self._by_provider() == self._untouched()
+
+  def test_copies_another_process_swapped_and_changed(self):
+    self._save()
+    mine = load_session("pair")
+    other = load_session("pair")
+    other.decisions.reverse()
+    other.decisions[1].tags = ["changed"]
+    save_session(other)
+    save_session(mine)
+    expected = self._untouched()
+    expected["scopus"] = (self.SCOPUS, "discarded", ["changed"],
+                          [("q", "scopus", "")])
+    assert self._by_provider() == expected
+
+  @pytest.mark.parametrize("providers, grown", [
+    (("scopus", "openalex"), False),
+    (("scopus", "scopus"), False),
+    (("scopus", "openalex"), True),
+  ])
+  def test_copies_in_one_state_keep_their_own_links(self, providers, grown):
+    from scholar.scholar import isolated_registry
+    copies = [(p, f"q{i}") for i, p in enumerate(providers)]
+    with isolated_registry():
+      session = ReviewSession(query="q", providers=list(providers),
+                              timestamp=datetime.now(), name="pair")
+      session.decisions = [
+        ReviewDecision(
+          paper=Paper(title="A Study", authors=["Lovelace A."], year=2014),
+          provider=p, status=DecisionStatus.KEPT, tags=["theme"],
+          found_by=[(q, p, "")])
+        for p, q in copies
+      ]
+      save_session(session)
+    mine = load_session("pair")
+    if grown:
+      for decision in mine.decisions:
+        decision.record_search("new", "s2", "")
+    other = load_session("pair")
+    other.decisions.reverse()
+    save_session(other)
+    save_session(mine)
+    with isolated_registry():
+      saved = load_session("pair").decisions
+    new = [("new", "s2", "")] if grown else []
+    assert sorted((d.provider, sorted(d.found_by)) for d in saved) == sorted(
+      (p, sorted([(q, p, "")] + new)) for p, q in copies)
+
+  def test_a_copy_another_process_put_first(self):
+    self._save()
+    mine = load_session("pair")
+    other = load_session("pair")
+    other.decisions.insert(0, ReviewDecision(
+      paper=Paper(title="A Study", authors=["Lovelace A."], year=2014),
+      provider="dblp"))
+    save_session(other)
+    save_session(mine)
+    expected = self._untouched()
+    expected["dblp"] = (self.SCOPUS, "pending", [], [])
+    assert self._by_provider() == expected
+
+  def test_a_new_copy_before_one_renamed_away(self):
+    self._save()
+    mine = load_session("pair")
+    mine.decisions[0].paper = Paper(title="A Study", authors=["A. Lovelace"],
+                                    year=2014)
+    other = load_session("pair")
+    other.decisions.insert(0, ReviewDecision(
+      paper=Paper(title="A Study", authors=["Lovelace A."], year=2014),
+      provider="dblp"))
+    save_session(other)
+    save_session(mine)
+    expected = self._untouched()
+    expected["scopus"] = (mine.decisions[0].paper.id,) + expected["scopus"][1:]
+    expected["dblp"] = (self.SCOPUS, "pending", [], [])
+    assert self._by_provider() == expected
+
+  def test_a_copy_renamed_away_stays_away_when_changed(self):
+    self._save()
+    mine = load_session("pair")
+    mine.decisions[0].paper = Paper(title="A Study", authors=["A. Lovelace"],
+                                    year=2014)
+    other = load_session("pair")
+    other.decisions[0].tags = ["changed"]
+    save_session(other)
+    save_session(mine)
+    expected = self._untouched()
+    expected["scopus"] = (mine.decisions[0].paper.id,) + expected["scopus"][1:]
+    assert self._by_provider() == expected
+
+  def test_keys_follow_the_order_saved(self):
+    self._save()
+    mine = load_session("pair")
+    mine.decisions.insert(0, ReviewDecision(
+      paper=Paper(title="A Study", authors=["Lovelace A."], year=2014),
+      provider="dblp"))
+    save_session(mine)
+    other = load_session("pair")
+    other.decisions[1].tags = ["changed"]
+    save_session(other)
+    save_session(mine)
+    expected = self._untouched()
+    expected["scopus"] = (self.SCOPUS, "discarded", ["changed"],
+                          [("q", "scopus", "")])
+    expected["dblp"] = (self.SCOPUS, "pending", [], [])
+    assert self._by_provider() == expected
+
+  def test_a_pair_built_from_the_store(self):
+    from scholar.notes import ReviewDecisionRecord, save_search_decisions
+    from scholar.scholar import SearchResult, isolated_registry
+    renamed = legacy_hash_paper_id("A Study", ["A. Lovelace"])
+    save_search_decisions("pair", {
+      renamed: ReviewDecisionRecord(
+        status="discarded", tags=["off-topic"], title="A Study",
+        authors=["A. Lovelace"], year=2014, provider="openalex"),
+      self.SCOPUS: ReviewDecisionRecord(
+        status="kept", tags=["theme"], title="A Study",
+        authors=["Lovelace A."], year=2014, provider="scopus"),
+    })
+    result = SearchResult(query="q", provider="s2", timestamp=datetime.now(),
+                          papers=[Paper(title="A Study",
+                                        authors=["A. Lovelace"], year=2014)],
+                          limit=10)
+    import copy
+    with isolated_registry():
+      mine = create_review_session([result], "q", session_name="pair")
+    other = copy.deepcopy(mine)
+    assert [d.paper.id for d in mine.decisions] == [renamed] * 2
+    other.decisions[1].tags = ["changed"]
+    save_session(other)
+    save_session(mine)
+    copies = self._by_provider()
+    assert copies["openalex"][1:3] == ("discarded", ["changed"])
+    assert copies["scopus, s2"][1:3] == ("kept", ["theme"])
+
+  def test_a_copy_another_process_folded_stays_folded(self):
+    doi_copy = ReviewDecision(
+      paper=Paper(title="A Study", authors=["A. Lovelace"], year=2014,
+                  doi="10.1/pair"),
+      provider="crossref", status=DecisionStatus.KEPT, tags=["theme"])
+    self._save(doi_copy)
+    other = load_session("pair")
+    other.decisions[0].status = DecisionStatus.PENDING
+    other.decisions[0].tags = []
+    save_session(other)
+    mine = load_session("pair")
+    other = load_session("pair")
+    del other.decisions[0]
+    other.folded[self.SCOPUS] = "doi:10.1/pair"
+    save_session(other)
+    save_session(mine)
+    copies = self._by_provider()
+    assert "scopus" not in copies
+    assert copies["openalex"] == self._untouched()["openalex"]
+@
+
 Extracting tags from a [[ReviewDecisionRecord]] is useful for backward compatibility
 with older session formats. We expose this as a public helper function.
 
@@ -7625,6 +8038,7 @@ def save_session(session: ReviewSession) -> Path:
         <<merge changes other processes saved>>
         <<write the session file>>
     session._baseline = SessionBaseline.of(session, from_file=True)
+    assign_baseline_keys(session)
 
     logger.debug("Saved %d decisions (%d kept, %d discarded, %d pending)",
                 len(session.decisions), len(session.kept_papers()),
@@ -7789,6 +8203,7 @@ def read_session_file(
         session._baseline = SessionBaseline.of(
             session, from_file=True, stored=stored
         )
+        assign_baseline_keys(session)
     session._loaded_from = session_path
     return session
 @
@@ -8168,6 +8583,83 @@ def decision_state(decision: ReviewDecision) -> tuple:
         *llm_audit_of(decision).values(),
         tuple(tuple(sorted(r.items())) for r in decision.relabelled),
     )
+@
+
+A session can hold two decisions under one id, copies of one work
+decided apart (\cref{sec:session-copies}).  Keyed by paper id alone,
+the baseline held one state for both, the file's copies one decision,
+and the merge met each of our copies with the file's last one: a change
+another process made to the first copy was lost, since the last copy
+was unchanged and so taken for nothing new, and the last copy's links
+passed to the first
+(\url{https://github.com/dbosk/scholarcli/issues/228}).  So the
+decisions are keyed by their occurrence when the baseline is taken:
+the paper id for the first decision of an id, the id and [[#2]],
+[[#3]], \dots\ for the copies after it, in session order
+([[decision_keys]]).  With one decision per id, which is every session
+but these, a key is the paper id, so the baseline and everything that
+reads it by paper id are unchanged.  The baseline also maps each key to
+its paper id ([[decision_ids]]), which the merge needs to know which of
+the copies it loaded a session no longer holds under their id
+(\cref{sec:copies-in-the-merge}).  The paper states stay keyed by paper
+id: when a session is loaded, the paper registry hands every copy of
+an id the same [[Paper]] object, so the copies have one paper state.
+
+A key names a place in the session as it was when the baseline was
+taken, and places move: this process renames a copy, and the next copy
+of its id becomes the first; another process drops, swaps or inserts
+copies.  So each decision also carries its key from then
+([[ReviewDecision.baseline_key]]), set where a baseline is taken from
+the session's own order ([[assign_baseline_keys]]): when the file is
+loaded, when it has been saved, and when a session that loaded nothing
+takes its built state.  [[dataclasses.replace]] carries the key over,
+as the append does for a decision it continues.  The key stands for
+the decision only while the decision is still under the paper id it had
+then ([[base_key_of]]).  A decision made since has none, and one whose
+id has changed (renamed, or the survivor of a fold, which takes the DOI
+copy's id) answers for the id it now has; both are looked up by their
+paper id, as every decision was before copies were told apart.  A fold's
+survivor so meets the baseline of the DOI copy it replaced, as it
+always did.
+
+<<review data structures>>=
+def decision_keys(decisions: list[ReviewDecision]) -> list[str]:
+    """The baseline key of each decision, in order.
+
+    The paper id for the first decision of an id; for later decisions
+    under the same id, the id with `#2`, `#3`, ... appended.
+    """
+    seen: dict[str, int] = {}
+    keys = []
+    for decision in decisions:
+        paper_id = get_paper_id(decision.paper)
+        seen[paper_id] = seen.get(paper_id, 0) + 1
+        n = seen[paper_id]
+        keys.append(paper_id if n == 1 else f"{paper_id}#{n}")
+    return keys
+
+
+def assign_baseline_keys(session: "ReviewSession") -> None:
+    """Give each decision of `session` its key by the session's order."""
+    for key, decision in zip(decision_keys(session.decisions),
+                             session.decisions):
+        decision.baseline_key = key
+
+
+def base_key_of(
+    decision: ReviewDecision, base: "SessionBaseline | None"
+) -> str:
+    """The key of `decision` in `base`.
+
+    Its own key while its paper id is still the one it had then, else
+    its paper id.
+    """
+    key = decision.baseline_key
+    paper_id = get_paper_id(decision.paper)
+    if key is not None and base is not None \
+            and base.decision_ids.get(key) == paper_id:
+        return key
+    return paper_id
 
 
 @dataclass
@@ -8177,11 +8669,14 @@ class SessionBaseline:
 
     `save_session` compares against it to tell the changes made in this
     process from the changes another process saved meanwhile.
+    `decisions` is keyed by `decision_keys`, and `decision_ids` maps
+    each of those keys to its paper id.
     """
     decisions: dict[str, tuple]
     research_context: str | None
     record_keys: frozenset = frozenset()
     papers: dict[str, tuple] = field(default_factory=dict)
+    decision_ids: dict[str, str] = field(default_factory=dict)
 
     @classmethod
     def of(
@@ -8196,10 +8691,12 @@ class SessionBaseline:
         that differs from the session's paper (see `read_session_file`).
         """
         stored = stored or {}
-        decisions, papers = {}, {}
-        for decision in session.decisions:
+        decisions, papers, ids = {}, {}, {}
+        keys = decision_keys(session.decisions)
+        for key, decision in zip(keys, session.decisions):
             paper_id = get_paper_id(decision.paper)
-            decisions[paper_id] = decision_state(decision)
+            decisions[key] = decision_state(decision)
+            ids[key] = paper_id
             if from_file:
                 papers[paper_id] = paper_state(
                     stored.get(paper_id, decision.paper)
@@ -8209,6 +8706,7 @@ class SessionBaseline:
             research_context=session.research_context,
             record_keys=frozenset(r.key for r in session.search_records),
             papers=papers,
+            decision_ids=ids,
         )
 @
 
@@ -8353,14 +8851,12 @@ def merge_concurrent_changes(
     base = session._baseline
     base_states = base.decisions if base else {}
     base_papers = base.papers if base else {}
-    disk_decisions = {get_paper_id(d.paper): d for d in on_disk.decisions}
+    paired, additions = pair_with_file(session, on_disk)
     <<find the legacy records this session replaced>>
 
-    own_ids = set()
     for decision in session.decisions:
         paper_id = get_paper_id(decision.paper)
-        own_ids.add(paper_id)
-        theirs = disk_decisions.get(paper_id)
+        theirs = paired.get(id(decision))
         mine = decision_state(decision)
         if theirs is not None:
             decision.paper = paper_merged_from(
@@ -8372,9 +8868,9 @@ def merge_concurrent_changes(
                 decision.add_same_id_copy(copy)
             for record in theirs.relabelled:
                 decision.add_relabel(record)
-        if theirs is None or paper_id not in base_states:
+        base_state = base_states.get(base_key_of(decision, base))
+        if theirs is None or base_state is None:
             continue
-        base_state = base_states[paper_id]
         if decision_state(theirs) in (base_state, mine):
             continue
         if mine == base_state:
@@ -8388,14 +8884,13 @@ def merge_concurrent_changes(
         else:
             <<warn that both processes decided the paper>>
 
-    for paper_id, theirs in disk_decisions.items():
-        if paper_id not in own_ids and paper_id not in base_states:
-            held = get_registry().register(theirs.paper)
-            if plausibly_same_work(held, theirs.paper):
-                theirs.paper = paper_filled_from(held, theirs.paper)
-            session.decisions.append(theirs)
+    for theirs in additions:
+        held = get_registry().register(theirs.paper)
+        if plausibly_same_work(held, theirs.paper):
+            theirs.paper = paper_filled_from(held, theirs.paper)
+        session.decisions.append(theirs)
     session.folded = {**on_disk.folded, **session.folded}
-    apply_tombstones(session, base_states, disk_decisions)
+    apply_tombstones(session, base, paired)
 
     <<merge research context from disk>>
 
@@ -8421,6 +8916,131 @@ def merge_concurrent_changes(
     repoint_folded_ids(session)
 
     session._invalidate_cache()
+@
+
+\paragraph{Which copy in the file is ours.}
+\label{sec:copies-in-the-merge}
+The merge meets each of our decisions with the file's decision of the
+same paper ([[pair_with_file]]).  With one decision per id there is
+nothing to choose.  With copies of a work under one id
+(\cref{sec:session-copies}) there is, and the places of the copies are
+no safe guide, since they move between the load and the save: a first
+version that paired the copies by place
+(\url{https://github.com/dbosk/scholarcli/pull/238}, review) paired a
+copy with the wrong one whenever this process renamed a copy before it,
+or another process dropped, swapped, inserted or folded one, and
+statuses, tags and links passed between the copies.  So each id's
+copies are paired in two passes.
+\begin{description}
+\item[By state] A copy the other process has not changed is in the file
+  as we loaded it.  So our copy is paired with a file copy whose
+  decision is the one our baseline holds for it ([[base_key_of]]).
+\item[By place] What is left (a copy the other process changed, a
+  decision made since the load) is paired in order with the file copies
+  left, as one decision per id always was.
+\end{description}
+Links, same-id notes, paper fields and decision changes then pass only
+between the copies so paired.
+
+A file copy left unpaired is either one this session loaded and has
+since renamed, folded or dropped, which must not come back, or one
+another process added, which must be added.  The baseline tells them
+apart: the copies of the id that it holds and that none of our copies
+of the id carries as its key were loaded and are gone from here
+([[decision_ids]]).  Each of them accounts for one unpaired file copy,
+one with its loaded decision first, else any; the file copies left
+over after that are new and are added.  With one decision per id this
+is the rule the merge always had: a file decision whose id we loaded
+and no longer hold is not brought back, any other is added.
+
+<<review session functions>>=
+def pair_with_file(
+    session: ReviewSession, on_disk: ReviewSession
+) -> tuple[dict[int, ReviewDecision], list[ReviewDecision]]:
+    """Pair the decisions of `session` with the copies in `on_disk`.
+
+    Returns the file copy of each paired decision, keyed by `id()` of
+    the decision, and the file's decisions to add to `session`.
+    """
+    base = session._baseline
+    base_states = base.decisions if base else {}
+    base_ids = base.decision_ids if base else {}
+    ours_by_id: dict[str, list[ReviewDecision]] = {}
+    for decision in session.decisions:
+        ours_by_id.setdefault(get_paper_id(decision.paper), []).append(
+            decision
+        )
+    disk_by_id: dict[str, list[ReviewDecision]] = {}
+    for theirs in on_disk.decisions:
+        disk_by_id.setdefault(get_paper_id(theirs.paper), []).append(
+            theirs
+        )
+    paired: dict[int, ReviewDecision] = {}
+    additions: list[ReviewDecision] = []
+    for paper_id, copies in disk_by_id.items():
+        ours = ours_by_id.get(paper_id, [])
+        free = list(copies)
+        <<pair our copies with file copies in their loaded state>>
+        <<pair the other copies by place>>
+        <<add the file copies this session never loaded>>
+    return paired, additions
+@
+
+The first pass looks for the decision as loaded among the file copies
+still free.  Copies in one state are interchangeable for the decision
+but not for the rest: two copies kept alike can have been found by
+different searches, and pairing them crosswise after another process
+swapped them gave each the other's links.  So among the copies in the
+state looked for, the one with our links and our provider is taken,
+then one with either, then the first.  The place a copy had when loaded
+is no guide here, since another process may have put an equal copy
+before it.  Only a decision that answers for its own key
+takes part:
+one made since, or one whose id has changed, has no loaded state of its
+own to look for, and the state of the copy whose id it borrows would
+pair it with that copy.
+
+<<pair our copies with file copies in their loaded state>>=
+for decision in ours:
+    key = base_key_of(decision, base)
+    if decision.baseline_key != key or key not in base_states:
+        continue
+    same = [i for i, theirs in enumerate(free)
+            if decision_state(theirs) == base_states[key]]
+    if same:
+        best = min(same, key=lambda i: (
+            set(free[i].found_by) != set(decision.found_by),
+            free[i].provider != decision.provider,
+            i,
+        ))
+        paired[id(decision)] = free.pop(best)
+<<pair the other copies by place>>=
+rest = [d for d in ours if id(d) not in paired]
+for decision, theirs in zip(rest, free):
+    paired[id(decision)] = theirs
+free = free[len(rest):]
+@
+
+The loaded copies gone from here are the baseline's entries of the id
+that no copy of ours carries.  Entries are matched by the state the file
+copy still has first, and only the entries left then by order, to the
+file copies left in order: when another process has put a new copy
+before one we renamed away, the state tells the renamed copy, which
+stays away, from the new one, which is added.
+
+<<add the file copies this session never loaded>>=
+carried = {base_key_of(d, base) for d in ours}
+gone = [key for key, i in base_ids.items()
+        if i == paper_id and key not in carried]
+unmatched = []
+for theirs in free:
+    match = [key for key in gone
+             if base_states[key] == decision_state(theirs)]
+    if match:
+        gone.remove(match[0])
+    else:
+        unmatched.append(theirs)
+additions.extend(unmatched[len(gone):])
 @
 
 A legacy record (\cref{sec:search-record-key}) is replaced by a re-run
@@ -9787,7 +10407,8 @@ def warn_if_decisions_dropped(
     reset_here = sum(
         1 for d in session.decisions
         if not d.is_decided
-        and base_states.get(get_paper_id(d.paper), (DecisionStatus.PENDING,))[0]
+        and base_states.get(base_key_of(d, session._baseline),
+                            (DecisionStatus.PENDING,))[0]
         != DecisionStatus.PENDING
     )
     session_ids = {get_paper_id(d.paper) for d in session.decisions}
@@ -10938,12 +11559,18 @@ it back from the file.  The search-record keys and the research context
 stay as loaded too: the keys tell the merge which legacy records it
 loaded from the file (\cref{sec:legacy-records}), which a record of
 this run never is, and the context is a single value that the loaded
-baseline already holds.
+baseline already holds.  A decision this run made carries no key from
+the load and is looked up by its paper id
+(\cref{sec:copies-in-the-merge}), the key of the first decision of that
+id; a returned paper whose id has loaded copies does not make one but
+attaches to the first copy, which keeps its key.  The map from keys to
+paper ids is filled with the states.
 
 <<fill the gaps of the loaded baseline from [[built]]>>=
 session._baseline = replace(
     session._baseline,
     decisions={**built.decisions, **session._baseline.decisions},
+    decision_ids={**built.decision_ids, **session._baseline.decision_ids},
 )
 @
 
@@ -11169,6 +11796,7 @@ A same-file append keeps the loaded keys, for the same reason.
 
 <<empty the record keys of the built baseline>>=
 session._baseline = replace(built, record_keys=frozenset())
+assign_baseline_keys(session)
 @
 
 Let's verify it for a session that loaded nothing and for an append
