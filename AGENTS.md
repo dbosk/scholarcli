@@ -1043,13 +1043,22 @@ relabel/resume/reconcile/check`, `llm classify/status/context/
 synthesize/sample`, `enrich`, `verify`) opens it with
 `cli.open_session_argument` → `review.load_session_argument` →
 `resolve_session_argument` (#237, review.nw `sec:session-arguments`):
-an argument ending in `.json` names that file in the sessions dir (base
-name only); any argument is also tried as `<arg>.json` and as its
-query's hash file. More than one existing file → `AmbiguousSessionError`
-(message names each file and what it holds, `describe_session_file`)
-→ exit 2, nothing read or written. One file → the same file as the old
-`load_session` lookup (labels still go through `load_session`, so
-stubs of it keep working). `session_argument(session)` /
+an argument ending in `.json` names that file in the sessions dir; a
+`.json` path is accepted only into the sessions dir, any other
+directory → `SessionArgumentError` "give a file name in <dir>" (taking
+the base name had opened the live file of that name instead). Any
+argument is also tried as `<arg>.json` and as its query's hash file.
+More than one existing file → `AmbiguousSessionError` (a
+`SessionArgumentError`; message names each file and what it holds,
+`describe_session_file`). Both → exit 2, nothing read or written. One
+file → read with `read_session_file` (the same file as the old
+`load_session` lookup); none → None, also for a query too long to be a
+file name. Tests of the commands stub `review.load_session_argument`.
+`sessions reconcile` re-reads the resolved file under the lock. `llm
+sample` and `sessions check` load a session named twice (`x x.json`)
+once (by `session_file_path`). The `sessions list` table shows `name
+(argument)` when they differ (`session_list_name`).
+`session_argument(session)` /
 `session_argument_for(label, path)` give what to type: the label, or
 the file name when the label opens another file or fits two; used by
 `list_sessions` (`argument` key), shell completion, `llm sample`'s drawn

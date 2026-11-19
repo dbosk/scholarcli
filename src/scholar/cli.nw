@@ -2890,8 +2890,6 @@ describes the metadata gaps, while the open-access and currency passes
 cover every selected paper.
 
 <<enrich session papers>>=
-from scholar.review import load_session
-
 console = Console()
 enrich_fields = parse_enrich_fields(fields)
 
@@ -3246,7 +3244,7 @@ consumer can pipe it straight into a parser.  A missing session is therefore an
 error on stderr plus a non-zero exit, never a stray line on stdout.
 
 <<verify session currency>>=
-from scholar.review import load_session, save_session
+from scholar.review import save_session
 from scholar.crossref import annotate_papers, currency_status
 from rich.progress import Progress
 
@@ -6704,7 +6702,7 @@ def sessions_list(
 
         for s in sessions:
             table.add_row(
-                Text(str(s["name"])),
+                Text(session_list_name(s)),
                 Text(s["timestamp"].strftime("%Y-%m-%d %H:%M")),
                 Text(str(s["kept"])),
                 Text(str(s["discarded"])),
@@ -6725,6 +6723,22 @@ in a warning after the table rather than in a column: the table and the
 JSON on stdout keep their shape for scripts (the JSON gains the
 [[needs_check]] field), and the warning goes to stderr, where it reaches
 the user in both formats.
+
+The Name column shows what the user types to open a session, and a
+name alone is not always that: the named session [[foo]] and the
+unnamed session of the query [[foo]] are both called \enquote{foo}, and
+a copy holds the name of another file (\cref{sec:cli-session-arguments}).
+So when the argument that opens the session differs from its name, the
+column adds it in parentheses, [[foo (foo.json)]]; every other row is
+unchanged.
+
+<<sessions command>>=
+def session_list_name(meta: dict) -> str:
+    """The Name cell of `sessions list`: the name, and the argument if not it."""
+    name = str(meta["name"])
+    argument = meta.get("argument") or name
+    return name if argument == name else f"{name} ({argument})"
+@
 
 <<warn about sessions without decisions>>=
 flagged = [str(s["name"]) for s in sessions if s.get("needs_check")]
@@ -6838,24 +6852,26 @@ file, a name or query opens the one file it fits, and an argument that
 fits two files (a named session [[foo]] beside the unnamed session of
 the query [[foo]]) is refused with exit status~2 and a message naming
 both files, before anything is read or written
-(\url{https://github.com/dbosk/scholarcli/issues/237}).  The commands
+(\url{https://github.com/dbosk/scholarcli/issues/237}); so is a path to
+a file outside the sessions directory.  The commands
 keep their own message and status for a session that is not found, so
 the helper returns [[None]] then, like [[load_session]].  It calls the
-review module's function through the module, so that tests which
-replace [[review.load_session]] by a stub still reach it.
+review module's function through the module, so that a test can
+replace [[review.load_session_argument]] by a stub.
 
 <<session error helpers>>=
 def open_session_argument(argument: str, *, strict: bool = False):
     """Load the session a user-typed argument names, or None if none.
 
-    An argument that fits two session files is reported on stderr and
-    ends the command with exit status 2.
+    An argument that fits two session files, or a path outside the
+    sessions directory, is reported on stderr and ends the command with
+    exit status 2.
     """
     from scholar import review
 
     try:
         return review.load_session_argument(argument, strict=strict)
-    except review.AmbiguousSessionError as error:
+    except review.SessionArgumentError as error:
         Console(stderr=True).print(f"[red]{escape(str(error))}[/red]")
         raise typer.Exit(2)
 @
@@ -6972,6 +6988,78 @@ def test_a_label_without_namesake_works_as_before(
   assert runner.invoke(
     app, ["sessions", "show", "unnamed query"]
   ).exit_code == 0
+
+def test_an_outside_path_is_refused(self, tmp_path, monkeypatch):
+  import shutil
+
+  named, unnamed = self._pair(tmp_path, monkeypatch)
+  outside = tmp_path / "elsewhere"
+  outside.mkdir()
+  copy = outside / "foo.json"
+  shutil.copy(named, copy)
+  before = (named.read_bytes(), copy.read_bytes())
+  result = runner.invoke(app, [
+    "sessions", "decide", str(copy), "--discard", "--doi", "10.1/named",
+    "--tag", "off-topic", "--source", "human",
+  ])
+  assert result.exit_code == 2, result.output
+  assert "give a file name in" in " ".join(result.output.split())
+  assert (named.read_bytes(), copy.read_bytes()) == before
+
+def test_reconcile_by_file_name_folds_only_that_file(
+  self, tmp_path, monkeypatch
+):
+  import json
+  from scholar.review import (
+    DecisionStatus, ReviewDecision, ReviewSession, save_session,
+  )
+
+  named, _ = self._pair(tmp_path, monkeypatch)
+  session = ReviewSession(
+    query="foo", providers=["p"], timestamp=datetime(2026, 11, 19),
+  )
+  session.decisions.extend([
+    ReviewDecision(
+      paper=Paper(title="A Work", authors=["Ada Lovelace"], year=2021),
+      provider="dblp",
+    ),
+    ReviewDecision(
+      paper=Paper(title="A Work", authors=["Ada Lovelace"], year=2021,
+                  doi="10.1/fold"),
+      provider="openalex", status=DecisionStatus.KEPT,
+    ),
+  ])
+  unnamed = save_session(session)
+  named_before = named.read_bytes()
+  result = runner.invoke(app, ["sessions", "reconcile", unnamed.name])
+  assert result.exit_code == 0, result.output
+  assert "Folded 1 copies" in result.output
+  assert sorted(
+    d["paper_id"] for d in json.loads(unnamed.read_text())["decisions"]
+  ) == ["doi:10.1/fold", "doi:10.1/unnamed"]
+  assert named.read_bytes() == named_before
+
+def test_sessions_list_shows_the_file_of_a_namesake(
+  self, tmp_path, monkeypatch
+):
+  named, unnamed = self._pair(tmp_path, monkeypatch)
+  self._save("solo", "q", "10.1/solo")
+  result = runner.invoke(app, ["sessions", "list"])
+  flat = " ".join(result.output.split())
+  assert "foo (foo.json)" in flat
+  assert f"foo ({unnamed.name})" in flat
+  assert "solo (" not in flat
+
+def test_one_file_named_twice_is_loaded_once(self, tmp_path, monkeypatch):
+  monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+  self._save("x", "x", "10.1/x")
+  result = runner.invoke(app, [
+    "llm", "sample", "x", "x.json", "--kept", "-n", "5", "--seed", "1",
+  ])
+  assert result.exit_code == 0, result.output
+  assert "drew 1 of 1 eligible" in result.output
+  report = runner.invoke(app, ["llm", "sample", "x", "x.json", "--report"])
+  assert report.output.count("not yet reviewed: x  doi:10.1/x") == 1
 
 def test_lists_name_the_file_when_the_label_is_ambiguous(
   self, tmp_path, monkeypatch
@@ -7162,7 +7250,7 @@ def sessions_show(
     """
     import sys
     from scholar.review import (
-        decision_source_counts, decision_source_items, load_session,
+        decision_source_counts, decision_source_items,
     )
     from scholar.review import conflicting_copies, copy_conflict_line
     from scholar.review import alike_copies, possible_copies
@@ -7446,7 +7534,6 @@ def sessions_export(
             --track "sökspår 1" --theme ml=maskininlärning -o review-full
     """
     from scholar.review import (
-        load_session,
         generate_latex_report,
         generate_csv_report,
         generate_audit_table,
@@ -8430,7 +8517,7 @@ def sessions_resume(
     Opens the interactive review interface with the saved session loaded.
     Use --report/-R to be prompted for saving reports after review.
     """
-    from scholar.review import load_session, save_session
+    from scholar.review import save_session
     from scholar.tui import PaperReviewApp, prompt_for_report
 
     console = Console()
@@ -8646,7 +8733,7 @@ def sessions_decide(
     """
     from scholar.review import (
         AUDIT_CATEGORIES, CopyConflict, DecisionStatus, ReviewSource,
-        clear_machine_audit, copy_conflict_line, load_session,
+        clear_machine_audit, copy_conflict_line,
         same_id_pairs, save_session, tags_after_decision,
     )
     from scholar.llm_review import mark_as_reviewed
@@ -10209,7 +10296,7 @@ def sessions_relabel(
 
     from scholar.review import (
         ReviewSource, SessionFileError, _utcnow, keep_copy_before_run,
-        load_session, relabel_source, save_session,
+        relabel_source, save_session,
     )
 
     console = Console()
@@ -10624,13 +10711,13 @@ def sessions_reconcile(
     `sessions show` to list. Notes move to the folded entry's id.
     """
     from scholar.review import (
-        AmbiguousSessionError, SessionFileError, reconcile_session,
+        SessionArgumentError, SessionFileError, reconcile_session,
     )
 
     console = Console()
     try:
         folds = reconcile_session(name, dry_run=dry_run)
-    except AmbiguousSessionError as error:
+    except SessionArgumentError as error:
         Console(stderr=True).print(f"[red]{escape(str(error))}[/red]")
         raise typer.Exit(2)
     except FileNotFoundError:
@@ -10918,7 +11005,7 @@ Loading is strict, so an unreadable file is an error and not a missing
 session, and nothing is saved afterwards.
 
 <<load the sessions to check, read-only>>=
-from scholar.review import load_session, SessionFileError
+from scholar.review import SessionFileError, session_file_path
 
 sessions = []
 for session_name in names:
@@ -10930,8 +11017,14 @@ for session_name in names:
     if loaded is None:
         err.print(f"[red]Session not found: {escape(session_name)}[/red]")
         raise typer.Exit(1)
-    sessions.append(loaded)
+    if all(session_file_path(loaded) != session_file_path(s)
+           for s in sessions):
+        sessions.append(loaded)
 @
+
+A session can be named twice, by its name and by its file name
+([[x x.json]]); it is checked once, as [[llm sample]] samples it once,
+since two copies of one file would count its papers twice.
 
 Each question is one search.  A provider blocked by its quota is
 skipped by [[Search.execute]] with a warning; here, where each question
@@ -12710,7 +12803,6 @@ def llm_status(
     Displays counts of human decisions, LLM and agent decisions pending
     review, reviewed LLM and agent decisions, and training examples.
     """
-    from scholar.review import load_session
     from scholar.llm_review import get_review_statistics
 
     console = Console()
@@ -12771,7 +12863,7 @@ def llm_context(
     Example:
         scholar llm context "my review" "I'm reviewing papers on ..."
     """
-    from scholar.review import load_session, save_session
+    from scholar.review import save_session
 
     console = Console()
     session = open_session_argument(session_name)
@@ -13384,7 +13476,9 @@ class TestLLMClassifyWithheld:
         session.decisions.append(
             review.ReviewDecision(paper=paper, provider="p")
         )
-        monkeypatch.setattr(review, "load_session", lambda x: session)
+        monkeypatch.setattr(
+            review, "load_session_argument", lambda x, **_: session
+        )
         monkeypatch.setattr(review, "save_session", lambda s: None)
         withheld = LLMDecision(
             paper_id=get_paper_id(paper), status="kept",
@@ -13422,7 +13516,9 @@ class TestLLMClassifyWithheld:
         session.decisions.append(
             review.ReviewDecision(paper=paper, provider="p")
         )
-        monkeypatch.setattr(review, "load_session", lambda x: session)
+        monkeypatch.setattr(
+            review, "load_session_argument", lambda x, **_: session
+        )
         monkeypatch.setattr(review, "save_session", lambda s: None)
         seen = {}
 
@@ -13546,7 +13642,7 @@ def llm_sample(
             -n 50 --seed 20261118
         scholar llm sample my-review --report
     """
-    from scholar.review import load_session, save_session
+    from scholar.review import save_session
 
     console = Console()
     <<load the sessions to sample>>
@@ -13557,14 +13653,22 @@ def llm_sample(
     <<draw and record the sample>>
 @
 
+A session named twice ([[x x.json]], \cref{sec:cli-session-arguments})
+is loaded once: two copies of one file would record the sample twice
+in it and count its papers twice in a report.
+
 <<load the sessions to sample>>=
+from scholar.review import session_file_path
+
 sessions = []
 for name in session_names:
     session = open_session_argument(name)
     if session is None:
         console.print(f"[red]Session not found: {escape(name)}[/red]")
         raise typer.Exit(1)
-    sessions.append(session)
+    if all(session_file_path(session) != session_file_path(s)
+           for s in sessions):
+        sessions.append(session)
 @
 
 <<check the sampling criteria>>=
@@ -13807,7 +13911,9 @@ class TestLLMCommands:
             query="t", providers=["p"], timestamp=datetime.now(),
             research_context="ctx", name="s",
         )
-        monkeypatch.setattr(review, "load_session", lambda x: session)
+        monkeypatch.setattr(
+            review, "load_session_argument", lambda x, **_: session
+        )
         seen = {}
 
         def fake_classify(**kwargs):
@@ -13848,7 +13954,9 @@ class TestLLMCommands:
             research_context="Test question",
             name="test-session",
         )
-        monkeypatch.setattr(review, "load_session", lambda x: session)
+        monkeypatch.setattr(
+            review, "load_session_argument", lambda x, **_: session
+        )
 
         result = runner.invoke(
             app, ["llm", "synthesize", "test-session", "--format", "invalid"]
@@ -13865,7 +13973,9 @@ class TestLLMCommands:
             query="test", providers=["test"], timestamp=datetime.now(),
             research_context="Test question", name="test-session",
         )
-        monkeypatch.setattr(review, "load_session", lambda x: session)
+        monkeypatch.setattr(
+            review, "load_session_argument", lambda x, **_: session
+        )
 
         result = runner.invoke(
             app, ["llm", "synthesize", "test-session", "-f", "latex",
@@ -13883,7 +13993,9 @@ class TestLLMCommands:
             query="test", providers=["test"], timestamp=datetime.now(),
             research_context="Test question", name="test-session",
         )
-        monkeypatch.setattr(review, "load_session", lambda x: session)
+        monkeypatch.setattr(
+            review, "load_session_argument", lambda x, **_: session
+        )
 
         result = runner.invoke(
             app, ["llm", "synthesize", "test-session", "--no-standalone",
