@@ -1252,7 +1252,31 @@ notes`:
 A note is parsed into ordered segments — `personal` (verbatim) or `prov`
 (a parsed block) — by `_split_note_segments`. Entries are keyed by
 reconstructing a `Paper` from the `.bib` fields and reusing `Paper.id`
-(DOI, else title+author hash). All round-trip code lives in `cli.nw`'s
+(DOI, else title+author hash). Our `.bib` fields are escaped (#230),
+so the id is recorded: `bibtex+prov` writes `% ID: <Paper.id>` in each
+block (`ID` is in `PROV_FIELD_NAMES`), `prov export` writes the note's
+current id into every block it emits, and `prov import` keys by it
+(`_recorded_id`) and drops it from the stored note (`_without_ids`).
+An entry's own DOI beats the recorded id (a paper that gained a DOI, a
+block copied above another entry; a differing id is a WARNING naming
+both); for a DOI-less entry the recorded id is tried like the other
+candidates, by whether a note exists under it, and keys a new note
+only when none does.
+Without the line (old or hand-made files, plain `-f bibtex` for
+export) `_paper_from_entry` tries existing notes: the id with the
+`BIBTEX_SPECIALS` escapes undone, then a DOI-less note whose
+`escape_bibtex` title equals the entry's and whose id that title and a
+spelling of the first author's surname give (`_unescaped_spellings`
+over `LATEX_UNICODE_PUNCTUATION`, `MAX_SPELLINGS`; `_noted_titles` is
+built lazily, once per command), then the id of the text as written
+(notes imported from hand-escaped files before #230); else the
+unescaped paper. An import keeps an existing note's title.
+`_unescape_bib` also drops the `\scholarnonlatin` wrapper (#234). When
+an entry uses that macro, `search -f bibtex`/`bibtex+prov` print one
+`@preamble{ "..." }` line with `review.nonlatin_definition()` before the
+first entry (`_nonlatin_preamble`, `uses_nonlatin`; biber copies it to
+the .bbl; checked with pdflatex/xelatex/lualatex); no stderr hint.
+All round-trip code lives in `cli.nw`'s
 `<<formatter classes>>` and `<<prov command>>` chunks.
 
 ### Search Provenance (`prov found-via`)
@@ -1389,7 +1413,11 @@ fixture has a quoted query, a `[`-row, `ĸ`, `CO₂`, a ligature. About
   `v5`: cached prose cites keys literally). `search -f bibtex` and
   `bibtex+prov` use it too (#122, `cli._keyed_papers`: keys assigned
   once over all results in output order); this changed their keys
-  for comma-form names, apostrophes and clashes. `prov import/export`
+  for comma-form names, apostrophes and clashes. Their title, author
+  and journal go through `escape_bibtex` like the export's `.bib`
+  (#230; before, raw `& % $ # _` and symbols stopped pdfLaTeX); the
+  layout, field order and DOI (verbatim in biblatex) are unchanged.
+  `prov import/export`
   match entries by `Paper.id`, never by key, so old `.bib` files still
   round-trip.
 - `scholar sessions export -f table --lang en|sv --label L --track T
