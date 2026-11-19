@@ -105,8 +105,11 @@ Providers self-register via `register_provider()` at module load time.
   otherwise it is listed as "Outcome not recorded: dblp"
   (`unrecorded_providers`, in the items and the abstract), not as "Not
   searched", also when another of its searches failed. `record_rank`
-  still ranks such a record as answered (the old run may have answered
-  with its linked papers), so a failed re-run does not replace it.
+  still ranks such a record as answered, but a re-run that failed
+  outright (or was skipped) replaces it when no decision's `found_by`
+  names its key (an old `(q, p, None)` link counts as naming it):
+  `session_preferred_record(a, b, links)` (#190). With a link the old
+  record stays (the old run may have answered with those papers).
 - One record per provider search (#164). `SearchResult.parts` /
   `found_in` (not compared): `merge` keeps the single-provider results
   it was made of and, per merged paper, the indices of the parts that
@@ -162,7 +165,10 @@ Providers self-register via `register_provider()` at module load time.
   source was last searched; older runs' links stay on the same key.
   `create_review_session` (new run first) and
   `merge_concurrent_changes` (own record first, for a shared key) both
-  use it.
+  use it through `session_preferred_record(a, b, links)`, which adds
+  the one session-dependent rule (#190, above; links from
+  `linked_search_keys`: the previous session's decisions, resp. the
+  merged ones), so `record_rank` stays a key of one record.
 - Search dates (#167). `SearchResult`/`SearchRecord` have `searched_at`
   (UTC ISO, the run; `utils.utc_now_iso`), `fetched_at` (when the
   service answered; for a cache hit the original fetch, `None` =
