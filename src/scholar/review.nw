@@ -2756,6 +2756,8 @@ def create_review_session(
     replaced_links: dict[tuple, tuple] = {}
     if previous_session:
         current_run = list(session.search_records)
+        previous_links = linked_search_keys(previous_session.decisions)
+        previous_names = decision_provider_names(previous_session)
         for record in previous_session.search_records:
             <<keep the preferred record of each search>>
             <<let a re-run replace a legacy record>>
@@ -2868,7 +2870,10 @@ what its latest run returned.
 
 Two records with equal keys are a true tie, and the first argument
 wins, so the caller decides: the new run here, the process's own record
-in a save.
+in a save.  Both callers go through [[session_preferred_record]], which
+adds the one rule that needs the session's papers: a failed re-run
+replaces a record without an outcome unless a paper links to it or
+names its provider (\cref{sec:unknown-outcome-replaced}).
 
 <<keep the preferred record of each search>>=
 for i, current in enumerate(session.search_records):
@@ -2878,7 +2883,9 @@ for i, current in enumerate(session.search_records):
         and (current.query, current.provider)
         == (record.query, record.provider)
     )
-    if same_search and preferred_record(current, record) is record:
+    if same_search and session_preferred_record(
+        current, record, previous_links, previous_names
+    ) is record:
         session.search_records[i] = record
         if current.key != record.key:
             replaced_links[current.key] = record.key
@@ -2998,6 +3005,319 @@ class TestPreferredRecord:
         assert preferred_record(current, legacy) is current
         failed = self._r(limit=5, hits=0, error="HTTP 503")
         assert preferred_record(failed, legacy) is legacy
+@
+
+\paragraph{A failed re-run and a record without an outcome}
+\label{sec:unknown-outcome-replaced}
+
+One pair of records needs more than the two records to decide.  A
+record written before outcomes were kept has neither hits nor an error
+([[outcome_unknown]], \cref{sec:unrecorded-outcome}), and
+[[record_rank]] ranks it as answered, so a re-run of the same search
+that failed outright never replaced it.  A session holding
+[[SearchRecord("q", "dblp", None, 40)]] kept that record after a DBLP
+re-run that got the anti-bot page (\enquote{non-JSON response}): the
+failure was recorded nowhere, and the report went on saying
+\enquote{Outcome not recorded: dblp}
+(\url{https://github.com/dbosk/scholarcli/issues/190}).  Such a
+session could never say that the provider fails now, short of editing
+the file, although the session must say when each source was last
+searched and with what result.
+
+The reason for keeping an answered record over a failure is that the
+session holds the answer's papers.  For a record without an outcome
+that reason holds only if the session has papers that its run may have
+returned; then replacing the record would turn a possible answer into a
+failure, and the report would call the provider \enquote{not searched}
+beside its papers.  Without such papers the record shows nothing that
+the failure would hide; it only says that the query was once sent.  So
+the failed re-run replaces it unless the session has evidence of an
+answer, of either of two kinds.
+\begin{description}
+\item[A link] Some decision's [[found_by]] names the record
+  (\cref{sec:review-found-by}): its key, or, for an old link, only its
+  query and provider (filters key [[None]],
+  \cref{sec:session-persistence}), since that link may mean this
+  record.
+\item[A paper from the provider] Some decision's [[provider]] names the
+  record's provider, compared as [[decision_provider_names]] compares
+  it (\cref{sec:unrecorded-outcome}).  Links alone do not suffice,
+  because they are younger than outcomes: records without an outcome
+  were written before links were kept
+  (\url{https://github.com/dbosk/scholar/issues/128}), so their papers
+  almost never link to them.  A session searched on OpenAlex then, with
+  a re-run refused for a spent daily budget, would otherwise read
+  \enquote{Not searched: openalex} while it holds OpenAlex's papers.
+  Decisions with links count too: a paper that the old run returned
+  and a later run returned again carries only the later run's link, so
+  its links do not show that the old run did not return it.
+\end{description}
+The second kind is evidence about the provider, not about the query,
+so it keeps every record without an outcome of a provider the session
+has papers from, also of a query that returned none of them; such a
+record then stays \enquote{outcome not recorded}, which is what the
+session can tell.  And it is no proof: before one record was kept per
+provider search (\cref{sec:merged-records}), every paper of a merged
+search was given every merged provider's name, so a decision of that
+time naming DBLP keeps DBLP's old record even when DBLP only served its
+anti-bot page.  This is the limitation that
+\cref{sec:unrecorded-outcome} describes for the report.  Without either
+kind, as in the issue's session, whose papers name OpenAlex only, the
+DBLP failure replaces the old record.
+A legacy record (\cref{sec:legacy-records}) has no outcome either, and
+in [[create_review_session]] it meets a re-run of its query and
+provider through the same call, so a failed re-run replaces a legacy
+record without evidence too; the legacy rule then has no links to move.
+
+Whether the session holds such evidence is a fact about the session,
+not about the record, so the rule cannot be part of [[record_rank]]:
+the rank is a key of one record, and it is what keeps
+[[preferred_record]] a total preorder.  The rule is a second step
+instead.  [[session_preferred_record]] asks [[preferred_record]] and
+overrides its choice in this one case.  The override applies to a pair
+of one record without an outcome and one failed outright, whichever
+argument each is, and [[preferred_record]] picks the record without an
+outcome in both orders; so the result still does not depend on the
+order of the arguments.  Both places that call [[preferred_record]]
+call this instead: [[create_review_session]] with the links and
+provider names of the previous session (a failed run has no papers, so
+it brings no evidence of its own), and the merge of a save
+(\cref{sec:session-integrity}) with those of the merged decisions.
+There the names come from both sides: for a paper that both hold, the
+merge unites the links but keeps this process's [[provider]] field, so
+the file's names would otherwise be lost, and a paper is evidence on
+either side.
+Applied in one place only, the other would undo it: a process that
+loaded the session before the re-run would save the old record back
+over the failure, and a process that did the re-run would get the old
+record back from its own file.
+
+<<review session functions>>=
+def linked_search_keys(decisions: list[ReviewDecision]) -> set[tuple]:
+    """The search keys that some decision's `found_by` names."""
+    return {link for decision in decisions for link in decision.found_by}
+
+
+def record_may_have_answered(
+    record: SearchRecord, links: set[tuple], provider_names: set[str]
+) -> bool:
+    """Whether the session has papers that `record`'s run may have returned.
+
+    A link in `links` names its key, or only its query and provider (an
+    old link, filters key `None`); or one of its providers is among
+    `provider_names` (lower-cased, as `decision_provider_names` gives).
+    """
+    return (
+        record.key in links
+        or (record.query, record.provider, None) in links
+        or any(
+            name.lower() in provider_names
+            for name in record.merged_providers
+        )
+    )
+
+
+def session_preferred_record(
+    a: SearchRecord,
+    b: SearchRecord,
+    links: set[tuple],
+    provider_names: set[str],
+) -> SearchRecord:
+    """Of two records of one search, the one a session keeps.
+
+    `preferred_record`, except that a run that failed outright replaces
+    a record without a recorded outcome when the session has no papers
+    that the record's run may have returned (`record_may_have_answered`
+    with the session's `links` and `provider_names`).
+    """
+    kept = preferred_record(a, b)
+    other = b if kept is a else a
+    if (outcome_unknown(kept) and failed_outright(other)
+            and not record_may_have_answered(kept, links, provider_names)):
+        return other
+    return kept
+@
+
+Let's verify the probe of the issue: a DBLP record without an outcome,
+then a DBLP re-run that fails, in a session whose paper names OpenAlex.
+The failure replaces the record, survives a save, and the report lists
+DBLP as not searched, with the failure as the reason, instead of under
+\enquote{Outcome not recorded}.  A link to the record keeps it, also an
+old link without filters, and so does a paper naming DBLP without any
+link, the case of the sessions written before links: an OpenAlex search
+re-run with a spent budget keeps its old record, and the report still
+counts OpenAlex as searched.  In the save's merge the same holds in
+both orders, the own record without an outcome and the file's failure
+or the other way round, and evidence on either side keeps the old
+record.
+
+<<test functions>>=
+class TestFailedRerunReplacesUnknownOutcome:
+    """A failed re-run replaces a record without an outcome or evidence."""
+
+    FAILURE = "non-JSON response (HTTP 200, text/html)"
+    SKIPPED = "skipped: daily quota spent; resets 2026-11-20T00:00Z"
+
+    @staticmethod
+    def _unknown():
+        return SearchRecord("q", "dblp", None, 40)
+
+    @classmethod
+    def _failed(cls):
+        return SearchRecord("q", "dblp", None, 40, hits=0, error=cls.FAILURE)
+
+    @staticmethod
+    def _session(records, evidence=None, name=None):
+        decision = ReviewDecision(
+            paper=Paper(title="Spacing", authors=["A"], year=2020,
+                        doi="10.1234/unknown-outcome-190"),
+            provider="openalex",
+        )
+        decision.record_search("q", "openalex", "")
+        if evidence == "linked":
+            decision.record_search("q", "dblp", "")
+        elif evidence == "named":
+            decision.provider = "openalex, DBLP"
+        session = ReviewSession(query="q", providers=["dblp", "openalex"],
+                                timestamp=datetime.now(), name=name)
+        session.search_records = list(records) + [
+            SearchRecord("q", "openalex", None, 40, hits=1),
+        ]
+        session.decisions = [decision]
+        return session
+
+    def _rerun(self, name, provider="dblp", error=None):
+        from scholar.scholar import SearchResult
+        return create_review_session([SearchResult(
+            query="q", provider=provider, timestamp="t", papers=[],
+            limit=40, error=error or self.FAILURE,
+        )], "q", session_name=name)
+
+    @staticmethod
+    def _dblp(session, provider="dblp"):
+        return [(r.hits, r.error) for r in session.search_records
+                if r.provider == provider]
+
+    def test_failed_rerun_replaces_record_without_evidence(self):
+        save_session(self._session([self._unknown()], name="unknown-190"))
+        session = self._rerun("unknown-190")
+        assert self._dblp(session) == [(0, self.FAILURE)]
+        save_session(session)
+        assert self._dblp(load_session("unknown-190")) == [
+            (0, self.FAILURE),
+        ]
+
+    def test_record_with_evidence_is_kept(self):
+        for evidence in ("linked", "named"):
+            name = f"{evidence}-190"
+            save_session(self._session([self._unknown()], evidence,
+                                       name=name))
+            session = self._rerun(name)
+            assert self._dblp(session) == [(None, None)], evidence
+
+    def test_paper_without_links_keeps_its_providers_record(self):
+        decision = ReviewDecision(
+            paper=Paper(title="Spacing", authors=["A"], year=2020,
+                        doi="10.1234/x198"),
+            provider="openalex",
+        )
+        session = ReviewSession(query="q", providers=["openalex"],
+                                timestamp=datetime.now(), name="probe-198")
+        session.search_records = [SearchRecord("q", "openalex", None, 40)]
+        session.decisions = [decision]
+        save_session(session)
+        after = self._rerun("probe-198", "openalex", self.SKIPPED)
+        assert self._dblp(after, "openalex") == [(None, None)]
+        items = dict(search_parameter_items(after))
+        assert items["Providers"] == "openalex"
+        assert "Not searched" not in items
+
+    def test_old_link_without_filters_keeps_the_record(self):
+        session = self._session([
+            self._unknown(),
+            SearchRecord("q", "dblp", {"year": "2020"}, 40, hits=2),
+        ], name="old-link-190")
+        session.decisions[0].found_by.append(("q", "dblp", None))
+        save_session(session)
+        assert ("q", "dblp", None) in (
+            load_session("old-link-190").decisions[0].found_by
+        )
+        after = self._rerun("old-link-190")
+        assert sorted(self._dblp(after), key=str) == [(2, None), (None, None)]
+
+    def test_report_turns_unrecorded_into_failed(self):
+        before = self._session([self._unknown()], name="report-190")
+        assert dict(search_parameter_items(before))[
+            "Outcome not recorded"] == "dblp"
+        save_session(before)
+        items = dict(search_parameter_items(self._rerun("report-190")))
+        assert "Outcome not recorded" not in items
+        assert items["Not searched"] == f"dblp ({self.FAILURE})"
+
+    def test_report_unchanged_with_evidence(self):
+        for evidence in ("linked", "named"):
+            before = self._session([self._unknown()], evidence,
+                                   name=f"report-{evidence}-190")
+            save_session(before)
+            after = self._rerun(f"report-{evidence}-190")
+            assert search_parameter_items(after) == (
+                search_parameter_items(before)
+            ), evidence
+
+    def test_concurrent_merge_in_both_orders(self):
+        for own, disk in [(self._unknown(), self._failed()),
+                          (self._failed(), self._unknown())]:
+            session = self._session([own])
+            merge_concurrent_changes(session, self._session([disk]))
+            assert self._dblp(session) == [(0, self.FAILURE)], own
+
+    def test_concurrent_merge_keeps_a_record_with_evidence_on_either_side(
+            self):
+        for own, disk in [(self._unknown(), self._failed()),
+                          (self._failed(), self._unknown())]:
+            for evidence in ("linked", "named"):
+                for mine in (True, False):
+                    session = self._session(
+                        [own], evidence if mine else None)
+                    on_disk = self._session(
+                        [disk], None if mine else evidence)
+                    merge_concurrent_changes(session, on_disk)
+                    assert self._dblp(session) == [(None, None)], (
+                        own, evidence, mine,
+                    )
+
+    def test_failed_rerun_replaces_legacy_record_without_evidence(self):
+        save_session(self._session([SearchRecord("q", "dblp")],
+                                   name="legacy-190"))
+        session = self._rerun("legacy-190")
+        assert self._dblp(session) == [(0, self.FAILURE)]
+        save_session(session)
+        assert self._dblp(load_session("legacy-190")) == [
+            (0, self.FAILURE),
+        ]
+
+    def test_evidence_in_either_argument_order(self):
+        unknown, failed = self._unknown(), self._failed()
+        for links, names in (({("q", "dblp", None)}, set()),
+                             ({("q", "dblp", "")}, set()),
+                             (set(), {"dblp"})):
+            for a, b in ((failed, unknown), (unknown, failed)):
+                assert session_preferred_record(
+                    a, b, links, names) is unknown
+        links = {("q", "openalex", ""), ("other", "dblp", None)}
+        names = {"openalex", "dblp-mirror"}
+        for a, b in ((failed, unknown), (unknown, failed)):
+            assert session_preferred_record(a, b, links, names) is failed
+
+    def test_stale_save_keeps_the_failure(self):
+        save_session(self._session([self._unknown()], name="stale-190"))
+        stale = load_session("stale-190")
+        save_session(self._rerun("stale-190"))
+        stale.decisions[0].status = DecisionStatus.KEPT
+        save_session(stale)
+        session = load_session("stale-190")
+        assert self._dblp(session) == [(0, self.FAILURE)]
+        assert session.decisions[0].status == DecisionStatus.KEPT
 @
 
 \label{sec:legacy-records}
@@ -6599,11 +6919,15 @@ def merge_concurrent_changes(
     <<merge research context from disk>>
 
     own_index = {r.key: i for i, r in enumerate(session.search_records)}
+    links = linked_search_keys(session.decisions)
+    provider_names = (
+        decision_provider_names(session) | decision_provider_names(on_disk)
+    )
     for record in on_disk.search_records:
         if record.key in own_index:
             i = own_index[record.key]
-            session.search_records[i] = preferred_record(
-                session.search_records[i], record
+            session.search_records[i] = session_preferred_record(
+                session.search_records[i], record, links, provider_names
             )
         elif record.key not in replaced:
             session.search_records.append(record)
@@ -8908,9 +9232,14 @@ The audit caption applies the same rule (\cref{sec:audit-databases}).
 
 The rule describes what the report claims, not which record a session
 keeps.  [[record_rank]] still ranks such a record as answered, so a
-failed re-run does not replace it: the old run may have answered with
-the papers linked to it, and replacing it would turn that into a
-failure.
+failed re-run does not replace it while a paper links to it or names
+its provider: the old run may have answered with them, and replacing
+it would turn that into a failure.  Otherwise the failed re-run
+replaces it (\cref{sec:unknown-outcome-replaced}).  A failed record
+never counts as searched, whatever the papers say, so the report then
+lists the provider under \enquote{Not searched} with the failure as
+the reason, unless another of its records answered, or has no outcome
+either and is listed under \enquote{Outcome not recorded}.
 
 <<review report generation>>=
 def outcome_unknown(record: SearchRecord) -> bool:
