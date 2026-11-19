@@ -2658,8 +2658,9 @@ naming the file instead (\cref{sec:session-integrity}); the command fails
 and the file stays as it is, to be repaired or restored from its
 [[.bak]].  The new session also inherits the loaded session's baseline,
 so that saving it merges what other processes saved in the meantime just
-as saving the loaded session itself would, and the file it was loaded
-from, so that it is saved back there (\cref{sec:session-own-file}).
+as saving the loaded session itself would, and, when it is the same
+session, the file it was loaded from, so that it is saved back there
+([[appends_to_loaded_file]], \cref{sec:session-own-file}).
 
 <<review session functions>>=
 def _normalize_paper_identifiers(paper: Paper) -> Paper:
@@ -2742,7 +2743,8 @@ def create_review_session(
         session.research_context = previous_session.research_context
     if previous_session:
         session._baseline = previous_session._baseline
-        session._loaded_from = previous_session._loaded_from
+        if appends_to_loaded_file(previous_session, session_name, query):
+            session._loaded_from = previous_session._loaded_from
         session.folded = dict(previous_session.folded)
 
     # Build search records (query, provider, filters, limit, outcome),
@@ -7090,12 +7092,45 @@ instead of deriving one.  Everything that writes a session or sits next
 to its file asks [[session_file_path]]: the lock, the re-read of the
 merge, the [[.bak]] and the atomic write in [[save_session]], the copy
 of [[keep_copy_before_run]] and the lock of [[reconcile_session]].
-[[create_review_session]] builds a new session object around the loaded
-one, so it carries the path over as it carries the baseline; otherwise
-an append to a session found by its query, in a file named after the
-query rather than its hash, would still go to the hash's file.  A
-session that was never read from a file still gets the file its name
+A session that was never read from a file still gets the file its name
 maps to.
+
+[[create_review_session]] builds a new session object around the loaded
+one, and there the loaded file is not always the new session's.  The
+append looks its predecessor up by one key, the [[-n]] name or else the
+query, and [[load_session]] tries that key as a file name before the
+query's hash.  So [[search foo --review]] (no name) loads [[foo.json]]
+even when that file holds the session named [[foo]] for another query,
+and [[search foo -n foo]] loads the unnamed session of query [[foo]]
+from its hash file when there is no [[foo.json]].  In both the new
+session is not the loaded one: it has another name, and before
+\url{https://github.com/dbosk/scholar/issues/181} it went to its own
+file and left the loaded one alone.  Carrying the path over would save
+it into the other session's file, the very mixing we set out to stop.
+The path is therefore carried over only when the new session is the
+loaded one: its identity (name, or query when unnamed) maps to the same
+file as the loaded session's.  We compare the file names that the
+identities map to rather than the names themselves, because two unnamed
+sessions have equal names ([[None]]) whatever their queries.
+The other way the two can belong together needs no rule: when
+[[-n a]] opens the renamed copy [[a.json]] holding [[b]], the new
+session is named [[a]], and the file its name maps to is [[a.json]]
+already.
+
+<<review session functions>>=
+def appends_to_loaded_file(
+    previous: ReviewSession, name: str | None, query: str
+) -> bool:
+    """Tell whether a session `name` (or `query`) continues `previous`.
+
+    True when the new session should be saved into the file `previous`
+    was loaded from: both identities map to the same file name.
+    """
+    return previous._loaded_from is not None and (
+        own_session_file_name(previous.name, previous.query)
+        == own_session_file_name(name, query)
+    )
+@
 
 We neither rename the file nor rewrite the stored name: either would
 decide which of the two names is right, and only the user knows whether
@@ -7129,8 +7164,11 @@ Let's verify it with a renamed copy: [[a.json]] holds a session named
 copy and saving it changes [[a.json]] and leaves [[b.json]] byte for
 byte as it was; so does a concurrent save, whose merge must re-read
 [[a.json]]; the copy before a run is a copy of [[a.json]]; an append
-through [[create_review_session]] saves into the file it loaded; and
-the warning comes once.
+through [[create_review_session]] saves into the file it loaded, but
+only when it continues that session (an unnamed append whose query is
+another session's name, a named one that found an unnamed session's
+hash file, and an unnamed one that found a file holding another query
+leave the loaded file byte for byte alone); and the warning comes once.
 
 <<test functions>>=
 class TestSaveToLoadedFile:
@@ -7250,6 +7288,77 @@ class TestSaveToLoadedFile:
         dois = {d["paper"]["doi"] for d in
                 json.loads(by_query.read_text())["decisions"]}
         assert dois == {"10.5555/wp181-q", "10.5555/wp181-new"}
+
+    @staticmethod
+    def _result(query, doi):
+        result = Mock()
+        result.provider = "openalex"
+        result.query = query
+        result.filters = None
+        result.limit = None
+        result.papers = [Paper(title="New", authors=["B"], doi=doi)]
+        return result
+
+    def test_unnamed_append_leaves_a_named_session_alone(
+        self, tmp_path, monkeypatch
+    ):
+        """`search foo --review` must not save into session foo's file."""
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        named = save_session(self._session("foo", "10.5555/wp181-foo",
+                                           query="bar"))
+        before = named.read_bytes()
+
+        session = create_review_session(
+            [self._result("foo", "10.5555/wp181-foo-new")], "foo"
+        )
+        path = save_session(session)
+        assert path.name == own_session_file_name(None, "foo")
+        assert named.read_bytes() == before
+
+    def test_named_append_leaves_the_query_file_alone(
+        self, tmp_path, monkeypatch
+    ):
+        """`search foo -n foo` on an unnamed foo session gets foo.json."""
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        unnamed = save_session(self._session(None, "10.5555/wp181-hash",
+                                             query="foo"))
+        before = unnamed.read_bytes()
+
+        session = create_review_session(
+            [self._result("foo", "10.5555/wp181-hash-new")], "foo", "foo"
+        )
+        path = save_session(session)
+        assert path == tmp_path / "review_sessions" / "foo.json"
+        assert unnamed.read_bytes() == before
+
+    def test_named_append_to_a_renamed_copy(self, tmp_path, monkeypatch):
+        """`-n a` on a.json holding "b" saves a.json, never b.json."""
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        a_path, b_path = self._renamed_copy()
+        before = b_path.read_bytes()
+
+        session = create_review_session(
+            [self._result("q", "10.5555/wp181-a-new")], "q", "a"
+        )
+        assert save_session(session) == a_path
+        assert b_path.read_bytes() == before
+
+    def test_unnamed_append_of_another_query_leaves_the_file_alone(
+        self, tmp_path, monkeypatch
+    ):
+        """A file named like the query, holding another query, is not it."""
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        stored = save_session(self._session(None, "10.5555/wp181-other",
+                                            query="other"))
+        by_query = stored.rename(stored.with_name("q.json"))
+        before = by_query.read_bytes()
+
+        session = create_review_session(
+            [self._result("q", "10.5555/wp181-other-new")], "q"
+        )
+        path = save_session(session)
+        assert path.name == own_session_file_name(None, "q")
+        assert by_query.read_bytes() == before
 
     def test_list_flags_the_mismatch(self, tmp_path, monkeypatch):
         monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))

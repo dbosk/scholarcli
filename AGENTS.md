@@ -882,7 +882,10 @@ context (#107). `review.save_session` now:
   `<name>.json.bak` (one generation).
 - **saves to the file it loaded** (#181): `read_session_file` sets
   `ReviewSession._loaded_from` (not persisted; `create_review_session`
-  carries it over) and `session_file_path` returns it, so lock, merge
+  carries it over only when `appends_to_loaded_file`: both identities
+  (name, else query hash) map to one file name; `search foo --review`
+  must not write into named session foo's file) and
+  `session_file_path` returns it, so lock, merge
   re-read, `.bak`, write and `keep_copy_before_run` use the loaded
   file, not the one the stored `name` maps to (`own_session_file_name`;
   new sessions still use that). A file whose stored name maps elsewhere
