@@ -252,7 +252,12 @@ Hyphen quoting takes the whole blank-delimited token (`don't-care` →
 a hyphenated word with `*` (`pre-print*`) is refused like foreign
 field syntax (`s2_hyphen_wildcard`; the docs define `*` for words
 only). A refused search has `last_via` None and `_routed` reset, so
-`applied_filters` reports no `--in` for it. `s2_foreign_field_syntax` refuses Scopus/WoS/arXiv field
+`applied_filters` reports no `--in` for it.
+`scholar.applied_filters(provider, query, filters, limit)` passes the
+limit to a provider method that names a `limit` parameter (S2's does,
+and recomputes the endpoint from query and limit), so a search skipped
+by the rate limiter records the same filters, hence key, as an
+answered one. `s2_foreign_field_syntax` refuses Scopus/WoS/arXiv field
 codes before any request: `last_error` "query uses <db> field syntax,
 not supported by Semantic Scholar" (failed, not cached). Plain words
 with a limit stay on `/paper/search` (`_search_uncached`), which never

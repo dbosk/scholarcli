@@ -3706,24 +3706,104 @@ A search records the filters its provider applied
 ([[applied_filters]], \cref{sec:providers-search-in}), and for Semantic
 Scholar that depends on the endpoint, which depends on the limit as
 well as the query.
-[[applied_filters(query, filters)]] is not given the limit, so
-[[search]] notes the endpoint it chose for its query ([[_routed]]), and
-[[applied_filters]], which [[Search.execute]] calls right after the
-search, reads it.
-For a query this provider has not just searched, it decides by the
-query alone.
+The endpoint is a function of the query and the limit, and
+[[search_provider]] hands both to [[applied_filters]], so the method
+recomputes it instead of remembering a search: for a search that was
+answered, one that was refused and one that was skipped by the rate
+limiter (which never reaches [[search]] at all) alike.
+A skipped and an answered search of the same query, limit and filters
+therefore record the same filters, hence the same record key, and the
+answered run replaces the skipped record (the record key, in the
+scholar module).
+A refused query applies nothing, and the refusals depend on the query
+alone, so the method checks them too.
+A caller that gives no limit gets the endpoint [[search]] noted for
+that query ([[_routed]]), else a guess from the query's operators.
 
 <<semantic scholar search method>>=
 def applied_filters(
-    self, query: str, filters: SearchFilters | None
+    self,
+    query: str,
+    filters: SearchFilters | None,
+    limit: int | None = None,
 ) -> SearchFilters | None:
     """The filters applied to `query`: `--in` only on the bulk search."""
     if not (filters and filters.search_in):
         return filters
-    routed_query, bulk = getattr(self, "_routed", None) or (None, False)
-    if routed_query != query:
-        bulk = s2_has_operators(query)
+    if limit is not None:
+        refused = s2_foreign_field_syntax(query) or s2_hyphen_wildcard(query)
+        bulk = not refused and s2_uses_bulk(query, limit)
+    else:
+        routed_query, bulk = getattr(self, "_routed", None) or (None, False)
+        if routed_query != query:
+            bulk = s2_has_operators(query)
     return filters if bulk else without_search_in(filters)
+@
+
+\paragraph{Checking a skipped search.}
+A provider whose quota is spent is skipped before its [[search]] runs,
+so the only thing that can make its record right is the query and the
+limit.
+The tests block Semantic Scholar's limiter and run the search through
+[[Search.execute]], in both orders: a bulk search (no limit, [[--in]]
+honoured) and then a skipped relevance search of the same query, and
+the reverse.
+
+<<test functions>>=
+class TestS2SkippedSearchFilters:
+  """A skipped search records what it would have applied."""
+
+  ASKED = SearchFilters(search_in="title-abstract")
+
+  def _run(self, monkeypatch, limit, *, blocked):
+    from scholar.ratelimit import limiter_for
+
+    _replay_s2(monkeypatch, [S2_BULK_SINGLE_PAGE, S2_BULK_SINGLE_PAGE])
+    provider = SemanticScholarProvider(api_key=None)
+    monkeypatch.setitem(PROVIDERS, "s2", provider)
+    if blocked:
+      limiter_for(provider).record_limit_hit(
+        reason="daily quota spent", exhausted_daily=True
+      )
+    [result] = Search("plain words").execute(
+      providers=["s2"], limit=limit, filters=self.ASKED,
+    )
+    return provider, result
+
+  def test_bulk_then_skipped_relevance(self, monkeypatch):
+    provider, answered = self._run(monkeypatch, 0, blocked=False)
+    assert answered.filters == {"search_in": "title-abstract"}
+    from scholar.ratelimit import limiter_for
+    limiter_for(provider).record_limit_hit(
+      reason="daily quota spent", exhausted_daily=True
+    )
+    [skipped] = Search("plain words").execute(
+      providers=["s2"], limit=100, filters=self.ASKED,
+    )
+    assert skipped.error.startswith("skipped: ")
+    assert skipped.filters is None
+
+  def test_relevance_then_skipped_bulk(self, monkeypatch):
+    provider, answered = self._run(monkeypatch, 100, blocked=False)
+    assert answered.filters is None
+    from scholar.ratelimit import limiter_for
+    limiter_for(provider).record_limit_hit(
+      reason="daily quota spent", exhausted_daily=True
+    )
+    [skipped] = Search("plain words").execute(
+      providers=["s2"], limit=0, filters=self.ASKED,
+    )
+    assert skipped.error.startswith("skipped: ")
+    assert skipped.filters == {"search_in": "title-abstract"}
+
+  def test_skipped_and_answered_records_share_a_key(self, monkeypatch):
+    provider, skipped = self._run(monkeypatch, 100, blocked=True)
+    from scholar.ratelimit import reset_state
+    reset_state()
+    [answered] = Search("plain words").execute(
+      providers=["s2"], limit=100, filters=self.ASKED,
+    )
+    assert answered.filters == skipped.filters
 @
 
 \paragraph{Checking the edge cases.}
