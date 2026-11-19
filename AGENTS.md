@@ -246,7 +246,13 @@ a limit it stops at `S2_BULK_SAFETY_CAP` = 100,000 papers and records
 quoted phrases and quotes unquoted hyphenated words, since bulk reads
 an inner `-` as negation, #161 comment: `re-execution` 18,149 vs 251;
 `s2_mixes_and_or` → WARNING for ungrouped AND/OR, no documented
-precedence). `s2_foreign_field_syntax` refuses Scopus/WoS/arXiv field
+precedence).
+Hyphen quoting takes the whole blank-delimited token (`don't-care` →
+`"don't-care"`; leading `+ - | (` and trailing `| )` stay outside);
+a hyphenated word with `*` (`pre-print*`) is refused like foreign
+field syntax (`s2_hyphen_wildcard`; the docs define `*` for words
+only). A refused search has `last_via` None and `_routed` reset, so
+`applied_filters` reports no `--in` for it. `s2_foreign_field_syntax` refuses Scopus/WoS/arXiv field
 codes before any request: `last_error` "query uses <db> field syntax,
 not supported by Semantic Scholar" (failed, not cached). Plain words
 with a limit stay on `/paper/search` (`_search_uncached`), which never
