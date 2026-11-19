@@ -7700,6 +7700,9 @@ def sessions_decide(
             help="Tag to remove from every selected paper before --tag "
                  "adds its tags, e.g. an exclusion criterion left from "
                  "an earlier discard. A tag no paper has is only noted. "
+                 "Needs --keep or --discard: it is a decision, so a "
+                 "machine's without -c clears its confidence, and a "
+                 "human's on an unreviewed agent/LLM decision reviews it. "
                  "Repeatable.",
         ),
     ] = None,
@@ -7750,7 +7753,11 @@ def sessions_decide(
     --untag removes a tag (repeatable) before --tag adds its tags. When
     the status changes, or a --tag is a category (supports-claim, ...),
     the paper's old category tags are removed too, so a record holds one
-    category; all other tags are kept. Otherwise the tags are added.
+    category (at most one category --tag is accepted); all other tags
+    are kept. Otherwise the tags are added. An --untag is part of a
+    decision like any other: an agent or LLM that untags without -c
+    clears the confidence (pass -c again), and a human untag of an
+    unreviewed agent or LLM decision counts as reviewing it.
 
     Examples:
         scholar sessions decide my-review --source human --keep \\
@@ -7759,8 +7766,8 @@ def sessions_decide(
             --doi 10.1145/3568813 --tag off-topic-false-hit -c 0.9
     """
     from scholar.review import (
-        DecisionStatus, ReviewSource, clear_machine_audit, load_session,
-        save_session, tags_after_decision,
+        AUDIT_CATEGORIES, DecisionStatus, ReviewSource, clear_machine_audit,
+        load_session, save_session, tags_after_decision,
     )
     from scholar.llm_review import mark_as_reviewed
 
@@ -7813,6 +7820,15 @@ if discard and not tag:
         "[red]--discard requires at least one --tag (motivation).[/red]"
     )
     raise typer.Exit(1)
+categories_given = [
+    t for t in dict.fromkeys(tag or []) if t in AUDIT_CATEGORIES
+]
+if len(categories_given) > 1:
+    console.print(
+        "[red]A paper holds one category, but --tag names "
+        f"{escape(', '.join(categories_given))}.[/red]"
+    )
+    raise typer.Exit(2)
 <<validate the decide confidence>>
 @
 
@@ -7916,22 +7932,31 @@ stands (\url{https://github.com/dbosk/scholar/issues/195}): an agent
 that re-decides [[--keep -t qualifies-claim]] on a record kept as
 [[supports-claim]] used to leave both, and the audit table's last-wins
 rule hid that the record held two classifications
-([[tags_after_decision]], \cref{sec:audit-table}, which explains why
-nothing else is removed). A same-status decision without a category
+([[tags_after_decision]], \cref{sec:audit-table}, which explains the
+rule and why nothing else is removed). A same-status decision without a category
 refines the record and the tags accumulate. [[add_tag]] is idempotent,
 so a repeated tag is not doubled.
 
 Nothing else removes a tag, and an exclusion criterion such as
 [[no-abstract]] left on a record that was discarded and then kept reads
 as a theme, which makes the audit table count the kept row as cited for
-that reason. [[--untag]] removes named tags from every selected record,
+that reason. A decision names at most one category: two among the
+[[--tag]]s would store both, which is the state this rule avoids, so
+that is a usage error (status~2, checked with the other options before
+the session is loaded) naming them. [[--untag]] removes named tags from every selected record,
 before [[--tag]] adds, so [[--untag no-abstract --tag ml]] replaces one
 by the other. A machine source may untag as it may tag; the guard
 against replacing a human's decision (above) is unchanged, since it runs
 before any tag is touched. A tag that no selected record held is not an
 error, since a script run twice should not fail the second time, but it
 is named on stderr, once per tag, because a misspelt tag would otherwise
-look like a success. Discarding still demands a [[--tag]] on the command
+look like a success. [[--untag]] is part of a decision, so it needs
+[[--keep]] or [[--discard]] and has their other effects: a machine
+decision without [[--confidence]] clears the earlier confidence and the
+classifier's audit fields, as any machine decision does, so an agent
+that only wants to untag passes its [[-c]] again; and a human decision
+on an unreviewed agent or LLM decision is a review, which marks it
+reviewed. Both are deliberate and pinned by tests. Discarding still demands a [[--tag]] on the command
 line, whatever [[--untag]] leaves on the record: the motivation is
 what the discarder states now.
 
@@ -8235,7 +8260,10 @@ line: [[--untag]] removes what it names, and a category among the
 
 <<test functions>>=
 class TestSessionsDecideUntag:
-    """`sessions decide --untag`, and one category per record."""
+    """`sessions decide --untag`, and one category per record.
+
+    Also pins that an untag is a decision: it reviews and it clears.
+    """
 
     DOI = "10.1/withdoi"
 
@@ -8320,6 +8348,54 @@ class TestSessionsDecideUntag:
         )
         assert result.exit_code == 0, result.output
         assert self._tags() == ["ml"]
+
+    def test_two_categories_in_one_decision_are_refused(
+        self, tmp_path, monkeypatch
+    ):
+        self._make_session(tmp_path, monkeypatch)
+        result = self._decide(
+            "--keep", "--tag", "supports-claim", "-t", "qualifies-claim",
+        )
+        assert result.exit_code == 2
+        assert "supports-claim, qualifies-claim" in result.output
+        assert self._tags() == []
+        # the same category twice is one category
+        result = self._decide(
+            "--keep", "--tag", "supports-claim", "-t", "supports-claim",
+        )
+        assert result.exit_code == 0, result.output
+
+    def test_untag_is_a_decision_that_clears_a_machine_confidence(
+        self, tmp_path, monkeypatch
+    ):
+        from scholar.review import load_session
+
+        self._make_session(tmp_path, monkeypatch)
+        self._decide("--keep", "--tag", "ml", "-t", "no-abstract", "-c",
+                     "0.8", source="agent")
+        assert load_session("headless").decisions[0].llm_confidence == 0.8
+        self._decide("--keep", "--untag", "no-abstract", source="agent")
+        assert load_session("headless").decisions[0].llm_confidence is None
+
+    def test_a_human_untag_reviews_an_agent_decision(
+        self, tmp_path, monkeypatch
+    ):
+        from scholar.review import ReviewSource, load_session
+
+        self._make_session(tmp_path, monkeypatch)
+        self._decide("--keep", "--tag", "ml", "-t", "no-abstract",
+                     source="agent")
+        self._decide("--keep", "--untag", "no-abstract")
+        decision = load_session("headless").decisions[0]
+        assert decision.source == ReviewSource.AGENT_REVIEWED
+        assert decision.tags == ["ml"]
+
+    def test_the_notice_goes_to_stderr(self, tmp_path, monkeypatch):
+        self._make_session(tmp_path, monkeypatch)
+        result = self._decide("--keep", "--untag", "typo")
+        assert result.exit_code == 0, result.output
+        assert "No selected paper had the tag typo" in result.stderr
+        assert "No selected paper had the tag" not in result.stdout
 
     def test_the_force_guard_covers_untag(self, tmp_path, monkeypatch):
         self._make_session(tmp_path, monkeypatch)
