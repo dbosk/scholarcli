@@ -813,8 +813,16 @@ tags/source: not folded, merging tags is a judgement) and
 `possible_copies` (DOI-less decisions sharing an `audit_work_key` with a
 DOI decision but in none of those lists) are shown by `sessions show`
 (lines; foldable and possible copies counted, ids in JSON) and counted
-in the report, which
-also states "Unique works" from the audit rows. **Remaining gap**: the
+in the report. The pairs are DOI-less/DOI copy pairs plus two decided
+decisions under one id whose `decision_state` differs (`same_id_pairs`,
+any id, DOI too; #215: a store re-run can leave them, see below);
+conflicting if statuses differ, else alike; same state or a pending
+copy: not listed; `sessions reconcile` never folds them (no other id to
+fold to). Not handled: `sessions decide --paper-id` selects one
+decision per id, and the next append keeps one decision per id
+(`_build_previous_decision_lookup`), so such a pair lasts until then.
+The report also states "Unique works" from the audit rows.
+**Remaining gap**: the
 pairing uses the exact title + surname hash, the audit work key is
 looser (punctuation, case, year), so on the real sessions 2995 DOI-less
 records share a work key with a DOI record and only 403 pair; the rest
@@ -850,7 +858,9 @@ the provider too (#192; before, the decision was rebuilt around the
 returned copy, losing abstracts, sources and providers). Without a
 session file, a decision from the old per-query decision store does
 the same with the record's paper (`paper_from_decision_record`, shared
-with the restore of papers not returned; provider
+with the restore of papers not returned; it drops DBLP homonym numbers
+only from a paper with a DOI, so a DOI-less record keeps the id it is
+stored under and the append's renaming moves its note, #215; provider
 `united_providers(record, search)`; decision fields via
 `decision_from_record`), filling only when
 `stored_paper_fills`: `plausibly_same_work` (left for a record under
@@ -1041,6 +1051,12 @@ context (#107). `review.save_session` now:
   (a hand copy) logs one WARNING per file and process
   (`warn_about_foreign_name`) and is flagged by `sessions list`
   (`name_mismatch` in the JSON, a stderr line); neither is renamed.
+  A stored name is no key (named `foo` of query `bar` and the unnamed
+  session of query `foo` both list as "foo"), so code that lists
+  sessions reads each by its path, `load_listed_session(meta)` (#221:
+  `list_all_themes`, `list_papers_for_theme`,
+  `complete_session_paper_id`), never `load_session(meta["name"])`;
+  pooled LLM sample sessions likewise by recorded file (#231).
   The loaded `_baseline` goes with `_loaded_from` (#207): an append
   that saves into another file takes `SessionBaseline.of(session)` at
   the end of `create_review_session` instead (no baseline would let
@@ -1386,7 +1402,24 @@ extras; `parse_llm_response(category_tags=…)` sets
 `LLMDecision.category_problem` unless exactly one category remains
 after mapping, that triggers the same single retry, and a paper still
 invalid afterwards gets no decision (stays pending) and is listed in
-`LLMBatchResult.withheld`, which `llm classify` prints at the end.
+`LLMBatchResult.withheld`, which `llm classify` prints at the end
+("Left pending, no single category that fits the decision").
+The category must also fit the decision (#224, `STATUS_CATEGORIES`):
+a keep takes supports/qualifies/adjacent, a discard adjacent/off-topic;
+otherwise `category_problem` is "category X does not fit a <status>
+paper" (checked only once exactly one category is left), with the same
+retry and withholding. The prompt's category section and the retry
+reminder state the rule (`_category_status_rule`, fixed wording, so the
+prompt version moves) and say to keep a paper that bears on the claim
+and leave its exclusion to a human. Once the session holds any of
+`AUDIT_CATEGORIES`, the classifier offers all four (and adds them to
+the vocabulary answers are checked against; themes and motivations stay
+the session's own), so every decision has a fitting category; the
+prompt-version probe offers the four too. Only classifier verdicts are
+checked: `llm classify` answers, and `sessions decide --source llm`
+(exit 2 before loading, naming the fitting categories). A human's or
+agent's "supports, excluded" (rendered on purpose by the audit table,
+#89) is recorded as given; existing records are not rewritten.
 Sessions without category tags are classified as before.
 
 ### Snowball and Tuxedo Subcommands (lazy)
@@ -1456,6 +1489,14 @@ A human review leaves them untouched (they are the model's record).
   x* = 2 for n <= 50 else 3), because plain Wilson coverage dips near
   p = 0, where disagreement rates live. The sentence says the rate
   covers only the reviewed part while some is unreviewed.
+  `LLMSample.sessions` are labels (`session_label`: name or query);
+  since #231 `session_files` (same order, `session_file_path(s).name`,
+  saved only when present; old samples load with None) records each
+  pooled session's file. `pooled_sample_sessions(sessions, load=)`
+  (used by `--report` and the report's screening section) reads the
+  other sessions from those files (`load_listed_session`; a file gone
+  -> its papers not found), old samples by label via `load`, each file
+  once. The population digest still hashes labels (unchanged).
 - **Report.** `build_review_provenance_latex` calls
   `llm_review.build_llm_screening_latex` (one local import + call): an
   "LLM screening" section with models, prompt versions, dates, the

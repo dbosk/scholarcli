@@ -567,17 +567,20 @@ def complete_paper_id(incomplete: str) -> list[str]:
 The [[prov found-via]] command traces papers through saved review sessions
 rather than through standalone notes, so its completion draws paper IDs from
 the sessions instead.  A paper can appear in several sessions, so we deduplicate
-as we go and swallow any load error---completion must never raise:
+as we go and swallow any load error---completion must never raise.  Each
+listed file is read by its path ([[load_listed_session]],
+\cref{sec:cross-session-themes}), since two sessions can be listed
+under one name:
 
 <<completion functions>>=
 def complete_session_paper_id(incomplete: str) -> list[str]:
     """Provide shell completion for paper IDs in saved sessions."""
-    from scholar.review import list_sessions, load_session
+    from scholar.review import list_sessions, load_listed_session
     results: list[str] = []
     seen: set[str] = set()
     try:
         for meta in list_sessions():
-            session = load_session(meta["name"])
+            session = load_listed_session(meta)
             if session is None:
                 continue
             for decision in session.decisions:
@@ -588,6 +591,31 @@ def complete_session_paper_id(incomplete: str) -> list[str]:
     except Exception:
         return []
     return results
+@
+
+Let's verify that both sessions listed under one name offer their
+papers, the named session [[foo]] and the unnamed session of query
+[[foo]] (\url{https://github.com/dbosk/scholarcli/issues/221}).
+
+<<test functions>>=
+class TestSessionPaperIdCompletion:
+  def test_both_sessions_listed_under_one_name_are_offered(
+      self, tmp_path, monkeypatch):
+    from scholar.review import (
+      DecisionStatus, ReviewDecision, ReviewSession, save_session,
+    )
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+    for name, query, doi in [("foo", "bar", "10.5555/wp221-named"),
+                             (None, "foo", "10.5555/wp221-unnamed")]:
+      session = ReviewSession(query=query, providers=["openalex"],
+                              timestamp=datetime(2026, 11, 19), name=name)
+      session.decisions = [ReviewDecision(
+        paper=Paper(title=doi, authors=["A"], doi=doi),
+        provider="openalex", status=DecisionStatus.KEPT,
+      )]
+      save_session(session)
+    assert sorted(complete_session_paper_id("doi:10.5555/wp221")) == [
+      "doi:10.5555/wp221-named", "doi:10.5555/wp221-unnamed"]
 @
 
 \subsection{Command options}
@@ -7888,7 +7916,87 @@ if len(categories_given) > 1:
         f"{escape(', '.join(categories_given))}.[/red]"
     )
     raise typer.Exit(2)
+<<refuse a relayed verdict whose category does not fit>>
 <<validate the decide confidence>>
+@
+
+[[--source llm]] relays a classifier's verdict, and a classifier's
+category must fit its decision: a discard does not take
+[[supports-claim]] or [[qualifies-claim]], and a keep does not take
+[[off-topic-false-hit]] ([[STATUS_CATEGORIES]],
+\cref{sec:category-fits-status} in the LLM review module).  The
+classifier withholds such an answer, so a relayed one must not slip
+in through [[decide]]: it is a usage error (status~2), refused with
+the other options before the session is loaded, naming the
+categories that fit.  A human's or an agent's decision is free to
+pair them, since the audit table shows a discarded bearing category
+on purpose, as excluded (issue~\#89): a reviewer may exclude a
+relevant hit under a rule of the review.  The rule's table lives with
+the classifier, so it is imported only when a relayed verdict names a
+category.
+
+<<refuse a relayed verdict whose category does not fit>>=
+if source == "llm" and categories_given:
+    from scholar.llm_review import STATUS_CATEGORIES
+
+    decided = "kept" if keep else "discarded"
+    fitting = STATUS_CATEGORIES[decided]
+    if categories_given[0] not in fitting:
+        console.print(
+            f"[red]A relayed classifier verdict (--source llm) must "
+            f"fit its decision: a {decided} paper takes "
+            f"{escape(', '.join(sorted(fitting, key=AUDIT_CATEGORIES.get)))}"
+            f", not {escape(categories_given[0])}.[/red]"
+        )
+        raise typer.Exit(2)
+@
+
+Let's check that each contradiction is refused, before the session is
+even looked up, and that a fitting relayed verdict and the other
+sources' free pairs are recorded:
+
+<<test functions>>=
+class TestRelayedVerdictFitsItsDecision:
+    def test_a_relayed_contradiction_is_refused(self, tmp_path, monkeypatch):
+        from scholar.review import DecisionStatus, load_session
+
+        TestSessionsDecideCommand()._make_session(tmp_path, monkeypatch)
+        for args in (["--discard", "--tag", "supports-claim"],
+                     ["--discard", "--tag", "qualifies-claim", "-t", "ml"],
+                     ["--keep", "--tag", "off-topic-false-hit"]):
+            result = runner.invoke(app, [
+                "sessions", "decide", "headless", "--source", "llm",
+                "--doi", "10.1/withdoi", *args,
+            ])
+            assert result.exit_code == 2, args
+            assert "must fit its decision" in result.output
+        assert {d.status for d in load_session("headless").decisions} \
+            == {DecisionStatus.PENDING}
+        result = runner.invoke(app, [
+            "sessions", "decide", "no-such-session", "--source", "llm",
+            "--discard", "--doi", "10.1/x", "--tag", "supports-claim",
+        ])
+        assert result.exit_code == 2
+
+    def test_fitting_verdicts_and_other_sources_are_recorded(
+        self, tmp_path, monkeypatch
+    ):
+        from scholar.review import load_session
+
+        TestSessionsDecideCommand()._make_session(tmp_path, monkeypatch)
+        for source, args in (
+            ("llm", ["--discard", "--tag", "adjacent-subtopic"]),
+            ("llm", ["--keep", "--tag", "adjacent-subtopic"]),
+            ("agent", ["--discard", "--tag", "supports-claim"]),
+            ("human", ["--discard", "--tag", "qualifies-claim"]),
+        ):
+            result = runner.invoke(app, [
+                "sessions", "decide", "headless", "--source", source,
+                "--doi", "10.1/withdoi", *args,
+            ])
+            assert result.exit_code == 0, (source, result.output)
+        decision = load_session("headless").discarded_papers()[0]
+        assert decision.tags[-1] == "qualifies-claim"
 @
 
 The source is settled first, before anything else is checked:
@@ -8166,7 +8274,8 @@ class TestSessionsDecideCommand:
         self._make_session(tmp_path, monkeypatch)
         result = runner.invoke(app, [
             "sessions", "decide", "headless", "--source", "llm",
-            "--discard", "--doi", "10.1/withdoi", "--tag", "supports-claim",
+            "--discard", "--doi", "10.1/withdoi", "--tag",
+            "off-topic-false-hit",
         ])
         assert result.exit_code == 0
         decision = load_session("headless").discarded_papers()[0]
@@ -8218,7 +8327,8 @@ class TestSessionsDecideCommand:
         self._make_session(tmp_path, monkeypatch)
         runner.invoke(app, [
             "sessions", "decide", "headless", "--source", "llm",
-            "--discard", "--doi", "10.1/withdoi", "--tag", "supports-claim",
+            "--discard", "--doi", "10.1/withdoi", "--tag",
+            "off-topic-false-hit",
         ])
         result = runner.invoke(app, [
             "sessions", "decide", "headless", "--source", "human",
@@ -11724,7 +11834,8 @@ def llm_synthesize(
 When the session's vocabulary holds audit categories, the classifier
 withholds the decision of a paper whose answer still lacks exactly one
 category after its retry (\cref{sec:classifier-categories} in the LLM
-review module). The paper silently staying pending would look like a
+review module), or whose category does not fit its decision, such as a
+discard under [[supports-claim]] (\cref{sec:category-fits-status}). The paper silently staying pending would look like a
 paper the batch never reached, so the run ends with a warning that
 names each one and says what was wrong; the reviewer can then decide
 it with [[sessions decide]] or leave it for the next batch.
@@ -11741,7 +11852,7 @@ def print_withheld_papers(console, session, withheld: list) -> None:
     }
     for heading, withheld_here in (
         ("no usable answer", [d for d in withheld if d.answer_problem]),
-        ("not exactly one category tag",
+        ("no single category that fits the decision",
          [d for d in withheld if not d.answer_problem]),
     ):
         if not withheld_here:
@@ -11806,8 +11917,8 @@ class TestLLMClassifyWithheld:
         )
         result = runner.invoke(app, ["llm", "classify", "s"])
         assert result.exit_code == 0, result.output
-        assert "Left pending, not exactly one category tag (1)" \
-            in result.output
+        assert "Left pending, no single category that fits the " \
+            "decision (1)" in result.output
         assert "Two Categories" in result.output
         assert "several category tags" in result.output
         assert session.decisions[0].status == review.DecisionStatus.PENDING
@@ -11878,8 +11989,10 @@ papers are printed with their ids, so that each can be reviewed with
 
 [[--report]] reports every sample stored in the given sessions.  A
 sample pooled over other sessions as well is reported over all of
-them: the other sessions are loaded read-only, and one that no longer
-exists is counted as \enquote{not found}.  [[-f json]] gives the same
+them: the other sessions are read read-only, from the files the
+sample recorded ([[pooled_sample_sessions]], which also says why not by
+name), and one that no longer exists is counted as \enquote{not
+found}.  [[-f json]] gives the same
 numbers for scripts, with the unreviewed papers listed by session and
 id.
 
@@ -12016,16 +12129,11 @@ console.print(
 @
 
 <<report the stored samples>>=
-from scholar.llm_review import sample_reports, sample_sentence, session_label
+from scholar.llm_review import (
+    pooled_sample_sessions, sample_reports, sample_sentence,
+)
 
-given = {session_label(s) for s in sessions}
-named = {n for s in sessions for sample in s.llm_samples
-         for n in sample.sessions}
-for name in sorted(named - given):
-    other = load_session(name)
-    if other is not None:
-        sessions.append(other)
-reports = sample_reports(sessions)
+reports = sample_reports(pooled_sample_sessions(sessions))
 if output_format == "json":
     print(json.dumps([
         {
@@ -12132,6 +12240,45 @@ def test_draw_needs_seed_and_size(self):
     assert "give the seed with --seed" in " ".join(result.output.split())
     from scholar.review import load_session
     assert load_session("cli-sample-c").llm_samples == []
+
+def test_report_reads_the_pooled_file_not_its_label(self):
+    """The unnamed session of query foo, pooled before a named foo (#231)."""
+    from datetime import datetime
+    from scholar import review
+
+    def save(name, query):
+        session = review.ReviewSession(
+            query=query, providers=["p"], timestamp=datetime(2026, 11, 19),
+            name=name,
+        )
+        session.decisions = [review.ReviewDecision(
+            paper=Paper(title=query, authors=["A"],
+                        doi=f"10.5555/cli-wp231-{query}"),
+            provider="p", status=review.DecisionStatus.DISCARDED,
+            tags=["off-topic"], source=review.ReviewSource.LLM_UNREVIEWED,
+        )]
+        review.save_session(session)
+
+    save(None, "foo")
+    save("cli-wp231-x", "cli-wp231-x")
+    drawn = runner.invoke(app, [
+        "llm", "sample", "foo", "cli-wp231-x", "--discarded", "-n", "2",
+        "--seed", "3",
+    ])
+    assert drawn.exit_code == 0, drawn.output
+    decided = runner.invoke(app, [
+        "sessions", "decide", "foo", "--keep", "--paper-id",
+        "doi:10.5555/cli-wp231-foo", "--source", "human",
+    ])
+    assert decided.exit_code == 0, decided.output
+    save("foo", "bar")
+    reported = runner.invoke(
+        app, ["llm", "sample", "cli-wp231-x", "--report", "-f", "json"]
+    )
+    assert reported.exit_code == 0, reported.output
+    (report,) = json.loads(reported.output)
+    assert (report["reviewed"], report["changed"], report["not_found"]) == (
+        1, 1, 0)
 @
 
 
