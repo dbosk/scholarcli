@@ -1163,13 +1163,21 @@ notes`:
 A note is parsed into ordered segments — `personal` (verbatim) or `prov`
 (a parsed block) — by `_split_note_segments`. Entries are keyed by
 reconstructing a `Paper` from the `.bib` fields and reusing `Paper.id`
-(DOI, else title+author hash). Our `.bib` fields are escaped (#230), so
-`_paper_from_entry` undoes the `BIBTEX_SPECIALS` escapes (`_unescape_bib`)
-and, for a DOI-less entry, takes an existing note whose title escaped
-by `escape_bibtex` equals the entry's and whose id that title and the
-entry's authors give (`_noted_titles`, built once per command). Gap: a
-first import (no note yet) of a title with lossy escapes (curly quotes,
-dashes, dropped symbols) keys the note by the escaped text.
+(DOI, else title+author hash). Our `.bib` fields are escaped (#230),
+so the id is recorded: `bibtex+prov` writes `% ID: <Paper.id>` in each
+block (`ID` is in `PROV_FIELD_NAMES`), `prov export` writes the note's
+current id into every block it emits, and `prov import` keys by it
+(`_recorded_id`) and drops it from the stored note (`_without_ids`).
+Without the line (old or hand-made files, plain `-f bibtex` for
+export) `_paper_from_entry` tries existing notes: the id with the
+`BIBTEX_SPECIALS` escapes undone, then a DOI-less note whose
+`escape_bibtex` title equals the entry's and whose id that title and a
+spelling of the first author's surname give (`_unescaped_spellings`
+over `LATEX_UNICODE_PUNCTUATION`, `MAX_SPELLINGS`; `_noted_titles` is
+built lazily, once per command), then the id of the text as written
+(notes imported from hand-escaped files before #230); else the
+unescaped paper. An import keeps an existing note's title. Non-Latin
+text is dropped by the escaper on main (PR #234 takes it on).
 All round-trip code lives in `cli.nw`'s
 `<<formatter classes>>` and `<<prov command>>` chunks.
 

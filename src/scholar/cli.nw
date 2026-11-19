@@ -12844,10 +12844,12 @@ set up for use with LaTeX}).  Curly quotes, dashes and the straight
 double quote compiled; the escaper maps them anyway, as it does for
 the export.  The DOI and the year are left alone: biblatex's data
 model declares [[doi]] a verbatim field ([[blx-dm.def]]), and
-escaping its [[_]] would change the link.  The escaped text no longer
-hashes to the paper's id when the paper has no DOI;
-\cref{sec:bib-escape-round-trip} explains how the provenance commands
-still find its note.
+escaping its [[_]] would change the link.  Text in a non-Latin script
+is not handled here: the escaper on main drops it (a Chinese title
+becomes empty), and \url{https://github.com/dbosk/scholar/pull/234}
+takes that on.  The escaped text no longer hashes to the paper's id
+when the paper has no DOI; \cref{sec:prov-paper-id} explains how the
+provenance commands still find its note.
 @
 
 Let's verify the BibTeX formatter produces valid entries with the correct
@@ -13053,6 +13055,7 @@ class BibTeXProvFormatter(BibTeXFormatter):
         for result, paper, key in _keyed_papers(results):
             date = _prov_date(result, paper)
             print(f"% === provenance: {key} ===")
+            print(f"% ID: {paper.id}")
             print("% CLAIM: TODO")
             print(f"% FOUND-VIA: {_found_via(result)}")
             print("% PICKED: TODO")
@@ -13335,7 +13338,8 @@ lets us treat everything outside a block as personal and keep it untouched.
 
 <<constants>>=
 PROV_FIELD_NAMES = {
-    "CLAIM", "FOUND-VIA", "PICKED", "QUOTE", "VERIFIED", "COUNTER", "DATE",
+    "ID", "CLAIM", "FOUND-VIA", "PICKED", "QUOTE", "VERIFIED", "COUNTER",
+    "DATE",
 }
 PROV_HEADER_RE = re.compile(r"^\s*===\s*provenance:\s*(.*?)\s*===\s*$")
 BIB_ENTRY_RE = re.compile(r"^\s*@\w+\s*\{\s*([^,\s]+)\s*,")
@@ -13681,27 +13685,54 @@ A paper with a DOI is identified by it, and the DOI is written verbatim.
 A paper without one is identified by a hash of its title and first
 author as the provider wrote them, but our own formatters write those
 fields escaped (\cref{sec:bibtex-escaping}), as most [[.bib]] files
-do: [[R&D]] is [[R\&D]] in the entry, and hashes to another id.  Two
-steps bring the entry back to the paper's id.  First we undo the escapes
-that have one meaning, those of [[BIBTEX_SPECIALS]] ([[\&]] is [[&]],
-[[\textquotedbl{}]] is the double quote; the braces are gone by now).
-That is enough for a first [[prov import]] of most stubs, when no note
-exists yet.  The other mappings of the escaper cannot be undone: a
-curly apostrophe and a straight one are both written [[']], a dash
-becomes [[--]], and a symbol is dropped.  For those the second step
-compares the other way: an existing note of a DOI-less paper
-([[_noted_titles]]) whose title, escaped as the formatter escapes it,
-is the entry's title, and whose id that title and the entry's authors
-give, is the note of the paper the entry was written from.  Escaping
-the note's title rather than inverting the entry's works for any
-escaper, also one that later maps more characters.  So [[prov export]]
-finds a note taken in the TUI, and [[prov import]] adds to it.  What
-stays out of reach is a first import, before any note exists, of a
-title whose escapes cannot be inverted: its note is keyed by the
-escaped text, so the entry and the note still find each other, but not
-the paper in the session.
+do: [[R&D]] is [[R\&D]] in the entry, and hashes to another id.  Some
+escapes can be undone, but not all: a curly apostrophe and a straight
+one are both written [[']], a dash becomes [[--]], and a symbol is
+dropped.  So the id cannot be recomputed from the entry in general, and
+we stop trying where we can: the provenance block that
+[[bibtex+prov]] writes names the paper ([[ID: hash:...]] or
+[[ID: doi:...]]), and so does every block that [[prov export]] writes
+(\cref{sec:prov-paper-id}).  [[prov import]] reads only entries with a
+block, so an entry from either command is keyed by its recorded id,
+whatever its title became.
+
+The rest serves entries without the line: [[.bib]] files written before
+it, by hand, or by plain [[search -f bibtex]] for [[prov export]].  We
+try, in order, the notes that exist, and fall back to the paper the
+entry describes:
+\begin{enumerate}
+\item the id of the fields with the escapes of [[BIBTEX_SPECIALS]]
+  undone, which have one meaning each ([[\&]] is [[&]],
+  [[\textquotedbl{}]] the double quote; the braces are gone by now);
+\item an existing note of a DOI-less paper whose title, escaped as the
+  formatter escapes it, is the entry's title ([[_noted_titles]]), and
+  whose id that title and a spelling of the entry's first author give.
+  The author is escaped too ([[Conan O’Brien]] is written
+  [[Conan O'Brien]]), so we try each spelling the escaper writes alike
+  ([[_unescaped_spellings]]).  Escaping the note's title rather than
+  inverting the entry's works for any escaper, also one that maps more
+  characters later;
+\item the id of the text as written, braces stripped.  Before the
+  escaping, an import from a hand-escaped [[.bib]] keyed its note so
+  ([[R\&D in practice]]); taking that note continues it instead of
+  starting a second one.
+\end{enumerate}
+The title index lists every note, so it is built only when an entry
+gets that far, once per command.
+
+The notes layer reads only a paper's id and title (and its DOI and
+authors when present), so an entry keyed by a recorded hash id needs no
+[[Paper]], only a [[_NoteKey]] that carries the two.
 
 <<formatter classes>>=
+@dataclass(frozen=True)
+class _NoteKey:
+    """The id and title under which the notes layer files a paper."""
+
+    id: str
+    title: str
+
+
 def _bib_field_text(value: str) -> str:
     """Return a field value as the `.bib` parser keeps it: no braces."""
     return value.replace("{", "").replace("}", "")
@@ -13729,12 +13760,25 @@ def _noted_titles() -> dict:
     return index
 
 
-def _paper_from_entry(fields: dict, noted: dict | None = None):
-    """Build a minimal Paper from entry fields, for note keying only.
+def _recorded_id(entry) -> "str | None":
+    """Return the paper id an entry's provenance block records, if any."""
+    for _, fields in entry.prov_blocks:
+        if fields.get("ID"):
+            return fields["ID"]
+    return None
 
-    `noted` (from `_noted_titles`) lets a DOI-less entry whose title was
-    escaped meet the note of the paper it was written from.
+
+def _paper_from_entry(
+    fields: dict, paper_id: "str | None" = None, noted=None
+):
+    """Return what the notes layer keys an entry's note by.
+
+    `paper_id` is the id the entry's provenance block records; it wins.
+    Without it, a DOI-less entry is matched to an existing note (see the
+    module documentation); `noted` is a callable returning
+    `_noted_titles()`.
     """
+    from scholar.notes import get_note
     from scholar.scholar import Paper
 
     year_raw = fields.get("year", "")
@@ -13745,14 +13789,76 @@ def _paper_from_entry(fields: dict, noted: dict | None = None):
         year=year,
         doi=fields.get("doi"),
     )
-    if paper.doi or not noted:
+    <<key an entry by its recorded id>>
+    if paper.doi or get_note(paper) is not None:
         return paper
-    for note in noted.get(fields.get("title", ""), []):
-        written_from = Paper(title=note.title, authors=paper.authors,
-                             year=year)
-        if written_from.id == note.paper_id:
-            return written_from
+    <<match a noted paper whose title escapes to the entry's>>
+    as_written = Paper(
+        title=fields.get("title", ""),
+        authors=_split_bib_authors(fields.get("author", "")),
+        year=year,
+    )
+    if get_note(as_written) is not None:
+        return as_written
     return paper
+@
+
+A recorded DOI id becomes a [[Paper]] with that DOI, so that the notes
+layer still moves a note kept under the paper's old hash id, as it does
+for every paper that gains a DOI.
+
+<<key an entry by its recorded id>>=
+if paper_id:
+    if paper_id.startswith("doi:"):
+        if paper.id == paper_id:
+            return paper
+        return Paper(title=paper.title, authors=paper.authors, year=year,
+                     doi=paper_id[len("doi:"):])
+    return _NoteKey(id=paper_id, title=paper.title)
+@
+
+<<match a noted paper whose title escapes to the entry's>>=
+from scholar.utils import legacy_hash_paper_id
+
+first = paper.authors[0] if paper.authors else ""
+surname = first.split()[-1] if first.split() else ""
+for note in (noted() if noted else {}).get(fields.get("title", ""), []):
+    for spelling in _unescaped_spellings(surname):
+        if legacy_hash_paper_id(note.title, [spelling]) == note.paper_id:
+            return _NoteKey(id=note.paper_id, title=note.title)
+@
+
+The escaper writes several characters alike: [[']] stands for itself or
+for a curly apostrophe, a modifier apostrophe or a prime, [[--]] for
+itself or an en dash, and so on through [[LATEX_UNICODE_PUNCTUATION]].
+A surname is short and holds few of them, so we list every spelling
+that escapes to it, longest sequence first ([[---]] before [[--]]),
+and stop at [[MAX_SPELLINGS]] in case a name is all punctuation.  A
+dropped character (a symbol, or with the escaper on main a non-Latin
+letter) cannot be listed; non-Latin text is handled by
+\url{https://github.com/dbosk/scholar/pull/234}.
+
+<<constants>>=
+MAX_SPELLINGS = 64
+<<formatter classes>>=
+def _unescaped_spellings(text: str) -> list:
+    """Return the spellings `escape_bibtex` writes as `text`, text first."""
+    from scholar.review import LATEX_UNICODE_PUNCTUATION
+
+    sources: dict = {}
+    for char, escaped in LATEX_UNICODE_PUNCTUATION.items():
+        written = _bib_field_text(escaped)
+        if written:
+            sources.setdefault(written, []).append(char)
+    pattern = "|".join(
+        re.escape(seq) for seq in sorted(sources, key=len, reverse=True)
+    )
+    spellings = [""]
+    for part in re.split(f"({pattern})", text) if pattern else [text]:
+        choices = [part] + sources.get(part, [])
+        spellings = [s + c for s in spellings for c in choices]
+        spellings = spellings[:MAX_SPELLINGS]
+    return spellings
 @
 
 A comment region may stack several blocks.  We strip the comment markers and
@@ -14021,6 +14127,36 @@ rather than overwriting --- is what preserves both prior claims and the user's
 own prose.  Entries without a block are skipped so we never create an empty
 note.
 
+\label{sec:prov-paper-id}
+A block records the id of its paper on an [[ID]] line, which
+[[bibtex+prov]] writes from the paper and [[prov export]] from the note
+it found, so the entry and its note meet whatever the escaping did to
+the entry's title (\cref{sec:bib-escape-round-trip}).  The line belongs
+to the [[.bib]], not to the note: the note is filed under that id
+already, and a stored copy could only disagree with it after the paper
+gains a DOI.  So an import drops it from the blocks it stores, and an
+export writes the note's current id into every block it emits.
+
+<<formatter classes>>=
+def _without_ids(blocks) -> list:
+    """Return provenance `(key, fields)` blocks without their ID field."""
+    return [
+        (key, {name: value for name, value in fields.items()
+               if name != "ID"})
+        for key, fields in blocks
+    ]
+@
+
+The note's title is the provider's, which the entry holds only escaped
+(\enquote{Developers' ``view''} for \enquote{Developers’ “view”}).
+Saving the note under the entry's text would replace the better title,
+so an existing note keeps its own; only a new note takes the entry's.
+
+<<keep the title an existing note has>>=
+if existing is not None:
+    paper = _NoteKey(id=existing.paper_id, title=existing.title)
+@
+
 <<prov command>>=
 @prov_app.command("import")
 def prov_import(
@@ -14035,6 +14171,8 @@ def prov_import(
     Each entry's block(s) are merged into that paper's note, keyed by
     CLAIM so re-importing never duplicates. Personal note text is kept.
     """
+    from functools import cache
+
     from scholar.notes import get_note, save_note
 
     console = Console()
@@ -14043,17 +14181,18 @@ def prov_import(
         raise typer.Exit(1)
 
     entries = _parse_bib_entries(bib_file.read_text(encoding="utf-8"))
-    noted = _noted_titles()
+    noted = cache(_noted_titles)
     count = 0
     for entry in entries:
         if not entry.prov_blocks:
             continue
-        paper = _paper_from_entry(entry.fields, noted)
+        paper = _paper_from_entry(entry.fields, _recorded_id(entry), noted)
         existing = get_note(paper)
+        <<keep the title an existing note has>>
         segments = (
             _split_note_segments(existing.note) if existing else []
         )
-        merged = _merge_prov(segments, entry.prov_blocks)
+        merged = _merge_prov(segments, _without_ids(entry.prov_blocks))
         save_note(paper, _render_note_segments(merged))
         count += 1
 
@@ -14127,6 +14266,8 @@ def prov_export(
     Personal note text is never emitted. Prints to stdout unless
     --in-place is given.
     """
+    from functools import cache
+
     from scholar.notes import get_note
 
     console = Console()
@@ -14136,16 +14277,21 @@ def prov_export(
 
     text = bib_file.read_text(encoding="utf-8")
     entries = _parse_bib_entries(text)
-    noted = _noted_titles()
+    noted = cache(_noted_titles)
 
     def blocks_for(entry):
-        note = get_note(_paper_from_entry(entry.fields, noted))
+        note = get_note(
+            _paper_from_entry(entry.fields, _recorded_id(entry), noted)
+        )
         if note is None:
             return []
         return [
-            payload
-            for kind, payload in _split_note_segments(note.note)
-            if kind == "prov"
+            (key, {"ID": note.paper_id, **fields})
+            for key, fields in _without_ids(
+                payload
+                for kind, payload in _split_note_segments(note.note)
+                if kind == "prov"
+            )
         ]
 
     new_text, count = _rewrite_with_blocks(text, entries, blocks_for)
@@ -14266,7 +14412,9 @@ pdfLaTeX; that test runs the real tools when they are installed, since
 only they can tell whether an entry is safe, and is skipped otherwise.
 
 The round trip has three cases, all for papers without a DOI, whose id
-hashes the title as the provider wrote it.  A note taken on the paper
+hashes the title as the provider wrote it, and for files without the
+[[ID]] line of \cref{sec:prov-paper-id}, which the tests after it
+cover.  A note taken on the paper
 elsewhere (here [[save_note]], as the TUI does) is found by
 [[prov export]] from the escaped entry; a first [[prov import]] of a
 stub for a title with a BibTeX special keys the new note by the
@@ -14422,6 +14570,150 @@ class TestBibtexFormatterEscaping:
         assert [n.paper_id for n in list_papers_with_notes()] == [paper.id]
         note = get_note(paper)
         assert "personal prose" in note.note and "CLAIM: merged" in note.note
+@
+
+The provenance block now names the paper it belongs to
+(\cref{sec:prov-paper-id}).  Let's verify that the stub carries the id
+and that an import keys the note by it even for a title whose escapes
+cannot be undone and no note exists yet, the case the title match could
+not reach; that an export writes the id of the note it found and an
+import does not store it in the note; that a file without the line still
+finds a note when the escaper changed the author's name too
+([[Conan O’Brien]]); that a note imported from a hand-escaped [[.bib]]
+before this change, keyed by the escaped text, is continued rather than
+doubled; that an entry whose unescaped id has a note never lists every
+note; and that an import keeps the title a note already has, which the
+entry holds only escaped.
+
+<<test functions>>=
+class TestProvPaperId:
+    """The provenance block carries the paper id (#230)."""
+
+    LOSSY = "Developers’ “view” – a study"
+
+    @staticmethod
+    def _paper(title, **fields):
+        from scholar import Paper
+        return Paper(title=title, authors=fields.pop("authors", ["A B"]),
+                     year=2024, **fields)
+
+    def _stub(self, tmp_path, paper, capsys):
+        """Write `paper` as `search -f bibtex+prov` does, CLAIM filled."""
+        BibTeXProvFormatter().format([SearchResult(
+            query="q", provider="dblp", timestamp="2024-01-01T00:00:00",
+            papers=[paper],
+        )])
+        text = capsys.readouterr().out.replace("% CLAIM: TODO",
+                                               "% CLAIM: stubbed")
+        bib = tmp_path / "refs.bib"
+        bib.write_text(text, encoding="utf-8")
+        return bib
+
+    @staticmethod
+    def _notes():
+        from scholar.notes import list_papers_with_notes
+        return {n.paper_id: n for n in list_papers_with_notes()}
+
+    def test_the_stub_names_the_paper(self, tmp_path, capsys):
+        paper = self._paper(self.LOSSY)
+        text = self._stub(tmp_path, paper, capsys).read_text()
+        assert f"% ID: {paper.id}\n" in text
+
+    def test_import_keys_a_lossy_title_by_the_recorded_id(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        paper = self._paper(self.LOSSY)
+        bib = self._stub(tmp_path, paper, capsys)
+        assert CliRunner().invoke(
+            app, ["prov", "import", str(bib)]).exit_code == 0
+        notes = self._notes()
+        assert list(notes) == [paper.id]
+        assert "CLAIM: stubbed" in notes[paper.id].note
+        assert "ID:" not in notes[paper.id].note
+
+    def test_export_writes_the_id_of_the_note(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        from scholar.notes import save_note
+        paper = self._paper("R&D in practice")
+        save_note(paper, "=== provenance: b2024 ===\nCLAIM: c")
+        bib = tmp_path / "refs.bib"
+        bib.write_text(
+            BibTeXFormatter()._format_paper(paper, "b2024") + "\n",
+            encoding="utf-8")
+        result = CliRunner().invoke(app, ["prov", "export", str(bib)])
+        assert result.exit_code == 0
+        assert f"% ID: {paper.id}\n% CLAIM: c" in result.output
+
+    def test_a_file_without_the_id_meets_an_escaped_author(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        from scholar.notes import save_note
+        paper = self._paper("A talk", authors=["Conan O’Brien"])
+        save_note(paper, "=== provenance: b2024 ===\nCLAIM: from the TUI")
+        bib = tmp_path / "refs.bib"
+        bib.write_text(
+            BibTeXFormatter()._format_paper(paper, "b2024") + "\n",
+            encoding="utf-8")
+        assert "O'Brien" in bib.read_text()
+        result = CliRunner().invoke(app, ["prov", "export", str(bib)])
+        assert "% CLAIM: from the TUI" in result.output
+
+    def test_a_note_keyed_by_hand_escaped_text_is_continued(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        from scholar.notes import save_note
+        old = self._paper(r"R\&D in practice")
+        save_note(old, "=== provenance: b2024 ===\nCLAIM: old")
+        bib = tmp_path / "refs.bib"
+        bib.write_text(
+            "% === provenance: b2024 ===\n% CLAIM: new\n"
+            "@article{b2024,\n  title = {R\\&D in practice},\n"
+            "  author = {A B},\n  year = {2024},\n}\n",
+            encoding="utf-8")
+        assert CliRunner().invoke(
+            app, ["prov", "import", str(bib)]).exit_code == 0
+        notes = self._notes()
+        assert list(notes) == [old.id]
+        assert "CLAIM: old" in notes[old.id].note
+        assert "CLAIM: new" in notes[old.id].note
+
+    def test_the_title_index_is_built_only_when_needed(
+        self, tmp_path, monkeypatch
+    ):
+        """An entry whose unescaped id has a note never lists all notes."""
+        import scholar.cli as cli
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        from scholar.notes import save_note
+        paper = self._paper("R&D in practice")
+        save_note(paper, "personal")
+        def refuse():
+            raise AssertionError("title index built")
+        monkeypatch.setattr(cli, "_noted_titles", refuse)
+        bib = tmp_path / "refs.bib"
+        bib.write_text(
+            "% === provenance: b2024 ===\n% CLAIM: new\n"
+            + BibTeXFormatter()._format_paper(paper, "b2024") + "\n",
+            encoding="utf-8")
+        result = CliRunner().invoke(app, ["prov", "import", str(bib)])
+        assert result.exit_code == 0, result.output
+        assert "CLAIM: new" in self._notes()[paper.id].note
+
+    def test_import_keeps_the_title_of_an_existing_note(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        from scholar.notes import save_note
+        paper = self._paper(self.LOSSY, doi="10.5555/p230")
+        save_note(paper, "personal")
+        bib = self._stub(tmp_path, paper, capsys)
+        assert CliRunner().invoke(
+            app, ["prov", "import", str(bib)]).exit_code == 0
+        assert self._notes()[paper.id].title == self.LOSSY
 @
 
 
