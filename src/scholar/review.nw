@@ -1869,8 +1869,8 @@ called whenever the decisions list or individual decision statuses change.
 The [[sort_by]] method calls this since sorting changes the list structure.
 
 The [[_baseline]] field is not persisted either.  It remembers the
-decisions and research context as they were when the session was loaded
-or last saved, so that saving can tell this process's own changes apart
+decisions and research context as they were when the session was loaded,
+built by [[create_review_session]] or last saved, so that saving can tell this process's own changes apart
 from changes another process saved meanwhile
 (\cref{sec:session-integrity}).
 Nor is [[_loaded_from]], the file the session was read from, which is
@@ -2663,7 +2663,8 @@ in the meantime just as saving the loaded session itself would
 ([[appends_to_loaded_file]], \cref{sec:session-own-file}).  When it is
 another session, saved into another file, it takes neither: its
 baseline is then the state it is built with (at the end of the
-function), since the loaded baseline describes another file.
+function), since the loaded baseline describes another file.  So is
+the baseline of a session that loaded nothing.
 
 <<review session functions>>=
 def _normalize_paper_identifiers(paper: Paper) -> Paper:
@@ -7106,10 +7107,12 @@ merge needs them for one case only: to tell a legacy record that another
 process replaced from one this process still holds
 (\cref{sec:legacy-records}).
 
-The merge itself applies the three rules.  A session that was never
-loaded (constructed in code, or created by an append to a session that did
-not exist yet) has no baseline; then nothing of its own counts as
-unchanged, and only papers new on disk are added.  The research context
+The merge itself applies the three rules.  A session constructed in
+code has no baseline; then nothing of its own counts as unchanged, and
+only papers new on disk are added.  A session that
+[[create_review_session]] builds always has one, also when it loaded
+nothing: the state it was built with, or the loaded file's baseline
+when it continues that file (\cref{sec:session-own-file}).  The research context
 gets one extra rule for this case: an empty context never replaces a
 non-empty one, since there is no way to clear a context by accident that
 we would want to honour.
@@ -8262,16 +8265,15 @@ saved meanwhile still wins over a decision this process only loaded,
 and a paper that this append renamed is not brought back from the file
 under its old id.  A baseline taken after the build would know neither,
 though the loaded one lacks the papers new in this run; the built state
-fills that gap (below).  A session that loaded nothing still has no
-baseline.
+fills that gap (below).  A session that loaded nothing takes its built
+state too (below).
 
 <<take the session as built as the baseline>>=
-if previous_session:
-    built = SessionBaseline.of(session)
-    if session._loaded_from is None:
-        session._baseline = built
-    elif session._baseline is not None:
-        <<fill the gaps of the loaded baseline from [[built]]>>
+built = SessionBaseline.of(session)
+if session._loaded_from is None:
+    session._baseline = built
+elif session._baseline is not None:
+    <<fill the gaps of the loaded baseline from [[built]]>>
 @
 
 Let's verify it with the scenarios of the issue.  Each test fills the
@@ -8545,6 +8547,130 @@ class TestNewPaperOfASameFileAppend:
             "10.5555/wp214-old": ("pending", []),
             "10.5555/wp214-new": ("kept", ["t1"]),
         }
+@
+
+\paragraph{A session that loaded nothing.}
+The same race has a third form, with no file at all to begin with.  Two
+processes run [[search foo -n new]] at the same time: both find no
+session, both build one from the same results, and the second decides a
+paper and saves first, creating the file.  The first process then saves
+a session that loaded nothing, so it had no baseline, and every decision
+it holds counted as its own: its pending decision replaced the second
+process's.  A brand-new session is no different from a session saved
+into another file than it loaded: what it holds when
+[[create_review_session]] returns it is what it built, not what the
+user decided, so it takes that state as its baseline as well.  The same
+goes for a session rebuilt from the old per-query decision store
+(\cref{sec:decision-store-fallback}), which loaded no session file
+either.
+
+Nothing else depended on such a session having no baseline.  Its built
+baseline holds only papers that the session holds, so the papers only
+the file has are still added; its research context is empty unless the
+caller sets one after the build, and an unchanged empty context then
+takes the file's, as the rule for a missing baseline did, while a
+context set after the build is a change and wins, as a non-empty one
+did; it holds no legacy records, since every search records its limit
+(\cref{sec:search-record-key}), so the legacy-record rule finds nothing
+to drop; and [[warn_if_decisions_dropped]] reads the baseline only to
+count the decisions this process reset to pending, which with a built
+baseline are those decided at the build (restored from the decision
+store) and pending at the save.  A session constructed in code, not
+through [[create_review_session]], still has no baseline.
+
+Let's verify it with real processes, as for the same-file append.
+
+<<test functions>>=
+class TestNewSessionRace:
+    """Two processes creating one new session: the decision wins."""
+
+    BUILD = """
+        import sys
+        from scholar.scholar import Paper, SearchResult
+        from scholar.review import (
+            DecisionStatus, create_review_session, save_session,
+        )
+        result = SearchResult(
+            query="foo", provider="openalex", timestamp="t",
+            papers=[Paper(title="New", authors=["B"],
+                          doi="10.5555/wp214-fresh")],
+        )
+        session = create_review_session([result], "foo", "fresh")
+        [new] = session.decisions
+    """
+
+    def test_the_first_saved_decision_survives(self, tmp_path, monkeypatch):
+        import subprocess
+        import sys
+        import textwrap
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        path = tmp_path / "review_sessions" / "fresh.json"
+
+        first = subprocess.Popen(
+            [sys.executable, "-c", textwrap.dedent(self.BUILD)
+             + textwrap.dedent("""
+                print("built", flush=True)
+                sys.stdin.readline()
+                save_session(session)
+             """)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+        )
+        try:
+            assert first.stdout.readline().strip() == "built"
+            assert not path.exists()
+            subprocess.run(
+                [sys.executable, "-c", textwrap.dedent(self.BUILD)
+                 + textwrap.dedent("""
+                    new.status, new.tags = DecisionStatus.KEPT, ["t1"]
+                    save_session(session)
+                 """)],
+                check=True, timeout=120,
+            )
+            first.communicate("go\n", timeout=120)
+        finally:
+            if first.poll() is None:
+                first.kill()
+        assert first.returncode == 0
+        [saved] = json.loads(path.read_text())["decisions"]
+        assert (saved["status"], saved["tags"]) == ("kept", ["t1"])
+
+    def test_a_decision_after_the_build_still_wins(
+        self, tmp_path, monkeypatch
+    ):
+        """The other order: the first process decides after its build."""
+        import subprocess
+        import sys
+        import textwrap
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        path = tmp_path / "review_sessions" / "fresh.json"
+
+        first = subprocess.Popen(
+            [sys.executable, "-c", textwrap.dedent(self.BUILD)
+             + textwrap.dedent("""
+                print("built", flush=True)
+                sys.stdin.readline()
+                new.status, new.tags = DecisionStatus.DISCARDED, ["p1"]
+                save_session(session)
+             """)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+        )
+        try:
+            assert first.stdout.readline().strip() == "built"
+            subprocess.run(
+                [sys.executable, "-c", textwrap.dedent(self.BUILD)
+                 + textwrap.dedent("""
+                    new.status, new.tags = DecisionStatus.KEPT, ["t1"]
+                    save_session(session)
+                 """)],
+                check=True, timeout=120,
+            )
+            first.communicate("go\n", timeout=120)
+        finally:
+            if first.poll() is None:
+                first.kill()
+        assert first.returncode == 0
+        [saved] = json.loads(path.read_text())["decisions"]
+        assert (saved["status"], saved["tags"]) == ("discarded", ["p1"])
 @
 
 \subsubsection{Persisting Query-Provider Pairs}

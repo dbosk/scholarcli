@@ -981,7 +981,10 @@ context (#107). `review.save_session` now:
   the loaded baseline (a renamed id must not come back from the file)
   and add the built state only for ids it lacks (#214: a paper new in
   this run, untouched, yields to another process's decision);
-  `record_keys` and the context stay as loaded. Known gap (#213): a
+  `record_keys` and the context stay as loaded. A session that loaded
+  nothing (brand new, or rebuilt from the decision store) takes the
+  built state too (#214: two processes creating one session at once);
+  only sessions constructed in code have no baseline. Known gap (#213): a
   renamed id leaves the target the work twice (old id: its own
   decision; new id: the loaded file's), reported by no copy list.
 
