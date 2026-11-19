@@ -956,18 +956,56 @@ context (#107). `review.save_session` now:
   and after each save). Decision fields and `research_context` this
   process did not change take the on-disk value. Papers, search records
   and snowball rounds that only the file has are added. Paper metadata
-  of a paper both hold is merged ours first (#194, `paper_filled_from`
-  = `ours.merge_with(theirs)`): the file's copy fills our empty
-  fields (gaps another process filled survive), sources/keywords
-  united; a field both hold keeps ours, even if the other process
-  updated it after our load (a newer Crossref `updated_by`/
-  `newer_versions` or Unpaywall `oa_status`/`oa_url` is lost: no
-  per-paper baseline yet). Nothing is filled from a namesake
-  (`plausibly_same_work`; DOI-less hash ids collide). The decision
-  keeps its very `Paper` object when nothing was filled. The file is
-  read with `read_session_file(path, use_registry=False)`, else the
-  registry would hand back our own objects and hide the file's copies;
-  a paper new on disk is registered (`register`), and if this process
+  of a paper both hold is merged three ways too (#206,
+  `paper_merged_from(ours, theirs, base_state)`): the baseline keeps
+  each paper's stored fields (`SessionBaseline.papers`: id →
+  `paper_state(paper)`, the `Paper.to_dict()` fields frozen into
+  immutable copies, lists → tuples, dicts → sorted item tuples, so
+  in-place changes are seen; `None` ≠ `()`). A field ours still has
+  as in the baseline takes the file's value if that differs and is
+  not `None` (a retraction `verify` saved; a `None` on disk is a gap
+  from an older writer or a hand edit); a field we changed keeps
+  ours (also when both changed); then gaps are filled (#194,
+  `paper_filled_from` = `ours.merge_with(theirs)`).
+  `PAPER_FIELD_GROUPS` (`oa_status`+`oa_url`, one Unpaywall answer)
+  are decided whole first: ours as loaded and the file's pair
+  different with a non-None status → the file's pair (its `None`
+  link too); else ours holds a status or changed → our pair whole,
+  restored after the fill; else fill. `pdf_url` and the Crossref
+  pair stay per field (Crossref never writes `None` there).
+  Crossref notices (`CROSSREF_NOTICE_FIELDS`: `updated_by`,
+  `newer_versions`) are united (#219, `united_crossref_notices`:
+  ours first, each notice whole, keyed by normalised DOI + `type` /
+  `relation`, DOI-less notices by equality; None+None → None,
+  []+None → []) when the paper has no paper state or both copies
+  changed them since the baseline (a retraction lost is worse than a
+  withdrawn notice kept, which `verify` replaces); only one side
+  changed → the three-way rule (ours as loaded → file's list; ours
+  changed, file as loaded → ours).
+  `ACCUMULATED_PAPER_FIELDS` are never judged three ways: sources,
+  keywords, tags united and `citation_count` max (by `merge_with`),
+  `preprint_versions`/`published_versions` united by
+  `united_version_links` (ours first, links whole, matched by
+  normalised DOI, DOI-less links by equality; also without a
+  baseline). Paper states are recorded only from the file
+  (`SessionBaseline.of(..., from_file=True)`: `read_session_file`
+  and after each save); a baseline `create_review_session` builds
+  (#209: other-file appends, new sessions, the ids a same-file append
+  adds) has decision states only, since a built paper is no ancestor
+  of the target's copy. No paper state (session never loaded or
+  built, paper new here) → nothing taken, gaps filled, ours wins
+  (Crossref notices united, above).
+  `read_session_file` takes the baseline from the file's copy
+  (`as_stored`), not from the registry's held object, else the
+  file's older values would overwrite ours; the save's re-read passes
+  `record_baseline=False` (it never needs one). Cost on an
+  11,162-paper session copy: ~5 MB, load ~+10%. Nothing is taken or
+  filled from a namesake (`plausibly_same_work`; DOI-less hash ids
+  collide). The decision keeps its very `Paper` object when nothing
+  changed. The file is read with
+  `read_session_file(path, use_registry=False)`, else the registry
+  would hand back our own objects and hide the file's copies; a paper
+  new on disk is registered (`register`), and if this process
   already holds a copy of the same work, that copy wins, gaps filled
   from the file (a held namesake: the file's paper stays).
 - **guards**: `warn_if_decisions_dropped` logs a WARNING (session,
