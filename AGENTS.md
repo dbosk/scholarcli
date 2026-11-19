@@ -557,6 +557,11 @@ At session append `review.py` strips it from incoming papers too
 (cached DBLP results still carry it) and reconciles entries stored with
 it like Scopus's surname-first ones (`homonym_free_id()` +
 `migrate_paper_id`, keeping decisions and notes).
+Papers stored with the number and not re-run keep it (in their id,
+authors and cite key, e.g. `00012014`); `audit_work_key` strips it
+(#233), so their audit rows and possible copies meet the plain-name
+copies; `cite_key_base` deliberately does not (keys already cited stay
+put; changing it would need a `SYNTHESIS_CACHE_VERSION` bump).
 
 ### Scopus Empty Results
 
@@ -1262,7 +1267,9 @@ report body builders (`build_review_provenance_latex`,
 - `scholar sessions export -f table --lang en|sv --label L --track T
   --theme TAG=NAME -o base` writes `base.tex`, always a fragment: one
   row per *work* (`audit_work_key`: title and first-author surname
-  (`author_surname`; a blank author gives an empty surname) reduced to case-folded letters and digits, year ignored; joined
+  (`author_surname`; a blank author gives an empty surname; DBLP's
+  homonym number is stripped first, #233) reduced to case-folded
+  letters and digits, year ignored; joined
   provider strings like `openalex; dblp` are split, mapped to codes and
   deduplicated, keeping only the names `decision_provider_evidence`
   supports (#191, see Data Models); the best copy gives the row its reason,
@@ -1370,7 +1377,24 @@ extras; `parse_llm_response(category_tags=…)` sets
 `LLMDecision.category_problem` unless exactly one category remains
 after mapping, that triggers the same single retry, and a paper still
 invalid afterwards gets no decision (stays pending) and is listed in
-`LLMBatchResult.withheld`, which `llm classify` prints at the end.
+`LLMBatchResult.withheld`, which `llm classify` prints at the end
+("Left pending, no single category that fits the decision").
+The category must also fit the decision (#224, `STATUS_CATEGORIES`):
+a keep takes supports/qualifies/adjacent, a discard adjacent/off-topic;
+otherwise `category_problem` is "category X does not fit a <status>
+paper" (checked only once exactly one category is left), with the same
+retry and withholding. The prompt's category section and the retry
+reminder state the rule (`_category_status_rule`, fixed wording, so the
+prompt version moves) and say to keep a paper that bears on the claim
+and leave its exclusion to a human. Once the session holds any of
+`AUDIT_CATEGORIES`, the classifier offers all four (and adds them to
+the vocabulary answers are checked against; themes and motivations stay
+the session's own), so every decision has a fitting category; the
+prompt-version probe offers the four too. Only classifier verdicts are
+checked: `llm classify` answers, and `sessions decide --source llm`
+(exit 2 before loading, naming the fitting categories). A human's or
+agent's "supports, excluded" (rendered on purpose by the audit table,
+#89) is recorded as given; existing records are not rewritten.
 Sessions without category tags are classified as before.
 
 ### Snowball and Tuxedo Subcommands (lazy)
