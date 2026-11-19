@@ -988,6 +988,50 @@ by:", marks after titles; JSON `source` per decision and
 confirmed/changed table (`machine_review_rows`, LLM and agent apart).
 Labels come from `review.DECISION_SOURCE_LABELS` /
 `decision_source_items` (decided papers only).
+**Correcting a source** (#216): `scholar sessions relabel S --from SRC
+[--from ...|a,b] --to agent|llm (--doi D ...|--paper-id ID ...|--all)
+[--dry-run] [--note TEXT] [--by TEXT]` changes the source of decided
+papers whose stored source is a `--from` value (pending papers never),
+via `review.relabel_source`: status, tags, confidence,
+`LLM_AUDIT_FIELDS`, `found_by`, provider stay; no `clear_machine_audit`.
+`is_example` ("a human changed the machine's verdict") is cleared and
+its old value stored in the record: left set, it counted as a training
+example (`llm status`, `example_papers`, TUI filter), sorted first
+under `--include-llm-examples`, and made a later unchanged human
+confirmation read as "changed" (`machine_review_rows`, CSV).
+`mark_as_reviewed` now sets `is_example = not user_agrees`, so no
+stale flag survives a confirmation.
+Targets are `review.RELABEL_TARGETS` (the `is_unreviewed` members):
+`human`, `llm_reviewed`, `agent_reviewed` claim a human's confirmation
+and exit 2 (a human confirms in the TUI or with `decide --source
+human`). An LLM call an agent (not a human) confirmed becomes `agent`,
+not `agent_reviewed` (that means agent proposed, human confirmed); its
+LLM trace stays as provenance, and the report's LLM screening
+sentence still counts it (`llm_review.first_made_by_llm`: an LLM
+source, `llm_model` set, or a relabel record from an LLM source). Usage
+errors exit 2 before loading (`--to` in `--from`, neither or both of
+`--all` and selectors, an unknown `--from` no decision holds); an
+unmatched selector exits 1 unsaved; a selected paper that is pending
+or has another source is named and skipped. A selector takes every
+decision of the paper. Prints `from -> to: N` counts; `--dry-run`
+writes nothing (no copy). Otherwise `keep_copy_before_run(session,
+"pre-relabel")`, one `_utcnow()` time for all records, `save_session`.
+Each decision records `ReviewDecision.relabelled`
+(`[{"from", "to", "at", "note", "by", "is_example"}]`; `by` only as
+given, never guessed; `add_relabel` once each, kept sorted by `at`,
+ties in insertion order): saved
+only when non-empty, old files load `[]`, kept by the append copy,
+united by `merge_concurrent_changes` (after `mine =
+decision_state(...)` is taken, since the list is part of
+`decision_state`: otherwise the union would read as a local change and
+a stale process would keep its old source). Shown by `sessions show`
+(`cli.relabel_mark` on the last record: "(relabelled from human)", or
+"(relabelled from llm to agent, now llm)" when the source differs from
+its `to`; JSON `relabelled` when set) and the CSV column
+`source_relabelled` (`from->to time [by NAME]; ...`, before
+`paper_id`).
+A Scholar from before this loads such files but drops the list on its
+next save (checked under 528d933).
 Together these let scripted/agent-driven systematic reviews produce the same
 session record and `sessions export` audit trail as TUI reviews.
 
@@ -1327,7 +1371,39 @@ report body builders (`build_review_provenance_latex`,
   tags; otherwise the last category tag (`audit_category`), with the
   confidence for unreviewed LLM or agent rows; notes are appended in
   parentheses, note-only rows are "other". An LLM's or an agent's keep
-  is a candidate, not a citation. Order: cited (0), `supports-claim` (1),
+  is a candidate, not a citation. That is the rule *without*
+  `--cited-from FILE.bib` (repeatable, `-f table` only, else exit 2;
+  #218, review.nw `sec:audit-cited-from`/`sec:audit-cited-entries`).
+  With it, *cited* = the text cites the work, whoever decided: the CLI
+  reads the files with bibtexparser 2 (`_cited_bib_papers`, NOT `prov
+  import`'s line reader, which misses wrapped fields and bare years:
+  322 of 529 titles in intropy's `ltnotes.bib`; `LatexDecodingMiddleware`
+  plus the `names` functions called directly, since the name
+  middlewares skip a field spelled `Author`; the DOI from the
+  undecoded parse, since decoding turns `--` into an en dash; year
+  from `year`, else
+  `date`; a second reading surname first when it names another surname,
+  so `Lopez Gallucci, N.` matches either stored form), skips entries
+  without title and DOI and counts unparsable blocks (stderr), and
+  `match_cited_entries(entries, session)` reuses the sessions check's
+  lookup (`matching_entries` over `session_match_index`: DOI incl.
+  version-link DOIs, else `audit_work_key` under `plausibly_same_work`)
+  → `CitedEntry.works` (work keys) → `collect_audit_rows(...,
+  cited_works=)` → `audit_reason(..., cited=True/False)` per copy
+  (None = old rule). Copies are still ranked on the screening's order
+  (`audit_reason(cited=None)`), so the citation never changes which
+  copy gives the row. Kept/pending + cited → order 0 (`\emph{cited}` +
+  theme/category, machine confidence kept; pending: ", pending,
+  unclassified"); discarded + cited → own reason + note "cited in the
+  text"; a keep not cited (any source) → category order, else "kept,
+  not cited in the text" (`audit_uncited_keep`, `AuditRow.uncited`;
+  own caption count `extra_uncited`, ahead of duplicates). Caption
+  gets `cited_rule` before the databases (en/sv), also when nothing
+  matched. stderr: match counts (DOI / title / not in session), then
+  `cited_text_disagreements` lists the excluded (any matched row
+  discarded) and the not-held entries (key: short title); not in the
+  caption. Without the option the output is byte-identical (checked on
+  real-session copies). Order: cited (0), `supports-claim` (1),
   `qualifies-claim` (2), `adjacent-subtopic` (3),
   `off-topic-false-hit` (4), pending (5), other (6). The status wins
   over the category (#89): a *discarded* row whose category is
