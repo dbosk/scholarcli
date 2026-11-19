@@ -6986,7 +6986,7 @@ def save_session(session: ReviewSession) -> Path:
     with file_lock(session_path):
         <<merge changes other processes saved>>
         <<write the session file>>
-    session._baseline = SessionBaseline.of(session)
+    session._baseline = SessionBaseline.of(session, from_file=True)
 
     logger.debug("Saved %d decisions (%d kept, %d discarded, %d pending)",
                 len(session.decisions), len(session.kept_papers()),
@@ -7147,7 +7147,9 @@ def read_session_file(
     warn_about_unknown_sources(session_path, session)
     warn_about_foreign_name(session_path, session)
     if record_baseline:
-        session._baseline = SessionBaseline.of(session, stored=stored)
+        session._baseline = SessionBaseline.of(
+            session, from_file=True, stored=stored
+        )
     session._loaded_from = session_path
     return session
 @
@@ -7537,11 +7539,13 @@ class SessionBaseline:
 
     @classmethod
     def of(
-        cls, session: "ReviewSession",
+        cls, session: "ReviewSession", *, from_file: bool = False,
         stored: dict[str, Paper] | None = None,
     ) -> "SessionBaseline":
         """Record the current state of `session`.
 
+        Paper states are recorded only `from_file`: when the session's
+        papers are as its file holds them, just loaded or just saved.
         `stored` maps a paper id to the paper as the file holds it, where
         that differs from the session's paper (see `read_session_file`).
         """
@@ -7550,9 +7554,10 @@ class SessionBaseline:
         for decision in session.decisions:
             paper_id = get_paper_id(decision.paper)
             decisions[paper_id] = decision_state(decision)
-            papers[paper_id] = paper_state(
-                stored.get(paper_id, decision.paper)
-            )
+            if from_file:
+                papers[paper_id] = paper_state(
+                    stored.get(paper_id, decision.paper)
+                )
         return cls(
             decisions=decisions,
             research_context=session.research_context,
@@ -7577,6 +7582,45 @@ shared, not copied, which keeps a baseline small.  [[None]] and an
 empty list stay apart ([[None]] against [[()]]), since for the check
 fields they mean \enquote{never checked} and \enquote{checked, nothing
 found} (\cref{crossref-module,unpaywall-module}).
+
+\label{sec:paper-baseline}
+Paper states are recorded only from a file: when [[read_session_file]]
+loads one and when [[save_session]] has written one ([[from_file]]),
+since only then are the session's papers the file's.  A baseline that
+[[create_review_session]] builds (\cref{sec:session-own-file}) holds
+decision states only, and so do the papers that a same-file append
+adds to the loaded baseline from the built state.  A built decision
+state is a fair ancestor: the build makes a paper pending or restores
+its stored decision, and nothing else.  A built paper is not.  Its
+fields come from this run's search results and from whatever file was
+loaded, while the file the session is saved to holds its own copy,
+gathered by other runs (another provider, another limit, a cached
+answer of another date).  Where the two differ, nothing says that the
+file's value replaced ours rather than that the two were gathered
+apart, so the merge must not take the file's value for a change.
+Without a paper state the gap fill decides ([[paper_filled_from]]):
+the file's copy fills what ours lacks, and where both hold a value,
+ours is kept, as for a decision changed on both sides, the file's
+value staying in the [[.bak]].  This holds in the three cases a built
+baseline covers.
+\begin{description}
+\item[An append into another file] (\cref{sec:session-own-file}).
+  The target's copy and ours were gathered by different runs, often
+  for different questions, so neither is the newer.  The cost of the
+  rule: a retraction the target holds is not taken over our
+  \enquote{checked, clean} from the loaded file; [[scholar verify]] on
+  the target finds it again.
+\item[A paper new in a same-file append.]  Another process that
+  appended to the same file may have found the same paper first; its
+  copy came from its own search, so it is a second gathering, not a
+  change of ours.
+\item[Two processes creating one new session.]  Both build from
+  their own results, which need not be the same answer; the copy the
+  first saved fills our gaps (its enrichment survives) but does not
+  replace our values.
+\end{description}
+After the first save, the session's baseline is taken from the file it
+wrote, so from then on its papers are judged three ways.
 
 The cost was measured on a copy of the largest real session in
 November 2026 (11\,162 papers, a 57\,MB file): the paper states held
@@ -8128,8 +8172,10 @@ class TestConcurrentSaveAnotherWork:
 
 \paragraph{Taking what the other process changed.}
 \label{sec:paper-three-way}
-A paper that this process loaded or saved has a baseline: its fields
-as the file stored them then ([[SessionBaseline.papers]], above).
+A paper that this process loaded from the file or saved to it has a
+baseline: its fields as the file stored them then
+([[SessionBaseline.papers]], above; a paper of a built baseline has
+none).
 With it, each field of a paper both hold is judged like a decision.
 A field whose value here still equals the baseline was not touched by
 this process; if the file's value differs, another process changed it
@@ -8190,31 +8236,89 @@ def paper_merged_from(
 ) -> Paper:
     """`ours`, with the fields that only `theirs` changed taken from it.
 
-    `base_state` is the paper's `paper_state` as loaded or last saved.
-    A field `ours` still has as there, and `theirs` holds otherwise and
-    not as None, takes the value of `theirs`. The accumulated fields
+    `base_state` is the paper's `paper_state` as loaded from or last
+    saved to the file `theirs` comes from. A field `ours` still has as
+    there, and `theirs` holds otherwise and not as None, takes the value
+    of `theirs`; a group of fields (`PAPER_FIELD_GROUPS`) is decided as
+    a whole, by its first field. The accumulated fields
     (`ACCUMULATED_PAPER_FIELDS`) are never taken: version links are
     united (`united_version_links`), the others left to
-    `Paper.merge_with`. Gaps are then filled (`paper_filled_from`).
-    Without a baseline no field is taken. Returns `ours` itself when
-    nothing changes, or when `theirs` is another work. Neither argument
-    is modified.
+    `Paper.merge_with`. Gaps are then filled (`paper_filled_from`),
+    except in a group that ours holds. Without a baseline no field is
+    taken. Returns `ours` itself when nothing changes, or when `theirs`
+    is another work. Neither argument is modified.
     """
     if theirs is ours or not plausibly_same_work(ours, theirs):
         return ours
-    changed_there = {}
-    for name, base_value in zip(PAPER_STATE_FIELDS, base_state or ()):
-        value = getattr(theirs, name)
-        if (name not in ACCUMULATED_PAPER_FIELDS and value is not None
-                and frozen_value(getattr(ours, name)) == base_value
-                and frozen_value(value) != base_value):
-            changed_there[name] = value
+    base = dict(zip(PAPER_STATE_FIELDS, base_state or ()))
+    changed_there, ours_whole = {}, {}
+    <<decide each group of paper fields whole>>
+    <<take the single paper fields only the file changed>>
     for name in VERSION_LINK_FIELDS:
         links = united_version_links(getattr(ours, name), getattr(theirs, name))
         if frozen_value(links) != frozen_value(getattr(ours, name)):
             changed_there[name] = links
     resolved = replace(ours, **changed_there) if changed_there else ours
-    return paper_filled_from(resolved, theirs)
+    merged = paper_filled_from(resolved, theirs)
+    if any(getattr(merged, name) != value
+           for name, value in ours_whole.items()):
+        merged = replace(merged, **ours_whole)
+    return merged
+<<take the single paper fields only the file changed>>=
+for name, base_value in base.items():
+    value = getattr(theirs, name)
+    if (name not in ACCUMULATED_PAPER_FIELDS
+            and name not in GROUPED_PAPER_FIELDS and value is not None
+            and frozen_value(getattr(ours, name)) == base_value
+            and frozen_value(value) != base_value):
+        changed_there[name] = value
+@
+
+\paragraph{One answer, two fields.}
+[[oa_status]] and [[oa_url]] are one Unpaywall answer:
+[[annotate_paper]] writes both together, and for a paper that is
+closed the link is [[None]] ([[_normalize_oa]],
+\cref{unpaywall-module}).  Judged one field at a time, with
+[[None]] read as a gap, an answer of \enquote{closed, no link} that
+replaced \enquote{green, a repository link} came out as
+\enquote{closed} beside the old link: the status was taken, the link
+filled back in, by the other process's own save (it changed both, then
+the gap fill refilled the link it had cleared from the file) and by
+ours.  So the pair is decided as a whole, by its status, before the
+single fields.  When our pair is as loaded and the file's differs with
+a status, the file's pair is taken, its [[None]] link included.
+Otherwise, when our pair holds a status or differs from the baseline,
+it stands whole: it is restored after the gap fill, so the file's link
+is never put beside our status.  A pair without a status on either
+side is left to the gap fill, as before.  Without a baseline only that
+last rule applies, so the pair stays whole there too.
+
+Only this pair is a group.  [[pdf_url]] is not part of the answer:
+providers and preprint adoption set it, and [[annotate_paper]] only
+fills it when it is empty, so judging it alone is right.  The
+Crossref pair [[updated_by]] and [[newer_versions]] is written
+together too ([[annotate_papers]]), but a check never writes [[None]]
+to either (\enquote{checked, nothing found} is an empty list,
+\cref{crossref-module}), so the [[None]] rule never splits the pair.
+It can be split only when each process changed one list, and then
+each list is still what a Crossref check reported.
+
+<<review session functions>>=
+PAPER_FIELD_GROUPS = (("oa_status", "oa_url"),)
+GROUPED_PAPER_FIELDS = frozenset(
+    name for group in PAPER_FIELD_GROUPS for name in group
+)
+<<decide each group of paper fields whole>>=
+for group in PAPER_FIELD_GROUPS:
+    mine = {name: getattr(ours, name) for name in group}
+    their = {name: getattr(theirs, name) for name in group}
+    loaded = tuple(base[name] for name in group) if base else None
+    unchanged_here = loaded == frozen_value(tuple(mine.values()))
+    if (unchanged_here and their[group[0]] is not None
+            and frozen_value(tuple(their.values())) != loaded):
+        changed_there.update(their)
+    elif mine[group[0]] is not None or (base and not unchanged_here):
+        ours_whole.update(mine)
 @
 
 Two links are one when they name the same DOI, compared as
@@ -8538,6 +8642,134 @@ paper.
                         lambda paper: states.append(paper) or real(paper))
     save_session(session)
     assert states == [session.decisions[0].paper]
+@
+
+Unpaywall's answer is one pair.  Here another process finds that a
+paper which was open is closed now, and saves both halves: the
+status, and no link.  Neither save may put the old link back beside
+the new status, neither the other process's (whose own merge would
+fill the link it cleared from the file) nor ours.
+
+<<test methods for concurrent paper updates>>=
+  def test_an_open_access_answer_is_taken_whole(self):
+    self._first_save(oa_status="green", oa_url="https://repo.example/a")
+    session = load_session(self.NAME)
+    self._other_process_sets(oa_status="closed", oa_url=None)
+    assert self._saved()["paper"]["oa_url"] is None
+    self._decide_and_save(session)
+    paper = self._saved()["paper"]
+    assert (paper["oa_status"], paper["oa_url"]) == ("closed", None)
+@
+
+A built baseline has no paper states (\cref{sec:paper-baseline}), so
+the papers it covers keep the gap fill.  Let's verify its three cases
+with a value that the file's copy holds differently from ours and one
+that only the file's copy holds: an append into another file (with
+the Unpaywall pair, which stays ours whole), a paper new in a
+same-file append, and two processes creating one new session, in real
+processes as in \cref{sec:session-own-file}.
+
+<<test functions>>=
+class TestBuiltPapersHaveNoBaseline:
+  """A paper's fields are judged three ways only against its file."""
+
+  DOI = "10.5555/wp206-built"
+
+  @staticmethod
+  def _result(query, paper):
+    from scholar.scholar import SearchResult
+    return SearchResult(query=query, provider="openalex", timestamp="t",
+                        papers=[paper])
+
+  @staticmethod
+  def _saved_paper(path, doi):
+    import json
+    [paper] = [d["paper"] for d in json.loads(path.read_text())["decisions"]
+               if d["paper"]["doi"] == doi]
+    return paper
+<<test methods for built papers>>
+@
+
+<<test methods for built papers>>=
+  def test_an_append_into_another_file_keeps_our_values(
+      self, tmp_path, monkeypatch):
+    helper = TestAppendBaselineFollowsTheFile
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+    save_session(helper._session("foo", "bar", [helper._decision(
+      Paper(title="P", authors=["A"], doi=self.DOI, oa_status="closed"),
+      DecisionStatus.KEPT, ["t1"])]))
+    target = save_session(helper._session(None, "foo", [helper._decision(
+      Paper(title="P", authors=["A"], doi=self.DOI, oa_status="green",
+            oa_url="https://repo.example/p", abstract="target abstract"))]))
+    session = create_review_session(
+      [self._result("foo", Paper(title="P", authors=["A"], doi=self.DOI))],
+      "foo")
+    assert save_session(session) == target
+    paper = self._saved_paper(target, self.DOI)
+    assert (paper["oa_status"], paper["oa_url"]) == ("closed", None)
+    assert paper["abstract"] == "target abstract"
+
+  def test_a_paper_new_in_a_same_file_append_keeps_our_values(
+      self, tmp_path, monkeypatch):
+    from scholar.scholar import isolated_registry
+    helper = TestAppendBaselineFollowsTheFile
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+    path = save_session(helper._session("foo", "foo", [helper._decision(
+      Paper(title="Old", authors=["A"], doi="10.5555/wp206-old"))]))
+    session = create_review_session([self._result("foo", Paper(
+      title="P", authors=["A"], doi=self.DOI, venue="V"))], "foo", "foo")
+    with isolated_registry():
+      other = create_review_session([self._result("foo", Paper(
+        title="P", authors=["A"], doi=self.DOI, venue="B venue",
+        abstract="from B"))], "foo", "foo")
+      save_session(other)
+    assert save_session(session) == path
+    paper = self._saved_paper(path, self.DOI)
+    assert (paper["venue"], paper["abstract"]) == ("V", "from B")
+
+  def test_the_new_session_race_keeps_our_values(
+      self, tmp_path, monkeypatch):
+    import subprocess
+    import sys
+    import textwrap
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+    build = textwrap.dedent(f"""
+      import sys
+      from dataclasses import replace
+      from scholar.scholar import Paper, SearchResult
+      from scholar.review import create_review_session, save_session
+      result = SearchResult(
+        query="foo", provider="openalex", timestamp="t",
+        papers=[Paper(title="P", authors=["A"], doi={self.DOI!r},
+                      venue="V")],
+      )
+      session = create_review_session([result], "foo", "fresh")
+      [new] = session.decisions
+    """)
+    first = subprocess.Popen(
+      [sys.executable, "-c", build + textwrap.dedent("""
+        print("built", flush=True)
+        sys.stdin.readline()
+        save_session(session)
+      """)],
+      stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+    )
+    try:
+      assert first.stdout.readline().strip() == "built"
+      subprocess.run([sys.executable, "-c", build + textwrap.dedent("""
+        new.paper = replace(new.paper, venue="B venue", abstract="from B",
+                            updated_by=[])
+        save_session(session)
+      """)], check=True, timeout=120)
+      first.communicate("go\n", timeout=120)
+    finally:
+      if first.poll() is None:
+        first.kill()
+    assert first.returncode == 0
+    paper = self._saved_paper(
+      tmp_path / "review_sessions" / "fresh.json", self.DOI)
+    assert paper["venue"] == "V"
+    assert (paper["abstract"], paper["updated_by"]) == ("from B", [])
 @
 
 A save can also fail for want of space.  A review that ran with a full

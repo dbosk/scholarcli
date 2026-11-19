@@ -963,18 +963,28 @@ context (#107). `review.save_session` now:
   immutable copies, lists → tuples, dicts → sorted item tuples, so
   in-place changes are seen; `None` ≠ `()`). A field ours still has
   as in the baseline takes the file's value if that differs and is
-  not `None` (a retraction `verify` saved, an Unpaywall `oa_status`;
-  a `None` on disk is a gap from an older writer or a hand edit, so
-  Unpaywall clearing `oa_url` is not taken either); a field we
-  changed keeps ours (also when both changed); then gaps are filled
-  (#194, `paper_filled_from` = `ours.merge_with(theirs)`).
+  not `None` (a retraction `verify` saved; a `None` on disk is a gap
+  from an older writer or a hand edit); a field we changed keeps
+  ours (also when both changed); then gaps are filled (#194,
+  `paper_filled_from` = `ours.merge_with(theirs)`).
+  `PAPER_FIELD_GROUPS` (`oa_status`+`oa_url`, one Unpaywall answer)
+  are decided whole first: ours as loaded and the file's pair
+  different with a non-None status → the file's pair (its `None`
+  link too); else ours holds a status or changed → our pair whole,
+  restored after the fill; else fill. `pdf_url` and the Crossref
+  pair stay per field (Crossref never writes `None` there).
   `ACCUMULATED_PAPER_FIELDS` are never judged three ways: sources,
   keywords, tags united and `citation_count` max (by `merge_with`),
   `preprint_versions`/`published_versions` united by
   `united_version_links` (ours first, links whole, matched by
   normalised DOI, DOI-less links by equality; also without a
-  baseline). No baseline for the paper (session never loaded, paper
-  new here) → nothing taken, gaps filled, ours wins.
+  baseline). Paper states are recorded only from the file
+  (`SessionBaseline.of(..., from_file=True)`: `read_session_file`
+  and after each save); a baseline `create_review_session` builds
+  (#209: other-file appends, new sessions, the ids a same-file append
+  adds) has decision states only, since a built paper is no ancestor
+  of the target's copy. No paper state (session never loaded or
+  built, paper new here) → nothing taken, gaps filled, ours wins.
   `read_session_file` takes the baseline from the file's copy
   (`as_stored`), not from the registry's held object, else the
   file's older values would overwrite ours; the save's re-read passes
