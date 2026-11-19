@@ -832,9 +832,12 @@ saved only when non-empty, unioned by the concurrent merge), which
 `scholar search -n <name>` persists the search to the named review session
 even without `--review`: it creates or appends (same
 `create_review_session()` merge the TUI uses — search records accumulate,
-prior decisions are preserved, new papers land pending). It appends to
-`<name>.json` only, and `search q --review` without `-n` to the hash
-file of `q` only (#213, see Session Integrity). A paper the
+prior decisions are preserved, new papers land pending). Every CLI
+append is named: `--review` without `-n` names the session after its
+query (`cli.nw`, `session_name = name if name else query`), so
+`search q --review` appends to `q.json`, or, when that does not exist,
+continues an unnamed session of query `q` in its hash file (#213, see
+Session Integrity). A paper the
 re-run returns again keeps its stored paper, gaps filled from the new
 copy (`stored_paper_with` → `Paper.merge_with`, stored values win,
 sources united; a DOI-less stored paper met by a DOI copy, found under
@@ -1041,26 +1044,35 @@ context (#107). `review.save_session` now:
   nothing (brand new, or rebuilt from the decision store) takes the
   built state too (#214: two processes creating one session at once);
   only sessions constructed in code have no baseline. Whenever the
-  session does not continue a loaded file, the built baseline's
-  `record_keys` are empty: nothing was loaded from the target, so the
-  legacy-record rule must not drop one of our legacy records.
-- **an append loads only its own file** (#213):
+  session does not conti- **an append loads only its own file** (#213):
   `create_review_session` loads `load_own_session(name, query)`, the
   file `own_session_file_name` gives (`<name>.json`, unnamed: the
-  query's hash), never `load_session`'s other guess (`search foo
-  --review` used to load named session foo's `foo.json`, whatever its
-  query, and copy its decisions into the hash file of query foo; `-n
-  foo` without `foo.json` the unnamed foo session's). When that other
-  file exists, one line names it and how to continue it (`pass -n
-  'foo'` / `search 'foo' without -n`): WARNING when the own file does
-  not exist (a new session starts where the old lookup continued the
-  other), INFO otherwise. A `<query>.json` too long for a file name
-  reads as absent (the old lookup raised `OSError`). So no append
-  saves into another file than it loaded; the #207 other-file
-  baseline now serves only an own file holding another identity (a
-  hand copy), where a renamed id still comes back beside the new one.
-  `load_session` keeps its tolerant lookup (name, then query hash) for
-  the user-facing commands (`sessions show/export/decide/...`, `llm`,
+  query's hash), never `load_session`'s other guess (an unnamed append
+  for foo used to load named session foo's `foo.json`, whatever its
+  query; `search bar -n foo` without `foo.json` the unnamed foo
+  session's hash file). One exception, the `--review` default: a named
+  append without its own file whose name is its query continues the
+  hash file of that query if it holds an unnamed session of that query
+  (that command always did); the session stays unnamed
+  (`<<continue an unnamed session without a name>>`), so it saves back
+  there with the loaded baseline and is found again next run. When the
+  other file exists and is not continued, one line names it, what it
+  stores (`_stored_identity`: name, or the unnamed session's query) and
+  `pass -n '<its stem>'` to continue it: WARNING when the own file does
+  not exist, INFO otherwise. A `<query>.json` too long for a file name
+  reads as absent (the old lookup raised `OSError`).
+  `appends_to_loaded_file` compares `previous._loaded_from.name` with
+  `own_session_file_name(name, query)` (identities got hand copies
+  wrong: `-n a` on `a.json` holding b took the built baseline and a
+  renamed homonym id came back beside the new one). So every append
+  that loaded a file continues it; the #207 built baseline serves only
+  sessions that loaded nothing. `load_session` keeps its tolerant
+  lookup for the user-facing commands (`sessions show/export/decide/
+  ...`, `llm`, `enrich`, `verify`); `search -n`/`--review`, `rq` and the
+  TUI all go through `create_review_session`. Real sessions
+  (2026-11-19): no hash-named file, no unnamed session.
+
+ user-facing commands (`sessions show/export/decide/...`, `llm`,
   `enrich`, `verify`); `search -n`/`--review`, `rq` and the TUI all go
   through `create_review_session`.
 
