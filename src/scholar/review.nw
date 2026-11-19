@@ -645,6 +645,9 @@ class ReviewDecision:
             paper's DOI-less id, with years too far apart to be the same
             work (`{"year", "venue", "provider"}` each); see
             `is_same_id_namesake`.
+        relabelled: Each time the source was corrected without changing
+            the decision (`{"from", "to", "at", "note", "by",
+            "is_example"}`), oldest first; see `relabel_source`.
     """
     paper: Paper
     provider: str
@@ -656,6 +659,7 @@ class ReviewDecision:
     <<LLM audit fields of a decision>>
     found_by: list[tuple[str, str, str | None]] = field(default_factory=list)
     same_id_copies: list[dict] = field(default_factory=list)
+    relabelled: list[dict] = field(default_factory=list)
 
     def __post_init__(self):
         """Coerce None list fields to empty lists."""
@@ -665,6 +669,18 @@ class ReviewDecision:
             self.found_by = []
         if self.same_id_copies is None:
             self.same_id_copies = []
+        if self.relabelled is None:
+            self.relabelled = []
+
+    def add_relabel(self, record: dict) -> None:
+        """Note a correction of the source (`relabel_source`), once.
+
+        The records stay in the order of their `at` times; records of
+        the same time keep the order they were added in.
+        """
+        if record not in self.relabelled:
+            self.relabelled.append(record)
+            self.relabelled.sort(key=lambda r: str(r.get("at") or ""))
 
     def add_same_id_copy(self, copy: dict) -> None:
         """Note another work returned under this paper's id, once."""
@@ -1019,6 +1035,351 @@ def test_concurrent_save_keeps_them(self):
     save_session(stale)
     assert llm_audit_of(load_session("audit-race").decisions[0]) \
         == self.AUDIT
+@
+
+
+\subsection{Correcting who decided}
+\label{sec:relabel-source}
+
+A decision's source can be wrong while the decision itself is right.
+Before [[sessions decide]] demanded [[--source]] off a terminal
+(issue~\#162), an AI agent that left the option out was recorded as
+[[human]], and an agent that confirmed an LLM's call the same way
+turned it into [[llm_reviewed]].  Issue~\#216 reports two sessions
+full of such decisions
+(\url{https://github.com/dbosk/scholar/issues/216}), and reports cite
+them as the author's.  The only repair [[sessions decide]] offers
+is to decide again with [[--source agent --force]], and that replaces
+the decision: it clears the classifier's record
+([[clear_machine_audit]], \cref{sec:review-source}) and the confidence,
+which are exactly what an audit of those rows would read.  So a
+correction of the source is an operation of its own,
+[[relabel_source]], which changes the source and leaves the decision
+as it is.
+
+Which sources may it give?  Only the unreviewed ones, [[agent]] and
+[[llm]].  The three others each say that a human decided or confirmed
+the decision: [[human]] by definition, and [[llm_reviewed]] and
+[[agent_reviewed]] because they are what a human's review turns a
+machine decision into (\cref{sec:review-source}).  A command that
+writes one of them asserts a human judgement that nobody made in that
+command, and a human who wants to confirm a row can do so where it is
+recorded as a review, in the TUI or with [[sessions decide --source
+human]].  The issue suggested mapping [[llm_reviewed]] to
+[[agent_reviewed]] when the reviewer was an agent.  That would be wrong
+by the meaning of the values: [[agent_reviewed]] says \enquote{an agent
+proposed it and a human confirmed it}, while these rows say \enquote{an
+LLM proposed it and an agent confirmed it}, which no human has looked
+at.  What an agent records after reading the model's call is the
+agent's own verdict, so the target is [[agent]].  The model's part is
+not lost: the classifier's fields ([[llm_model]], [[llm_reason]], \dots,
+\cref{sec:llm-audit-fields}) and its confidence stay, and they now
+describe the proposal the agent checked.  Once a human confirms such a
+row in the TUI it becomes [[agent_reviewed]], which is then true.
+
+A pending paper is never relabelled.  Its source is the default
+[[human]], which says nothing because nobody decided anything, and
+turning it into [[agent]] would invent an agent decision.  For the same
+reason the source may not stay what it was: a relabel that changes
+nothing would only add a misleading record.
+
+Everything else stays as it is: status, tags, confidence, the
+classifier's fields, [[found_by]] and the provider.  The one exception
+is [[is_example]], which means \enquote{a human changed the machine's
+verdict}: [[mark_as_reviewed]] sets it when a reviewer's decision
+differs from the machine's, and every place that records a fresh
+machine decision clears it ([[apply_llm_decisions]], a machine
+[[sessions decide]]).  On a relabelled decision the flag would be
+wrong.  The decision is an unreviewed machine decision again, so no
+human has changed anything; yet the flag would count it as a training
+example in [[llm status]], in [[ReviewSession.example_papers]] and in
+the TUI's examples filter, sort it ahead of confirmed examples when
+unreviewed ones are let in ([[--include-llm-examples]]), and, once a
+human confirms the row unchanged, make [[machine_review_rows]] and the
+CSV report the agreement as a change.  So the relabel clears the flag
+and keeps its old value in the record, where an auditor can still see
+that a reviewer, human or not, once changed the machine's call.
+
+Each relabel is recorded on the decision, in [[relabelled]], as
+[[{"from", "to", "at", "note", "by", "is_example"}]]: the source before
+and after, the UTC time, the caller's note, the caller's name for who
+made or asked for the correction (both [[None]] when not given;
+Scholar does not guess a user name), and the [[is_example]] flag the
+decision had before.  It is a list because a source can be corrected
+more than once, and each correction is an event an auditor may need to
+see; nothing ever removes one.  The list is kept in time order, so that
+records united from two processes (below) still read oldest first;
+records of the same time keep the order they were added in.  The time
+is taken from [[_utcnow]], the module's clock seam
+(\cref{sec:session-integrity}).
+
+<<review data structures>>=
+RELABEL_TARGETS: tuple[ReviewSource, ...] = tuple(
+    source for source in ReviewSource if source.is_unreviewed
+)
+
+
+def relabel_source(
+    decision: ReviewDecision,
+    target: ReviewSource,
+    at: str,
+    note: str | None = None,
+    by: str | None = None,
+) -> dict:
+    """Set the source of `decision` to `target`, keeping the decision.
+
+    Only the unreviewed sources (`RELABEL_TARGETS`) can be given, since
+    the others claim a human's confirmation, and only to a decided paper
+    whose source differs. `is_example` is cleared, since no human has
+    changed the now unreviewed decision. The change is recorded in
+    `decision.relabelled` as `{"from", "to", "at", "note", "by",
+    "is_example"}` (the old flag) and returned.
+
+    Raises:
+        ValueError: For any other target, a pending paper, or a target
+            equal to the current source.
+    """
+    if target not in RELABEL_TARGETS:
+        raise ValueError(
+            f"{target.value} claims a human's confirmation; only "
+            f"{', '.join(s.value for s in RELABEL_TARGETS)} can be given"
+        )
+    if not decision.is_decided:
+        raise ValueError("a pending paper has no decision to relabel")
+    if decision.source is target:
+        raise ValueError(f"the source is already {target.value}")
+    record = {
+        "from": decision.source.value, "to": target.value,
+        "at": at, "note": note, "by": by,
+        "is_example": decision.is_example,
+    }
+    decision.source = target
+    decision.is_example = False
+    decision.add_relabel(record)
+    return record
+@
+
+[[RELABEL_TARGETS]] is derived from [[is_unreviewed]] rather than
+listing the members, for the reason given with the properties: a
+source added later is a target exactly when it waits for a human.
+Unknown stored values (\cref{sec:review-source}) are unreviewed too,
+but they are not members the enum iterates, so none of them can be a
+target: a relabel should name a source Scholar knows.  As
+\emph{from}, an unknown value is fine: that is how a decision whose
+source is [[manual]] gets a known one.
+
+The record travels like the other lists a decision keeps about its
+history.  It is saved only when non-empty, as [[same_id_copies]] is,
+so the file of a session nobody relabelled is unchanged, and a file
+without the key loads it as empty.  An append of new search results
+copies it with the decision (\cref{sec:review-create-strict}).  A save
+that merges another process's changes unites the two lists
+(\cref{sec:session-integrity}): a relabel is a fact about the decision,
+like a search that returned the paper.  When both processes relabelled
+the same decision, the source follows the usual rule (this process's
+decision is kept, with a warning), but both records stay, so the
+history shows what each did.  It is also part of
+[[decision_state]], so that two copies of a work with different
+histories are not taken for equal decisions when copies are folded.
+A Scholar from before this field loads such a file, since it reads only
+the keys it knows, but drops the list when it next saves the session
+(checked on November 19, 2026, by loading and saving a session with
+the key under commit 528d933); the source itself survives, since
+[[agent]] and [[llm]] are known to every version since
+issue~\#162.
+
+Let's check that a relabel changes the source and leaves the
+decision as it is (the example flag moves into the record), that
+it refuses every target that claims a human's confirmation, and that
+the record survives a save, a load, an append and a concurrent save.
+
+<<test functions>>=
+class TestRelabelSource:
+    """Correcting who decided keeps the decision (#216)."""
+
+    <<relabel source test methods>>
+
+<<relabel source test methods>>=
+AT = "2026-11-19T10:00:00+00:00"
+
+def _reviewed_llm_call(self, doi="10.5555/relabel"):
+    return ReviewDecision(
+        paper=Paper(title="Relabelled", authors=["A"], doi=doi),
+        provider="openalex", status=DecisionStatus.DISCARDED,
+        tags=["off-topic-false-hit"], source=ReviewSource.LLM_REVIEWED,
+        is_example=True, llm_confidence=0.8,
+        llm_model="m-1", llm_decided_at="2026-11-01T09:00:00+00:00",
+        llm_prompt_version="0123456789abcdef", llm_reason="Off topic.",
+        llm_abstract_truncated=False,
+        found_by=[("q", "openalex", "")],
+    )
+
+def test_only_the_source_changes(self):
+    from dataclasses import asdict
+
+    decision = self._reviewed_llm_call()
+    before = asdict(decision)
+    record = relabel_source(
+        decision, ReviewSource.AGENT_UNREVIEWED, self.AT, note="why",
+        by="the author",
+    )
+    assert decision.source is ReviewSource.AGENT_UNREVIEWED
+    assert record == {"from": "llm_reviewed", "to": "agent",
+                      "at": self.AT, "note": "why", "by": "the author",
+                      "is_example": True}
+    assert decision.relabelled == [record]
+    assert decision.is_example is False
+    after = asdict(decision)
+    for name in ("source", "relabelled", "is_example"):
+        del before[name], after[name]
+    assert after == before
+
+def test_a_relabelled_correction_is_no_example(self):
+    from scholar.llm_review import (
+        get_example_decisions, get_review_statistics, mark_as_reviewed,
+    )
+
+    session = ReviewSession(
+        query="q", providers=["openalex"], timestamp=datetime(2026, 11, 19),
+    )
+    relabelled = self._reviewed_llm_call()
+    human = ReviewDecision(
+        paper=Paper(title="Human", authors=["H"], doi="10.5555/human"),
+        provider="openalex", status=DecisionStatus.DISCARDED,
+        tags=["off-topic-false-hit"],
+    )
+    session.decisions = [relabelled, human]
+    relabel_source(relabelled, ReviewSource.AGENT_UNREVIEWED, self.AT)
+    assert session.example_papers() == [human]
+    assert get_review_statistics(session)["examples"] == 0
+    assert session.llm_review_statistics()["examples"] == 1
+    _, discarded = get_example_decisions(session, include_unreviewed=True)
+    assert discarded == [human, relabelled]
+    mark_as_reviewed(relabelled, user_agrees=True)
+    assert relabelled.source is ReviewSource.AGENT_REVIEWED
+    assert relabelled.is_example is False
+    rows = dict(machine_review_rows(session.decisions))
+    assert (rows["Agent confirmed"], rows["Agent changed"]) == (1, 0)
+
+def test_records_are_kept_in_time_order(self):
+    decision = self._reviewed_llm_call()
+    late = {"from": "llm", "to": "agent", "at": "2026-11-19T12:00:00+00:00"}
+    early = {"from": "human", "to": "llm", "at": "2026-11-19T09:00:00+00:00"}
+    tie = {"from": "agent", "to": "llm", "at": "2026-11-19T12:00:00+00:00"}
+    for record in (late, early, tie, early):
+        decision.add_relabel(record)
+    assert decision.relabelled == [early, late, tie]
+
+def test_targets_are_the_unreviewed_sources(self):
+    assert set(RELABEL_TARGETS) == {
+        ReviewSource.AGENT_UNREVIEWED, ReviewSource.LLM_UNREVIEWED,
+    }
+
+@pytest.mark.parametrize("target", [
+    ReviewSource.HUMAN, ReviewSource.LLM_REVIEWED,
+    ReviewSource.AGENT_REVIEWED, ReviewSource("manual"),
+])
+def test_a_confirmed_target_is_refused(self, target):
+    decision = self._reviewed_llm_call()
+    decision.source = ReviewSource.AGENT_UNREVIEWED
+    with pytest.raises(ValueError):
+        relabel_source(decision, target, self.AT)
+    assert decision.source is ReviewSource.AGENT_UNREVIEWED
+    assert decision.relabelled == []
+
+def test_pending_and_unchanged_are_refused(self):
+    pending = ReviewDecision(paper=Paper(title="P", authors=["A"]),
+                             provider="p")
+    with pytest.raises(ValueError, match="pending"):
+        relabel_source(pending, ReviewSource.AGENT_UNREVIEWED, self.AT)
+    decided = self._reviewed_llm_call()
+    decided.source = ReviewSource.AGENT_UNREVIEWED
+    with pytest.raises(ValueError, match="already"):
+        relabel_source(decided, ReviewSource.AGENT_UNREVIEWED, self.AT)
+    assert pending.relabelled == decided.relabelled == []
+
+def test_history_is_part_of_the_decision_state(self):
+    plain, relabelled = self._reviewed_llm_call(), self._reviewed_llm_call()
+    plain.source = ReviewSource.AGENT_UNREVIEWED
+    relabel_source(relabelled, ReviewSource.AGENT_UNREVIEWED, self.AT)
+    assert decision_state(plain) != decision_state(relabelled)
+
+def _session(self, name):
+    session = ReviewSession(
+        query="q", providers=["openalex"], timestamp=datetime(2026, 11, 19),
+        name=name,
+    )
+    session.decisions.append(
+        self._reviewed_llm_call(f"10.5555/relabel-{name}")
+    )
+    return session
+
+def test_saved_only_when_non_empty(self, tmp_path, monkeypatch):
+    import json
+
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+    path = save_session(self._session("relabel-file"))
+    assert "relabelled" not in json.loads(path.read_text())["decisions"][0]
+    session = load_session("relabel-file")
+    assert session.decisions[0].relabelled == []
+    relabel_source(session.decisions[0], ReviewSource.AGENT_UNREVIEWED,
+                   self.AT)
+    save_session(session)
+    assert json.loads(path.read_text())["decisions"][0]["relabelled"] == [
+        {"from": "llm_reviewed", "to": "agent", "at": self.AT,
+         "note": None, "by": None, "is_example": True},
+    ]
+    loaded = load_session("relabel-file").decisions[0]
+    assert loaded.source is ReviewSource.AGENT_UNREVIEWED
+    assert loaded.relabelled == session.decisions[0].relabelled
+
+def test_append_keeps_it(self, tmp_path, monkeypatch):
+    from scholar.scholar import SearchResult
+
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+    session = self._session("relabel-append")
+    relabel_source(session.decisions[0], ReviewSource.AGENT_UNREVIEWED,
+                   self.AT)
+    save_session(session)
+    stored = load_session("relabel-append").decisions[0]
+    paper = Paper(title="Relabelled", authors=["A"],
+                  doi="10.5555/relabel-relabel-append",
+                  sources=["openalex"])
+    appended = create_review_session([SearchResult(
+        query="q", provider="openalex", timestamp="t", papers=[paper],
+    )], "q", session_name="relabel-append")
+    decision = appended.decisions[0]
+    assert decision.source is ReviewSource.AGENT_UNREVIEWED
+    assert decision.relabelled == stored.relabelled != []
+
+def test_concurrent_save_keeps_it(self, tmp_path, monkeypatch):
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+    save_session(self._session("relabel-race"))
+    stale = load_session("relabel-race")
+    relabeller = load_session("relabel-race")
+    relabel_source(relabeller.decisions[0],
+                   ReviewSource.AGENT_UNREVIEWED, self.AT)
+    save_session(relabeller)
+    stale.decisions[0].paper.abstract = "Enriched."
+    save_session(stale)
+    decision = load_session("relabel-race").decisions[0]
+    assert decision.source is ReviewSource.AGENT_UNREVIEWED
+    assert decision.relabelled == relabeller.decisions[0].relabelled
+    assert decision.llm_reason == "Off topic."
+
+def test_concurrent_relabels_are_united(self, tmp_path, monkeypatch):
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+    save_session(self._session("relabel-both"))
+    first, second = load_session("relabel-both"), load_session("relabel-both")
+    relabel_source(first.decisions[0], ReviewSource.AGENT_UNREVIEWED,
+                   "2026-11-19T09:00:00+00:00")
+    save_session(first)
+    relabel_source(second.decisions[0], ReviewSource.LLM_UNREVIEWED,
+                   self.AT, note="second")
+    save_session(second)
+    decision = load_session("relabel-both").decisions[0]
+    assert decision.source is ReviewSource.LLM_UNREVIEWED
+    assert [r["to"] for r in decision.relabelled] == ["agent", "llm"]
 @
 
 
@@ -4700,6 +5061,7 @@ for result in results:
                 tags=list(prev_dec.tags),
                 found_by=list(prev_dec.found_by),
                 same_id_copies=list(prev_dec.same_id_copies),
+                relabelled=list(prev_dec.relabelled),
             )
         elif prev_record:
             <<rebuild the decision from the old decision store>>
@@ -7409,6 +7771,7 @@ def read_session_file(
                     **{name: dec_data.get(name) for name in LLM_AUDIT_FIELDS},
                     found_by=found_by,
                     same_id_copies=list(dec_data.get("same_id_copies") or []),
+                    relabelled=list(dec_data.get("relabelled") or []),
                 )
             )
         
@@ -7537,6 +7900,7 @@ data = {
                 {"same_id_copies": d.same_id_copies}
                 if d.same_id_copies else {}
             ),
+            **({"relabelled": d.relabelled} if d.relabelled else {}),
             "paper": d.paper.to_dict(include_refs_cites=True),
         }
         for d in session.decisions
@@ -7762,7 +8126,12 @@ links to the searches that returned it ([[found_by]],
 a judgement, so the links the file holds for a paper are added to the
 links this process holds, whatever the decision rules decide.  The
 same goes for the other works a search returned under a paper's id
-([[same_id_copies]], \cref{sec:session-copies}).  After the
+([[same_id_copies]], \cref{sec:session-copies}) and for the
+corrections of its source ([[relabelled]], \cref{sec:relabel-source}).
+Those are also part of the decision's state, so this process's state
+is taken before the file's are added: otherwise the union itself would
+look like a change made here, and a process that changed nothing would
+keep its stale source over the file's corrected one.  After the
 decisions are merged, the tombstones of folded copies are united with
 the file's and applied ([[apply_tombstones]], \cref{sec:session-copies}),
 so that a copy that [[sessions reconcile]] folded after this process
@@ -7793,6 +8162,7 @@ def decision_state(decision: ReviewDecision) -> tuple:
         decision.is_example,
         decision.llm_confidence,
         *llm_audit_of(decision).values(),
+        tuple(tuple(sorted(r.items())) for r in decision.relabelled),
     )
 
 
@@ -7987,6 +8357,7 @@ def merge_concurrent_changes(
         paper_id = get_paper_id(decision.paper)
         own_ids.add(paper_id)
         theirs = disk_decisions.get(paper_id)
+        mine = decision_state(decision)
         if theirs is not None:
             decision.paper = paper_merged_from(
                 decision.paper, theirs.paper, base_papers.get(paper_id)
@@ -7995,9 +8366,11 @@ def merge_concurrent_changes(
                 decision.record_search(*replaced.get(link, link))
             for copy in theirs.same_id_copies:
                 decision.add_same_id_copy(copy)
+            for record in theirs.relabelled:
+                decision.add_relabel(record)
         if theirs is None or paper_id not in base_states:
             continue
-        mine, base_state = decision_state(decision), base_states[paper_id]
+        base_state = base_states[paper_id]
         if decision_state(theirs) in (base_state, mine):
             continue
         if mine == base_state:
@@ -18432,6 +18805,11 @@ The review columns ([[llm_review_outcome]], [[llm_change_direction]])
 describe how a human handled a machine decision and apply to the agent's
 decisions as much as to the LLM's; their names predate the agent source,
 and [[decision_source]] says which machine it was.
+[[source_relabelled]] lists the corrections of the source
+(\cref{sec:relabel-source}) as [[from->to time]] (with
+[[by NAME]] when the record names who), separated by
+semicolons, so that a spreadsheet that counts sources can see which of
+them were set after the decision, and from what.
 
 <<review report generation>>=
 def generate_csv_report(session: ReviewSession, output_path: Path) -> None:
@@ -18449,6 +18827,8 @@ def generate_csv_report(session: ReviewSession, output_path: Path) -> None:
     - llm_review_outcome: human/unreviewed/confirmed/changed (for LLM
       and agent decisions alike; `decision_source` tells them apart)
     - llm_change_direction: kept->discarded or discarded->kept (only for changed)
+    - source_relabelled: each correction of the source, as
+      `from->to time [by NAME]`
 
     Args:
         session: The ReviewSession to report on.
@@ -18493,6 +18873,7 @@ def generate_csv_report(session: ReviewSession, output_path: Path) -> None:
                 "llm_confidence",
                 "llm_review_outcome",
                 "llm_change_direction",
+                "source_relabelled",
                 "paper_id",
             ]
         )
@@ -18520,6 +18901,11 @@ def generate_csv_report(session: ReviewSession, output_path: Path) -> None:
                     ),
                     llm_review_outcome(decision),
                     llm_change_direction(decision),
+                    "; ".join(
+                        f"{r.get('from')}->{r.get('to')} {r.get('at')}"
+                        + (f" by {r['by']}" if r.get("by") else "")
+                        for r in decision.relabelled
+                    ),
                     get_paper_id(paper),
                 ]
             )
@@ -18561,6 +18947,44 @@ class TestCsvReportAgentSource:
             "Changed": ("agent_reviewed", "changed", "discarded->kept"),
             "Confirmed": ("agent_reviewed", "confirmed", ""),
         }
+@
+
+A relabelled decision names its corrections, and the paper id stays the
+last column:
+
+<<test functions>>=
+class TestCsvReportRelabelled:
+    def test_corrections_are_listed(self, tmp_path):
+        import csv
+
+        decision = ReviewDecision(
+            paper=Paper(title="Relabelled", authors=["A"], year=2024),
+            provider="p", status=DecisionStatus.KEPT, tags=["t"],
+        )
+        relabel_source(decision, ReviewSource.LLM_UNREVIEWED,
+                       "2026-11-19T10:00:00+00:00")
+        relabel_source(decision, ReviewSource.AGENT_UNREVIEWED,
+                       "2026-11-19T11:00:00+00:00", by="the author")
+        plain = ReviewDecision(
+            paper=Paper(title="Plain", authors=["B"], year=2024),
+            provider="p", status=DecisionStatus.KEPT, tags=["t"],
+        )
+        session = ReviewSession(
+            query="q", providers=["p"], timestamp=datetime(2026, 11, 19),
+        )
+        session.decisions = [decision, plain]
+        path = tmp_path / "r.csv"
+        generate_csv_report(session, path)
+        with path.open() as f:
+            rows = list(csv.reader(f))
+        assert rows[0][-2:] == ["source_relabelled", "paper_id"]
+        records = [dict(zip(rows[0], row)) for row in rows[1:]]
+        assert records[0]["source_relabelled"] == (
+            "human->llm 2026-11-19T10:00:00+00:00; "
+            "llm->agent 2026-11-19T11:00:00+00:00 by the author"
+        )
+        assert records[0]["decision_source"] == "agent"
+        assert records[1]["source_relabelled"] == ""
 @
 
 \subsection{Testing Report Generation}
