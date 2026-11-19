@@ -1249,8 +1249,10 @@ decodes only those; non-ASCII/`"`/`\` fragments decode every file.
 ### LaTeX Output: Standalone, Fragment, Audit Table
 
 `review.py` owns the shared LaTeX pieces: the escapers (`escape_latex`,
-`escape_bibtex`: one pass, Unicode punctuation mapped to TeX, symbols
-above U+2100 dropped so pdflatex never sees `☆`), `LATEX_PACKAGES`,
+`escape_bibtex`: one pass, Unicode punctuation mapped to TeX, single
+Greek letters and math symbols in math mode, symbol-only characters
+beyond Latin Extended-B (`☆`, emoji) dropped so pdflatex never sees
+them), `LATEX_PACKAGES`,
 `latex_document` (compilable skeleton, escaped title), `latex_fragment`
 (body plus a `%` header telling the includer which packages,
 `\addbibresource` line and biber run it needs; `\addbibresource` is
@@ -1258,6 +1260,59 @@ preamble-only, so a fragment can only instruct), `refsection`, the two
 report body builders (`build_review_provenance_latex`,
 `build_review_decisions_latex`) and the audit table
 (`build_audit_table_latex` / `generate_audit_table`).
+
+Text in other scripts (#220, `review.nw` `sec:non-latin-text`): every
+run of letters/digits pdflatex cannot set in T1 (Cyrillic, CJK, Arabic,
+Greek *words*: 3+ letters or an accented one; single Greek letters stay
+math) is wrapped in `\scholarnonlatin{...}` by both escapers, never
+dropped (`split_nonlatin`; a run bridges spaces, digits and punctuation
+between such characters, stops at a Latin letter, brace or backslash;
+specials inside are escaped). Also flagged: the 213 code points in
+U+0080..U+024F that T1+utf8 inputenc does not set up (`T1_UNSET_RANGES`:
+C1 controls, `ĸ`, `ħ`, `ſ`, most of Latin Extended-B; exactly what
+`t1enc/ts1enc/omsenc/utf8enc.dfu` of TeX Live 2025 leave undeclared,
+checked by compiling each code point and by
+`test_t1_ranges_match_the_encoding_files`); a word holding a flagged
+*Latin* letter (Unicode name `LATIN…`, e.g. Vietnamese) is wrapped
+whole. The `.bib` keeps it the same way. A table row's first escaped
+cell goes through `latex_row_cell` (`{}` before a leading `[` or `*`,
+else unchanged), so `\\` before it cannot read `[conference paper]` as
+a length (audit table, provider-specific queries table; the others
+start with `\citetitle` or a number). Readable characters beyond the
+cutoff are rendered, not wrapped: ligatures U+FB00–FB06 folded by NFKC
+(`LATIN_LIGATURES`, only these), super/subscripts U+2070–209C to
+`\textsuperscript{}`/`\textsubscript{}` (`LATEX_SCRIPT_CHARS`, built
+from names + NFKC; script minus → `-`), `ℓ` → `\ensuremath{\ell}`,
+`ʻ ʽ` → `` ` ``, `ʹ` → `'`; other spacing modifiers U+02B0–02FF do not
+make a run text (`SPACING_MODIFIERS`), so alone they are dropped. Cc
+controls are dropped inside runs too (they stop the T2A recipe).
+`latex_document` loads `\usepackage[T1]{fontenc}`
+(`STANDALONE_FONTENC`) before `LATEX_PACKAGES`: in OT1 `\textquotedbl`
+(any quoted query) and `« » ð þ` … failed; the one line is the only
+change to Latin-only standalone output. Fragments do not load it (the
+host's choice, like inputenc).
+`latex_document`/`latex_fragment` add `nonlatin_definition(marker)`
+only when the output uses the macro (`uses_nonlatin` over title,
+abstract, body, appendix and the `bib_text` callers pass), so Latin-only
+output is byte-identical: three `\providecommand` lines, the text under
+XeTeX/LuaTeX (`\ifdefined\XeTeXversion`/`\directlua`), else the marker
+`[non-Latin text]` (`NONLATIN_MARKER`; audit table:
+`AUDIT_STRINGS[lang]["nonlatin"]`, sv `[icke-latinsk text]`). Standalone:
+in the preamble; fragment: in the body before first use, with a `%`
+header saying how to define it first (pdflatex Cyrillic:
+`\usepackage[T2A,T1]{fontenc}` +
+`\newcommand{\scholarnonlatin}[1]{{\fontencoding{T2A}\selectfont #1}}`).
+An audit row whose title keeps no letter outside such runs
+(`only_nonlatin_letters`) also prints `(paper id)` (`doi:…`, else the
+hash id; `audit_title_cell`, `AuditRow.nonlatin_title`), and
+`build_audit_table_latex` warns once per table counting those rows.
+`TestNonLatinCompiles` (marker `latex`, registered in `pyproject.toml`;
+`-m "not latex"` skips; skipped without latexmk/biber/engine/pdftotext)
+compiles the standalone report and both fragments in a pdflatex+T1 host
+and the table under xelatex and lualatex (DejaVu Serif, `pdftotext`
+shows the text; the lualatex run covers the `\directlua` line); the
+fixture has a quoted query, a `[`-row, `ĸ`, `CO₂`, a ligature. About
+30–60 s in all.
 
 - `scholar sessions export -f latex [--standalone|--no-standalone]` →
   `generate_latex_report(session, path, standalone=True)`. Always writes
