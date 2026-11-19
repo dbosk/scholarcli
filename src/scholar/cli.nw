@@ -8915,9 +8915,12 @@ def sessions_decide(
             "--reasons-file",
             help="With --source agent: select the papers and give each "
                  "its own reason, one per line as ID<TAB>REASON or "
-                 "ID<TAB>REASON<TAB>CONFIDENCE (a session paper id or a "
-                 "DOI; no tabs in a reason; blank and # lines skipped). "
-                 "Replaces --doi/--paper-id.",
+                 "ID<TAB>REASON<TAB>CONFIDENCE. ID is doi:..., a bare "
+                 "DOI or a session paper id (no https://doi.org/ "
+                 "links). Columns are not quoted (not CSV): quote marks "
+                 "are stored as written, and a reason cannot hold a "
+                 "tab. Blank and # lines are skipped. Replaces "
+                 "--doi/--paper-id.",
             exists=True, dir_okay=False, readable=True,
         ),
     ] = None,
@@ -8969,7 +8972,8 @@ def sessions_decide(
     without `doi:`) are the selection, so it cannot be combined with
     --doi or --paper-id; an optional third column `<TAB>CONFIDENCE`
     (0-1) overrides -c for that line. Tabs are not allowed in a
-    reason. Status, tags and -c apply to the whole file, so group the
+    reason, and nothing is quoted: quote marks are stored as written.
+    Status, tags and -c apply to the whole file, so group the
     lines by verdict. Any bad line, any id not in the session, or one
     id given two reasons aborts the batch unsaved. Reasons are
     stripped and must hold 1 to 2000 characters. An agent decision
@@ -9677,7 +9681,13 @@ if source == "agent" and reason is None and reasons_file is None:
 
 The reason, the name and the file's lines are checked by two small
 functions, which return the problems instead of printing them, so that
-every problem of a file is reported in one run.
+every problem of a file is reported in one run.  The file is read as
+bytes, so that Python's universal newlines do not turn a lone carriage
+return inside a reason into a line end (below), and decoded as
+[[utf-8-sig]], which drops a byte-order mark at its start: editors on
+Windows and spreadsheets write one, and read as plain UTF-8 it would
+stick to the first id, so the first line's paper would not be found
+(or a first comment line would not start with [[#]]).
 
 <<check the reason, the name and the reasons file>>=
 problems: list[str] = []
@@ -9692,7 +9702,7 @@ if by is not None:
         problems.append("--by: empty name")
 if reasons_file is not None:
     try:
-        text = reasons_file.read_text(encoding="utf-8")
+        text = reasons_file.read_bytes().decode("utf-8-sig")
     except (OSError, UnicodeDecodeError) as error:
         problems.append(f"{reasons_file}: cannot be read ({error})")
     else:
@@ -9745,16 +9755,31 @@ def parse_reasons_file(text: str) -> tuple[list[ReasonLine], list[str]]:
     """
     entries: list[ReasonLine] = []
     problems: list[str] = []
-    for number, raw in enumerate(text.splitlines(), start=1):
+    for number, raw in enumerate(text.split("\n"), start=1):
+        raw = raw.removesuffix("\r")
         if not raw.strip() or raw.lstrip().startswith("#"):
             continue
         <<parse one line of a reasons file>>
     return entries, problems
 @
 
+Only a newline ends a line, and a carriage return before it is dropped
+(a file saved on Windows).  [[str.splitlines]] would also split at a
+lone carriage return, a line separator (U+2028), a next-line
+character, a form feed and other
+characters that a reason copied from a PDF may hold: the reason would
+be cut in two, the second half read as a line without a tab, and every
+error after it would name a line number one higher than the editor
+shows.  Splitting at newlines alone keeps such characters inside the
+reason, where they are stored as they were written.
+
 A line has two or three columns.  The third is optional, and an empty
 one (a spreadsheet's export of an empty cell) counts as absent rather
-than as a bad number.
+than as a bad number.  A fourth column comes from a tab inside the
+reason or from tabs after the confidence; the message names each extra
+column and what it holds, since an empty one (two trailing tabs) is
+otherwise invisible.  The file is not quoted, as a CSV file would be:
+quote marks are part of the reason and stored as written.
 
 <<parse one line of a reasons file>>=
 columns = raw.split("\t")
@@ -9762,9 +9787,14 @@ if len(columns) < 2:
     problems.append(f"line {number}: no tab between the id and the reason")
     continue
 if len(columns) > 3:
+    extra = ", ".join(
+        f"{index} ({column!r})"
+        for index, column in enumerate(columns[3:], start=4)
+    )
     problems.append(
-        f"line {number}: more than three columns (a reason cannot "
-        "contain a tab)"
+        f"line {number}: extra column {extra} after the confidence "
+        "(a line holds an id, a reason and an optional confidence; a "
+        "tab inside a reason starts a new column)"
     )
     continue
 paper = columns[0].strip()
@@ -10061,7 +10091,7 @@ def test_a_bad_file_is_refused_line_by_line(self, tmp_path, monkeypatch):
     "line 8: reason of 2001 characters",
   ):
     assert expected in output, expected
-  self._refused(path, result, 2, "line 5: more than three columns")
+  self._refused(path, result, 2, "line 5: extra column 4 ('0.5')")
   empty = self._file(tmp_path, "# nothing yet\n\n")
   result = self._decide("--keep", "--tag", "ml", "--source", "agent",
                         "--reasons-file", empty)
@@ -10085,6 +10115,70 @@ def test_unknown_ids_and_clashes_abort(self, tmp_path, monkeypatch):
   same = self._file(tmp_path, "10.1/one\tFine.\ndoi:10.1/one\tFine.\n")
   result = self._decide(*keep, "--reasons-file", same)
   assert result.exit_code == 0, result.output
+@
+
+Files come from editors and spreadsheets, not only from the agent's
+own code.  A file saved with a byte-order mark still decides its first
+line, whether that line is a paper or a comment.  Only a newline ends a
+line: a reason copied from a PDF may hold a line separator (U+2028), a
+next-line character or a form feed, which must stay in the stored
+reason and must not shift the line numbers of the errors, which an
+editor counts by newlines; a Windows line end is one line end.  Quote
+marks are not syntax, so they are stored as written.
+
+<<decide reason test methods>>=
+def test_a_bom_does_not_stick_to_the_first_id(self, tmp_path, monkeypatch):
+  from scholar.review import load_session
+
+  self._make_session(tmp_path, monkeypatch)
+  path = tmp_path / "bom.tsv"
+  for text in ("doi:10.1/one\tFirst line.\n",
+               "# a comment first\ndoi:10.1/one\tAfter a comment.\n"):
+    path.write_text(text, encoding="utf-8-sig")
+    result = self._decide("--keep", "--tag", "ml", "--source", "agent",
+                          "--reasons-file", str(path))
+    assert result.exit_code == 0, result.output
+    reason = text.splitlines()[-1].split("\t")[1]
+    assert load_session("reasons").decisions[0].agent_reason == reason
+
+def test_only_a_newline_ends_a_line(self, tmp_path, monkeypatch):
+  from scholar.review import load_session
+
+  _, path = self._make_session(tmp_path, monkeypatch)
+  self._content = path.read_bytes()
+  odd = "Two lines,\x85a page\x0cbreak\rand a return."
+  bad = self._file(tmp_path, (
+    f"10.1/one\t{odd}\n"
+    "10.1/two no tab here\n"
+  ))
+  result = self._decide("--keep", "--tag", "ml", "--source", "agent",
+                        "--reasons-file", bad)
+  self._refused(path, result, 2, "line 2: no tab between")
+  assert "line 3" not in result.output
+  good = tmp_path / "crlf.tsv"
+  good.write_bytes(
+    f'10.1/one\t{odd}\r\n10.1/two\t"Quoted", as written.\t0.5\r\n'
+    .encode("utf-8")
+  )
+  result = self._decide("--keep", "--tag", "ml", "--source", "agent",
+                        "--reasons-file", str(good))
+  assert result.exit_code == 0, result.output
+  decisions = {d.paper.title: d for d in load_session("reasons").decisions}
+  assert decisions["One"].agent_reason == odd
+  assert decisions["Two"].agent_reason == '"Quoted", as written.'
+  assert decisions["Two"].llm_confidence == 0.5
+
+def test_two_trailing_tabs_name_the_extra_column(
+  self, tmp_path, monkeypatch
+):
+  _, path = self._make_session(tmp_path, monkeypatch)
+  self._content = path.read_bytes()
+  for line_end in ("\n", "\r\n"):
+    result = self._decide(
+      "--keep", "--tag", "ml", "--source", "agent", "--reasons-file",
+      self._file(tmp_path, f"10.1/one\tFine.\t\t{line_end}"),
+    )
+    self._refused(path, result, 2, "line 1: extra column 4 ('')")
 @
 
 With [[--keep-trace]] the confidence comes from [[-c]] or from the
@@ -10146,6 +10240,9 @@ def test_the_help_states_the_limit(self):
     .get_command(context, "decide")
   helps = {param.name: param.help for param in decide.params}
   assert f"at most {MAX_AGENT_REASON_CHARS} characters" in helps["reason"]
+  assert "not quoted" in helps["reasons_file"]
+  assert "doi:..., a bare DOI or a session paper id" \
+    in helps["reasons_file"]
 @
 
 Selection collects matches into a dict keyed by the decision object,

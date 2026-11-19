@@ -992,9 +992,13 @@ agent's. A human decide and `sessions relabel` keep it. `decide
 that reason, `--by` (None if not given, never guessed) and one
 `utc_now_iso()` per run. `--reasons-file F` (lines
 `ID<TAB>REASON[<TAB>CONFIDENCE]`; ID = session paper id, else a DOI
-bare or `doi:`, `cli.decisions_named_by`; blank/`#` lines skipped;
-an empty third column = none; no tabs in a reason, a 4th column is
-refused) is the selection (exit 2 with `--doi`/`--paper-id` or
+bare or `doi:`, `cli.decisions_named_by`, no `https://doi.org/`
+links, as for `--doi`; blank/`#` lines skipped; an empty third column
+= none; no tabs in a reason, a 4th column is refused naming each extra
+column; not quoted, not CSV: quote marks are stored as written; read
+as `utf-8-sig`, so a BOM is dropped; lines end only at `\n` (a `\r`
+before it is dropped), so U+2028, NEL, form feed stay in the reason
+and error line numbers match an editor) is the selection (exit 2 with `--doi`/`--paper-id` or
 `--reason`); its confidence overrides `-c` per line, and with
 `--keep-trace` and no `-c` every line needs one. Usage errors (exit 2,
 before loading): `--reason`/`--reasons-file`/`--by` with `--source
