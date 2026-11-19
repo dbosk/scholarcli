@@ -1313,8 +1313,19 @@ extras; `parse_llm_response(category_tags=…)` sets
 `LLMDecision.category_problem` unless exactly one category remains
 after mapping, that triggers the same single retry, and a paper still
 invalid afterwards gets no decision (stays pending) and is listed in
-`LLMBatchResult.withheld`, which `llm classify` prints at the end.
-Sessions without category tags are classified as before.
+`LLMBatchResult.withheld`, which `llm classify` prints at the end
+("Left pending, no single category that fits the decision").
+The category must also fit the decision (#224, `STATUS_CATEGORIES`):
+a keep takes supports/qualifies/adjacent, a discard adjacent/off-topic;
+otherwise `category_problem` is "category X does not fit a <status>
+paper" (checked only once exactly one category is left), with the same
+retry and withholding. The prompt's category section and the retry
+reminder state the rule (`_category_status_rule`, fixed wording, so the
+prompt version moves) and say to keep a paper that bears on the claim
+and leave its exclusion to a human. Only classifier answers are
+checked: a human's "supports, excluded" (rendered on purpose by the
+audit table, #89) is recorded as given; existing records are not
+rewritten. Sessions without category tags are classified as before.
 
 ### Snowball and Tuxedo Subcommands (lazy)
 
