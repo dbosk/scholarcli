@@ -1173,6 +1173,11 @@ so the id is recorded: `bibtex+prov` writes `% ID: <Paper.id>` in each
 block (`ID` is in `PROV_FIELD_NAMES`), `prov export` writes the note's
 current id into every block it emits, and `prov import` keys by it
 (`_recorded_id`) and drops it from the stored note (`_without_ids`).
+An entry's own DOI beats the recorded id (a paper that gained a DOI, a
+block copied above another entry; a differing id is a WARNING naming
+both); for a DOI-less entry the recorded id is tried like the other
+candidates, by whether a note exists under it, and keys a new note
+only when none does.
 Without the line (old or hand-made files, plain `-f bibtex` for
 export) `_paper_from_entry` tries existing notes: the id with the
 `BIBTEX_SPECIALS` escapes undone, then a DOI-less note whose
