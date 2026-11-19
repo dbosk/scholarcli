@@ -794,7 +794,13 @@ keywords, sources), and the decision is kept whole
 (`dataclasses.replace`, lists copied) with `united_providers(old, new)`
 as provider; the duplicate, folded, renamed and adopted branches unite
 the provider too (#192; before, the decision was rebuilt around the
-returned copy, losing abstracts, sources and providers). Tests of this
+returned copy, losing abstracts, sources and providers). Without a
+session file, a decision from the old per-query decision store does
+the same with the record's paper (`paper_from_decision_record`, shared
+with the restore of papers not returned; provider
+`united_providers(record, search)`), filling only when
+`plausibly_same_work` (a legacy-id record may be a namesake) (#194).
+Tests of this
 path need `isolated_registry()` between runs, else `Paper.from_dict`
 returns the held object and hides the loss. The save
 confirmation goes to stderr so `-f json`/`-f bibtex` stdout stays pure.
@@ -862,8 +868,17 @@ context (#107). `review.save_session` now:
   `session._baseline` (`SessionBaseline`, recorded by `read_session_file`
   and after each save). Decision fields and `research_context` this
   process did not change take the on-disk value. Papers, search records
-  and snowball rounds that only the file has are added. Paper metadata is
-  not merged (ours wins).
+  and snowball rounds that only the file has are added. Paper metadata
+  of a paper both hold is merged ours first (#194, `paper_filled_from`
+  = `ours.merge_with(theirs)`): our non-empty fields win, the file's
+  copy fills our empty ones (another process's enrichment survives),
+  sources/keywords united; the decision keeps its very `Paper` object
+  when nothing was filled. The file is read with
+  `read_session_file(path, use_registry=False)`, else the registry
+  would hand back our own objects and hide the file's copies; a paper
+  new on disk is registered (`register`), and if this process already
+  holds one, that copy wins, gaps filled from the file. No baseline
+  for papers: no code clears a known paper field.
 - **guards**: `warn_if_decisions_dropped` logs a WARNING (session,
   before/after decided counts, `.bak` path) when the save still leaves
   fewer decided papers than the file has, beyond this process's own
