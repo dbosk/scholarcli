@@ -1044,7 +1044,10 @@ context (#107). `review.save_session` now:
   nothing (brand new, or rebuilt from the decision store) takes the
   built state too (#214: two processes creating one session at once);
   only sessions constructed in code have no baseline. Whenever the
-  session does not conti- **an append loads only its own file** (#213):
+  session does not continue a loaded file, the built baseline's
+  `record_keys` are empty: nothing was loaded from the target, so the
+  legacy-record rule must not drop one of our legacy records.
+- **an append loads only its own file** (#213):
   `create_review_session` loads `load_own_session(name, query)`, the
   file `own_session_file_name` gives (`<name>.json`, unnamed: the
   query's hash), never `load_session`'s other guess (an unnamed append
@@ -1071,10 +1074,6 @@ context (#107). `review.save_session` now:
   ...`, `llm`, `enrich`, `verify`); `search -n`/`--review`, `rq` and the
   TUI all go through `create_review_session`. Real sessions
   (2026-11-19): no hash-named file, no unnamed session.
-
- user-facing commands (`sessions show/export/decide/...`, `llm`,
-  `enrich`, `verify`); `search -n`/`--review`, `rq` and the TUI all go
-  through `create_review_session`.
 
 `scholar enrich` saves after every `ENRICH_SAVE_EVERY` (50) papers
 (`cli.nw`, `sec:enrich-chunks`): enrich → Crossref check → assign →
