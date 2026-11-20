@@ -1783,6 +1783,29 @@ checked: `llm classify` answers, and `sessions decide --source llm`
 agent's "supports, excluded" (rendered on purpose by the audit table,
 #89) is recorded as given; existing records are not rewritten.
 Sessions without category tags are classified as before.
+A record whose category does not fit its status (a human's "supports,
+excluded", or a pre-#177 leftover) is no example, though (#255,
+llm_review.nw
+`sec:example-category`): `get_example_decisions` leaves out every
+candidate (`example_candidates`: tagged, kept/discarded, confirmed, or
+unreviewed with `--include-llm-examples`) whose `audit_category` (last
+category tag) is not in `STATUS_CATEGORIES[status]`
+(`category_contradicts_status`), before the sort and the cut to
+`max_kept`/`max_discarded`, so the lists stay full. Left out rather
+than shown without a category (the prompt demands exactly one). Not
+vocabulary-dependent; no category tag, no check. The INFO log says
+"Left out N examples whose category does not fit their decision";
+`llm status` counts the confirmed ones with the same
+`contradictory_examples(session)` (row "Confirmed, not examples
+(category does not fit decision)" only when > 0, apart from "Training
+examples", which counts `is_example`; JSON `examples_left_out`
+always). An example shows `example_tags(tags)` (llm_review.nw
+`sec:example-tags`): no note tags and only the deciding category, so a
+pre-#195 record tagged `supports-claim, off-topic-false-hit` shows
+`off-topic-false-hit`; records with one category or none print as
+before. The prompt version does not move (it hashes a fixed probe,
+not the session's examples). `sessions show` does not list such
+records.
 
 ### Snowball and Tuxedo Subcommands (lazy)
 
