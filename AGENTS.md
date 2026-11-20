@@ -1626,8 +1626,8 @@ never changed (tested on the saved JSON). **Screener identity**
 the identity of the snapshot of a decision the same model made, else
 the latest-record rule hides the first verdict. Only `llm classify
 --second-screen` writes `via: "classify"`; snapshots are `"snapshot"`,
-`sessions screen` `"screen"`. Report surfaces: see "Double screen in
-the documents" below; the screen sheet is not yet built (#253 PR E).
+`sessions screen` `"screen"`. Report surfaces and the screen sheet:
+see "Double screen in the documents" below.
 **TUI blind review (#253 part D, closes #254's last point; tui.nw
 `sec:tui-blind-review`).** `scholar sessions resume S --blind [--by
 NAME]` (`PaperReviewApp(..., blind=True)`) starts blind mode in
@@ -1840,6 +1840,18 @@ screeners)}.
   `TestDoubleScreeningCompiles` (marker `latex`) compiles report
   fragment + sv table in the pdfLaTeX T1 host with a name full of
   specials.
+- **Screen sheet** (cli.nw `sec:screen-sheet`): `scholar sessions
+  export S -f screen-sheet [--sample ID] [--undecided-by NAME] [-o
+  F[.tsv]]` writes a header line `id title year venue abstract` and
+  one line per paper id (copies once), tab-separated UTF-8, nothing
+  else; tabs and every `str.splitlines` break → space
+  (`sheet_field`). Papers = `second_screen_candidates` (`over="all"`,
+  or the sample: decided, reset-since-draw left out);
+  `--undecided-by` drops papers where `has_verdict_by` (a counted
+  screening of that name, any kind, or `verdict_screener` name). The
+  two options with another format, or empty, exit 2; unknown sample
+  exit 2 (screen's chunk). Prints "N paper(s) on the screen sheet."
+  and no machine-review table. `all` stays csv + latex.
 
 ### Session Arguments
 
