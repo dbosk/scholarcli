@@ -1180,9 +1180,21 @@ three fields per decision (`null` when unset) and `review_records`
 (counts by stored value); the report's "Decided:" rows, its abstract
 sentence (`decision_sources_sentence`) and `llm synthesize`'s summary
 note only when a record is missing, so a fully recorded session reads
-as before. The CSV adds `human_decided_at, human_decided_via,
-human_by` after `agent_decided_at`. The audit table and caption are
-unchanged (tested byte-identical). Wording: "without a record of the
+as before; with the note they also give `REVIEW_RECORD_EXPLANATION`
+once (`review_record_sentence`: after the report's summary, in its
+abstract, after both synthesis summaries; no version or date in it).
+The CSV adds `human_decided_at, human_decided_via,
+human_by` after `agent_decided_at`. The audit table and its caption
+are deliberately unchanged: they neither count nor mention the
+records (tested byte-identical). Copies are compared by
+`decision_verdict` (= `decision_state` without `HUMAN_AUDIT_FIELDS`;
+LLM/agent fields stay in) in `_fold_direction`, `same_id_pairs` and
+`_decided_pairs` (alike/conflicting), so two copies a human decided
+alike at two moments still fold, are no alike pair and need no
+`--all-copies`; a fold keeps the newer record (`newer_human_record`:
+by `human_decided_at`, a record beats none). `decision_state` (merge,
+baseline, `pair_with_file`, `apply_tombstones`) keeps the record: those
+compare one decision with itself across file versions. Wording: "without a record of the
 review", never "not human" (old decisions have none). The default
 source stays `human` (an undecided paper's). Checked 2026-11-20: the
 pipx build of 4ba7a23 loads such a file and drops the fields on save.
