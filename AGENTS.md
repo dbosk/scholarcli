@@ -917,7 +917,7 @@ line, a table fragment, ... Flag, never drop.
   from enrich.nw, stdlib + `scholar.utils` only, so `sessions show` and
   the report do not import providers or the Crossref cache). Order:
   (1) `is_table_of_contents` (front-matter heading at the start, not
-  followed by a lower-case word, and "Chapter 1"/"Part I"/"1. X" within
+  followed by a lower-case word other than "by <Capitalised>", and "Chapter 1"/"Part I"/"1. X" within
   `FRONT_MATTER_CHARS` = 300) → "table of contents"; (2) `DOUBTFUL_OPENINGS`: per kind (the reason
   string) a few regexes matched only at the START of the text, after
   `TEXT_START` (white space, inline tags, footnote marks/quotes, a
@@ -980,7 +980,14 @@ line, a table fragment, ... Flag, never drop.
   keywords, 1 funding, 1 acknowledgements heading; 22 list abstracts.
   The review of PR #294 then narrowed (3), the heading delimiter, the
   table/front-matter/funding/correspondence openings and the floor (CJK)
-  for real topics it found; a third run is pending. Not covered: free-form statements, an
+  for real topics it found. Third run 2026-11-20: 145,772 judged, 724
+  doubtful (0.50 %): 647 floor, 65 TOC, 6 thanks, 2 COI, 1
+  supplementary, 1 keywords, 1 funding, 1 acknowledgements heading; 22
+  list abstracts; against run 2 five dropped, none added (a complete
+  Chinese abstract, a supplemental-content sentence before a real
+  abstract, and three true TOCs opening "Foreword by <Name>"). After
+  it, a front-matter word followed by "by" + a capitalised name is a
+  heading again ("Foreword by the editors ... argues" stays prose). Not covered: free-form statements, an
   article's opening paragraph, non-English boilerplate. 10,000
   abstracts of ~1,000 characters take about 0.2 s (test allows 1 s).
 - **enrich** (`sec:replace-doubtful-abstract`): `needs_enrichment(p,
