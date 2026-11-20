@@ -1480,10 +1480,20 @@ when the service answered (\cref{sec:lookup-outcome}).
 Unpaywall's client does the same for the open-access lookup
 (\cref{unpaywall-module}).
 Enrichment collects these into one [[LookupOutcome]] per paper: the
-providers it asked, in order, the failed ones with their reasons, and
-the reason the open-access lookup failed, if it did.
-A provider skipped because it is not configured, or not reached because
-an earlier one filled every requested field, is not among those asked.
+providers it asked, in order, the failed ones with their reasons, the
+providers that declined to ask, with theirs, and the reason the
+open-access lookup failed, if it did.
+A provider declines when it has nothing it could ask with: no key, or
+Scopus without its [[COMPLETE]] view ([[last_lookup_declined]],
+\cref{sec:lookup-outcome}).
+That is neither an answer nor a failure, and it is kept apart from
+both: a declining provider is not among those asked, so a paper every
+asked provider answered for still reads as settled, and it is not a
+failure, so it does not ask the user to run again from a network where
+it would decline again.
+A provider skipped because [[is_available]] says it is not configured,
+or not reached because an earlier one filled every requested field, is
+neither asked nor declined.
 
 The record is optional.
 [[enrich_paper]] fills one only when given one ([[outcome=]]), and
@@ -1504,20 +1514,23 @@ class LookupOutcome:
 
     `asked` lists the providers asked for the DOI, in order; `failed`
     maps those whose lookup failed to the reason. `open_access_error`
-    is the reason the Unpaywall lookup failed, if it did.
+    is the reason the Unpaywall lookup failed, if it did. `declined`
+    maps the providers that declined to ask (and are not in `asked`)
+    to their reason.
     """
 
     asked: list[str] = field(default_factory=list)
     failed: dict[str, str] = field(default_factory=dict)
     open_access_error: str | None = None
+    declined: dict[str, str] = field(default_factory=dict)
 <<lookup outcome imports>>=
 from collections import Counter
 from dataclasses import dataclass, field
 @
 
-The reason is read the way [[provider_outcome]] reads a search's
-[[last_error]] (\cref{sec:provider-protocol}): as an optional
-attribute, accepted only if it is a non-empty string.
+The reasons are read the way [[provider_outcome]] reads a search's
+[[last_error]] (\cref{sec:provider-protocol}): as optional
+attributes, accepted only if they are non-empty strings.
 A provider from elsewhere has no such attribute, and the [[MagicMock]]
 providers of the tests answer every attribute with another mock; both
 read as \enquote{answered}, which is what they reported before this
@@ -1533,6 +1546,15 @@ def lookup_error(source) -> str | None:
     return _as_reason(getattr(source, "last_lookup_error", None))
 
 
+def lookup_declined(source) -> str | None:
+    """Return why `source` declined its last DOI lookup, or None.
+
+    Reads the optional `last_lookup_declined` attribute, as
+    `lookup_error` reads its own.
+    """
+    return _as_reason(getattr(source, "last_lookup_declined", None))
+
+
 def _as_reason(value) -> str | None:
     """Return `value` if it is a non-empty string, else None."""
     return value if isinstance(value, str) and value else None
@@ -1544,10 +1566,14 @@ skipped as not matching still counts as asked and answered.
 
 <<note the outcome of the provider's lookup>>=
 if outcome is not None:
-    outcome.asked.append(provider_name)
-    error = lookup_error(provider)
-    if error is not None:
-        outcome.failed[provider_name] = error
+    declined = lookup_declined(provider)
+    if declined is not None:
+        outcome.declined[provider_name] = declined
+    else:
+        outcome.asked.append(provider_name)
+        error = lookup_error(provider)
+        if error is not None:
+            outcome.failed[provider_name] = error
 @
 
 Unpaywall is reached through the module's shared client, so its reason
@@ -1632,6 +1658,38 @@ class TestLookupOutcome:
         assert enrich_papers(papers, fields=["abstract"]) == papers
 @
 
+A provider that declines is recorded apart, and is not among those
+asked.
+The Scopus provider here is the real one under [[SCOPUS_VIEW=standard]],
+which declines every DOI lookup without a request; the Semantic Scholar
+one answers from its cache, as in the test above.
+
+<<test functions>>=
+class TestDeclinedLookup:
+    """A declining provider is neither asked nor failed (#259)."""
+
+    def test_declined_is_recorded_apart(self, monkeypatch):
+        from scholar.providers import ScopusProvider, SemanticScholarProvider
+
+        monkeypatch.setenv("SCOPUS_VIEW", "standard")
+        s2 = SemanticScholarProvider(api_key=None)
+        monkeypatch.setattr(s2, "_cache", {("doi", "10.1/d"): None})
+        providers = {"s2": s2, "scopus": ScopusProvider(api_key="dummy")}
+        outcome = LookupOutcome()
+        with patch("scholar.enrich.get_provider", providers.get):
+            enrich_paper(
+                Paper(title="T", authors=["a"], doi="10.1/d"),
+                fields=["abstract"],
+                providers=["s2", "scopus"],
+                outcome=outcome,
+            )
+        assert outcome.asked == ["s2"]
+        assert outcome.failed == {}
+        assert outcome.declined == {
+            "scopus": "SCOPUS_VIEW=standard has no abstracts"
+        }
+@
+
 The open-access lookup is told apart the same way.
 Here the Unpaywall client is the real one with a contact address set
 and a cooldown on its limiter.
@@ -1680,9 +1738,14 @@ without an abstract, and sorts them into four kinds:
   provider and reason, one count per paper, so a paper both Semantic
   Scholar and OpenAlex refused counts once in each row.
 \item[Without a DOI] nothing could be asked.
-\item[None asked] the paper has a DOI, but no provider was asked, as
-  when none is configured.
+\item[None asked] the paper has a DOI, but no provider was asked:
+  each declined, or none is configured.
 \end{description}
+A paper is answered when every provider that was asked answered;
+providers that declined do not count against it.
+They are reported apart, one line per provider and reason with the
+number of papers still without an abstract that it declined for, and
+without the hint to run again.
 A paper whose lookups failed but which got its abstract elsewhere is
 not counted: the failure cost it nothing.
 
@@ -1709,6 +1772,7 @@ class LookupTally:
     without_doi: int = 0
     none_asked: int = 0
     failures: Counter = field(default_factory=Counter)
+    declined: Counter = field(default_factory=Counter)
     oa_undetermined: int = 0
     oa_without_doi: int = 0
     oa_not_found: int = 0
@@ -1722,8 +1786,8 @@ def tally_lookups(
     """Count why `papers` still lack an abstract or an open-access status.
 
     `outcomes[i]` is the outcome of enriching `papers[i]`; a missing
-    one reads as nothing asked. `failures` counts papers per
-    `(provider, reason)`, `oa_failures` per reason.
+    one reads as nothing asked. `failures` and `declined` count papers
+    per `(provider, reason)`, `oa_failures` per reason.
     """
     tally = LookupTally(papers=len(papers))
     for index, paper in enumerate(papers):
@@ -1735,6 +1799,7 @@ def tally_lookups(
 <<count a paper still without an abstract>>=
 if needs_enrichment(paper, ["abstract"]):
     tally.without_abstract += 1
+    tally.declined.update(outcome.declined.items())
     if outcome.failed:
         tally.with_failure += 1
         tally.failures.update(outcome.failed.items())
@@ -1787,8 +1852,12 @@ def abstract_tally_lines(tally: LookupTally, scope: str) -> list[str]:
     if tally.none_asked:
         lines.append(
             f"  {tally.none_asked} with a DOI that no database was "
-            "asked about (none available)."
+            "asked about: each one declined or was unavailable."
         )
+    lines.extend(
+        f"  {provider} not asked: {reason} ({_papers(count)})"
+        for (provider, reason), count in _most_frequent(tally.declined)
+    )
     if tally.with_failure:
         lines.append(
             f"  {tally.with_failure} with a failed lookup, by database "
@@ -1829,6 +1898,11 @@ def open_access_tally_lines(tally: LookupTally, scope: str) -> list[str]:
         )
         lines.append(f"  {RUN_AGAIN_HINT}")
     return lines
+
+
+def _papers(count: int) -> str:
+    """Return "1 paper" or "N papers"."""
+    return f"{count} paper" if count == 1 else f"{count} papers"
 
 
 def _most_frequent(counts: Counter) -> list:
@@ -1911,6 +1985,40 @@ class TestLookupTally:
             [Paper(title="A", authors=["a"], doi="10.1/a")], []
         )
         assert (tally.none_asked, tally.with_failure) == (1, 0)
+
+    def test_declined_is_information_not_failure(self):
+        declined = {"scopus": "SCOPUS_VIEW=standard has no abstracts"}
+        papers = [
+            Paper(title="A", authors=["a"], doi="10.1/a"),
+            Paper(title="B", authors=["a"], doi="10.1/b"),
+            Paper(title="C", authors=["a"], doi="10.1/c"),
+        ]
+        outcomes = [
+            LookupOutcome(["s2"], declined=dict(declined)),
+            LookupOutcome(["s2"], declined=dict(declined)),
+            LookupOutcome(declined=dict(declined)),
+        ]
+        tally = tally_lookups(papers, outcomes)
+        assert (tally.all_answered, tally.with_failure) == (2, 0)
+        assert tally.none_asked == 1
+        assert abstract_tally_lines(tally, "papers") == [
+            "Still without an abstract: 3 of 3 papers.",
+            "  2 answered by every database asked: no abstract in any "
+            "of them.",
+            "  1 with a DOI that no database was asked about: each one "
+            "declined or was unavailable.",
+            "  scopus not asked: SCOPUS_VIEW=standard has no abstracts "
+            "(3 papers)",
+        ]
+
+    def test_declined_line_for_one_paper(self):
+        tally = tally_lookups(
+            [Paper(title="A", authors=["a"], doi="10.1/a")],
+            [LookupOutcome(["s2"], declined={"ieee": "IEEE_API_KEY not set"})],
+        )
+        assert abstract_tally_lines(tally, "papers")[-1] == (
+            "  ieee not asked: IEEE_API_KEY not set (1 paper)"
+        )
 
     def test_open_access_text(self):
         papers = [

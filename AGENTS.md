@@ -502,13 +502,21 @@ since their text quotes the URL with DOI, key or address; anything
 else, e.g. the `OSError` "Could not find a suitable TLS CA certificate
 bundle, ..." -> its text, redacted, one line, <= 120 chars);
 `providers.lookup_failure_reason` adds the limiter's reason for
-`RateLimited`. WoS records `SEARCH_CUT_SHORT` from the tiers'
-`cacheable` flag (also for a limiter refusal); keyless IEEE/Scopus/WoS
-name their variable; Scopus without COMPLETE says "not asked: ..."
-(`_lookup_declined_reason`, counted as failed: Scopus was not asked).
-`UnpaywallClient` and `CrossrefClient` keep `last_lookup_error` the
-same way (module `last_lookup_error()`). Enrichment reads them
-Mock-safely (`enrich.lookup_error`, only a non-empty str counts).
+`RateLimited`. WoS: each tier keeps the caught exception's reason in
+`_tier_failure` (reset at the tier's start); the lookup records it,
+`SEARCH_CUT_SHORT` only as fallback (searches still record
+`SEARCH_CUT_SHORT`). arXiv's `UnexpectedEmptyPageError` ->
+`ARXIV_EMPTY_PAGE` (its text quotes the URL). A third outcome,
+*declined*, goes to `last_lookup_declined` (reset first thing too;
+`last_lookup_error` stays None): keyless IEEE/Scopus/WoS (reason names
+the variable) and Scopus without COMPLETE, under `SCOPUS_VIEW=standard`
+or after the 401 view refusal (`_lookup_declined_reason`). Declining is
+not failing: off campus Scopus would otherwise make every paper
+"failed" and every run say "run again". `UnpaywallClient` and
+`CrossrefClient` keep `last_lookup_error` the same way (module
+`last_lookup_error()`); their warning lines log the exception through
+`network.redact_secrets`. Enrichment reads both attributes Mock-safely
+(`enrich.lookup_error`/`lookup_declined`, only a non-empty str counts).
 
 OpenAlex (#150, #151): a limiter refusal sets `last_error` to its
 reason; a refusal or failed request after some pages keeps those pages
@@ -535,7 +543,7 @@ lookups (`get_paper_by_doi`, `get_preprint_locations`,
 
 Keys in messages (#159): `network.redact_secrets(text)` hides the
 values of `api_key`/`apikey`/`api-key`/`key` URL parameters and
-`mailto` (personal data, #160), in any case. `check_provider` applies it to every health message; the
+`mailto`/`email` (personal data, #160, #259), in any case. `check_provider` applies it to every health message; the
 OpenAlex and IEEE (`apikey` in the URL) error logs use it. The OpenAlex
 `/works` probe sends the key as `Authorization: Bearer` (documented,
 as pyalex does); `/rate-limit` keeps the `api_key` parameter (the only
@@ -730,12 +738,16 @@ Lookup tally (#259, enrich.nw `sec:enrich-lookup-outcomes`, cli.nw
 `sec:enrich-lookup-tally`): `enrich_paper(..., outcome=LookupOutcome())`
 / `enrich_papers(..., outcomes=[])` (optional; TUI and `search
 --enrich` pass none, return types unchanged) record per paper the
-providers asked, the failed ones with reasons, and the Unpaywall
-failure. `scholar enrich` collects them per chunk and, when `abstract`
+providers asked, the failed ones with reasons, the declined ones
+(`LookupOutcome.declined`, not in `asked`) and the Unpaywall failure.
+`scholar enrich` collects them per chunk and, when `abstract`
 is in `--fields`, ends (also on the exit-130 interrupt path, over the
 saved papers) with `abstract_tally_lines`: "Still without an abstract:
-N of M papers." then answered by every database asked / without a DOI
-/ no database asked / failed lookups per `provider: reason (count)`
+N of M papers." then answered by every database asked (every provider
+that was asked answered; declined ones do not count) / without a DOI /
+"with a DOI that no database was asked about: each one declined or was
+unavailable" / one info line per declined `provider not asked: reason
+(N papers)`, no hint / failed lookups per `provider: reason (count)`
 plus "Run again to retry the failed lookups." only when something
 failed. After the `Open access:` line, `open_access_tally_lines` splits
 unknown statuses into without a DOI / not in Unpaywall / failed (per
@@ -780,7 +792,8 @@ superseded, using Crossref's `updated-by` (Retraction-Watch-backed) and
   wraps `annotate_papers`' progress callback (read right after each
   lookup; `annotate_papers`' signature is unchanged, so stand-ins keep
   working) and `check_failure_lines` prints "Crossref check failed for
-  N papers; their retraction status stays unknown:" + `crossref: reason
+  N papers (not checked in this run):" (true also for a paper whose
+  earlier result is kept after a failed re-check) + `crossref: reason
   (n)` + `network.RUN_AGAIN_HINT`; enrich after its currency line,
   verify on stderr (JSON stays pure). The run never aborts.
 
