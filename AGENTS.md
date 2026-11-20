@@ -1016,7 +1016,45 @@ columns before `reset_from`; `paper_id` stays last) and the report (one English 
 the summary, `agent_reasons_sentence`: agent and agent_reviewed
 decisions with/without a reason). An older Scholar loads such files
 and drops the fields on its next save (checked with the installed
-pre-#249 pipx build). A machine
+pre-#249 pipx build).
+**Quote check (#256, review.nw `sec:reason-quotes`, cli.nw
+`sec:decide-quote-check`).** Pure functions: `quotes_in_reason`
+(text between double marks `"…"`, `“…”`, `”…”`, `„…“`/`„…”`, `«…»`,
+`»…«`; never single marks, apostrophes), `unmatched_quotes(reason,
+paper, extra_texts=())` (quotes of >= `MIN_QUOTE_WORDS` = 3 words,
+shorter = "not checked", never matched; compared with title, abstract
+and the extras after `normalized_for_quotes`: `clean_metadata_text`,
+NFKC, soft hyphen dropped, dashes and quote marks unified, casefold,
+white space collapsed; `exam- ple` not repaired; an ellipsis `…`,
+`...`, `[...]`, `(...)` splits into parts found in order in one text;
+edge punctuation ignored; parts at word bounds; nothing fuzzy),
+`reason_quote_checks(decision)` (one `ReasonQuoteCheck` per
+`agent_reason`/`llm_reason`), `quote_check_tally`, `unmatched_quotes_of`.
+Nothing stored; computed when shown. Limits: an abstract replaced
+since (enrich) no longer matches; the classifier saw only
+`MAX_ABSTRACT_CHARS`; `--full-text` passages are not stored (only the
+run checks them); a found quote is the record's words, not a right
+decision. `decide --reason/--reasons-file` checks each reason against
+its own record after the ids resolve, before saving: stderr
+`line N, ID: "quote"` (or `ID: "quote"` for `--reason`), first
+`QUOTE_PROBLEMS_SHOWN` = 20, rest counted, saved anyway;
+`--strict-quotes` refuses unsaved (exit 2), and without a reason
+option exits 2 before loading. Bad file lines (exit 2 before loading):
+a reason that is only a number or a paper id (`doi:`, `hash:`, `10.`
+without a space; `reason_column_shift`), and a placeholder
+(`is_placeholder_reason`: casefolded, letters/digits only, in
+`REASON_PLACEHOLDERS` = placeholder, todo, tbd, xxx, reason, na), the
+latter also for `--reason`. `sessions show`: a "Reasons: N recorded,
+X with quotes checked, M with a quote not found in the record's title
+or abstract" line when any machine reason exists, a mark `(quote not
+in title or abstract)` on those papers, JSON `unmatched_quotes` per
+decision (absent when empty) and top-level `reason_quotes` (per kind:
+reasons, checked, unmatched). Report: `reason_quotes_sentence` after
+`agent_reasons_sentence` (agent and classifier apart; none without
+machine reasons). Audit table and CSV unchanged. Cost: one check per
+decision per command (folding the abstract is most of it; ASCII and
+single-space shortcuts in `normalized_for_quotes`, tested against the
+plain definition). A machine
 `decide` never replaces a decided
 paper whose source is `human`, `llm_reviewed` or `agent_reviewed`:
 the batch is refused unsaved (exit 2, each conflict named) unless
@@ -1760,6 +1798,14 @@ A human review leaves them untouched (they are the model's record).
   then withheld with the category-rule ones (`LLMDecision.problem`);
   `llm classify` and `rq` list them (`print_withheld_papers`) under
   "Left pending, no usable answer".
+- **Quotes in the reasons (#256).** `llm classify` (not `rq`) ends
+  with one line, `Reasons quoting words not in the record (N): id:
+  "quote"; ...` (first `LLM_QUOTE_MISSES_SHOWN` = 3), when an applied
+  decision's stored `llm_reason` quotes >= 3 words not in its title,
+  abstract or the `--full-text` passages of this run
+  (`LLMBatchResult.passages`, paper id -> passage texts, not stored).
+  Nothing is withheld or retried for it. Later checks (`sessions show`,
+  report) see only title and abstract (see Headless Review Sessions).
   Answers without a valid `paper_index` are skipped (never index 0).
 - **Abstracts.** `MAX_ABSTRACT_CHARS` = 4000 for papers to classify
   (marked `[abstract truncated]` in the prompt), `EXAMPLE_ABSTRACT_CHARS`
