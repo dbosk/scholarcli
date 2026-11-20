@@ -83,6 +83,7 @@ from unittest.mock import Mock, patch, MagicMock
 
 import json
 
+import scholar.pdf
 from scholar.pdf import *
 
 
@@ -251,8 +252,9 @@ One lock rather than one per PDF: a lock file stays behind after its
 lock is released (deleting it while another process waits for it would
 let two processes hold the lock), and a lock per PDF left one hidden
 file for every PDF a clear had looked at.
-Downloads take no lock: they replace their file atomically
-(\cref{sec:pdf-download}) and never consult the records.
+A download takes the lock only for the moment it puts its file in
+place, after the transfer (\cref{sec:pdf-download}), so that it never
+replaces an import.
 
 <<pdf constants>>=
 PDF_CACHE_LOCK_NAME = "import"
@@ -1199,7 +1201,29 @@ with temp_beside(cache_path) as tmp:
             f.write(chunk)
         f.flush()
         os.fsync(f.fileno())
-    os.replace(tmp, cache_path)
+    <<put the download in place unless an import is there>>
+@
+
+A download can take a while, and the user may import a PDF for the same
+key meanwhile, most likely because this very download looked hopeless.
+A file the user fetched by hand must never be replaced by a later
+automatic one, so the download is put in place under the lock that
+import and clear share (\cref{sec:pdf-cache-imports}), after a last look
+at the key: if it now holds an import (a file its record matches), the
+import stays and the downloaded copy is discarded.
+The lock is held for that look and the rename only, never during the
+transfer, which could otherwise keep an import waiting for minutes.
+An import that starts after the rename finds the download in place and
+needs [[--replace]], as for any download.
+
+<<put the download in place unless an import is there>>=
+with pdf_cache_lock():
+    if import_record_of(cache_path) is not None:
+        logger.info(
+            "Keeping the PDF imported for %s; discarding the download", url
+        )
+    else:
+        os.replace(tmp, cache_path)
 @
 
 \subsection{Downloading by DOI}
@@ -2306,6 +2330,115 @@ def test_a_trailing_full_stop_is_not_part_of_the_key(
   assert outcome.path == get_cached_doi_pdf_path("10.9999/ex.1")
   assert outcome.record["stored_doi"] == "10.9999/ex.1"
   assert outcome.record["doi"] == "10.9999/Ex.1."
+@
+
+A download and an import of the same key meet in two orders, tested
+with real threads.
+The download's stand-in response yields the start of its body and then
+blocks until the test releases it, so the transfer is in progress for
+as long as the test needs.
+In the first order the import completes while the download is still
+transferring; when the download finishes, the import must still be in
+place.
+In the second the download finishes while the import is still checking
+its copy (the import is held in [[pdf_has_text]], before it takes the
+lock); the import, given [[replace]] because a download is now there,
+then puts its file in place.
+Either way the imported file and its record are what remain.
+
+<<test functions>>=
+class TestDownloadMeetsImport:
+  """A download never replaces a PDF imported while it ran."""
+
+  URL = "https://pub.example/slow.pdf"
+
+  def slow_response(self, body, started, release):
+    response = MagicMock()
+    response.headers = {"content-type": "application/pdf"}
+
+    def chunks(chunk_size):
+      yield body[:100]
+      started.set()
+      assert release.wait(timeout=10)
+      yield body[100:]
+
+    response.iter_content.side_effect = chunks
+    return response
+
+  def start_download(self, tmp_path, started, release):
+    import threading
+
+    body = make_pdf(tmp_path / "downloaded.pdf", width=400).read_bytes()
+    response = self.slow_response(body, started, release)
+    errors = []
+
+    def run():
+      try:
+        download_pdf(self.URL)
+      except BaseException as error:
+        errors.append(error)
+
+    patcher = patch("scholar.pdf.requests.get", return_value=response)
+    patcher.start()
+    thread = threading.Thread(target=run)
+    thread.start()
+    assert started.wait(timeout=10)
+    return thread, patcher, errors
+
+  def assert_the_import_remains(self, imported):
+    path = get_cached_pdf_path(self.URL)
+    assert path.read_bytes() == imported.read_bytes()
+    assert import_record_of(path)["sha256"] == file_sha256(imported)
+    assert [p.name for p in get_pdf_cache_dir().glob("*.tmp")] == []
+
+  def test_import_finishes_first(self, tmp_path, monkeypatch):
+    import threading
+
+    monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path / "cache"))
+    started, release = threading.Event(), threading.Event()
+    thread, patcher, errors = self.start_download(tmp_path, started, release)
+    try:
+      imported = make_pdf(tmp_path / "imported.pdf")
+      assert import_pdf(imported, url=self.URL).status == "imported"
+    finally:
+      release.set()
+      thread.join(timeout=10)
+      patcher.stop()
+    assert errors == []
+    self.assert_the_import_remains(imported)
+
+  def test_download_finishes_first(self, tmp_path, monkeypatch):
+    import threading
+
+    monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path / "cache"))
+    started, release = threading.Event(), threading.Event()
+    downloaded = threading.Event()
+    real_has_text = scholar.pdf.pdf_has_text
+
+    def has_text_after_the_download(path):
+      assert downloaded.wait(timeout=10)
+      return real_has_text(path)
+
+    monkeypatch.setattr("scholar.pdf.pdf_has_text", has_text_after_the_download)
+    thread, patcher, errors = self.start_download(tmp_path, started, release)
+    imported = make_pdf(tmp_path / "imported.pdf")
+    outcomes = []
+    importer = threading.Thread(target=lambda: outcomes.append(
+      import_pdf(imported, url=self.URL, replace=True)
+    ))
+    try:
+      importer.start()
+      release.set()
+      thread.join(timeout=10)
+      assert get_cached_pdf_path(self.URL).exists()
+    finally:
+      downloaded.set()
+      release.set()
+      importer.join(timeout=10)
+      patcher.stop()
+    assert errors == []
+    assert [o.status for o in outcomes] == ["replaced"]
+    self.assert_the_import_remains(imported)
 @
 
 \section{Opening PDFs}

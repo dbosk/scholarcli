@@ -765,8 +765,10 @@ and caches under whichever delivered.
   `os.replace` into place, so a broken response or Ctrl-C leaves
   nothing. `find_quote_candidates` turns a `PdfiumError` into `[]`, or
   with `raise_errors=True` (what `pdf quote` passes) into a one-line
-  `PDFUnreadableError` (a `PDFDownloadError`); `pdf quote` now also
-  reports a failed download (exit 1) instead of "No candidate passages".
+  `PDFUnreadableError` (a `PDFDownloadError`). **Change:** `pdf quote`
+  now exits 1 with "Download failed: ..." when no PDF could be had; it
+  used to print "No candidate passages found." and exit 0, but a failed
+  download is not an empty result.
 - **Import**: where a publisher answers with a bot check (scholar stops
   there, see Network), `scholar pdf import FILE (--url URL | --doi DOI)
   [--from TEXT] [--replace]` (FILE takes the positional slot of
@@ -799,7 +801,10 @@ and caches under whichever delivered.
   `clear` and an import of that key delete them.
 - **Lock**: import and clear share one directory lock,
   `pdfs/.import.lock` (`pdf_cache_lock`); no per-PDF lock files.
-  Downloads take none.
+  A download takes it only around its final rename: if the key then
+  holds an import (record matches), the import stays and the download
+  is discarded (one INFO line), so a hand-fetched file is never
+  replaced by an automatic one (threads test, both orders).
 - **Overwrite**: same content → no-op ("unchanged"), or adds the record
   to a same-content download ("recorded").
 - **Clear/info**: `clear_pdf_cache` keeps imports unless
