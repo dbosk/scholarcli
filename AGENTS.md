@@ -1467,11 +1467,103 @@ time [by NAME]; ...`, no text, `review.abstract_from_cell`, after
 `reset_from`, before `paper_id`). The audit table is unchanged.
 Together these let scripted/agent-driven systematic reviews produce the same
 session record and `sessions export` audit trail as TUI reviews.
+#### Screenings: a second screener's verdicts (#253, part A)
+
+`ReviewDecision.screenings` (review.nw `sec:screenings`, declared after
+`abstract_set`) holds other screeners' verdicts beside the decision,
+which stays the outcome; nothing reads the list to decide kept/cited.
+Each record has every key of `review.SCREENING_KEYS` (`id` uuid4 hex,
+`origin` screen|decision, `kind` llm|agent|human, `name`,
+`confirmed_from`, `confirmed_name`, `status` kept|discarded, `tags`,
+`confidence`, `reason` whole, `at`, `recorded_at`, `prompt_version`,
+`abstract_truncated`, `blind`, `blind_basis` prompt|tui|declared,
+`sample_id`, `via`), built by `new_screening` (validates) or
+`decision_snapshot`. `record_screening(decision, record)` first adds a
+snapshot of a *decided* paper's current verdict (`origin: "decision"`,
+`via: "snapshot"`) unless a counted snapshot with the same
+`_snapshot_key` (status, tags, kind, name, confirmed_*, at) exists;
+pending papers get none. Snapshot screener (`verdict_screener`):
+unreviewed llm/agent → kind llm/agent named by `llm_model`/`agent_by`
+with its confidence, reason, time; `human`/`llm_reviewed`/
+`agent_reviewed` → kind `human`, `name` = `human_by`, `at` =
+`human_decided_at`, `confirmed_from` llm/agent/None, `confirmed_name`
+model/`agent_by` (no machine confidence or reason); unknown source →
+all None. `counted_screenings` = valid entries (`is_valid_screening`:
+dict with `id` and kept/discarded status), not marked `set_aside_at`,
+recorded strictly after the last reset's `at`; malformed entries are kept verbatim, skipped, one
+WARNING per file (`warn_about_malformed_screenings`).
+**Not in `decision_state` nor `decision_verdict`** (on purpose, unlike
+`resets`): in the state a stale `screen` save would put an old decision
+back over a human's (#258's finding); in the copy comparison a
+screening would keep copies decided alike apart (#257's finding).
+Instead: saved only when non-empty, loaded `[]`, copied by the append,
+united by `unite_screenings` in `merge_concurrent_changes` and in the
+fold (`<<fold [[absorbed]] into [[survivor]]>>`), which drops a second
+snapshot of a verdict already held under another id. `add_screening`
+dedups by `id`; two versions of one id become `merged_screening` (the
+later `relabelled_at`'s, with the earliest `set_aside_at` of either).
+`is_unscreened` requires no screenings. Not in `MACHINE_AUDIT_FIELDS`.
+`relabel_source` (via `correct_relabelled_snapshots`) replaces the
+screener fields of every counted snapshot of the old verdict with the
+new `verdict_screener`, stamps `relabelled_at`, keeps the replaced
+values under `before_relabel` (the first relabel's), and records the
+old kind as `screenings_kind` in the relabel record (only when one was
+corrected). `reset_decision` keeps the list and records
+`"screenings": n` (the counted ones it saw) in the reset record when
+n > 0. **Races** (`ConcurrentHistory.of(ours, theirs)` before the
+union, `settle_concurrent_screenings` after the decision is merged, in
+`merge_concurrent_changes`; the loop no longer `continue`s past it):
+screenings one side added while the other side added a reset get
+`set_aside_at` = that reset's `at`; snapshots one side added while the
+other relabelled are corrected from `relabelled_verdict_keys` (undoes
+the relabels: `from` source plus the record's `human`). The reset
+record's count is not changed afterwards. Tested with real
+subprocesses in both save orders (`TestScreeningRaces`). `screenings_summary`
+gives `sessions show`'s line ("Screenings: N on P paper(s), S of them
+snapshots of the decision; K set aside by a reset; M malformed,
+skipped."); `show -f json` adds `screenings` per decision when
+non-empty. Checked: the pre-change pipx build (1.29) loads such a file
+and drops the list on save. Size in indented JSON: ~670 bytes per
+screening, ~690 per snapshot, plus reasons.
+**`scholar sessions screen S --as agent|human|llm --by NAME
+(--verdicts-file F | (--doi D|--paper-id ID)... --keep|--discard
+[--tag T]... [--reason TEXT]) [-c C] [--blind|--not-blind] [--sample
+ID] [--all-copies] [--dry-run] [--strict-quotes]`** (cli.nw
+`sec:sessions-screen`): `--as` defaults to human at a terminal, else
+exit 2; `--by` required for every kind (exit 2 before loading; the
+model for llm); a screener whose `(kind, name)` is that of a selected
+decided paper's `verdict_screener` is refused (exit 2, unsaved, papers
+named: a change of mind is a `decide`; self-agreement is not computed
+and a second record under one identity would hide the first); `-c`
+refused with `--as human` (also file confidences). Verdicts file lines
+`ID<TAB>kept|discarded<TAB>TAGS<TAB>REASON[<TAB>CONFIDENCE]` (TAGS
+comma-separated, may be empty for a keep): parsed by `parse_tab_file`
+with `VERDICTS_LAYOUT`; `parse_reasons_file` is the same function with
+`REASONS_LAYOUT` (`TabFileLayout`/`TabFileColumn`: a column spec, same
+line rules, `read_reason_column` applies #256's placeholder and
+column-shift refusals). A discard needs a tag; at most one category.
+Session uses categories (any decision tag in `AUDIT_CATEGORIES`) →
+agent/llm verdicts need exactly one category fitting
+`STATUS_CATEGORIES` (exit 2, lines named); human verdicts free.
+Unknown ids exit 1, two different verdicts for one paper exit 2,
+copies decided apart need `--all-copies`, `--sample` must be a
+`sample_id` or a banded sample's `criteria["stratum"]["group"]` (exit 2
+listing the held ids; membership of papers is not checked here). The
+quote check is decide's chunk (`<<check the quotes of the agent's
+reasons>>`, `--strict-quotes`); its "Saved all the same" line prints
+only when `saving` (set before the chunk: decide True, screen
+`not dry_run`). One `utc_now_iso()` per run =
+`recorded_at` = `at`; `keep_copy_before_run(session, "pre-screen")`;
+`--dry-run` writes nothing. `--blind`/`--not-blind` → `blind`
+True/False, `blind_basis: "declared"`; neither → None. The decision is
+never changed (tested on the saved JSON). Not yet built (later #253
+PRs): agreement numbers, conflicts, `llm classify --second-screen`, the
+TUI's blind mode, report surfaces, the screen sheet.
 
 ### Session Arguments
 
 Every command that takes a saved session (`sessions show/export/decide/
-relabel/reset/set-abstract/resume/reconcile/check`, `llm classify/status/context/
+relabel/reset/set-abstract/screen/resume/reconcile/check`, `llm classify/status/context/
 synthesize/sample`, `enrich`, `verify`) opens it with
 `cli.open_session_argument` → `review.load_session_argument` →
 `resolve_session_argument` (#237, review.nw `sec:session-arguments`):
@@ -1815,6 +1907,25 @@ in the preamble; fragment: in the body before first use, with a `%`
 header saying how to define it first (pdflatex Cyrillic:
 `\usepackage[T2A,T1]{fontenc}` +
 `\newcommand{\scholarnonlatin}[1]{{\fontencoding{T2A}\selectfont #1}}`).
+Separator (#262): where a wrapped run touches a letter or digit of the
+source (CJK written against Latin: `\u5b66\u4e60Mac OS X...`), both
+escapers write `\scholarnonlatinsep{}` between them (`NONLATIN_SEP`,
+`_touches_text`; never next to a space or punctuation, so such output
+is byte-identical). `nonlatin_definition(marker, separator=True)`
+prepends `NONLATIN_SEP_DEFINITION` (empty under XeTeX/LuaTeX, else
+`\ `; deliberately no test of whether `\scholarnonlatin` is defined:
+an earlier fragment or a cited scholar `.bib`'s `@preamble` defines it
+too, and the marker then ran into the Latin words), added by
+`latex_document`/`latex_fragment`/`nonlatin_bib_preamble` only when
+`uses_nonlatin_sep`; the fragment header then tells a host whose
+`\scholarnonlatin` prints the text to add
+`\newcommand{\scholarnonlatinsep}{}` (without it: a space where the
+scripts touch). `uses_nonlatin` detects either macro; `cli._unescape_bib`
+drops the separator before the wrapper; the `--cited-from` reader
+(bibtexparser decoding) already drops it (pinned). pdflatex prints
+"[non-Latin text] Mac OS X [non-Latin text]", also after an earlier
+fragment and after a cited new or old-style `.bib`
+(`TestNonLatinSeparatorCompiles`).
 An audit row whose title keeps no letter outside such runs
 (`only_nonlatin_letters`) also prints `(paper id)` (`doi:…`, else the
 hash id; `audit_title_cell`, `AuditRow.nonlatin_title`), and
@@ -1909,7 +2020,19 @@ fixture has a quoted query, a `[`-row, `ĸ`, `CO₂`, a ligature. About
   shown for unreviewed and human-confirmed LLM or agent rows, not for
   changed ones, and
   such a row without one shows `AUDIT_STRINGS[lang]["no_confidence"]`
-  (`n/a`, `saknas`) because the caption promises a confidence. The
+  (`n/a`, `saknas`) because the caption promises a confidence. Whose
+  confidence (#262): `audit_reason_and_confidence` also returns the
+  origin when the label shows one (`audit_confidence_origin`: agent
+  sources → `agent`, LLM and unknown sources → `llm`; `audit_reason`
+  drops it), kept as `AuditRow.confidence_by`; `audit_confidence_sentence`
+  picks `confidence_llm`/`confidence_agent`/`confidence_both` or none
+  from the *listed* rows (both caption forms, `{confidence}`). Numbers
+  (#262): `audit_number(value, strings, decimals=None)` with
+  `AUDIT_STRINGS[lang]["decimal_mark"]`/`["group_separator"]` (en `.`
+  `,`; sv `,` `\,`), grouping from 1000, for every confidence and every
+  caption count (categories, extras, k of n queries/searches, semantic
+  n); years, DOIs, ids, dates never. Column head `provider` is
+  "Database"/"Databas". The
   escapers decode HTML entities, strip inline markup, repair
   cp1252/Latin-1 mojibake and turn `"` into `\textquotedbl{}` (babel
   shorthand). Titles are printed whole unless `--truncate-titles`
@@ -1973,7 +2096,8 @@ fixture has a quoted query, a `[`-row, `ĸ`, `CO₂`, a ligature. About
   the rest as "other hits" (all localised). Criteria are the review's own labels, so
   there is no fixed list. The caption never
   names the session (it is a `%` comment in the fragment) and ends with
-  a full-name-first "Databases:" sentence built from the providers
+  a full-name-first "Databases searched:" ("Sökta databaser:", #262)
+  sentence built from the providers
   the session searched (search records that answered at least once,
   zero hits included, plus the rows; rows only for old sessions). A
   database known only from records without an outcome and from no row
@@ -1984,7 +2108,12 @@ fixture has a quoted query, a `[`-row, `ĸ`, `CO₂`, a ligature. About
   "failed for k of n queries" / "incomplete for k of n queries"
   (localised), and one that failed every query outright is not
   named. `--bearing-only` lists only orders 0-2 and states the other
-  counts in the caption. `all` stays csv + latex.
+  counts in the caption: without extras "the A adjacent and B false
+  hits" (`unlisted_pair`), with extras each group with its noun and
+  `audit_joined_list` putting "and"/"och" before the last ("the A
+  adjacent hits, the B false hits, 2 unclassified and 1 ..."); the
+  `extra_*` strings have no leading comma (the full caption adds ", ").
+  `all` stays csv + latex.
 - The TUI's `prompt_for_report` keeps the standalone default.
 
 ### Provider Text Cleaning
