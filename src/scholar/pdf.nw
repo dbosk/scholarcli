@@ -62,6 +62,7 @@ claim (see the Quote Extraction section).
 <<pdf cache functions>>
 <<doi resolution functions>>
 <<pdf download functions>>
+<<pdf import functions>>
 <<pdf open functions>>
 <<quote extraction functions>>
 @
@@ -79,6 +80,8 @@ import pytest
 from pathlib import Path
 from unittest.mock import Mock, patch, MagicMock
 
+import json
+
 from scholar.pdf import *
 
 
@@ -93,11 +96,13 @@ from pathlib import Path
 from typing import Any, Callable
 import hashlib
 import html
+import json
 import logging
 import os
 import re
 import subprocess
 import sys
+from dataclasses import dataclass
 
 import requests
 
@@ -105,6 +110,12 @@ from scholar import network
 from scholar.cache import get_cache_dir
 from scholar.ratelimit import get_limiter, limiter_for
 from scholar.unpaywall import resolve_pdf_url
+from scholar.utils import (
+    atomic_write_bytes,
+    atomic_write_text,
+    file_lock,
+    utc_now_iso,
+)
 
 logger = logging.getLogger(__name__)
 @
@@ -117,6 +128,7 @@ PDF_CACHE_SUBDIR = "pdfs"
 
 
 \section{Cache Directory Management}
+\label{sec:pdf-cache-dir}
 
 The PDF cache lives in the user's cache directory under a \enquote{pdfs}
 subdirectory. This keeps PDFs separate from search result caches.
@@ -162,10 +174,14 @@ def get_cached_pdf_path(url: str) -> Path:
     return get_pdf_cache_dir() / f"{url_hash}.pdf"
 
 
-def clear_pdf_cache() -> int:
+def clear_pdf_cache(include_imported: bool = False) -> int:
     """
-    Delete all cached PDFs.
-    
+    Delete cached PDFs, keeping the imported ones by default.
+
+    A PDF imported by hand (`import_pdf`) cannot be fetched again by a
+    later run, so it is deleted only with `include_imported`, together
+    with its record.
+
     Returns:
         Number of PDF files deleted.
     """
@@ -173,12 +189,20 @@ def clear_pdf_cache() -> int:
     logger.info("Clearing PDF cache at %s", cache_dir)
     count = 0
     for pdf_file in cache_dir.glob("*.pdf"):
-        try:
-            pdf_file.unlink()
-            count += 1
-            logger.debug("Deleted cached PDF: %s", pdf_file.name)
-        except OSError as e:
-            logger.warning("Failed to delete %s: %s", pdf_file.name, e)
+        record = import_record_path(pdf_file)
+        with file_lock(pdf_file):
+            if record.exists() and not include_imported:
+                continue
+            try:
+                pdf_file.unlink()
+                record.unlink(missing_ok=True)
+                count += 1
+                logger.debug("Deleted cached PDF: %s", pdf_file.name)
+            except OSError as e:
+                logger.warning("Failed to delete %s: %s", pdf_file.name, e)
+    if include_imported:
+        for record in cache_dir.glob(f"*{IMPORT_RECORD_SUFFIX}"):
+            record.unlink(missing_ok=True)
     logger.info("Deleted %d cached PDF files", count)
     return count
 
@@ -186,20 +210,57 @@ def clear_pdf_cache() -> int:
 def get_pdf_cache_info() -> dict[str, int]:
     """
     Get information about the PDF cache.
-    
+
     Returns:
-        Dictionary with 'count' (number of files) and 'size_bytes' (total size).
+        Dictionary with 'count' (number of files) and 'size_bytes'
+        (total size), and 'imported' and 'imported_bytes' for the
+        part of them that was imported by hand.
     """
     cache_dir = get_pdf_cache_dir()
-    count = 0
-    size_bytes = 0
+    info = {"count": 0, "size_bytes": 0, "imported": 0, "imported_bytes": 0}
     for pdf_file in cache_dir.glob("*.pdf"):
-        count += 1
         try:
-            size_bytes += pdf_file.stat().st_size
+            size = pdf_file.stat().st_size
         except OSError:
-            pass
-    return {"count": count, "size_bytes": size_bytes}
+            size = 0
+        info["count"] += 1
+        info["size_bytes"] += size
+        if import_record_path(pdf_file).exists():
+            info["imported"] += 1
+            info["imported_bytes"] += size
+    return info
+@
+
+A PDF that the user imported by hand (\cref{sec:pdf-import}) is not
+like the others in this directory: a download can be repeated, an
+import cannot, since the copy came from somewhere scholar cannot reach
+(a publisher that answered scholar with a bot-check page, say).
+The cache command keeps the LLM caches for the same reason, paid output
+that a clear cannot bring back (\cref{cache-module}), and the PDF
+cache follows its example: [[clear_pdf_cache]] keeps an imported PDF
+unless [[include_imported]] is given, and [[get_pdf_cache_info]] counts
+the imported ones apart, so that the user sees before a clear what it
+leaves behind.
+An import is marked by a record beside the PDF, [[<hash>.import.json]];
+its name does not end in [[.pdf]], so the globs above never take it
+for a PDF.
+The search caches' [[scholar cache clear]] deletes only the [[*.pkl]]
+files at the top of the cache directory and never enters
+[[pdfs/]], so imports need no protection there (a test in
+\cref{sec:pdf-import} pins that).
+
+Clearing takes the PDF's lock (the one an import holds,
+\cref{sec:pdf-import-write}) around the question and the deletion.
+Without it, a clear could find no record, an import with
+[[--replace]] could then write its record and its file, and the clear
+would delete the imported file it had just decided was a download.
+
+<<pdf constants>>=
+IMPORT_RECORD_SUFFIX = ".import.json"
+<<pdf cache functions>>=
+def import_record_path(pdf_path: Path) -> Path:
+    """The record of a PDF imported by hand: `<hash>.import.json`."""
+    return pdf_path.with_name(pdf_path.stem + IMPORT_RECORD_SUFFIX)
 @
 
 \subsection{Testing cache functions}
@@ -909,6 +970,10 @@ we are not on a network the publisher admits.
 We keep the reasons, since when every candidate fails the user is best
 served by seeing each source's failure, not only the last; the
 [[skip]] parameter lets a caller exclude a URL it has tried already.
+Before any of that, a PDF the user imported for this DOI
+(\cref{sec:pdf-import}) is used as it is: it is the copy the candidates
+failed to deliver, or the user would not have imported it, and finding
+it costs no request.
 
 <<pdf download functions>>=
 def download_doi_pdf(
@@ -923,6 +988,11 @@ def download_doi_pdf(
         PDFDownloadError: If no source names a PDF, or none delivers;
             the message lists every attempt.
     """
+    imported = get_cached_doi_pdf_path(doi)
+    if imported.exists():
+        if progress_callback:
+            progress_callback(f"Using imported PDF: {imported}")
+        return imported
     failures = []
     for source, url in doi_pdf_candidates(doi, progress_callback):
         if url in skip:
@@ -952,6 +1022,13 @@ the CLI/TUI.
 A paper's own [[pdf_url]] is one more candidate, tried first because a
 provider named it for this very record; if it fails and the paper has a
 DOI, the DOI's candidates follow.
+
+A copy already on disk comes before any request, though: the cached
+download of the [[pdf_url]], else a PDF imported for the paper's DOI
+(\cref{sec:pdf-import}).
+Without that, a paper whose [[pdf_url]] answers with a login page would
+make the full-text classification ask the publisher again on every
+run, and fail, before it reached the PDF the user imported by DOI.
 
 <<pdf download functions>>=
 def get_pdf(
@@ -995,6 +1072,7 @@ def get_pdf(
         raise PDFDownloadError(
             f"Paper has no PDF URL or DOI: {paper_title}"
         )
+    <<use a copy on disk before any request>>
     first_failure = None
     if url:
         try:
@@ -1016,6 +1094,22 @@ def get_pdf(
         raise PDFDownloadError(
             f"{e}\nThe paper's own link: {first_failure} ({url})"
         ) from e
+@
+
+The cached download and the imported PDF are looked up by the same
+keys [[download_pdf]] and [[download_doi_pdf]] use, so this only moves
+the two cache hits ahead of the first request.
+
+<<use a copy on disk before any request>>=
+on_disk = [get_cached_pdf_path(url)] if url else []
+if doi:
+    on_disk.append(get_cached_doi_pdf_path(doi))
+for path in on_disk:
+    if path.exists():
+        logger.debug("PDF on disk for %s: %s", paper_title, path.name)
+        if progress_callback:
+            progress_callback(f"Using cached PDF: {path}")
+        return path
 @
 
 \subsection{Testing download functions}
@@ -1074,6 +1168,7 @@ class TestPDFDownload:
         
         paper = Mock()
         paper.pdf_url = "https://example.com/paper.pdf"
+        paper.doi = None  # a bare Mock attribute is no DOI string
         paper.title = "Test Paper"
         
         mock_response = MagicMock()
@@ -1186,6 +1281,571 @@ class TestDOIDownload:
              pytest.raises(PDFDownloadError) as error:
             get_pdf(paper)
         assert "did not return a PDF" in str(error.value)
+@
+
+\section{Importing a PDF the user holds}
+\label{sec:pdf-import}
+
+Some PDFs scholar cannot fetch.
+A publisher may answer the download with a bot-check page, and that is
+where scholar stops (\cref{ch:network}); the user may then get the PDF
+by other means they are entitled to, a browser on the library's network
+for instance.
+Without a way to hand that file over, [[scholar pdf quote]] and the
+full-text classification (which read the PDF through [[get_pdf]]) never
+see it, the next session does not find it either, and the full text
+behind a quoted passage lives outside scholar.
+[[import_pdf]] closes the gap: it checks that the file is a PDF, copies
+it into the cache under the key a later lookup for that URL or DOI
+uses, and writes a record of what file it was.
+
+The rest of this section takes the parts in the order an import meets
+them: which key the copy goes under (\cref{sec:pdf-import-key}), how
+the file is told from a page that is not a PDF
+(\cref{sec:pdf-import-check}), and how it is written, recorded and
+protected against overwriting (\cref{sec:pdf-import-write}).
+How the copies are kept by [[clear_pdf_cache]] and counted by
+[[get_pdf_cache_info]] was shown with those functions
+(\cref{sec:pdf-cache-dir}); the lookups that find an imported PDF by
+DOI without a request are in [[download_doi_pdf]] and [[get_pdf]]
+(\cref{sec:pdf-download-doi}).
+
+\subsection{The key of an imported PDF}
+\label{sec:pdf-import-key}
+
+By URL there is nothing to decide: [[download_pdf]] looks for
+[[get_cached_pdf_path(url)]], so an import by URL goes there, and
+[[scholar pdf open]] or [[pdf quote]] of that URL, and a paper whose
+[[pdf_url]] it is, find it as a cache hit.
+
+A DOI has no such key.
+The download resolves the DOI to candidate URLs first
+(\cref{sec:doi-resolution}) and caches the PDF under whichever URL
+delivered, so the file's key depends on the answers of Unpaywall,
+Semantic Scholar and the publisher at download time.
+Keying an import by one of those URLs would need those requests at
+import time, and the lookup would find it only while the resolvers kept
+answering the same.
+We considered an index file beside the cache, DOI to cached file,
+consulted before resolving; it works, but it is a second structure
+that must agree with the files (an entry can outlive its file, and two
+imports at once must not tear the index).
+Instead an import by DOI goes under the key of the DOI's resolver URL,
+[[https://doi.org/<doi>]], computed from the DOI alone, and the DOI
+lookups consult that key before resolving ([[download_doi_pdf]],
+[[get_pdf]]).
+The lookup is one [[exists]] call, and the import is found whichever URL
+the resolvers would have given.
+No download writes under that key through [[get_pdf]], which sends any
+[[doi.org]] URL down the DOI path, so the key is the import's own slot.
+The DOI is normalised as paper ids normalise it
+([[Paper._normalize_doi]]: lower case, no resolver prefix), so
+[[10.1000/ABC]], [[doi:10.1000/abc]] and
+[[https://doi.org/10.1000/abc]] name one file.
+
+<<pdf cache functions>>=
+def get_cached_doi_pdf_path(doi: str) -> Path:
+    """
+    Get the cache path of a PDF imported for `doi`.
+
+    The key is the DOI's resolver URL (`https://doi.org/` plus the
+    normalised DOI), so the path follows from the DOI alone.
+    """
+    from scholar.scholar import Paper
+
+    return get_cached_pdf_path(DOI_RESOLVER_URL + Paper._normalize_doi(doi))
+@
+
+\subsection{Telling a PDF from a page}
+\label{sec:pdf-import-check}
+
+[[download_pdf]] tells a PDF from an HTML page by the response's
+[[Content-Type]] header; it never looks at the bytes.
+A local file has no such header, and guessing one from the file name
+would accept exactly the case an import must refuse: the bot-check page
+saved as [[paper.pdf]].
+So the import asks the question that matters for what follows: can
+PDFium, the engine [[extract_pdf_pages]] reads the full text with
+(\cref{sec:quote-extraction}), open the file, and does it have a page?
+A file that passes is one [[pdf quote]] and the classification can
+read.
+When PDFium refuses a file that begins like an HTML page, the reason
+says so, since that is the likely mistake: saving the publisher's
+answer instead of the PDF.
+
+<<pdf import functions>>=
+def pdf_file_problem(data: bytes) -> str | None:
+    """
+    Return why `data` is not a readable PDF, or None if it is one.
+
+    Readable means that PDFium (the engine `extract_pdf_pages` uses)
+    opens it and finds at least one page.
+    """
+    import pypdfium2 as pdfium
+
+    try:
+        document = pdfium.PdfDocument(data)
+    except pdfium.PdfiumError as error:
+        reason = f"PDFium cannot read it ({error})"
+        if looks_like_html(data):
+            reason += (
+                "; it begins like an HTML page, such as a login or "
+                "bot-check page"
+            )
+        return reason
+    try:
+        if len(document) == 0:
+            return "it has no pages"
+    finally:
+        document.close()
+    return None
+
+
+def looks_like_html(data: bytes) -> bool:
+    """Whether `data` begins like an HTML document."""
+    head = data[:HTML_SNIFF_BYTES].lstrip(b"\xef\xbb\xbf \t\r\n").lower()
+    return head.startswith((b"<!doctype html", b"<html")) or b"<html" in head
+<<pdf constants>>=
+HTML_SNIFF_BYTES = 1024
+@
+
+\subsection{Copying, recording and refusing to overwrite}
+\label{sec:pdf-import-write}
+
+The file is read once into memory: the check, the hash and the copy
+all need its bytes, and reading it once means that the bytes checked
+are the bytes copied, even if the user's file changes meanwhile.
+The user's file is only read, never moved or changed.
+
+Each import has a record beside the copy, [[<hash>.import.json]]: the
+SHA-256 and size of the content, the time of the import (UTC), the
+file's base name, the [[--from]] text that says where it came from, and
+the URL or DOI it was imported for, as given.
+JSON of built-in types, so any later version can read it.
+Only the base name is stored, not the directory the user typed: a path
+says more about the user than the record needs.
+The record is what marks the copy as imported, for [[clear_pdf_cache]]
+and [[get_pdf_cache_info]] (\cref{sec:pdf-cache-dir}).
+
+An existing copy under the key with other content is not overwritten
+unless the caller says [[replace]]: it may be a download that works,
+or an earlier import whose source is gone.
+The error names the hash that is there, so the user can tell which
+file it was.
+The same content is not copied again; if that copy has no record yet
+(a download of the same file), the record is added, since the user has
+now said that this copy matters.
+
+Two processes importing for the same key at once would each find no
+copy, each write, and leave whichever finished last.
+Each file is written with [[atomic_write_bytes]] (a temporary file
+renamed into place, \cref{sec:atomic-write}), so no reader ever sees
+half a PDF, and the whole compare-and-write runs under [[file_lock]] on
+the copy's path (\cref{sec:file-lock}), so the second import sees the
+first one's copy and is refused or recognised as the same.
+The record is written before the PDF.
+If the process dies between the two, what is left is a record without
+a PDF, which marks nothing; the other order could leave an imported PDF
+without its record, which the next [[clear_pdf_cache]] would delete as
+a download.
+
+<<pdf import functions>>=
+class PDFImportError(Exception):
+    """A file that `import_pdf` refuses; the message says why."""
+
+
+@dataclass
+class PDFImport:
+    """
+    The outcome of `import_pdf`.
+
+    `status` is "imported", "replaced", "recorded" (same content was
+    cached, without a record) or "unchanged" (same content, already
+    imported).
+    """
+
+    path: Path
+    record: dict
+    status: str
+
+
+def import_pdf(
+    file: str | os.PathLike,
+    *,
+    url: str | None = None,
+    doi: str | None = None,
+    source: str | None = None,
+    replace: bool = False,
+) -> PDFImport:
+    """
+    Copy a local PDF into the cache under the key of `url` or `doi`.
+
+    The file is checked to be a PDF, copied (never moved) and recorded
+    with its SHA-256, size, import time, base name, `source` and the
+    URL or DOI given. A different PDF already cached under the key is
+    replaced only with `replace`.
+
+    Raises:
+        ValueError: Unless exactly one of `url` and `doi` is given.
+        PDFImportError: If the file cannot be read, is not a PDF, the
+            DOI is not one, or another PDF is cached under the key.
+    """
+    <<choose the key of an import>>
+    <<read and check the file to import>>
+    record = {
+        "sha256": digest,
+        "size": len(data),
+        "imported_at": utc_now_iso(),
+        "file_name": Path(file).name,
+        "from": source,
+        "url": url,
+        "doi": doi,
+    }
+    record_path = import_record_path(cache_path)
+    with file_lock(cache_path):
+        <<compare with the copy already cached>>
+        atomic_write_text(record_path, json.dumps(record, indent=2) + "\n")
+        atomic_write_bytes(cache_path, data)
+    logger.info("Imported %s as %s", record["file_name"], cache_path.name)
+    return PDFImport(cache_path, record, status)
+@
+
+A URL that is a DOI's resolver URL is taken as that DOI, because that
+is how [[get_pdf]] reads it: [[pdf quote https://doi.org/...]] looks up
+the DOI, so an import under that URL's own key would never be found.
+The record keeps the URL as given beside the DOI it named.
+A DOI that does not have the form of one is refused rather than
+imported under a key nothing will look up.
+
+<<choose the key of an import>>=
+if (url is None) == (doi is None):
+    raise ValueError("give exactly one of url and doi")
+if url is not None and extract_doi(url):
+    doi = extract_doi(url)
+if doi is not None:
+    from scholar.scholar import Paper
+
+    if not DOI_PATTERN.match(Paper._normalize_doi(doi)):
+        raise PDFImportError(f"not a DOI: {doi}")
+    cache_path = get_cached_doi_pdf_path(doi)
+else:
+    cache_path = get_cached_pdf_path(url)
+<<read and check the file to import>>=
+try:
+    data = Path(file).read_bytes()
+except OSError as error:
+    raise PDFImportError(f"cannot read {file}: {error.strerror}") from error
+problem = pdf_file_problem(data)
+if problem:
+    raise PDFImportError(f"{Path(file).name} is not a PDF: {problem}")
+digest = hashlib.sha256(data).hexdigest()
+@
+
+The comparison reads the cached copy's bytes under the lock, so it
+judges the copy the write would replace.
+
+<<compare with the copy already cached>>=
+status = "imported"
+if cache_path.exists():
+    cached = hashlib.sha256(cache_path.read_bytes()).hexdigest()
+    if cached == digest:
+        if record_path.exists():
+            return PDFImport(
+                cache_path, read_import_record(cache_path), "unchanged"
+            )
+        atomic_write_text(record_path, json.dumps(record, indent=2) + "\n")
+        return PDFImport(cache_path, record, "recorded")
+    if not replace:
+        raise PDFImportError(
+            f"another PDF is cached for this key (sha256 {cached}); "
+            "pass --replace to overwrite it"
+        )
+    status = "replaced"
+@
+
+Reading a record back serves the listing of [[scholar pdf info]] as
+well as the import.
+A record that does not parse still marks its PDF as imported (the file
+exists), so it reads as an empty record with a warning rather than as
+an error that would hide the other imports.
+
+<<pdf import functions>>=
+def read_import_record(pdf_path: Path) -> dict:
+    """The import record of `pdf_path`, or {} if it cannot be read."""
+    try:
+        return json.loads(import_record_path(pdf_path).read_text())
+    except (OSError, ValueError) as error:
+        logger.warning(
+            "Cannot read the import record of %s: %s", pdf_path.name, error
+        )
+        return {}
+
+
+def list_imported_pdfs() -> list[tuple[Path, dict]]:
+    """The imported PDFs in the cache with their records, oldest first."""
+    imported = [
+        (pdf_file, read_import_record(pdf_file))
+        for pdf_file in get_pdf_cache_dir().glob("*.pdf")
+        if import_record_path(pdf_file).exists()
+    ]
+    imported.sort(
+        key=lambda item: (item[1].get("imported_at") or "", item[0].name)
+    )
+    return imported
+@
+
+\subsection{Testing the import}
+
+The tests need real PDFs, since the check opens the file with PDFium:
+[[b"%PDF-1.4"]], which the other tests write as a stand-in, is refused
+by PDFium as it should be.
+PDFium itself writes one: a new document with one blank page, saved to
+bytes, gives a small file that PDFium reads back.
+Two page widths give two PDFs with different content.
+The cache directory is moved to [[tmp_path]] in every test, and the
+DOI tests run under the conftest's network block, which fails a test
+that makes a request: so a DOI lookup that reached the resolvers would
+fail the test even where its answer would not matter.
+
+<<test functions>>=
+def make_pdf(path, width=200):
+  """Write a real one-page PDF, made by PDFium, to `path`."""
+  import io
+  import pypdfium2 as pdfium
+
+  document = pdfium.PdfDocument.new()
+  document.new_page(width, 200)
+  buffer = io.BytesIO()
+  document.save(buffer)
+  document.close()
+  path.write_bytes(buffer.getvalue())
+  return path
+
+
+class TestImportPDF:
+  """Tests for importing a local PDF into the cache."""
+
+  <<import pdf test methods>>
+@
+
+First the two keys.
+By URL, the copy lands where [[download_pdf]] looks, and a download of
+that URL then returns it without a request; by DOI it lands under the
+resolver URL, whatever the spelling of the DOI.
+
+<<import pdf test methods>>=
+def test_by_url_is_the_download_key(self, tmp_path, monkeypatch):
+  monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path / "cache"))
+  pdf = make_pdf(tmp_path / "paper.pdf")
+  outcome = import_pdf(pdf, url="https://pub.example/a.pdf")
+  assert outcome.status == "imported"
+  assert outcome.path == get_cached_pdf_path("https://pub.example/a.pdf")
+  assert outcome.path.read_bytes() == pdf.read_bytes()
+  assert pdf.exists()
+  with patch("scholar.pdf.requests.get") as get:
+    assert download_pdf("https://pub.example/a.pdf") == outcome.path
+  get.assert_not_called()
+
+def test_by_doi_in_any_spelling(self, tmp_path, monkeypatch):
+  monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path / "cache"))
+  pdf = make_pdf(tmp_path / "paper.pdf")
+  outcome = import_pdf(pdf, doi="doi:10.9999/Example.42")
+  for spelling in ("10.9999/example.42", "https://doi.org/10.9999/EXAMPLE.42"):
+    assert get_cached_doi_pdf_path(spelling) == outcome.path
+  assert outcome.path == get_cached_pdf_path(
+    "https://doi.org/10.9999/example.42"
+  )
+
+def test_a_resolver_url_is_a_doi(self, tmp_path, monkeypatch):
+  monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path / "cache"))
+  pdf = make_pdf(tmp_path / "paper.pdf")
+  outcome = import_pdf(pdf, url="https://doi.org/10.9999/Example.42")
+  assert outcome.path == get_cached_doi_pdf_path("10.9999/example.42")
+  assert outcome.record["url"] == "https://doi.org/10.9999/Example.42"
+  assert outcome.record["doi"] == "10.9999/Example.42"
+@
+
+Then the lookups without a request: a DOI string through [[get_pdf]]
+(what [[pdf quote]] passes for a DOI or its resolver URL), and a paper
+with that DOI whose own [[pdf_url]] is not cached (what the full-text
+classification passes).
+The network block would fail the test if either reached a resolver or
+the [[pdf_url]].
+
+<<import pdf test methods>>=
+def test_doi_lookup_needs_no_request(self, tmp_path, monkeypatch):
+  monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path / "cache"))
+  outcome = import_pdf(make_pdf(tmp_path / "p.pdf"), doi="10.9999/ex.1")
+  assert get_pdf("10.9999/ex.1") == outcome.path
+  assert get_pdf("https://doi.org/10.9999/EX.1") == outcome.path
+
+def test_paper_with_the_doi_needs_no_request(self, tmp_path, monkeypatch):
+  from scholar.scholar import Paper
+
+  monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path / "cache"))
+  outcome = import_pdf(make_pdf(tmp_path / "p.pdf"), doi="10.9999/ex.1")
+  paper = Paper(
+    title="An Invented Study", authors=["Ada Example"], year=2020,
+    doi="10.9999/ex.1", pdf_url="https://login.pub.example/ex.1.pdf",
+  )
+  assert get_pdf(paper) == outcome.path
+@
+
+The refusals.
+An HTML page saved as [[.pdf]] is refused with the reason, and nothing
+is written to the cache.
+A different PDF under the same key is refused naming the hash that is
+there, unless [[replace]]; the same content is a no-op.
+
+<<import pdf test methods>>=
+def test_an_html_page_is_refused(self, tmp_path, monkeypatch):
+  monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path / "cache"))
+  page = tmp_path / "paper.pdf"
+  page.write_text("<!DOCTYPE html><html><title>Just a moment</title></html>")
+  with pytest.raises(PDFImportError) as error:
+    import_pdf(page, url="https://pub.example/a.pdf")
+  assert "is not a PDF" in str(error.value)
+  assert "HTML page" in str(error.value)
+  assert list(get_pdf_cache_dir().iterdir()) == []
+
+def test_another_pdf_is_kept_unless_replace(self, tmp_path, monkeypatch):
+  import hashlib
+
+  monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path / "cache"))
+  first = make_pdf(tmp_path / "first.pdf", width=200)
+  second = make_pdf(tmp_path / "second.pdf", width=300)
+  url = "https://pub.example/a.pdf"
+  path = import_pdf(first, url=url).path
+  with pytest.raises(PDFImportError) as error:
+    import_pdf(second, url=url)
+  assert hashlib.sha256(first.read_bytes()).hexdigest() in str(error.value)
+  assert path.read_bytes() == first.read_bytes()
+  assert import_pdf(first, url=url).status == "unchanged"
+  outcome = import_pdf(second, url=url, replace=True, source="library")
+  assert outcome.status == "replaced"
+  assert path.read_bytes() == second.read_bytes()
+  assert read_import_record(path)["from"] == "library"
+
+def test_a_download_of_the_same_file_gets_a_record(
+  self, tmp_path, monkeypatch
+):
+  monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path / "cache"))
+  pdf = make_pdf(tmp_path / "paper.pdf")
+  url = "https://pub.example/a.pdf"
+  get_cached_pdf_path(url).write_bytes(pdf.read_bytes())
+  assert import_pdf(pdf, url=url).status == "recorded"
+  assert import_record_path(get_cached_pdf_path(url)).exists()
+@
+
+The record holds what the import promised, and only the base name of
+the file: the test puts the file in a directory whose name must not
+appear anywhere in the record.
+
+<<import pdf test methods>>=
+def test_the_record(self, tmp_path, monkeypatch):
+  import hashlib
+  from datetime import datetime
+
+  monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path / "cache"))
+  folder = tmp_path / "private-folder"
+  folder.mkdir()
+  pdf = make_pdf(folder / "paper.pdf")
+  outcome = import_pdf(pdf, doi="10.9999/ex.1", source="interlibrary loan")
+  text = import_record_path(outcome.path).read_text()
+  record = json.loads(text)
+  assert record == outcome.record
+  assert record["sha256"] == hashlib.sha256(pdf.read_bytes()).hexdigest()
+  assert record["size"] == pdf.stat().st_size
+  assert record["file_name"] == "paper.pdf"
+  assert record["from"] == "interlibrary loan"
+  assert record["doi"] == "10.9999/ex.1" and record["url"] is None
+  imported_at = datetime.fromisoformat(record["imported_at"])
+  assert imported_at.utcoffset().total_seconds() == 0
+  assert "private-folder" not in text
+@
+
+An imported PDF survives [[clear_pdf_cache]] and the search caches'
+[[clear_cache]], is counted apart by [[get_pdf_cache_info]], and goes,
+with its record, only with [[include_imported]].
+
+<<import pdf test methods>>=
+def test_clear_keeps_imports(self, tmp_path, monkeypatch):
+  from scholar.cache import clear_cache
+
+  monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path / "cache"))
+  imported = import_pdf(make_pdf(tmp_path / "p.pdf"), doi="10.9999/ex.1")
+  downloaded = get_cached_pdf_path("https://pub.example/b.pdf")
+  downloaded.write_bytes(b"x" * 10)
+  info = get_pdf_cache_info()
+  assert (info["count"], info["imported"]) == (2, 1)
+  assert info["imported_bytes"] == imported.path.stat().st_size
+  assert [path for path, _ in list_imported_pdfs()] == [imported.path]
+
+  clear_cache(include_llm=True)
+  assert clear_pdf_cache() == 1
+  assert imported.path.exists() and not downloaded.exists()
+  assert clear_pdf_cache(include_imported=True) == 1
+  assert list(get_pdf_cache_dir().glob("*.pdf")) == []
+  assert list(get_pdf_cache_dir().glob("*.json")) == []
+@
+
+Two imports of different files for one key at once must leave one of
+the two files whole with its own record, never a mixture, and one of
+them must be refused.
+Threads in one process meet the same [[file_lock]] that separates
+processes (\cref{sec:file-lock}); a barrier starts both imports
+together.
+Left to chance, the two threads rarely overlap in the few instructions
+between looking for a copy and writing one, so the test widens that
+window: the record write, the first write after the look, waits up to a
+second for the other thread to arrive there too.
+Under the lock the other thread cannot arrive (it waits for the lock),
+the wait times out and the second import finds the first one's copy;
+without the lock both arrive, both write, and the test fails every
+time rather than now and then.
+
+
+<<import pdf test methods>>=
+def test_two_imports_at_once(self, tmp_path, monkeypatch):
+  import hashlib
+  import threading
+  import scholar.pdf
+
+  monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path / "cache"))
+  files = [make_pdf(tmp_path / f"{w}.pdf", width=w) for w in (200, 300)]
+  barrier = threading.Barrier(2)
+  meeting = threading.Barrier(2)
+  real_write = scholar.pdf.atomic_write_text
+  outcomes = []
+
+  def write_after_meeting(*args, **kwargs):
+    try:
+      meeting.wait(timeout=1)
+    except threading.BrokenBarrierError:
+      pass
+    return real_write(*args, **kwargs)
+
+  monkeypatch.setattr("scholar.pdf.atomic_write_text", write_after_meeting)
+
+  def run(pdf):
+    barrier.wait()
+    try:
+      outcomes.append(import_pdf(pdf, url="https://pub.example/a.pdf"))
+    except PDFImportError as error:
+      outcomes.append(error)
+
+  threads = [threading.Thread(target=run, args=(f,)) for f in files]
+  for thread in threads:
+    thread.start()
+  for thread in threads:
+    thread.join()
+  assert sorted(type(o).__name__ for o in outcomes) == [
+    "PDFImport", "PDFImportError"
+  ]
+  path = get_cached_pdf_path("https://pub.example/a.pdf")
+  digest = hashlib.sha256(path.read_bytes()).hexdigest()
+  assert digest in {hashlib.sha256(f.read_bytes()).hexdigest() for f in files}
+  assert read_import_record(path)["sha256"] == digest
 @
 
 \section{Opening PDFs}
