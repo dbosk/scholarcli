@@ -156,6 +156,7 @@ class CrossrefClient:
         register_cache(self.name, self._cache)
         self._limiter = limiter_for(self)
         self._session = self._create_session()
+        self.last_lookup_error: str | None = None
 
     @property
     def mailto(self) -> str | None:
@@ -223,6 +224,22 @@ uncached so a later run can try again.  While the limiter refuses (a
 remembered cooldown), the lookup is likewise undetermined; the limiter
 has already said so once, so we stay quiet rather than warn per DOI.
 
+[[None]] thus stands both for an answer (no DOI to ask about, or
+Crossref has no record of it) and for a check that failed.
+A paper whose check failed keeps its currency fields as they were
+([[annotate_papers]] below), so it stays \enquote{never checked},
+which is right; but a run that failed for every paper (a broken TLS
+set-up, say) used to end with \enquote{No retractions or corrections
+found} as if it had checked them all.
+So the client keeps the reason the last lookup failed in
+[[last_lookup_error]], as the providers' DOI lookups and Unpaywall do
+(\cref{sec:lookup-outcome}): reset first thing, set on exactly the
+uncached failure paths, in the words of
+[[network.request_failure_reason]] (\cref{sec:request-failure-reason}),
+which never quote a [[requests]] exception and hence never the URL
+with its [[mailto]] address.
+The commands count these reasons (\cref{sec:crossref-check-failures}).
+
 The cache key carries an explicit schema version.  When the [[preprints]]
 key was added to the result dictionary, entries cached under the old
 key shape lacked it, and a reader could not tell \enquote{no preprint
@@ -242,8 +259,9 @@ def fetch_currency(self, doi: str | None) -> dict | None:
     On an HTTP 200 response, returns a dict with ``updated_by``,
     ``newer_versions``, and ``preprints`` lists (each possibly empty).
     Returns ``None`` when the DOI is missing, not found, rate-limited,
-    or the request fails.
+    or the request fails. The last two set `last_lookup_error`.
     """
+    self.last_lookup_error = None
     if not doi:
         return None
 
@@ -270,6 +288,7 @@ def fetch_currency(self, doi: str | None) -> dict | None:
             return None
         if response.status_code == 429:
             logger.warning("crossref: rate limited for DOI %s", doi)
+            self.last_lookup_error = network.http_status_reason(429)
             return None
 
         response.raise_for_status()
@@ -282,13 +301,16 @@ def fetch_currency(self, doi: str | None) -> dict | None:
         self._cache[cache_key] = result
         return result
 
-    except RateLimited:
+    except RateLimited as e:
+        self.last_lookup_error = e.reason
         return None
     except requests.exceptions.HTTPError as e:
         logger.warning("crossref: lookup error for %s: %s", doi, e)
+        self.last_lookup_error = network.request_failure_reason(e)
         return None
     except Exception as e:
         logger.warning("crossref: lookup failed for %s: %s", doi, e)
+        self.last_lookup_error = network.request_failure_reason(e)
         return None
 @
 
@@ -706,6 +728,11 @@ _client = CrossrefClient()
 def fetch_currency(doi: str | None) -> dict | None:
     """Look up currency metadata for a single DOI (see CrossrefClient)."""
     return _client.fetch_currency(doi)
+
+
+def last_lookup_error() -> str | None:
+    """Why the shared client's last lookup failed; None if it did not."""
+    return _client.last_lookup_error
 @
 
 \subsection{Listing a work's preprint DOIs}
@@ -821,6 +848,130 @@ class TestAnnotatePapers:
         assert out[0].updated_by == []  # checked, clean
         assert out[1].updated_by is None  # never checked
 @
+
+\subsection{Counting the checks that failed}
+\label{sec:crossref-check-failures}
+
+[[annotate_papers]] returns papers, and its callers' stand-ins in the
+tests return papers too, so the failures are not added to its return
+value.
+They are read where the batch already reports after each paper: its
+progress callback runs right after that paper's lookup, while the
+client's [[last_lookup_error]] still describes it.
+[[noting_failures]] wraps a caller's callback (or none) into one that
+first counts the reason, if the check failed, in a [[Counter]] the
+caller holds.
+[[check_failure_lines]] then says how many papers' checks failed, per
+reason, and that their currency is still unknown, with the hint to run
+again that the other lookups' tallies give
+(\cref{sec:enrich-lookup-tally}); it says nothing when none failed.
+[[scholar enrich]] and [[scholar verify]] both print it.
+
+<<module-level currency interface>>=
+def noting_failures(failures: Counter, progress_callback=None):
+    """Return a progress callback for `annotate_papers` that counts
+    failed checks.
+
+    After each paper, adds the reason its check failed, if it did, to
+    `failures`, then calls `progress_callback(done, total)` if given.
+    """
+
+    def callback(done: int, total: int) -> None:
+        reason = _client.last_lookup_error
+        if reason:
+            failures[reason] += 1
+        if progress_callback:
+            progress_callback(done, total)
+
+    return callback
+
+
+def check_failure_lines(failures: Counter, scope: str) -> list[str]:
+    """Describe the failed checks per reason; no lines if none failed."""
+    total = sum(failures.values())
+    if not total:
+        return []
+    lines = [
+        f"Crossref check failed for {total} {scope}; their retraction "
+        "status stays unknown:"
+    ]
+    lines.extend(
+        f"  crossref: {reason} ({count})"
+        for reason, count in sorted(
+            failures.items(), key=lambda item: (-item[1], item[0])
+        )
+    )
+    lines.append(f"  {network.RUN_AGAIN_HINT}")
+    return lines
+<<imports>>=
+from collections import Counter
+@
+
+Let's verify the whole path on an environment that cannot make any
+HTTPS request, the failure reported from a real run: [[requests]] reads
+the CA bundle from [[REQUESTS_CA_BUNDLE]], and a path that does not
+exist makes [[HTTPAdapter.cert_verify]] raise its [[OSError]] before
+any connection is opened, so the test needs neither a mock nor the
+network.
+The check must fail with that reason, counted per paper, and the paper
+must stay \enquote{never checked} ([[updated_by]] [[None]]), not become
+\enquote{checked, clean}; a DOI-less paper is asked nothing and is not
+counted.
+
+<<test functions>>=
+class TestCheckFailures:
+    """A failed check is counted, and the paper stays unchecked (#259)."""
+
+    BUNDLE = "/nonexistent/scholar-test/ca.pem"
+
+    def test_broken_tls_setup(self, monkeypatch):
+        monkeypatch.setenv("REQUESTS_CA_BUNDLE", self.BUNDLE)
+        papers = [
+            Paper(title="A", authors=["x"], doi="10.1/tls-a"),
+            Paper(title="B", authors=["x"], doi="10.1/tls-b"),
+            Paper(title="C", authors=["x"]),
+        ]
+        failures = Counter()
+        done = []
+        out = annotate_papers(
+            papers,
+            progress_callback=noting_failures(
+                failures, lambda d, t: done.append(d)
+            ),
+        )
+        assert [p.updated_by for p in out] == [None, None, None]
+        assert done == [1, 2, 3]
+        [(reason, count)] = failures.items()
+        assert count == 2
+        assert reason.startswith(
+            "Could not find a suitable TLS CA certificate bundle"
+        )
+        assert self.BUNDLE in reason
+
+    def test_lines(self):
+        failures = Counter({"HTTP 503": 1, "rate limited (HTTP 429)": 3})
+        assert check_failure_lines(failures, "papers") == [
+            "Crossref check failed for 4 papers; their retraction status "
+            "stays unknown:",
+            "  crossref: rate limited (HTTP 429) (3)",
+            "  crossref: HTTP 503 (1)",
+            "  Run again to retry the failed lookups.",
+        ]
+        assert check_failure_lines(Counter(), "papers") == []
+
+    def test_answer_after_failure_leaves_none(self):
+        with patch.object(
+            _client._session, "get", side_effect=OSError("no bundle")
+        ):
+            assert fetch_currency("10.1/fails") is None
+        assert last_lookup_error() == "no bundle"
+        with patch.object(
+            _client._session, "get", return_value=_mock_response(404)
+        ):
+            assert fetch_currency("10.1/unknown") is None
+        assert last_lookup_error() is None
+@
+
 
 \subsection{Reducing a paper to a status}
 
