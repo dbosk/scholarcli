@@ -1003,8 +1003,9 @@ and error line numbers match an editor) is the selection (exit 2 with `--doi`/`-
 `--reason`); its confidence overrides `-c` per line, and with
 `--keep-trace` and no `-c` every line needs one. Usage errors (exit 2,
 before loading): `--reason`/`--reasons-file`/`--by` with `--source
-llm` (the classifier's reason is `llm classify`'s) or `human` (out of
-scope), `--by` alone, any bad file line (all named:
+llm` (the classifier's reason is `llm classify`'s), `--reason`/
+`--reasons-file` with `human` (out of scope; `--by` alone is accepted
+for a human since #257, below), `--by` alone for an agent, any bad file line (all named:
 `cli.parse_reasons_file`), empty or > `review.MAX_AGENT_REASON_CHARS`
 (2000, stripped, never truncated) reason. After loading: an unknown id
 exits 1 (like `--doi`), one paper given two different reasons or
@@ -1012,7 +1013,8 @@ confidences exits 2, both unsaved. `--source agent` without a reason
 warns on stderr and records the decision. Shown in `sessions show`
 (a `reason (by): …` line, cut at `SHOW_REASON_CHARS` = 160; JSON:
 the three fields, `null` when unset), the per-decision CSV (three
-columns before `reset_from`; `paper_id` stays last) and the report (one English sentence after
+columns after `source_relabelled`, before the human record's;
+`paper_id` stays last) and the report (one English sentence after
 the summary, `agent_reasons_sentence`: agent and agent_reviewed
 decisions with/without a reason). An older Scholar loads such files
 and drops the fields on its next save (checked with the installed
@@ -1138,12 +1140,65 @@ apply); else `keep_copy_before_run(session, "pre-reset")`, one
 is hidden on a still-pending reset paper and when the last relabel is
 older than the last reset, `relabel_after_reset`; JSON `resets`) and
 the CSV column `reset_from` (`status by source time [by NAME]; ...`,
-after the agent-trace columns, before `paper_id`). Effects: audit table and
+after the agent-trace and human-record columns, before
+`abstract_from`). Effects: audit table and
 report show pending; a sampled decision reset at or after the draw
 is gone from the sample (see Samples: `reset_since_draw`);
 `first_made_by_llm` is False for any pending
 paper; after a full reset the classifier vocabulary (tags of decided
 papers) is empty, so pass `llm classify --tag`.
+**Human review record (#257, review.nw `sec:human-review-record`).**
+`human` is the dataclass default and needed no evidence, so scripts
+writing through the API gave >1000 decisions a human source nobody
+gave. `ReviewDecision` now has `human_decided_at` (UTC ISO),
+`human_decided_via` (`tui` | `decide`, `HUMAN_DECISION_CHANNELS`) and
+`human_by` (as given, never guessed), named once in
+`review.HUMAN_AUDIT_FIELDS` (`human_record_of`; load, save only when
+set via `human_record_data`, `decision_state`, concurrent merge,
+`is_unscreened`; the append keeps the decision whole). NOT in
+`MACHINE_AUDIT_FIELDS` (so not cleared by `clear_machine_audit`, not
+in a reset's `trace`). Set only by `review.record_human_decision(d,
+via, by=None, at=None)` (raises unless decided with a source in
+`REVIEWED_BY_A_HUMAN` = human/llm_reviewed/agent_reviewed; `at`
+defaults to `_utcnow`), called by the TUI's keep/themes/discard/confirm
+in both screens (after `mark_as_reviewed`) and by `sessions decide`
+with a human source (`--source human` or the terminal default; one
+`utc_now_iso()` per run; `--by NAME` now accepted with human). The
+API (`ReviewDecision(source=HUMAN)`, `mark_as_reviewed` alone) sets
+nothing. A machine `decide` (with `--force` over a human/reviewed
+decision) calls `clear_human_record`; `relabel_source` clears it and
+keeps the set fields as `"human"` in its relabel record (key absent
+without a record); a reset only takes unreviewed decisions, which have
+none; a later human decision overwrites it (time included). Counted by
+`human_record_counts(decisions)` (decided papers with
+`human_decided_at` per `REVIEWED_BY_A_HUMAN` source) and
+`decision_source_rows(decisions, always_note=False)` → `(label, count,
+note)`, note "(k with a record of the review)" on those sources' rows
+with a count, when `always_note` or any such decision lacks a record
+(`source_row_text(count, note)`). `sessions show` "Decided by:" always
+notes (`human: 1200 (0 with a record of the review)`), JSON adds the
+three fields per decision (`null` when unset) and `review_records`
+(counts by stored value); the report's "Decided:" rows, its abstract
+sentence (`decision_sources_sentence`) and `llm synthesize`'s summary
+note only when a record is missing, so a fully recorded session reads
+as before; with the note they also give `REVIEW_RECORD_EXPLANATION`
+once (`review_record_sentence`: after the report's summary, in its
+abstract, after both synthesis summaries; no version or date in it).
+The CSV adds `human_decided_at, human_decided_via,
+human_by` after `agent_decided_at`. The audit table and its caption
+are deliberately unchanged: they neither count nor mention the
+records (tested byte-identical). Copies are compared by
+`decision_verdict` (= `decision_state` without `HUMAN_AUDIT_FIELDS`;
+LLM/agent fields stay in) in `_fold_direction`, `same_id_pairs` and
+`_decided_pairs` (alike/conflicting), so two copies a human decided
+alike at two moments still fold, are no alike pair and need no
+`--all-copies`; a fold keeps the newer record (`newer_human_record`:
+by `human_decided_at`, a record beats none; the fold also carries both copies' `abstract_set` records). `decision_state` (merge,
+baseline, `pair_with_file`, `apply_tombstones`) keeps the record: those
+compare one decision with itself across file versions. Wording: "without a record of the
+review", never "not human" (old decisions have none). The default
+source stays `human` (an undecided paper's). Checked 2026-11-20: the
+pipx build of 4ba7a23 loads such a file and drops the fields on save.
 **`scholar sessions set-abstract S (--paper-id ID | --doi D) --file F
 --from TEXT [--by NAME] [--replace] [--dry-run]`**, or `--abstracts-file
 F` (lines `ID<TAB>FROM<TAB>ABSTRACT`, split at the first two tabs, so
