@@ -487,6 +487,37 @@ show "failed". The keyed REST providers (S2/WoS/IEEE) set the generic
 OpenAlex (+ source-pinned), HAL and arXiv set specific reasons. A new
 provider should do the same.
 
+DOI lookups (#259, providers.nw `sec:lookup-outcome`): every
+`get_paper_by_doi` (S2, OpenAlex + subclasses, IEEE, WoS, arXiv,
+Scopus; DBLP and HAL have none) resets `last_lookup_error = None`
+first thing (its own attribute, so a lookup never overwrites a
+search's `last_error`) and sets a reason on every uncached failure
+path; an answer (record, 404/empty result, cache hit, arXiv's instant
+"not an arXiv DOI") leaves None. Reasons are worded once in
+network.nw (`sec:request-failure-reason`): `http_status_reason` ("rate
+limited (HTTP 429)", "HTTP 503") and `request_failure_reason`
+(`RetryError` -> `RETRIES_SPENT`, connection/timeout -> "connection
+failed (SSLError)", other `requests` exceptions -> class name only,
+since their text quotes the URL with DOI, key or address; anything
+else, e.g. the `OSError` "Could not find a suitable TLS CA certificate
+bundle, ..." -> its text, redacted, one line, <= 120 chars);
+`providers.lookup_failure_reason` adds the limiter's reason for
+`RateLimited`. WoS: each tier keeps the caught exception's reason in
+`_tier_failure` (reset at the tier's start); the lookup records it,
+`SEARCH_CUT_SHORT` only as fallback (searches still record
+`SEARCH_CUT_SHORT`). arXiv's `UnexpectedEmptyPageError` ->
+`ARXIV_EMPTY_PAGE` (its text quotes the URL). A third outcome,
+*declined*, goes to `last_lookup_declined` (reset first thing too;
+`last_lookup_error` stays None): keyless IEEE/Scopus/WoS (reason names
+the variable) and Scopus without COMPLETE, under `SCOPUS_VIEW=standard`
+or after the 401 view refusal (`_lookup_declined_reason`). Declining is
+not failing: off campus Scopus would otherwise make every paper
+"failed" and every run say "run again". `UnpaywallClient` and
+`CrossrefClient` keep `last_lookup_error` the same way (module
+`last_lookup_error()`); their warning lines log the exception through
+`network.redact_secrets`. Enrichment reads both attributes Mock-safely
+(`enrich.lookup_error`/`lookup_declined`, only a non-empty str counts).
+
 OpenAlex (#150, #151): a limiter refusal sets `last_error` to its
 reason; a refusal or failed request after some pages keeps those pages
 (`PagesCutShort` from the paging loop → `N, incomplete (reason)`,
@@ -512,7 +543,7 @@ lookups (`get_paper_by_doi`, `get_preprint_locations`,
 
 Keys in messages (#159): `network.redact_secrets(text)` hides the
 values of `api_key`/`apikey`/`api-key`/`key` URL parameters and
-`mailto` (personal data, #160), in any case. `check_provider` applies it to every health message; the
+`mailto`/`email` (personal data, #160, #259), in any case. `check_provider` applies it to every health message; the
 OpenAlex and IEEE (`apikey` in the URL) error logs use it. The OpenAlex
 `/works` probe sends the key as `Authorization: Bearer` (documented,
 as pyalex does); `/rate-limit` keeps the `api_key` parameter (the only
@@ -703,6 +734,27 @@ against `enrich.ENRICHMENT_FIELD_NAMES` (unknown name: exit 2);
 leaving out `pdf_url` also skips Unpaywall and the preprint fallback
 (`--fields abstract` is the cheap run). The Crossref check always runs.
 
+Lookup tally (#259, enrich.nw `sec:enrich-lookup-outcomes`, cli.nw
+`sec:enrich-lookup-tally`): `enrich_paper(..., outcome=LookupOutcome())`
+/ `enrich_papers(..., outcomes=[])` (optional; TUI and `search
+--enrich` pass none, return types unchanged) record per paper the
+providers asked, the failed ones with reasons, the declined ones
+(`LookupOutcome.declined`, not in `asked`) and the Unpaywall failure.
+`scholar enrich` collects them per chunk and, when `abstract`
+is in `--fields`, ends (also on the exit-130 interrupt path, over the
+saved papers) with `abstract_tally_lines`: "Still without an abstract:
+N of M papers." then answered by every database asked (every provider
+that was asked answered; declined ones do not count) / without a DOI /
+"with a DOI that no database was asked about: each one declined or was
+unavailable" / one info line per declined `provider not asked: reason
+(N papers)`, no hint / failed lookups per `provider: reason (count)`
+plus "Run again to retry the failed lookups." only when something
+failed. After the `Open access:` line, `open_access_tally_lines` splits
+unknown statuses into without a DOI / not in Unpaywall / failed (per
+reason). Existing lines unchanged. Nothing is stored in the session
+(the outcome is the run's). Stand-ins for `enrich_papers` must accept
+`outcomes=` (or `**kwargs`).
+
 **Batched OpenAlex DOI lookups.** `OpenAlexProvider.prefetch_dois(dois)`
 (`sec:openalex-doi-batch`) fills the `("doi", CACHE_VERSION, doi)` cache
 that `get_paper_by_doi` reads, 50 DOIs per request via
@@ -733,6 +785,17 @@ superseded, using Crossref's `updated-by` (Retraction-Watch-backed) and
 - `scholar verify "<session>"` reports per-paper status (with `--json`);
   `scholar enrich "<session>"` warns on issues as a side effect. Both
   persist the findings back to the session.
+- A failed check (any `fetch_currency` failure) leaves the paper
+  unchanged, so `updated_by` stays None ("never checked"). Both commands
+  count failures per reason (#259, crossref.nw
+  `sec:crossref-check-failures`): `noting_failures(counter, callback)`
+  wraps `annotate_papers`' progress callback (read right after each
+  lookup; `annotate_papers`' signature is unchanged, so stand-ins keep
+  working) and `check_failure_lines` prints "Crossref check failed for
+  N papers (not checked in this run):" (true also for a paper whose
+  earlier result is kept after a failed re-check) + `crossref: reason
+  (n)` + `network.RUN_AGAIN_HINT`; enrich after its currency line,
+  verify on stderr (JSON stays pure). The run never aborts.
 
 ### Preprint Fallback (adopt a preprint when no PDF is found)
 
@@ -1003,8 +1066,9 @@ and error line numbers match an editor) is the selection (exit 2 with `--doi`/`-
 `--reason`); its confidence overrides `-c` per line, and with
 `--keep-trace` and no `-c` every line needs one. Usage errors (exit 2,
 before loading): `--reason`/`--reasons-file`/`--by` with `--source
-llm` (the classifier's reason is `llm classify`'s) or `human` (out of
-scope), `--by` alone, any bad file line (all named:
+llm` (the classifier's reason is `llm classify`'s), `--reason`/
+`--reasons-file` with `human` (out of scope; `--by` alone is accepted
+for a human since #257, below), `--by` alone for an agent, any bad file line (all named:
 `cli.parse_reasons_file`), empty or > `review.MAX_AGENT_REASON_CHARS`
 (2000, stripped, never truncated) reason. After loading: an unknown id
 exits 1 (like `--doi`), one paper given two different reasons or
@@ -1012,11 +1076,63 @@ confidences exits 2, both unsaved. `--source agent` without a reason
 warns on stderr and records the decision. Shown in `sessions show`
 (a `reason (by): …` line, cut at `SHOW_REASON_CHARS` = 160; JSON:
 the three fields, `null` when unset), the per-decision CSV (three
-columns before `reset_from`; `paper_id` stays last) and the report (one English sentence after
+columns after `source_relabelled`, before the human record's;
+`paper_id` stays last) and the report (one English sentence after
 the summary, `agent_reasons_sentence`: agent and agent_reviewed
 decisions with/without a reason). An older Scholar loads such files
 and drops the fields on its next save (checked with the installed
-pre-#249 pipx build). A machine
+pre-#249 pipx build).
+**Quote check (#256, review.nw `sec:reason-quotes`, cli.nw
+`sec:decide-quote-check`).** Pure functions: `quotes_in_reason`
+(text between double marks `"…"`, `“…”`, `”…”`, `„…“`/`„…”`, `«…»`,
+`»…«`; never single marks, apostrophes; a straight `"` right after a
+letter or digit opens nothing: `5" disks`), `unmatched_quotes(reason,
+paper, extra_texts=())` (quotes of >= `MIN_QUOTE_WORDS` = 3 words,
+shorter = "not checked", never matched; compared with title, abstract
+and the extras after `normalized_for_quotes`: `clean_metadata_text`,
+then tag-like markup it leaves (`<jats:italic>`, `</jats:p>`:
+`QUOTE_TAG`, a letter-initial name of letters, digits, `:`, `-`, only
+`name="value"` attributes), NFKC, soft hyphens and quote marks of every
+kind (single and apostrophes too) removed on both sides, dashes
+unified, casefold, white space collapsed; `exam- ple` not repaired;
+accents (`naive`/`naïve`) and LaTeX math not folded, so reported; an
+ellipsis `…`, `...`, `. . .`, `[...]`, `(...)` splits into parts found
+in order in one text; edge punctuation ignored; parts at word bounds;
+nothing fuzzy),
+`reason_quote_checks(decision)` (one `ReasonQuoteCheck` per
+`agent_reason`/`llm_reason`, with `short` = quotes too short to
+check), `quote_check_tally` (per kind: reasons, checked, unmatched
+counted in reasons; `short_quotes` in quotes), `unmatched_quotes_of`.
+Nothing stored; computed when shown. Limits: an abstract replaced
+since (enrich) no longer matches; the classifier saw only
+`MAX_ABSTRACT_CHARS`; `--full-text` passages are not stored (only the
+run checks them); a found quote is the record's words, not a right
+decision. `decide --reason/--reasons-file` checks each reason against
+its own record after the ids resolve, before saving: stderr
+`line N, ID: "quote"` (or `ID: "quote"` for `--reason`), first
+`QUOTE_PROBLEMS_SHOWN` = 20, rest counted, saved anyway;
+`--strict-quotes` refuses unsaved (exit 2), and without a reason
+option exits 2 before loading. Bad file lines (exit 2 before loading):
+a reason that is only a number or a paper id (starts with `doi:`,
+`hash:` or `10.` and holds no white space; `reason_column_shift`), one
+with no letter or digit (`-`, `...`), and a placeholder
+(`is_placeholder_reason`: casefolded, letters/digits only, in
+`REASON_PLACEHOLDERS` = placeholder, todo, tbd, xxx, reason, na), the
+last two also for `--reason`. `sessions show`: a "Reasons: N recorded,
+X with quotes checked, M with a quote not found in the record's title
+or abstract" line when any machine reason exists, a mark `(quote not
+in title or abstract)` on those papers, JSON `unmatched_quotes` per
+decision (absent when empty) and top-level `reason_quotes` (per kind:
+reasons, checked, unmatched, short_quotes; absent without machine
+reasons, so such a session's JSON is as before). Report: `reason_quotes_sentence` after
+`agent_reasons_sentence` (agent and classifier apart; none without
+machine reasons). Audit table and CSV unchanged. Cost: one check per
+decision per command (folding the abstract is most of it; ASCII and
+single-space shortcuts in `normalized_for_quotes`, tested against the
+plain definition; a review measured 30,000 decisions with two reasons
+each at 3.0-4.4 s CPU under heavy load; the 10,000-decision test's 8 s
+CPU limit guards against the ~10x slower `str.translate` folding, it
+is no performance promise). A machine
 `decide` never replaces a decided
 paper whose source is `human`, `llm_reviewed` or `agent_reviewed`:
 the batch is refused unsaved (exit 2, each conflict named) unless
@@ -1138,12 +1254,65 @@ apply); else `keep_copy_before_run(session, "pre-reset")`, one
 is hidden on a still-pending reset paper and when the last relabel is
 older than the last reset, `relabel_after_reset`; JSON `resets`) and
 the CSV column `reset_from` (`status by source time [by NAME]; ...`,
-after the agent-trace columns, before `paper_id`). Effects: audit table and
+after the agent-trace and human-record columns, before
+`abstract_from`). Effects: audit table and
 report show pending; a sampled decision reset at or after the draw
 is gone from the sample (see Samples: `reset_since_draw`);
 `first_made_by_llm` is False for any pending
 paper; after a full reset the classifier vocabulary (tags of decided
 papers) is empty, so pass `llm classify --tag`.
+**Human review record (#257, review.nw `sec:human-review-record`).**
+`human` is the dataclass default and needed no evidence, so scripts
+writing through the API gave >1000 decisions a human source nobody
+gave. `ReviewDecision` now has `human_decided_at` (UTC ISO),
+`human_decided_via` (`tui` | `decide`, `HUMAN_DECISION_CHANNELS`) and
+`human_by` (as given, never guessed), named once in
+`review.HUMAN_AUDIT_FIELDS` (`human_record_of`; load, save only when
+set via `human_record_data`, `decision_state`, concurrent merge,
+`is_unscreened`; the append keeps the decision whole). NOT in
+`MACHINE_AUDIT_FIELDS` (so not cleared by `clear_machine_audit`, not
+in a reset's `trace`). Set only by `review.record_human_decision(d,
+via, by=None, at=None)` (raises unless decided with a source in
+`REVIEWED_BY_A_HUMAN` = human/llm_reviewed/agent_reviewed; `at`
+defaults to `_utcnow`), called by the TUI's keep/themes/discard/confirm
+in both screens (after `mark_as_reviewed`) and by `sessions decide`
+with a human source (`--source human` or the terminal default; one
+`utc_now_iso()` per run; `--by NAME` now accepted with human). The
+API (`ReviewDecision(source=HUMAN)`, `mark_as_reviewed` alone) sets
+nothing. A machine `decide` (with `--force` over a human/reviewed
+decision) calls `clear_human_record`; `relabel_source` clears it and
+keeps the set fields as `"human"` in its relabel record (key absent
+without a record); a reset only takes unreviewed decisions, which have
+none; a later human decision overwrites it (time included). Counted by
+`human_record_counts(decisions)` (decided papers with
+`human_decided_at` per `REVIEWED_BY_A_HUMAN` source) and
+`decision_source_rows(decisions, always_note=False)` → `(label, count,
+note)`, note "(k with a record of the review)" on those sources' rows
+with a count, when `always_note` or any such decision lacks a record
+(`source_row_text(count, note)`). `sessions show` "Decided by:" always
+notes (`human: 1200 (0 with a record of the review)`), JSON adds the
+three fields per decision (`null` when unset) and `review_records`
+(counts by stored value); the report's "Decided:" rows, its abstract
+sentence (`decision_sources_sentence`) and `llm synthesize`'s summary
+note only when a record is missing, so a fully recorded session reads
+as before; with the note they also give `REVIEW_RECORD_EXPLANATION`
+once (`review_record_sentence`: after the report's summary, in its
+abstract, after both synthesis summaries; no version or date in it).
+The CSV adds `human_decided_at, human_decided_via,
+human_by` after `agent_decided_at`. The audit table and its caption
+are deliberately unchanged: they neither count nor mention the
+records (tested byte-identical). Copies are compared by
+`decision_verdict` (= `decision_state` without `HUMAN_AUDIT_FIELDS`;
+LLM/agent fields stay in) in `_fold_direction`, `same_id_pairs` and
+`_decided_pairs` (alike/conflicting), so two copies a human decided
+alike at two moments still fold, are no alike pair and need no
+`--all-copies`; a fold keeps the newer record (`newer_human_record`:
+by `human_decided_at`, a record beats none; the fold also carries both copies' `abstract_set` records). `decision_state` (merge,
+baseline, `pair_with_file`, `apply_tombstones`) keeps the record: those
+compare one decision with itself across file versions. Wording: "without a record of the
+review", never "not human" (old decisions have none). The default
+source stays `human` (an undecided paper's). Checked 2026-11-20: the
+pipx build of 4ba7a23 loads such a file and drops the fields on save.
 **`scholar sessions set-abstract S (--paper-id ID | --doi D) --file F
 --from TEXT [--by NAME] [--replace] [--dry-run]`**, or `--abstracts-file
 F` (lines `ID<TAB>FROM<TAB>ABSTRACT`, split at the first two tabs, so
@@ -1884,6 +2053,14 @@ A human review leaves them untouched (they are the model's record).
   then withheld with the category-rule ones (`LLMDecision.problem`);
   `llm classify` and `rq` list them (`print_withheld_papers`) under
   "Left pending, no usable answer".
+- **Quotes in the reasons (#256).** `llm classify` (not `rq`) ends
+  with one line, `Reasons quoting words not in the record (N): id:
+  "quote"; ...` (first `LLM_QUOTE_MISSES_SHOWN` = 3), when an applied
+  decision's stored `llm_reason` quotes >= 3 words not in its title,
+  abstract or the `--full-text` passages of this run
+  (`LLMBatchResult.passages`, paper id -> passage texts, not stored).
+  Nothing is withheld or retried for it. Later checks (`sessions show`,
+  report) see only title and abstract (see Headless Review Sessions).
   Answers without a valid `paper_index` are skipped (never index 0).
 - **Abstracts.** `MAX_ABSTRACT_CHARS` = 4000 for papers to classify
   (marked `[abstract truncated]` in the prompt), `EXAMPLE_ABSTRACT_CHARS`

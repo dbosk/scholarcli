@@ -359,6 +359,78 @@ def cache_answer(provider, key, papers) -> None:
     )
 @
 
+\subsection{The outcome of a DOI lookup}
+\label{sec:lookup-outcome}
+
+Enrichment (\cref{enrich-module}) asks providers for single papers by
+DOI through [[get_paper_by_doi]], and like [[search]] that method
+raises nothing: it returns the paper or [[None]].
+[[None]] used to stand for two different things.
+The service may have answered that it holds no record under the DOI
+(a 404, an empty result), or the request may have failed: refused by
+the rate limiter, answered with a 429 or a 5xx, cut off by the
+network.
+Enrichment could not tell them apart, so a record left without an
+abstract because Semantic Scholar was throttling looked the same as a
+record no database had an abstract for, and a review excluding records
+for lack of an abstract excluded both
+(\url{https://github.com/dbosk/scholarcli/issues/259}).
+The first kind can be retried; the second cannot.
+
+Every [[get_paper_by_doi]] therefore reports its outcome the way
+[[search]] reports through [[last_error]]
+(\cref{sec:provider-protocol}), in an attribute of its own,
+[[last_lookup_error]], so that a lookup between two searches never
+overwrites what the last search reported.
+The method resets it to [[None]] first thing and sets it to a short
+reason on every path that returns [[None]] because the request failed:
+the limiter refused it (its own reason, which already says what and
+until when), the service answered with an error status, or the
+transport failed.
+It stays [[None]] when the service answered, with a record or with
+\enquote{no such DOI}, and when the answer came from the cache, which
+holds only answers.
+The paths that set a reason are exactly the ones that do not cache,
+which is the same rule the search paths follow
+(\cref{sec:cache-successful-only}).
+
+A third outcome is neither: the provider \emph{declines} to ask.
+A keyed provider without its key has nothing to send, and Scopus has
+no abstract to give where Elsevier does not serve its [[COMPLETE]]
+view, or under [[SCOPUS_VIEW=standard]] (\cref{sec:scopus-doi-lookup}).
+Counting these as failures would hide the very case enrichment must
+show: off campus every lookup of every paper would include a
+\enquote{failed} Scopus lookup, no record would ever read as answered
+by every database asked, and the advice to run again would be wrong,
+since a second run from the same network declines again.
+So a declining lookup sets [[last_lookup_declined]] to its reason
+instead, reset first thing like [[last_lookup_error]], and leaves
+[[last_lookup_error]] at [[None]]; enrichment then reports the provider
+once, as not asked, and judges the paper by the providers that were
+(\cref{sec:enrich-lookup-outcomes}).
+
+The reasons are worded once for every service a run asks, in the
+network module (\cref{sec:request-failure-reason}): a status becomes
+\enquote{HTTP 503}, or \enquote{rate limited (HTTP 429)}
+([[network.http_status_reason]]), in the words [[_pause]] and the
+limiter use for the cooldowns they record (\cref{sec:s2-retrying});
+a failed connection becomes \enquote{connection failed} with the
+exception's class; and any other exception keeps its text, redacted
+and on one line, unless it comes from [[requests]] and so quotes the
+URL, DOI included, which would make the reason differ from paper to
+paper ([[network.request_failure_reason]]).
+The one thing the network module cannot know is the limiter, so
+[[lookup_failure_reason]] adds it: a [[RateLimited]] gives its own
+reason, which already says what and until when.
+
+<<provider protocol>>=
+def lookup_failure_reason(failure: Exception) -> str:
+    """Return the short reason a DOI lookup failed with `failure`."""
+    if isinstance(failure, RateLimited):
+        return failure.reason
+    return network.request_failure_reason(failure)
+@
+
 \subsection{API keys: argument first, then the environment}
 \label{sec:provider-api-keys}
 
@@ -3978,6 +4050,14 @@ calling code---they can write [[get_paper_by_doi(paper.doi)]] without first
 checking if [[paper.doi]] is set.
 The tests verify this behavior by passing [[None]] explicitly.
 
+A 404 is Semantic Scholar's answer that it has no such paper, and is
+cached as one.
+The 429 and 403 that reach this method are what is left after
+[[_send]] has retried and [[_request]] has dropped a rejected key, so
+they, the limiter's refusal and every exception are failures: they are
+not cached and they set [[last_lookup_error]]
+(\cref{sec:lookup-outcome}).
+
 <<semantic scholar get paper by doi>>=
 def get_paper_by_doi(self, doi: str | None) -> Paper | None:
     """
@@ -3989,6 +4069,8 @@ def get_paper_by_doi(self, doi: str | None) -> Paper | None:
     Returns:
         Paper if found, None otherwise.
     """
+    self.last_lookup_error = None
+    self.last_lookup_declined = None
     if not doi:
         return None
 
@@ -4017,11 +4099,13 @@ def get_paper_by_doi(self, doi: str | None) -> Paper | None:
 
         if response.status_code == 429:
             logger.warning("s2: Rate limited (429) during DOI lookup")
+            self.last_lookup_error = network.http_status_reason(429)
             return None
 
         if response.status_code == 403:
             # Key rejected and anonymous access also forbidden (logged by
             # the helper). Do not cache; a later call may succeed.
+            self.last_lookup_error = network.http_status_reason(403)
             return None
 
         response.raise_for_status()
@@ -4031,14 +4115,17 @@ def get_paper_by_doi(self, doi: str | None) -> Paper | None:
         self._cache[cache_key] = paper
         return paper
 
-    except RateLimited:
+    except RateLimited as e:
         # The limiter already logged the reason once
+        self.last_lookup_error = lookup_failure_reason(e)
         return None
     except requests.exceptions.HTTPError as e:
         logger.warning("s2: DOI lookup error: %s", e)
+        self.last_lookup_error = lookup_failure_reason(e)
         return None
     except Exception as e:
         logger.warning("s2: DOI lookup failed: %s", e)
+        self.last_lookup_error = lookup_failure_reason(e)
         return None
 @
 
@@ -7488,7 +7575,12 @@ that on every enrichment.  So we cache the miss like a successful
 lookup and log at debug level; treating it as a warning turned every
 enrich run into a wall of noise, and leaving it uncached re-asked the
 same dead DOI on every run.  Other HTTP errors and transport failures
-stay uncached warnings, so transient trouble is retried later.
+stay uncached warnings, so transient trouble is retried later, and
+they set [[last_lookup_error]] (\cref{sec:lookup-outcome}).
+The reason is the bare status, not the explanation OpenAlex may give
+in the body ([[_refusal_reason]]): the explanation goes to the log
+line, while the reason is counted in a tally where one row per status
+says more than one row per wording of a message.
 
 <<openalex get paper by doi>>=
 def get_paper_by_doi(self, doi: str | None) -> Paper | None:
@@ -7501,6 +7593,8 @@ def get_paper_by_doi(self, doi: str | None) -> Paper | None:
     Returns:
         Paper if found, None otherwise.
     """
+    self.last_lookup_error = None
+    self.last_lookup_declined = None
     if not doi:
         return None
 
@@ -7527,8 +7621,9 @@ def get_paper_by_doi(self, doi: str | None) -> Paper | None:
         self._cache[cache_key] = paper
         return paper
 
-    except RateLimited:
+    except RateLimited as e:
         # The limiter already logged the reason once
+        self.last_lookup_error = lookup_failure_reason(e)
         return None
     except requests.exceptions.HTTPError as e:
         if getattr(e.response, "status_code", None) == 404:
@@ -7537,11 +7632,13 @@ def get_paper_by_doi(self, doi: str | None) -> Paper | None:
             self._cache[cache_key] = None
             return None
         self._note_http_error(e, during=f"DOI lookup for {doi}")
+        self.last_lookup_error = lookup_failure_reason(e)
         return None
     except Exception as e:
         logger.warning(
             "openalex: DOI lookup failed: %s", network.redact_secrets(e)
         )
+        self.last_lookup_error = lookup_failure_reason(e)
         return None
 @
 
@@ -10398,6 +10495,7 @@ def _search_starter(
     all_papers: list[Paper] = []
     page = 1
     page_size = 50  # Starter API max per page
+    self._tier_failure = None
 
     try:
         effective_query = self._format_query(query)
@@ -10437,11 +10535,13 @@ def _search_starter(
                 break
 
         return all_papers, True
-    except RateLimited:
+    except RateLimited as e:
         # The limiter already logged the reason once
+        self._tier_failure = lookup_failure_reason(e)
         return all_papers, False
     except Exception as e:
         logger.warning("wos (starter): %s", e)
+        self._tier_failure = lookup_failure_reason(e)
         return all_papers, False
 @
 
@@ -10470,6 +10570,7 @@ def _search_expanded(
     all_papers: list[Paper] = []
     first_record = 1  # 1-indexed
     page_size = 100  # Expanded API max per page
+    self._tier_failure = None
 
     try:
         effective_query = self._format_query(query)
@@ -10519,11 +10620,13 @@ def _search_expanded(
                 break
 
         return all_papers, True
-    except RateLimited:
+    except RateLimited as e:
         # The limiter already logged the reason once
+        self._tier_failure = lookup_failure_reason(e)
         return all_papers, False
     except Exception as e:
         logger.warning("wos (expanded): %s", e)
+        self._tier_failure = lookup_failure_reason(e)
         # Try falling back to Starter API if we have a starter key
         if self._starter_key and self._starter_key != self._expanded_key:
             logger.info("wos: Falling back to Starter API")
@@ -11049,6 +11152,31 @@ def search_for_citation_report(
         logger.warning("wos: search_for_citation_report failed: %s", e)
         return None
 
+@
+
+The DOI lookup is a one-record search with the [[DO=]] field tag, so it
+learns how the request went from the [[cacheable]] flag the search
+tiers return (\cref{sec:cache-successful-only}): false exactly when a
+rate limit or an HTTP or parse error cut the search short.
+An empty answer with the flag set is Web of Science saying it has no
+record under the DOI; one without it is a failure, recorded in
+[[last_lookup_error]] (\cref{sec:lookup-outcome}).
+The flag does not say which cause it was, so each tier also keeps the
+reason of the exception it caught in [[_tier_failure]], worded as for
+every other provider ([[lookup_failure_reason]]) and reset when the
+tier starts; the lookup records that, and [[SEARCH_CUT_SHORT]] only if
+it is missing.
+The search itself still records [[SEARCH_CUT_SHORT]], as it always
+did.
+Without a key no request can be made, and the lookup declines
+([[last_lookup_declined]]); enrichment never gets that far, though,
+since [[is_available]] is false then.
+
+<<wos constants>>=
+WOS_NOT_CONFIGURED = (
+    "no API key (set WOS_STARTER_API_KEY or WOS_EXPANDED_API_KEY)"
+)
+<<wos extended methods>>=
 # Accept str | None to simplify calling code - callers can pass paper.doi
 # without checking for None first (see Semantic Scholar implementation notes).
 def get_paper_by_doi(self, doi: str | None) -> Paper | None:
@@ -11065,7 +11193,12 @@ def get_paper_by_doi(self, doi: str | None) -> Paper | None:
         Paper if found, None otherwise. The paper will have WOS UID
         in its metadata if found via the Expanded API.
     """
-    if not doi or not self._api_key:
+    self.last_lookup_error = None
+    self.last_lookup_declined = None
+    if not doi:
+        return None
+    if not self._api_key:
+        self.last_lookup_declined = WOS_NOT_CONFIGURED
         return None
 
     # Search by DOI using the DO= field tag
@@ -11073,17 +11206,25 @@ def get_paper_by_doi(self, doi: str | None) -> Paper | None:
 
     try:
         if self._api_tier == "expanded":
-            papers, _ = self._search_expanded(query, limit=1, filters=None)
+            papers, answered = self._search_expanded(
+                query, limit=1, filters=None
+            )
         else:
-            papers, _ = self._search_starter(query, limit=1, filters=None)
+            papers, answered = self._search_starter(
+                query, limit=1, filters=None
+            )
 
         if papers:
             return papers[0]
+        if not answered:
+            self.last_lookup_error = self._tier_failure or SEARCH_CUT_SHORT
         return None
     except Exception as e:
         logger.warning("wos: DOI lookup failed for %s: %s", doi, e)
+        self.last_lookup_error = lookup_failure_reason(e)
         return None
 
+<<wos extended methods>>=
 def _get_uid_for_doi(self, doi: str) -> str | None:
     """
     Get the WOS UID for a paper given its DOI.
@@ -12495,12 +12636,22 @@ Each lookup passes through the same [[acquire()]]/record bracket as the
 search path: enrichment performs one lookup per paper, which makes this
 method, not [[search]], the biggest consumer of IEEE's 200-request daily
 budget.
+The uncached paths are the failures that [[last_lookup_error]] reports
+(\cref{sec:lookup-outcome}); a 403 there may also be IEEE's way of
+saying the day's quota is spent, which [[_record_mashery_rejection]]
+turns into a block, so the next lookup fails with the limiter's
+reason instead.
 
 <<ieee provider>>=
 
     def get_paper_by_doi(self, doi: str | None) -> Paper | None:
         """Fetch a single paper by DOI via the IEEE Xplore API."""
-        if not doi or not self.api_key:
+        self.last_lookup_error = None
+        self.last_lookup_declined = None
+        if not doi:
+            return None
+        if not self.api_key:
+            self.last_lookup_declined = "IEEE_API_KEY not set"
             return None
 
         cache_key = ("doi", doi)
@@ -12527,10 +12678,12 @@ budget.
 
             if response.status_code == 429:
                 logger.warning("ieee: Rate limited during DOI lookup")
+                self.last_lookup_error = network.http_status_reason(429)
                 return None
 
             if response.status_code == 403:
                 logger.warning("ieee: Access denied during DOI lookup")
+                self.last_lookup_error = network.http_status_reason(403)
                 return None
 
             response.raise_for_status()
@@ -12544,18 +12697,21 @@ budget.
             paper = self._convert_article(article)
             self._cache[cache_key] = paper
             return paper
-        except RateLimited:
+        except RateLimited as e:
             # The limiter already logged the reason once
+            self.last_lookup_error = lookup_failure_reason(e)
             return None
         except requests.exceptions.HTTPError as e:
             logger.warning(
                 "ieee: DOI lookup error: %s", network.redact_secrets(e)
             )
+            self.last_lookup_error = lookup_failure_reason(e)
             return None
         except Exception as e:
             logger.warning(
                 "ieee: DOI lookup failed: %s", network.redact_secrets(e)
             )
+            self.last_lookup_error = lookup_failure_reason(e)
             return None
 
     <<convert ieee article>>
@@ -13481,6 +13637,7 @@ def check(self) -> tuple[str, str]:
     return classify_check_response(response, authenticated=False)
 <<arxiv constants>>=
 ARXIV_API_URL = "https://export.arxiv.org/api/query"
+ARXIV_EMPTY_PAGE = "arXiv returned an unexpectedly empty page"
 @
 
 \subsubsection{DOI lookup}
@@ -13490,10 +13647,24 @@ arXiv DOI format [[10.48550/arXiv.<id>]].
 
 arXiv's API does not provide a general DOI lookup, so we only handle this DOI
 family by converting it back to an arXiv identifier and querying arXiv by ID.
+Any other DOI is answered at once, and cached, as not held: it is
+outside what this lookup can ask arXiv about, so no later run would
+get another answer, and enrichment counts it as an answer, not a
+failure (\cref{sec:lookup-outcome}).
+The limiter's refusal and any exception from the [[arxiv]] client set
+[[last_lookup_error]] and are not cached.
+The client's [[HTTPError]] is not a [[requests]] one, and its message
+holds the whole query URL, so the reason takes only its [[status]],
+in the same words as for the other providers.
+Its [[UnexpectedEmptyPageError]] (a page that should have held results
+came back empty) quotes the URL too, and has nothing else to take, so
+its reason is a constant: one row in the tally for every paper it hit.
 
 <<arxiv get paper by doi>>=
 def get_paper_by_doi(self, doi: str | None) -> Paper | None:
     """Fetch a single arXiv paper by its arXiv DOI."""
+    self.last_lookup_error = None
+    self.last_lookup_declined = None
     if not doi:
         return None
 
@@ -13540,11 +13711,21 @@ def get_paper_by_doi(self, doi: str | None) -> Paper | None:
 
         self._cache[cache_key] = None
         return None
-    except RateLimited:
+    except RateLimited as e:
         # The limiter already logged the reason once
+        self.last_lookup_error = lookup_failure_reason(e)
+        return None
+    except arxiv.HTTPError as e:
+        logger.warning("arxiv: DOI lookup failed: %s", e)
+        self.last_lookup_error = network.http_status_reason(e.status)
+        return None
+    except arxiv.UnexpectedEmptyPageError as e:
+        logger.warning("arxiv: DOI lookup failed: %s", e)
+        self.last_lookup_error = ARXIV_EMPTY_PAGE
         return None
     except Exception as e:
         logger.warning("arxiv: DOI lookup failed: %s", e)
+        self.last_lookup_error = lookup_failure_reason(e)
         return None
 @
 
@@ -16985,7 +17166,29 @@ query language would read as grouping; a quote inside a DOI cannot be
 escaped, so we drop it and let the search find nothing rather than
 fail to parse.
 
+A lookup without the [[COMPLETE]] view has not asked Scopus about the
+DOI, and is not a failure either: it \emph{declines}
+([[last_lookup_declined]], \cref{sec:lookup-outcome}), leaving
+[[last_lookup_error]] at [[None]].
+Scopus may well hold an abstract that a lookup from the institution's
+network would get, but running again from the same network declines
+again, so [[scholar enrich]] does not count the paper as failed or tell
+the user to run again; it names Scopus once, as not asked, with the
+reason, which is also the remedy.
+The same holds under [[SCOPUS_VIEW=standard]], which never asks, and
+for the 401 that tells a new process the view is refused: Scopus was
+reached, but the answer is about the entitlement, not the DOI.
+
 <<scopus provider>>=
+
+    def _lookup_declined_reason(self) -> str:
+        """Why a DOI lookup asks Scopus nothing: no COMPLETE view."""
+        if self.view_mode == "standard":
+            return "SCOPUS_VIEW=standard has no abstracts"
+        return (
+            "the COMPLETE view (abstracts) is not authorized from this "
+            "network"
+        )
 
     def get_paper_by_doi(self, doi: str | None) -> Paper | None:
         """Look a paper up by DOI; None unless the COMPLETE view serves it.
@@ -16994,22 +17197,38 @@ fail to parse.
         so a network without the COMPLETE view gets None, and after the
         first refusal without any request.
         """
-        if not doi or not self.api_key or not self._wants_complete():
+        self.last_lookup_error = None
+        self.last_lookup_declined = None
+        if not doi:
+            return None
+        if not self.api_key:
+            self.last_lookup_declined = "SCOPUS_API_KEY not set"
+            return None
+        if not self._wants_complete():
+            self.last_lookup_declined = self._lookup_declined_reason()
             return None
         query = 'DOI("%s")' % doi.replace('"', "")
         try:
             response = self._get_best_view(
                 self._headers(), {"query": query, "count": 1}, retry=False
             )
+            if scopus_view_refused(response):
+                self.last_lookup_declined = self._lookup_declined_reason()
+                return None
             if response.status_code != 200:
+                self.last_lookup_error = network.http_status_reason(
+                    response.status_code
+                )
                 return None
             entries = scopus_result_entries(
                 response.json().get("search-results", {})
             )
-        except RateLimited:
+        except RateLimited as e:
+            self.last_lookup_error = lookup_failure_reason(e)
             return None
         except Exception as e:
             logger.warning("scopus: DOI lookup failed for %s: %s", doi, e)
+            self.last_lookup_error = lookup_failure_reason(e)
             return None
         for entry in entries:
             if entry.get("dc:title"):
@@ -17915,6 +18134,328 @@ class TestFetchTimes:
     )
     assert provider.last_total == 30
 @
+
+\section{Lookup outcomes across providers}
+\label{sec:lookup-outcome-tests}
+
+Every [[get_paper_by_doi]] promises the same thing
+(\cref{sec:lookup-outcome}): [[last_lookup_error]] is [[None]] after an
+answer, \enquote{no such DOI} included, and a reason after a failure.
+We check the promise for every provider enrichment asks
+([[ENRICHMENT_PROVIDERS]], \cref{sec:enrichment-providers}) with one
+table and the same few situations, so that a provider added later is
+tested by adding a row.
+
+The requests are real down to the socket: [[lookup_loopback]] sends
+every request, whatever its host, to the local stand-in of
+\cref{sec:openalex-cut-short} ([[OpenAlexLoopback]]), below the
+providers' sessions, so the providers' own request code, retries and
+status handling run as in use.
+The \enquote{not found} answers are written by hand, as the smallest
+bodies the parsers accept: a 404 for Semantic Scholar and OpenAlex,
+whose lookup endpoints answer an unknown DOI that way (the existing
+code caches it as a miss), and an empty result for the providers whose
+lookup is a one-record search.
+Scopus's empty result is the live shape that its search loop quotes,
+as recorded on 2026-10-11; arXiv's is an Atom feed without entries.
+They are hand-written rather than recorded because what is tested is
+the outcome of a status, not the parsing of a body, which the
+providers' own tests cover with recordings where they matter.
+
+Each row gives the provider, a DOI it can look up, its not-found answer
+and the reason a 503 leaves.
+
+<<test functions>>=
+ARXIV_EMPTY_FEED = (
+  b'<?xml version="1.0" encoding="UTF-8"?>'
+  b'<feed xmlns="http://www.w3.org/2005/Atom"'
+  b' xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/">'
+  b"<opensearch:totalResults>0</opensearch:totalResults>"
+  b"<opensearch:startIndex>0</opensearch:startIndex>"
+  b"<opensearch:itemsPerPage>1</opensearch:itemsPerPage>"
+  b"</feed>"
+)
+
+
+def _wos_starter(monkeypatch):
+  return WebOfScienceProvider(starter_api_key="k", expanded_api_key=None)
+
+
+LOOKUP_CASES = {
+  "s2": (
+    lambda mp: SemanticScholarProvider(api_key=None), "10.1/l259",
+    (404, {"error": "Paper not found"}), "HTTP 503",
+  ),
+  "openalex": (
+    lambda mp: OpenAlexProvider(api_key=None), "10.1/l259",
+    (404, {"error": "Not Found"}), "HTTP 503",
+  ),
+  "ssrn": (
+    lambda mp: OpenAlexSourceProvider("ssrn", "S4210172589", "SSRN"),
+    "10.1/l259", (404, {"error": "Not Found"}), "HTTP 503",
+  ),
+  "arxiv": (
+    lambda mp: ArxivProvider(), ARXIV_TEST_DOI,
+    (200, ARXIV_EMPTY_FEED), "HTTP 503",
+  ),
+  "ieee": (
+    lambda mp: IEEEXploreProvider(api_key="k"), "10.1/l259",
+    (200, {"total_records": 0, "articles": []}), "HTTP 503",
+  ),
+  "wos": (
+    _wos_starter, "10.1/l259",
+    (200, {"metadata": {"total": 0}, "hits": []}), "HTTP 503",
+  ),
+  "scopus": (
+    lambda mp: ScopusProvider(api_key="k"), "10.1/l259",
+    (200, {"search-results": {
+      "opensearch:totalResults": "0",
+      "entry": [{"@_fa": "true", "error": "Result set was empty"}],
+    }}), "HTTP 503",
+  ),
+}
+
+
+@pytest.fixture
+def lookup_loopback(monkeypatch):
+  """Send every request, whatever its host, to an `OpenAlexLoopback`."""
+  import requests.adapters
+  from urllib.parse import urlsplit
+
+  loopback = OpenAlexLoopback()
+  real_send = requests.adapters.HTTPAdapter.send
+
+  def send(adapter, request, **kwargs):
+    parts = urlsplit(request.url)
+    origin = f"{parts.scheme}://{parts.netloc}"
+    request.url = loopback.base + request.url[len(origin):]
+    return real_send(adapter, request, **kwargs)
+
+  monkeypatch.setattr(requests.adapters.HTTPAdapter, "send", send)
+  yield loopback
+  loopback.close()
+
+
+class TestLookupOutcomes:
+  """`last_lookup_error` and `last_lookup_declined` after every kind
+  of DOI lookup (#259)."""
+
+  <<lookup outcome test methods>>
+@
+
+A not-found answer leaves no reason, even where an earlier lookup left
+one, failed or declined: the resets come first.
+A 503 (repeated, since Semantic Scholar retries it) leaves the row's
+reason, and the answer is not cached, which is what lets a later run
+ask again.
+
+<<lookup outcome test methods>>=
+@pytest.mark.parametrize("name", list(LOOKUP_CASES))
+def test_not_found_is_an_answer(self, name, lookup_loopback, monkeypatch):
+  make, doi, not_found, _ = LOOKUP_CASES[name]
+  provider = make(monkeypatch)
+  provider.last_lookup_error = "left by an earlier lookup"
+  provider.last_lookup_declined = "left by an earlier lookup"
+  lookup_loopback.plan.append(not_found)
+  assert provider.get_paper_by_doi(doi) is None
+  assert provider.last_lookup_error is None
+  assert provider.last_lookup_declined is None
+  assert lookup_loopback.paths
+
+@pytest.mark.parametrize("name", list(LOOKUP_CASES))
+def test_server_error_is_a_failure(self, name, lookup_loopback,
+                                   monkeypatch):
+  make, doi, _, reason = LOOKUP_CASES[name]
+  provider = make(monkeypatch)
+  cached_before = dict(provider._cache)
+  lookup_loopback.plan.extend([(503, {})] * 10)
+  assert provider.get_paper_by_doi(doi) is None
+  assert provider.last_lookup_error == reason
+  assert dict(provider._cache) == cached_before
+
+@pytest.mark.parametrize("name", list(LOOKUP_CASES))
+def test_too_many_requests_is_a_failure(self, name, lookup_loopback,
+                                        monkeypatch):
+  make, doi, _, reason = LOOKUP_CASES[name]
+  provider = make(monkeypatch)
+  lookup_loopback.plan.extend([(429, {})] * 10)
+  assert provider.get_paper_by_doi(doi) is None
+  assert provider.last_lookup_error == "rate limited (HTTP 429)"
+@
+
+The limiter's refusal comes before any request and keeps the limiter's
+own reason, which names the cooldown; a cached answer afterwards is an
+answer again.
+
+<<lookup outcome test methods>>=
+@pytest.mark.parametrize("name", list(LOOKUP_CASES))
+def test_refusal_keeps_the_limiters_reason(self, name, lookup_loopback,
+                                           monkeypatch):
+  make, doi, _, _ = LOOKUP_CASES[name]
+  provider = make(monkeypatch)
+  provider._limiter.record_limit_hit(
+    retry_after=3600, reason="cooldown for #259"
+  )
+  assert provider.get_paper_by_doi(doi) is None
+  assert "cooldown for #259" in provider.last_lookup_error
+  assert lookup_loopback.paths == []
+
+@pytest.mark.parametrize("name, key", [
+  ("s2", ("doi", "10.1/l259")),
+  ("openalex", ("doi", OpenAlexProvider.CACHE_VERSION, "10.1/l259")),
+  ("ieee", ("doi", "10.1/l259")),
+  ("arxiv", ("doi", ARXIV_TEST_DOI)),
+])
+def test_cached_answer_after_a_refusal(self, name, key, monkeypatch):
+  make, doi, _, _ = LOOKUP_CASES[name]
+  provider = make(monkeypatch)
+  monkeypatch.setattr(provider, "_cache", {})
+  provider._limiter.record_limit_hit(retry_after=3600, reason="cooldown")
+  assert provider.get_paper_by_doi(doi + "-other") is None
+  assert provider.last_lookup_error
+  provider._cache[key] = None
+  assert provider.get_paper_by_doi(doi) is None
+  assert provider.last_lookup_error is None
+@
+
+A failed connection is a failure too.
+The stand-in is closed before the lookup, so the connection is refused
+at once, and the reason names the failure without the URL, so that it
+is the same for every DOI.
+
+<<lookup outcome test methods>>=
+@pytest.mark.parametrize("name", list(LOOKUP_CASES))
+def test_refused_connection_is_a_failure(self, name, lookup_loopback,
+                                         monkeypatch):
+  make, doi, _, _ = LOOKUP_CASES[name]
+  provider = make(monkeypatch)
+  lookup_loopback.close()
+  assert provider.get_paper_by_doi(doi) is None
+  assert provider.last_lookup_error == "connection failed (ConnectionError)"
+@
+
+Web of Science's lookup goes through the search tiers, which catch
+every exception themselves; the reason they keep must still be the one
+the other providers give, so that the tally above groups it the same
+way, while the search reports what it always did.
+
+<<lookup outcome test methods>>=
+def test_wos_search_reports_as_before(self, lookup_loopback,
+                                      monkeypatch):
+  provider = _wos_starter(monkeypatch)
+  lookup_loopback.plan.extend([(503, {})] * 2)
+  assert provider.search("q", limit=1) == []
+  assert provider.last_error == SEARCH_CUT_SHORT
+  assert provider.get_paper_by_doi("10.1/l259") is None
+  assert provider.last_lookup_error == "HTTP 503"
+@
+
+The providers that decline say so in [[last_lookup_declined]], not
+in [[last_lookup_error]]: a provider without its key, and Scopus
+without the [[COMPLETE]] view or set to the standard view
+(\cref{sec:scopus-doi-lookup}).
+Scopus learns that the view is refused from a 401 with Elsevier's
+[[AUTHORIZATION_ERROR]] (\cref{sec:scopus-view}); the next lookup then
+declines without a request, and under [[SCOPUS_VIEW=standard]] it
+never sends one.
+
+<<lookup outcome test methods>>=
+def test_without_a_key(self, monkeypatch):
+  monkeypatch.delenv("IEEE_API_KEY", raising=False)
+  monkeypatch.delenv("SCOPUS_API_KEY", raising=False)
+  for provider, variable in (
+    (IEEEXploreProvider(api_key=None), "IEEE_API_KEY"),
+    (ScopusProvider(api_key=None), "SCOPUS_API_KEY"),
+    (WebOfScienceProvider(starter_api_key=None, expanded_api_key=None),
+     "WOS_STARTER_API_KEY"),
+  ):
+    if isinstance(provider, WebOfScienceProvider):
+      provider._api_key = None
+    assert provider.get_paper_by_doi("10.1/l259") is None
+    assert variable in provider.last_lookup_declined
+    assert provider.last_lookup_error is None
+
+def test_scopus_without_the_complete_view(self, lookup_loopback):
+  lookup_loopback.plan.append((401, {"service-error": {"status": {
+    "statusCode": "AUTHORIZATION_ERROR",
+    "statusText": "The requestor is not authorized to access the "
+                  "requested view or fields of the resource",
+  }}}))
+  provider = ScopusProvider(api_key="k")
+  assert provider.get_paper_by_doi("10.1/l259") is None
+  first = provider.last_lookup_declined
+  assert provider.last_lookup_error is None
+  assert provider.get_paper_by_doi("10.1/l259-other") is None
+  assert first == provider.last_lookup_declined
+  assert first.startswith("the COMPLETE view")
+  assert len(lookup_loopback.paths) == 1
+
+def test_scopus_standard_view(self, lookup_loopback, monkeypatch):
+  monkeypatch.setenv("SCOPUS_VIEW", "standard")
+  provider = ScopusProvider(api_key="k")
+  provider.last_lookup_error = "left by an earlier lookup"
+  assert provider.get_paper_by_doi("10.1/l259") is None
+  assert provider.last_lookup_declined == (
+    "SCOPUS_VIEW=standard has no abstracts"
+  )
+  assert provider.last_lookup_error is None
+  assert lookup_loopback.paths == []
+@
+
+arXiv's client also raises [[UnexpectedEmptyPageError]] when a page it
+expected to hold results comes back empty; its text quotes the query
+URL, DOI included, so the reason is worded here instead.
+The exception is raised by a stand-in for the client's [[results]],
+since provoking it needs a server that changes its answer between
+pages.
+
+<<lookup outcome test methods>>=
+def test_arxiv_empty_page_groups_by_cause(self, monkeypatch):
+  import arxiv as arxiv_package
+
+  provider = ArxivProvider()
+  monkeypatch.setattr(provider, "_cache", {})
+
+  def empty_page(search, offset=0):
+    raise arxiv_package.UnexpectedEmptyPageError(
+      f"https://export.arxiv.org/api/query?id_list={search.id_list[0]}",
+      0, None,
+    )
+
+  monkeypatch.setattr(provider._client, "results", empty_page)
+  reasons = set()
+  for doi in (ARXIV_TEST_DOI, "10.48550/arXiv.2101.00002"):
+    assert provider.get_paper_by_doi(doi) is None
+    reasons.add(provider.last_lookup_error)
+  assert reasons == {ARXIV_EMPTY_PAGE}
+@
+
+Finally, the batched OpenAlex lookup (\cref{sec:openalex-doi-batch})
+stops quietly at its first failure and leaves the DOIs to the single
+lookups, which must then report the failure themselves.
+A 429 on the batch starts a cooldown ([[_note_http_error]]), so the
+single lookup is refused with the limiter's reason before it sends
+anything; a 503 starts none, so the single lookup asks and records its
+own 503.
+
+<<lookup outcome test methods>>=
+def test_failed_prefetch_surfaces_in_the_lookup(self, lookup_loopback):
+  lookup_loopback.plan.append((429, {}, {"Retry-After": "30"}))
+  provider = OpenAlexProvider(api_key=None)
+  assert provider.prefetch_dois(["10.1/l259"]) == 0
+  assert provider.get_paper_by_doi("10.1/l259") is None
+  assert "rate limited" in provider.last_lookup_error
+  assert len(lookup_loopback.paths) == 1
+
+def test_prefetch_503_then_lookup_503(self, lookup_loopback):
+  lookup_loopback.plan.extend([(503, {}), (503, {})])
+  provider = OpenAlexProvider(api_key=None)
+  assert provider.prefetch_dois(["10.1/l259"]) == 0
+  assert provider.get_paper_by_doi("10.1/l259") is None
+  assert provider.last_lookup_error == "HTTP 503"
+  assert len(lookup_loopback.paths) == 2
+@
+
 
 \section{Dependencies}
 

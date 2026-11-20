@@ -88,6 +88,7 @@ hands the settings to pyalex.
 <<library configuration>>
 <<route reporting>>
 <<secret redaction>>
+<<failure reasons>>
 @
 
 
@@ -733,9 +734,9 @@ reaches the log and, through [[last_error]], a session file.
 name says it is a key: [[api_key]], [[apikey]], [[api-key]] and
 [[key]], in any case (so [[apiKey]] too).
 It also hides [[mailto]], the contact address that OpenAlex and
-Crossref take in the URL: it is not a secret, but it is personal data,
-and a failure message is shown, logged and pasted into bug reports
-(issue~\#160).
+Crossref take in the URL, and [[email]], where Unpaywall takes it: it
+is not a secret, but it is personal data, and a failure message is
+shown, logged and pasted into bug reports (issues~\#160 and \#259).
 The name must start the parameter: [[monkey=1]] or [[keyword=x]] are
 not keys and are left alone.
 The value ends where a URL parameter ends, or at a quote, a bracket or
@@ -755,13 +756,14 @@ their errors, not the headers.
 def redact_secrets(text: str) -> str:
     """Return `text` with the values of key-like URL parameters hidden.
 
-    Covers `api_key`, `apikey`, `api-key`, `key` and `mailto`, in any
-    case.
+    Covers `api_key`, `apikey`, `api-key`, `key`, `mailto` and
+    `email`, in any case.
     """
     return SECRET_PARAMETER.sub(rf"\1={REDACTED}", str(text))
 <<constants>>=
 SECRET_PARAMETER = re.compile(
-    r"(?i)(?<![\w.-])(api[_-]?key|key|mailto)=[^&\s'\"<>()\[\]{}]*"
+    r"(?i)(?<![\w.-])(api[_-]?key|key|mailto|email)"
+    r"=[^&\s'\"<>()\[\]{}]*"
 )
 REDACTED = "[redacted]"
 @
@@ -793,12 +795,144 @@ class TestRedactSecrets:
         ("url: /a?api-key=SECRETKEY123)", "url: /a?api-key=[redacted])"),
         ("url: /works?per-page=1&mailto=someone%40example.invalid)",
          "url: /works?per-page=1&mailto=[redacted])"),
+        ("url: /v2/10.1%2Fx?email=someone@example.org (Caused by",
+         "url: /v2/10.1%2Fx?email=[redacted] (Caused by"),
         ("url: /a?monkey=1&keyword=x", "url: /a?monkey=1&keyword=x"),
         ("no url here", "no url here"),
     ], ids=["proxy-error", "ieee", "camel-case", "upper-case", "hyphen",
-            "mailto", "near-misses", "no-url"])
+            "mailto", "email", "near-misses", "no-url"])
     def test_redacts_only_keys(self, text, expected):
         assert redact_secrets(text) == expected
+@
+
+
+\section{Saying why a request failed}
+\label{sec:request-failure-reason}
+
+The per-paper lookups of an enrichment run (the providers' DOI
+lookups, Unpaywall, the Crossref check) return \enquote{undetermined}
+on any failure, and since issue~\#259 they also leave a short reason,
+which [[scholar enrich]] counts in a tally at the end of the run
+(\cref{sec:enrich-lookup-tally}).
+A reason is counted, so it must be the same for every paper the same
+cause hit, and it is printed, so it must carry neither a key nor the
+contact address.
+An exception's own text meets neither demand when it comes from
+[[requests]]: it names the request's URL, with the DOI and the query
+parameters, the address among them for Unpaywall ([[email]]) and
+Crossref ([[mailto]]).
+[[request_failure_reason]] therefore puts such failures in words of
+its own:
+\begin{description}
+\item[A status] becomes \enquote{HTTP 503}, or \enquote{rate limited
+  (HTTP 429)} for the status that says to wait, the words the rate
+  limiter and Semantic Scholar's retries use for the cooldowns they
+  record ([[http_status_reason]]).
+\item[Spent retries] of a session with a [[Retry]] (Crossref,
+  Unpaywall) end in [[RetryError]], which [[HTTPAdapter.send]] raises
+  for a [[MaxRetryError]] whose cause is an error answer.
+\item[A connection] that failed or timed out (including [[SSLError]]
+  and [[ProxyError]], which are [[ConnectionError]]s) is named by its
+  class.
+\item[Any other [[requests]] failure] (an invalid URL, a body that is
+  not JSON) is named by its class alone.
+\end{description}
+Everything else keeps its text, on one line, redacted
+(\cref{sec:redact-secrets}) and cut to [[FAILURE_REASON_MAX_CHARS]].
+That is where the most useful reasons come from: an environment that
+cannot make any HTTPS request at all, such as one without a CA
+bundle, gets a plain [[OSError]] from [[HTTPAdapter.cert_verify]]
+(\enquote{Could not find a suitable TLS CA certificate bundle, invalid
+path: \dots}), before any URL is involved, and that text is what the
+user needs to see, once per service, with the number of papers it
+cost.
+
+A limiter's refusal ([[RateLimited]]) is not handled here: this module
+does not know the limiter, and each caller catches the refusal
+separately anyway, taking its [[reason]].
+
+<<failure reasons>>=
+def http_status_reason(status: int) -> str:
+    """Return the reason a request answered with HTTP `status` failed."""
+    if status == 429:
+        return "rate limited (HTTP 429)"
+    return f"HTTP {status}"
+
+
+def request_failure_reason(failure: Exception) -> str:
+    """Return a short reason for a failed request, without its URL.
+
+    The same cause gives the same reason for every request, and no key
+    or contact address is quoted.
+    """
+    if isinstance(failure, requests.exceptions.RetryError):
+        return RETRIES_SPENT
+    if isinstance(failure, (requests.ConnectionError, requests.Timeout)):
+        return f"connection failed ({type(failure).__name__})"
+    status = getattr(getattr(failure, "response", None), "status_code", None)
+    if isinstance(failure, requests.HTTPError) and isinstance(status, int):
+        return http_status_reason(status)
+    if isinstance(failure, requests.RequestException):
+        return type(failure).__name__
+    text = " ".join(redact_secrets(failure).split())
+    if not text:
+        return type(failure).__name__
+    if len(text) > FAILURE_REASON_MAX_CHARS:
+        text = text[:FAILURE_REASON_MAX_CHARS - 3].rstrip() + "..."
+    return text
+<<constants>>=
+RETRIES_SPENT = "retries spent on HTTP 429 or 5xx answers"
+FAILURE_REASON_MAX_CHARS = 120
+@
+
+A tally of such reasons ends with the one thing the user can do about
+them, in the same words wherever it is printed:
+
+<<constants>>=
+RUN_AGAIN_HINT = "Run again to retry the failed lookups."
+@
+
+Let's verify each kind with the exceptions [[requests]] raises, built
+with a URL that holds a DOI and an address: none of the reasons may
+contain either.
+The [[OSError]] is the text [[cert_verify]] raises (requests 2.32).
+
+<<test functions>>=
+class TestRequestFailureReason:
+    """Failed requests are named without their URLs (#259)."""
+
+    URL = "https://api.unpaywall.org/v2/10.1%2Fx?email=someone@example.org"
+
+    @pytest.mark.parametrize("failure, reason", [
+        (requests.exceptions.RetryError(URL), RETRIES_SPENT),
+        (requests.exceptions.ConnectionError(URL),
+         "connection failed (ConnectionError)"),
+        (requests.exceptions.SSLError(URL), "connection failed (SSLError)"),
+        (requests.exceptions.ReadTimeout(URL),
+         "connection failed (ReadTimeout)"),
+        (requests.exceptions.HTTPError(
+            URL, response=Mock(status_code=503)), "HTTP 503"),
+        (requests.exceptions.HTTPError(
+            URL, response=Mock(status_code=429)), "rate limited (HTTP 429)"),
+        (requests.exceptions.InvalidJSONError(URL), "InvalidJSONError"),
+    ], ids=["retries", "connection", "ssl", "timeout", "503", "429", "json"])
+    def test_requests_failures_in_our_words(self, failure, reason):
+        assert request_failure_reason(failure) == reason
+
+    def test_other_failures_keep_their_text(self):
+        failure = OSError(
+            "Could not find a suitable TLS CA certificate bundle, "
+            "invalid path: /nonexistent/ca.pem"
+        )
+        assert request_failure_reason(failure) == str(failure)
+
+    def test_long_text_is_cut_and_redacted(self):
+        reason = request_failure_reason(
+            ValueError("bad\n answer from /a?api_key=SECRET " + "x" * 200)
+        )
+        assert reason.startswith("bad answer from /a?api_key=[redacted] ")
+        assert len(reason) == FAILURE_REASON_MAX_CHARS
+        assert reason.endswith("...")
 @
 
 

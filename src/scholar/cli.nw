@@ -2902,6 +2902,7 @@ if session_data is None:
 <<enrich and save chunk by chunk>>
 <<report open-access findings during enrich>>
 <<warn on currency issues during enrich>>
+<<report the papers still without an abstract>>
 <<report how many papers gained metadata>>
 @
 
@@ -2988,15 +2989,20 @@ through [[sys.exit(130)]] and runs its exit handler.
 The work of the chunk in progress is lost either way, apart from what
 the providers cached.
 The papers already processed are in [[originals]] and [[processed]],
-which the reports below use.
+and the outcomes of their lookups in [[lookup_outcomes]]
+(\cref{sec:enrich-lookup-tally}), which the reports below use.
 
 <<enrich and save chunk by chunk>>=
+from collections import Counter
+
 from rich.progress import Progress
 from scholar.notes import get_paper_id, migrate_paper_id
 from scholar.review import keep_copy_before_run
 
 originals: list = []
 processed: list = []
+lookup_outcomes: list = []
+crossref_failures: Counter = Counter()
 adopted_any = False
 pre_run_copy = (
     keep_copy_before_run(session_data, "pre-enrich") if selected else None
@@ -3012,6 +3018,7 @@ except KeyboardInterrupt:
         f"[yellow]Interrupted: saved {len(processed)} of {len(selected)} "
         f"{scope}; run again to continue.[/yellow]"
     )
+    <<report the papers still without an abstract>>
     <<say where the pre-run copy is>>
     raise typer.Exit(130)
 @
@@ -3053,10 +3060,11 @@ the old id are moved by the time the session names the new one.
 
 <<enrich, check and save one chunk>>=
 from scholar.enrich import enrich_papers
-from scholar.crossref import annotate_papers
+from scholar.crossref import annotate_papers, noting_failures
 from scholar.review import save_session
 
 before = [decision.paper for decision in chunk]
+chunk_outcomes: list = []
 after = enrich_papers(
     before,
     fields=enrich_fields,
@@ -3065,14 +3073,18 @@ after = enrich_papers(
         task, completed=start + current
     ),
     preprint_search=preprint_search,
+    outcomes=chunk_outcomes,
 )
-after = annotate_papers(after)
+after = annotate_papers(
+    after, progress_callback=noting_failures(crossref_failures)
+)
 for decision, paper in zip(chunk, after):
     decision.paper = paper
 <<record preprint adoptions during enrich>>
 save_session(session_data)
 originals.extend(before)
 processed.extend(after)
+lookup_outcomes.extend(chunk_outcomes)
 @
 
 [[signal.signal]] may only be called from the main thread, and the
@@ -3151,6 +3163,7 @@ elif unpaywall.is_configured():
         f"[cyan]Open access: {len(open_papers)} of {len(checked)} checked "
         f"{scope} ({len(with_pdf)} with PDF link).[/cyan]"
     )
+    <<say why open-access statuses are still unknown>>
 else:
     console.print(
         "[dim]Unpaywall lookup skipped: set SCHOLAR_EMAIL to enable "
@@ -3182,6 +3195,309 @@ if warnings:
         console.print(text)
 else:
     console.print("[green]No retractions or corrections found.[/green]")
+<<say how many currency checks failed>>
+@
+
+\enquote{No retractions or corrections found} speaks only for the
+papers Crossref answered for.
+A check that failed leaves its paper unchecked
+([[annotate_papers]], \cref{crossref-module}), and a run whose checks
+all failed, as they do in an environment without a CA bundle, used to
+end with that line and nothing else.
+So the chunks count the failed checks per reason ([[noting_failures]]
+wraps the check's progress callback, \cref{sec:crossref-check-failures})
+and the report adds [[check_failure_lines]] after it: how many papers'
+checks failed, why, and that running again retries them.
+The run itself goes on, as it always did; the tally is what makes the
+failures visible.
+
+<<say how many currency checks failed>>=
+from scholar.crossref import check_failure_lines
+
+for line in check_failure_lines(crossref_failures, scope):
+    console.print(escape(line), style="yellow", soft_wrap=True)
+@
+
+\subsection{Why lookups found nothing}
+\label{sec:enrich-lookup-tally}
+
+A paper still without an abstract after the run is either one that no
+database asked has an abstract for, or one whose lookup failed and may
+succeed on another run; a review that excludes records for lack of an
+abstract must not treat the second kind as the first
+(\url{https://github.com/dbosk/scholarcli/issues/259}).
+The command therefore collects the outcome of every paper's lookups
+([[LookupOutcome]], \cref{sec:enrich-lookup-outcomes}) beside the
+papers themselves, chunk by chunk, and ends with their tally
+([[abstract_tally_lines]]): how many papers still lack an abstract, how
+many of those every database asked answered for, how many had no DOI,
+and how many had a failed lookup, per database and reason, with a hint
+to run again only when there are such.
+The interrupt path prints the same tally over the papers saved so far,
+since those are the ones a second run would continue from; without an
+abstract among [[--fields]] no lookup was made for one and nothing is
+said.
+The lines are printed escaped and soft-wrapped: a reason is the
+service's or the limiter's text and may hold brackets, which [[rich]]
+would read as markup.
+
+<<report the papers still without an abstract>>=
+if "abstract" in enrich_fields and processed:
+    from scholar.enrich import abstract_tally_lines, tally_lookups
+
+    lookup_tally = tally_lookups(processed, lookup_outcomes)
+    for line in abstract_tally_lines(lookup_tally, scope):
+        console.print(
+            escape(line),
+            style="yellow" if lookup_tally.with_failure else "cyan",
+            soft_wrap=True,
+        )
+@
+
+The open-access tally above counts the checked papers only.
+The others are unknown for one of three reasons, which
+[[open_access_tally_lines]] tells apart: no DOI to look up, no record in
+Unpaywall, or a failed lookup, counted per reason
+(\cref{unpaywall-module}).
+Only the last is worth a second run, and only then is the hint given.
+
+<<say why open-access statuses are still unknown>>=
+from scholar.enrich import open_access_tally_lines, tally_lookups
+
+for line in open_access_tally_lines(
+    tally_lookups(processed, lookup_outcomes), scope
+):
+    console.print(escape(line), style="cyan", soft_wrap=True)
+@
+
+Let's verify both tallies through the real command and the real
+enrichment.
+The stand-ins are at the network's edge, as in the tests of
+\cref{sec:enrich-chunks}: the Crossref check passes the papers
+through, and the providers are reduced to one real Semantic Scholar
+provider whose limiter is in a cooldown and whose cache holds the
+answer \enquote{no such paper} for the second paper's DOI.
+The first paper's lookup is thus refused before any request, the way a
+throttled run's is, and the second is answered, the way a 404 is.
+For the open-access tally the real Unpaywall client is used the same
+way, and the preprint fallback, which would ask OpenAlex and Crossref,
+finds nothing.
+
+<<test functions>>=
+class TestEnrichLookupTally:
+  """`scholar enrich` says why papers still lack an abstract (#259)."""
+
+  REASON = "cooldown for the tally test"
+
+  @staticmethod
+  def _throttled_s2(monkeypatch, answered_doi):
+    from scholar.providers import SemanticScholarProvider
+
+    provider = SemanticScholarProvider(api_key=None)
+    monkeypatch.setattr(provider, "_cache", {("doi", answered_doi): None})
+    provider._limiter.record_limit_hit(
+      retry_after=3600, reason=TestEnrichLookupTally.REASON
+    )
+    return provider
+
+  @staticmethod
+  def _invoke(args, provider):
+    with patch(
+      "scholar.enrich.get_provider",
+      lambda name: provider if name == "s2" else None,
+    ), patch(
+      "scholar.crossref.annotate_papers",
+      side_effect=lambda papers, **kw: list(papers),
+    ):
+      return runner.invoke(app, ["enrich", *args])
+
+  <<enrich lookup tally test methods>>
+@
+
+A refused and an answered lookup end in different rows, the old lines
+stay, and the hint to run again is there:
+
+<<enrich lookup tally test methods>>=
+def test_refused_and_answered_are_told_apart(self, tmp_path, monkeypatch):
+  name = TestEnrichSelectionAndSaving._session(tmp_path, monkeypatch, 2)
+  s2 = self._throttled_s2(monkeypatch, "10.1/c137-1")
+  result = self._invoke([name, "--fields", "abstract"], s2)
+  assert result.exit_code == 0, result.stdout
+  out = result.stdout
+  assert "Still without an abstract: 2 of 2 papers." in out
+  assert "1 answered by every database asked" in out
+  assert "1 with a failed lookup, by database and reason:" in out
+  assert f"s2: {self.REASON}" in out
+  assert "Run again to retry the failed lookups." in out
+  assert "Enriched 0 papers." in out
+@
+
+An interruption prints the tally of the papers saved before it.
+The provider is wrapped so that the second paper's lookup is where the
+interruption happens:
+
+<<enrich lookup tally test methods>>=
+def test_interrupt_prints_the_tally(self, tmp_path, monkeypatch):
+  monkeypatch.setattr("scholar.cli.ENRICH_SAVE_EVERY", 1)
+  name = TestEnrichSelectionAndSaving._session(tmp_path, monkeypatch, 2)
+  s2 = self._throttled_s2(monkeypatch, "10.1/unused")
+
+  class InterruptedAtSecond:
+    @property
+    def last_lookup_error(self):
+      return s2.last_lookup_error
+
+    def get_paper_by_doi(self, doi):
+      if doi == "10.1/c137-1":
+        raise KeyboardInterrupt
+      return s2.get_paper_by_doi(doi)
+
+  result = self._invoke(
+    [name, "--fields", "abstract"], InterruptedAtSecond()
+  )
+  assert result.exit_code == 130
+  out = result.stdout
+  assert "Interrupted: saved 1 of 2 papers" in out
+  assert "Still without an abstract: 1 of 1 papers." in out
+  assert f"s2: {self.REASON}" in out
+@
+
+The open-access part separates a DOI Unpaywall answered for without a
+record (a cached 404) from one whose lookup was refused:
+
+<<enrich lookup tally test methods>>=
+def test_open_access_unknown_reasons(self, tmp_path, monkeypatch):
+  from scholar import unpaywall
+
+  name = TestEnrichSelectionAndSaving._session(tmp_path, monkeypatch, 2)
+  monkeypatch.setenv("SCHOLAR_EMAIL", "tests@example.org")
+  monkeypatch.setitem(unpaywall._client._cache, ("oa", "10.1/c137-1"), None)
+  unpaywall._client._limiter.record_limit_hit(
+    retry_after=3600, reason=self.REASON
+  )
+  monkeypatch.setattr(
+    "scholar.preprint.find_preprint", lambda paper, search=False: None
+  )
+  result = self._invoke([name, "--fields", "pdf_url"], None)
+  assert result.exit_code == 0, result.stdout
+  out = result.stdout
+  assert "Open access: 0 of 0 checked papers (0 with PDF link)." in out
+  assert (
+    "Open-access status unknown for 2 papers: 1 not in Unpaywall, "
+    "1 with a failed lookup." in out
+  )
+  assert f"unpaywall: {self.REASON}" in out
+  assert "Still without an abstract" not in out
+@
+
+Last, the failure reported from a real run: an environment that can
+make no HTTPS request at all.
+[[REQUESTS_CA_BUNDLE]] pointing at a file that does not exist makes
+every request through [[requests]] raise the same [[OSError]] in
+[[HTTPAdapter.cert_verify]], before a connection is opened, so the
+whole run is real down to that point: Semantic Scholar and OpenAlex
+(fresh providers with empty caches, OpenAlex's batch included),
+Unpaywall and the Crossref check.
+Each service must be named with that reason in the tallies, the run
+must finish (exit 0), and the papers must be saved as never checked by
+Crossref.
+
+<<enrich lookup tally test methods>>=
+def test_broken_tls_setup_is_named_for_every_service(
+  self, tmp_path, monkeypatch
+):
+  from scholar import crossref, unpaywall
+  from scholar.providers import OpenAlexProvider, SemanticScholarProvider
+
+  bundle = "/nonexistent/scholar-test/ca.pem"
+  name = TestEnrichSelectionAndSaving._session(tmp_path, monkeypatch, 2)
+  monkeypatch.setenv("REQUESTS_CA_BUNDLE", bundle)
+  monkeypatch.setenv("SCHOLAR_EMAIL", "tests@example.org")
+  monkeypatch.setattr(unpaywall._client, "_cache", {})
+  monkeypatch.setattr(crossref._client, "_cache", {})
+  monkeypatch.setattr(
+    "scholar.preprint.find_preprint", lambda paper, search=False: None
+  )
+  providers = {
+    "s2": SemanticScholarProvider(api_key=None),
+    "openalex": OpenAlexProvider(api_key=None),
+  }
+  for provider in providers.values():
+    monkeypatch.setattr(provider, "_cache", {})
+  with patch("scholar.enrich.get_provider", providers.get):
+    result = runner.invoke(app, [
+      "enrich", name, "--fields", "abstract,pdf_url",
+      "--enrich-providers", "s2,openalex",
+    ])
+  assert result.exit_code == 0, result.stdout
+  out = result.stdout
+  reason = (
+    "Could not find a suitable TLS CA certificate bundle, invalid path: "
+    + bundle
+  )
+  for service in ("s2", "openalex", "unpaywall", "crossref"):
+    assert f"{service}: {reason} (2)" in out, service
+  assert "2 with a failed lookup, by database and reason:" in out
+  assert "Crossref check failed for 2 papers" in out
+  saved = TestEnrichSelectionAndSaving._saved(name)
+  assert [d.paper.updated_by for d in saved.values()] == [None, None]
+@
+
+A database that declines is information, not a failure.
+Off campus Scopus has no abstracts to give and asks nothing
+(\cref{sec:scopus-doi-lookup}); a run there must still read the papers
+every other database answered for as settled, name Scopus once with
+its reason, and not tell the user to run again.
+
+<<enrich lookup tally test methods>>=
+def test_declining_scopus_is_not_a_failure(self, tmp_path, monkeypatch):
+  from scholar.providers import ScopusProvider, SemanticScholarProvider
+
+  name = TestEnrichSelectionAndSaving._session(tmp_path, monkeypatch, 2)
+  monkeypatch.setenv("SCOPUS_VIEW", "standard")
+  s2 = SemanticScholarProvider(api_key=None)
+  monkeypatch.setattr(s2, "_cache", {
+    ("doi", "10.1/c137-0"): None, ("doi", "10.1/c137-1"): None,
+  })
+  providers = {"s2": s2, "scopus": ScopusProvider(api_key="dummy")}
+  with patch("scholar.enrich.get_provider", providers.get), patch(
+    "scholar.crossref.annotate_papers",
+    side_effect=lambda papers, **kw: list(papers),
+  ):
+    result = runner.invoke(app, [
+      "enrich", name, "--fields", "abstract",
+      "--enrich-providers", "s2,scopus",
+    ])
+  assert result.exit_code == 0, result.stdout
+  out = result.stdout
+  assert "2 answered by every database asked" in out
+  assert (
+    "scopus not asked: SCOPUS_VIEW=standard has no abstracts (2 papers)"
+    in out
+  )
+  assert "failed lookup" not in out
+  assert "Run again" not in out
+@
+
+[[scholar verify]] counts the failed checks the same way, on stderr, so
+that its [[--json]] output stays a clean array:
+
+<<enrich lookup tally test methods>>=
+def test_verify_counts_failed_checks(self, tmp_path, monkeypatch):
+  from scholar import crossref
+
+  name = TestEnrichSelectionAndSaving._session(tmp_path, monkeypatch, 2)
+  monkeypatch.setattr(crossref._client, "_cache", {})
+  crossref._client._limiter.record_limit_hit(
+    retry_after=3600, reason=self.REASON
+  )
+  result = runner.invoke(app, ["verify", name, "--json"])
+  assert result.exit_code == 0
+  assert [p["status"] for p in json.loads(result.stdout)] == [
+    "unknown", "unknown",
+  ]
+  assert "Crossref check failed for 2 papers" in result.stderr
+  assert f"crossref: {self.REASON} (2)" in result.stderr
 @
 
 Finally we count the papers that gained an abstract or a PDF link.
@@ -3244,8 +3560,15 @@ consumer can pipe it straight into a parser.  A missing session is therefore an
 error on stderr plus a non-zero exit, never a stray line on stdout.
 
 <<verify session currency>>=
+from collections import Counter
+
 from scholar.review import save_session
-from scholar.crossref import annotate_papers, currency_status
+from scholar.crossref import (
+    annotate_papers,
+    check_failure_lines,
+    currency_status,
+    noting_failures,
+)
 from rich.progress import Progress
 
 console = Console()
@@ -3263,8 +3586,20 @@ papers = [decision.paper for decision in session_data.decisions]
 for decision, paper in zip(session_data.decisions, checked):
     decision.paper = paper
 save_session(session_data)
+<<say on stderr how many checks failed>>
 
 <<output the currency report>>
+@
+
+A paper whose check failed reads \enquote{unknown} in the report, like
+one without a DOI, so the failures are counted as [[enrich]] counts
+them (\cref{sec:crossref-check-failures}) and said once, per reason.
+They go to [[err_console]] in both modes: they are a diagnostic of the
+run, like the progress bar, and the [[--json]] output must stay pure.
+
+<<say on stderr how many checks failed>>=
+for line in check_failure_lines(crossref_failures, "papers"):
+    err_console.print(escape(line), style="yellow", soft_wrap=True)
 @
 
 The progress bar is attached to [[err_console]] for the same reason: a Rich
@@ -3280,7 +3615,11 @@ with Progress(console=err_console) as progress:
     def update_progress(done: int, total: int) -> None:
         progress.update(task, completed=done)
 
-    checked = annotate_papers(papers, progress_callback=update_progress)
+    crossref_failures: Counter = Counter()
+    checked = annotate_papers(
+        papers,
+        progress_callback=noting_failures(crossref_failures, update_progress),
+    )
 @
 
 The JSON shape mirrors what a verification checklist needs: the DOI and title to
@@ -3392,7 +3731,7 @@ class TestEnrichCommand:
     @staticmethod
     def _fake_enrich(
         papers, fields=None, providers=None, progress_callback=None,
-        preprint_search=False,
+        preprint_search=False, outcomes=None,
     ):
         """Stand in for enrich_papers: mark everything gold OA with a PDF."""
         from dataclasses import replace
@@ -7124,7 +7463,17 @@ title.  [[show]] is what an author reads before exporting, so it must
 not present a list of machine verdicts as a screened list.  The JSON
 form gives each decision its stored [[source]] and the counts under
 [[decision_sources]], keyed by the stored values, so a script can check
-what still needs review.  A decision whose source was corrected after
+what still needs review.  Each source that claims a human also says how
+many of its decisions carry a record of the review
+(\cref{sec:human-review-record} in the review module): \enquote{human:
+1200 (0 with a record of the review)}.  The listing gives that note
+always, unlike the report, because it is the working view in which a
+reviewer checks what the file can show.  A decision without a record is
+not thereby a machine's: decisions made before the record existed have
+none either.  The JSON form gives each decision the three fields
+([[human_decided_at]], [[human_decided_via]], [[human_by]], [[null]]
+when unset) and the counts under [[review_records]], keyed by the
+stored values of the three sources.  A decision whose source was corrected after
 the fact ([[sessions relabel]], \cref{sec:sessions-relabel}) says so
 after its title, naming the source the last correction replaced, and
 its JSON entry carries the [[relabelled]] records (only when there are
@@ -7350,6 +7699,120 @@ class TestShowTheAgentsReason:
     assert flat.count("reason(") + flat.count("reason:") == 2
 @
 
+\paragraph{Quotes in the machine reasons.}
+A reason that quotes words its record does not hold
+(\cref{sec:reason-quotes} in the review module) reads as evidence it
+is not, and a reviewer looking at a screened session should see how
+many there are and where.  When the session holds any machine reason,
+an agent's or a classifier's, one line after \enquote{Decided by} says
+how many reasons it holds, how many quote three or more words of their
+record, and how many hold a quote not found in the record's title or
+abstract; each paper with such a reason gets a mark after its title.
+The JSON form gives every decision with such a reason its
+[[unmatched_quotes]] (the key is absent otherwise, as for the other
+optional fields) and, when the session holds a machine reason, the
+counts per kind at the top level ([[reason_quotes]], with the number
+of quotes left unchecked for being short), so the JSON of a session
+without one is as it was.  The check runs once per decision, through
+[[reason_quote_checks]], whose results the summary line, the marks and
+the JSON all read, so a session of 30\,000 reasons is checked once per
+command.  It compares with the record as the session holds it now: a
+quote from a full-text passage, or from an abstract replaced since,
+is listed as not found.
+
+<<sessions command>>=
+QUOTE_MARK = "quote not in title or abstract"
+
+
+def reason_quotes_line(tally: dict) -> str:
+    """The `sessions show` summary of the quote check, or "" if no reason."""
+    reasons = sum(counts["reasons"] for counts in tally.values())
+    if not reasons:
+        return ""
+    checked = sum(counts["checked"] for counts in tally.values())
+    unmatched = sum(counts["unmatched"] for counts in tally.values())
+    return (
+        f"Reasons: {reasons} recorded, {checked} with quotes checked, "
+        f"{unmatched} with a quote not found in the record's title or "
+        "abstract"
+    )
+@
+
+Let's check the three forms on a session with an agent's reason that
+quotes its abstract, one that does not, a classifier's reason whose
+quote is too short to check, and a decision without a reason.
+
+<<test functions>>=
+class TestShowTheQuoteCheck:
+  def test_line_marks_and_json(self, tmp_path, monkeypatch):
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+    from scholar.review import (
+      DecisionStatus, ReviewDecision, ReviewSession, ReviewSource,
+      save_session,
+    )
+
+    def decided(title, **reasons):
+      return ReviewDecision(
+        paper=Paper(title=title, authors=["A"], doi=f"10.1/{title}",
+                    abstract="Most students treated recursion as a loop."),
+        provider="openalex", status=DecisionStatus.DISCARDED,
+        tags=["off-topic-false-hit"], source=ReviewSource.AGENT_UNREVIEWED,
+        **reasons,
+      )
+    save_session(ReviewSession(
+      query="q", providers=["openalex"], timestamp=datetime(2026, 11, 20),
+      name="quoted", decisions=[
+        decided("found", agent_reason='"treated recursion as a loop"'),
+        decided("missing", agent_reason='"recursion was taught late"'),
+        decided("short", llm_reason='Only "recursion".'),
+        decided("none"),
+      ],
+    ))
+    result = runner.invoke(app, ["sessions", "show", "quoted"])
+    assert result.exit_code == 0, result.output
+    flat = " ".join(result.output.split())
+    assert ("Reasons: 3 recorded, 2 with quotes checked, 1 with a quote "
+            "not found in the record's title or abstract") in flat
+    assert flat.count(f"({QUOTE_MARK})") == 1
+    assert flat.index("missing") < flat.index(QUOTE_MARK) \
+      < flat.index("short")
+
+    result = runner.invoke(app, ["sessions", "show", "quoted", "-f", "json"])
+    data = json.loads(result.output)
+    assert {d["title"]: d.get("unmatched_quotes")
+            for d in data["decisions"]} == {
+      "found": None, "missing": ["recursion was taught late"],
+      "short": None, "none": None,
+    }
+    assert data["reason_quotes"] == {
+      "agent": {"reasons": 2, "checked": 2, "unmatched": 1,
+                "short_quotes": 0},
+      "llm": {"reasons": 1, "checked": 0, "unmatched": 0,
+              "short_quotes": 1},
+    }
+
+  def test_no_line_without_machine_reasons(self, tmp_path, monkeypatch):
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+    from scholar.review import ReviewDecision, ReviewSession, save_session
+
+    save_session(ReviewSession(
+      query="q", providers=["openalex"], timestamp=datetime(2026, 11, 20),
+      name="unreasoned", decisions=[ReviewDecision(
+        paper=Paper(title="T", authors=["A"], doi="10.1/unreasoned"),
+        provider="openalex",
+      )],
+    ))
+    result = runner.invoke(app, ["sessions", "show", "unreasoned"])
+    assert result.exit_code == 0, result.output
+    assert "Reasons:" not in result.output
+    result = runner.invoke(
+      app, ["sessions", "show", "unreasoned", "-f", "json"]
+    )
+    data = json.loads(result.output)
+    assert "reason_quotes" not in data
+    assert all("unmatched_quotes" not in d for d in data["decisions"])
+@
+
 Each line under \enquote{Queries by provider:} also says what the search
 returned, as recorded in the session (\cref{sec:search-result-error}):
 the hit count, or a highlighted \enquote{failed} with the reason.  This
@@ -7446,11 +7909,13 @@ def relabel_mark(decision) -> str:
     return f"relabelled from {old} to {new}, now {decision.source.value}"
 
 
-def session_paper_line(decision) -> str:
+def session_paper_line(decision, unmatched_quotes=()) -> str:
     """Return the Rich markup `sessions show` prints for one paper.
 
     Two lines: the title with provider and tags, then the paper id that
     `sessions decide --paper-id` accepts (`doi:...` or `hash:...`).
+    A mark follows the title when `unmatched_quotes` holds a quote of
+    its reasons that the record does not.
     """
     from scholar.review import unreviewed_mark
 
@@ -7468,6 +7933,8 @@ def session_paper_line(decision) -> str:
         unreviewed += f" [dim]({escape(abstract_mark(decision))})[/dim]"
     if earlier_classifier_trace(decision):
         unreviewed += f" [dim](llm trace: {EARLIER_TRACE_LABEL})[/dim]"
+    if unmatched_quotes:
+        unreviewed += f" [yellow]({QUOTE_MARK})[/yellow]"
     return (
         f"  • {escape(paper.title or '')}{provider}{tags}{unreviewed}\n"
         f"    [dim]{escape(paper.id)}[/dim]"
@@ -7499,14 +7966,25 @@ def sessions_show(
     Displays all papers with their decisions, themes, and motivations,
     each with the paper id that `sessions decide --paper-id` accepts.
     Uses a pager for interactive viewing when output is a terminal.
+
+    "Decided by:" counts the decisions by source; each source that
+    claims a human (human, LLM or agent reviewed by a human) says how
+    many carry a record of the review (made in the TUI or with
+    `sessions decide --source human`). Decisions made before such
+    records were kept have none, which does not mean that no human
+    made them.
     """
     import sys
     from scholar.review import (
-        agent_audit_of, decision_source_counts, decision_source_items,
+        agent_audit_of, decision_source_counts, decision_source_rows,
+        human_record_counts, human_record_of, source_row_text,
     )
     from scholar.review import conflicting_copies, copy_conflict_line
     from scholar.review import alike_copies, possible_copies
     from scholar.review import foldable_copies
+    from scholar.review import (
+        quote_check_tally, reason_quote_checks, unmatched_quotes_of,
+    )
 
     console = Console()
     session = open_session_argument(name)
@@ -7514,6 +7992,13 @@ def sessions_show(
     if session is None:
         console.print(f"[red]Session not found: {escape(name)}[/red]")
         raise typer.Exit(1)
+
+    quote_checks = {id(d): reason_quote_checks(d) for d in session.decisions}
+    quote_tally = quote_check_tally(quote_checks.values())
+    unmatched = {
+        key: unmatched_quotes_of(checks)
+        for key, checks in quote_checks.items()
+    }
 
     if output_format == "json":
         output = {
@@ -7549,6 +8034,11 @@ def sessions_show(
                 for source, count in
                 decision_source_counts(session.decisions).items()
             },
+            "review_records": {
+                source.value: count
+                for source, count in
+                human_record_counts(session.decisions).items()
+            },
             "decisions": [
                 {
                     "title": d.paper.title,
@@ -7571,9 +8061,18 @@ def sessions_show(
                         if earlier_classifier_trace(d) else {}
                     ),
                     **agent_audit_of(d),
+                    **human_record_of(d),
+                    **(
+                        {"unmatched_quotes": unmatched[id(d)]}
+                        if unmatched[id(d)] else {}
+                    ),
                 }
                 for d in session.decisions
             ],
+            **(
+                {"reason_quotes": quote_tally}
+                if reason_quotes_line(quote_tally) else {}
+            ),
             **{
                 key: [
                     {
@@ -7628,11 +8127,22 @@ def sessions_show(
             con.print()
 
             # Show who decided
-            sources = decision_source_items(session.decisions)
+            sources = decision_source_rows(
+                session.decisions, always_note=True
+            )
             if sources:
                 con.print("[cyan bold]Decided by:[/cyan bold]")
-                for label, count in sources:
-                    con.print(f"  • {escape(label)}: {count}")
+                for label, count, note in sources:
+                    con.print(
+                        f"  • {escape(label)}: "
+                        f"{escape(source_row_text(count, note))}"
+                    )
+                con.print()
+
+            # Show the quote check of the machine reasons
+            quotes_line = reason_quotes_line(quote_tally)
+            if quotes_line:
+                con.print(f"[cyan]{escape(quotes_line)}[/cyan]")
                 con.print()
 
             # Show themes overview
@@ -7651,7 +8161,7 @@ def sessions_show(
             if kept:
                 con.print(f"[green bold]Kept ({len(kept)}):[/green bold]")
                 for d in kept:
-                    con.print(session_paper_line(d))
+                    con.print(session_paper_line(d, unmatched[id(d)]))
                 con.print()
 
             # Show discarded papers
@@ -7661,7 +8171,7 @@ def sessions_show(
                     f"[red bold]Discarded ({len(discarded)}):[/red bold]"
                 )
                 for d in discarded:
-                    con.print(session_paper_line(d))
+                    con.print(session_paper_line(d, unmatched[id(d)]))
                 con.print()
 
             # Show pending papers
@@ -7671,7 +8181,7 @@ def sessions_show(
                     f"[yellow bold]Pending ({len(pending)}):[/yellow bold]"
                 )
                 for d in pending:
-                    con.print(session_paper_line(d))
+                    con.print(session_paper_line(d, unmatched[id(d)]))
                 con.print()
 
             <<show the conflicting copies>>
@@ -8980,8 +9490,11 @@ def sessions_decide(
         Optional[str],
         typer.Option(
             "--by",
-            help="Who gave the --reason or --reasons-file reasons, e.g. "
-                 "the agent's name or role. Not guessed when left out.",
+            help="Who decided: with --source agent, who gave the "
+                 "--reason or --reasons-file reasons (the agent's name "
+                 "or role); with --source human, the human's name, "
+                 "kept in the record of the review. Not guessed when "
+                 "left out.",
         ),
     ] = None,
     reasons_file: Annotated[
@@ -8999,6 +9512,18 @@ def sessions_decide(
             exists=True, dir_okay=False, readable=True,
         ),
     ] = None,
+    strict_quotes: Annotated[
+        bool,
+        typer.Option(
+            "--strict-quotes",
+            help="With --reason or --reasons-file: refuse the batch "
+                 "(exit 2, nothing saved) when a reason quotes, between "
+                 "double quote marks, three or more words that its "
+                 "record's title and abstract do not hold. Without it "
+                 "such quotes are listed on stderr and the batch is "
+                 "saved.",
+        ),
+    ] = False,
 ) -> None:
     """
     Record keep/discard decisions in a saved session, without the TUI.
@@ -9054,7 +9579,24 @@ def sessions_decide(
     stripped and must hold 1 to 2000 characters. An agent decision
     without a reason is recorded, with a warning. A later agent or
     LLM decision clears the reason (also with --keep-trace, which
-    keeps only the classifier's record).
+    keeps only the classifier's record). A reason that is a placeholder
+    (PLACEHOLDER, TODO, TBD, XXX, REASON, N/A) or has no letter or
+    digit is refused, and so is a
+    file line whose reason is only a number or a paper id (a shifted
+    column).
+
+    Each reason is checked against its own record: a quote of three or
+    more words between double quote marks that the record's title and
+    abstract do not hold is listed on stderr (line, id, quote), since
+    it is a paraphrase or belongs to another record. The batch is saved
+    all the same, unless --strict-quotes refuses it (exit 2).
+
+    A human decision (--source human, also the default at a terminal)
+    keeps a record of the review: the time, the channel (`decide`) and
+    the name given with --by (not guessed). `sessions show` and the
+    report count the human decisions with and without such a record;
+    decisions made before it was kept have none, which does not mean
+    a human did not make them. An agent or LLM decision clears it.
 
     Examples:
         scholar sessions decide my-review --source human --keep \\
@@ -9074,8 +9616,9 @@ def sessions_decide(
     """
     from scholar.review import (
         AGENT_AUDIT_FIELDS, AUDIT_CATEGORIES, CopyConflict, DecisionStatus,
-        ReviewSource, clear_machine_audit, copy_conflict_line,
-        same_id_pairs, save_session, tags_after_decision,
+        ReviewSource, clear_human_record, clear_machine_audit,
+        copy_conflict_line, record_human_decision, same_id_pairs,
+        save_session, tags_after_decision,
     )
     from scholar.llm_review import mark_as_reviewed
     from scholar.utils import utc_now_iso
@@ -9091,6 +9634,7 @@ def sessions_decide(
     <<select decisions by doi and paper id>>
     <<refuse to decide copies decided apart>>
     <<refuse to let a machine replace a human decision>>
+    <<check the quotes of the agent's reasons>>
 
     status = DecisionStatus.KEPT if keep else DecisionStatus.DISCARDED
     untag_seen: set[str] = set()
@@ -9276,11 +9820,180 @@ elif decision.source.is_unreviewed:
 else:
     decision.status = status
     decision.source = ReviewSource.HUMAN
+<<keep the record of a human's review>>
 <<replace the tags of a changed decision>>
 @
 
 The option's values are the stored values of the unreviewed sources,
 so [[ReviewSource(source)]] turns one into the other.
+
+A human decision, whichever branch recorded it, keeps the record of
+the human's review (\cref{sec:human-review-record} in the review
+module): the run's time, the channel [[decide]] and the name given with
+[[--by]], or none, since a login guessed here would put a name on a
+record its owner never made.  This is one of the two places where a
+human decides (the TUI is the other), and the default at a terminal is
+such a decision too, since that is what the default asserts.  A machine
+decision clears the record instead: it replaces the human's decision
+(with [[--force]], below) or a machine's, and either way no human
+decision stands that the record could describe.  A later human decision
+replaces the record, time included, since the record belongs to the
+decision that stands.
+
+<<keep the record of a human's review>>=
+if source in MACHINE_DECISION_SOURCES:
+    clear_human_record(decision)
+else:
+    record_human_decision(decision, "decide", by=by, at=decided_at)
+@
+
+Let's check the channel: a human decision records its time, channel
+and name, one time for the run; a confirmation of an agent's call
+records the same; a later decision by a human replaces the record; an
+agent decision forced over a human one clears it; a reset paper decided
+anew by a human gets a new one; and [[--by]] is accepted for a human
+but still refused for a relayed classifier verdict.
+
+<<test functions>>=
+class TestDecideKeepsTheHumanRecord:
+  <<decide human record test methods>>
+<<decide human record test methods>>=
+def _session(self, tmp_path, monkeypatch):
+  monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+  from scholar.review import (
+    DecisionStatus, ReviewDecision, ReviewSession, ReviewSource,
+    save_session,
+  )
+
+  save_session(ReviewSession(
+    query="q", providers=["openalex"], timestamp=datetime(2026, 11, 20),
+    name="humans", decisions=[
+      ReviewDecision(paper=Paper(title="One", authors=["A"],
+                                 doi="10.1/one"), provider="openalex"),
+      ReviewDecision(paper=Paper(title="Two", authors=["A"],
+                                 doi="10.1/two"), provider="openalex"),
+      ReviewDecision(paper=Paper(title="Agent", authors=["A"],
+                                 doi="10.1/agent"), provider="openalex",
+                     status=DecisionStatus.DISCARDED, tags=["off-topic"],
+                     source=ReviewSource.AGENT_UNREVIEWED,
+                     llm_confidence=0.7),
+    ],
+  ))
+
+def _decide(self, *args):
+  return runner.invoke(app, ["sessions", "decide", "humans", *args])
+
+def _decisions(self):
+  from scholar.review import load_session
+
+  return {d.paper.title: d for d in load_session("humans").decisions}
+
+def _clock(self, monkeypatch, at):
+  import scholar.utils
+
+  monkeypatch.setattr(scholar.utils, "utc_now_iso", lambda: at)
+
+def test_a_human_decision_is_recorded(self, tmp_path, monkeypatch):
+  self._session(tmp_path, monkeypatch)
+  self._clock(monkeypatch, "2026-11-20T09:00:00+00:00")
+  result = self._decide("--source", "human", "--keep", "--tag", "ml",
+                        "--doi", "10.1/one", "--doi", "10.1/two",
+                        "--by", "the author")
+  assert result.exit_code == 0, result.output
+  decisions = self._decisions()
+  for title in ("One", "Two"):
+    assert (decisions[title].human_decided_at,
+            decisions[title].human_decided_via,
+            decisions[title].human_by) \
+      == ("2026-11-20T09:00:00+00:00", "decide", "the author")
+  assert decisions["Agent"].human_decided_at is None
+
+def test_a_confirmation_is_recorded(self, tmp_path, monkeypatch):
+  from scholar.review import ReviewSource
+
+  self._session(tmp_path, monkeypatch)
+  result = self._decide("--source", "human", "--discard",
+                        "--tag", "off-topic", "--doi", "10.1/agent")
+  assert result.exit_code == 0, result.output
+  agent = self._decisions()["Agent"]
+  assert agent.source is ReviewSource.AGENT_REVIEWED
+  assert agent.human_decided_via == "decide"
+  assert agent.human_by is None
+  assert agent.human_decided_at.endswith("+00:00")
+
+def test_a_later_decision_replaces_the_record(self, tmp_path, monkeypatch):
+  self._session(tmp_path, monkeypatch)
+  self._clock(monkeypatch, "2026-11-20T09:00:00+00:00")
+  self._decide("--source", "human", "--keep", "--doi", "10.1/one",
+               "--by", "first")
+  self._clock(monkeypatch, "2026-11-20T10:00:00+00:00")
+  result = self._decide("--source", "human", "--discard",
+                        "--tag", "off-topic", "--doi", "10.1/one")
+  assert result.exit_code == 0, result.output
+  one = self._decisions()["One"]
+  assert (one.human_decided_at, one.human_by) \
+    == ("2026-11-20T10:00:00+00:00", None)
+
+def test_a_forced_machine_decision_clears_it(self, tmp_path, monkeypatch):
+  self._session(tmp_path, monkeypatch)
+  self._decide("--source", "human", "--keep", "--doi", "10.1/one",
+               "--by", "the author")
+  result = self._decide("--source", "agent", "--discard", "--force",
+                        "--tag", "off-topic", "-c", "0.6",
+                        "--doi", "10.1/one")
+  assert result.exit_code == 0, result.output
+  one = self._decisions()["One"]
+  assert (one.human_decided_at, one.human_decided_via, one.human_by) \
+    == (None, None, None)
+
+def test_a_reset_paper_decided_anew_is_recorded(self, tmp_path, monkeypatch):
+  self._session(tmp_path, monkeypatch)
+  result = runner.invoke(app, ["sessions", "reset", "humans",
+                               "--doi", "10.1/agent"])
+  assert result.exit_code == 0, result.output
+  assert self._decisions()["Agent"].human_decided_at is None
+  result = self._decide("--source", "human", "--keep", "--tag", "ml",
+                        "--doi", "10.1/agent")
+  assert result.exit_code == 0, result.output
+  assert self._decisions()["Agent"].human_decided_via == "decide"
+
+def test_copies_recorded_apart_need_no_all_copies(
+  self, tmp_path, monkeypatch
+):
+  monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+  from scholar.review import (
+    DecisionStatus, ReviewDecision, ReviewSession, load_session,
+    record_human_decision, save_session,
+  )
+
+  paper = Paper(title="Twice", authors=["A"], doi="10.1/twice")
+  copies = [ReviewDecision(paper=paper, provider=provider,
+                           status=DecisionStatus.KEPT, tags=["ml"])
+            for provider in ("openalex", "dblp")]
+  for decision, at in zip(copies, ("2026-11-20T09:00:00+00:00",
+                                   "2026-11-20T09:01:00+00:00")):
+    record_human_decision(decision, "tui", at=at)
+  save_session(ReviewSession(
+    query="q", providers=["openalex"], timestamp=datetime(2026, 11, 20),
+    name="humans", decisions=copies,
+  ))
+  result = self._decide("--source", "human", "--keep", "--tag", "core",
+                        "--paper-id", "doi:10.1/twice")
+  assert result.exit_code == 0, result.output
+  assert [d.tags for d in load_session("humans").decisions] \
+    == [["ml", "core"], ["ml", "core"]]
+
+def test_by_names_a_human_but_not_a_classifier(self, tmp_path, monkeypatch):
+  self._session(tmp_path, monkeypatch)
+  result = self._decide("--source", "llm", "--keep", "--doi", "10.1/one",
+                        "--by", "someone")
+  assert result.exit_code == 2
+  assert self._decisions()["One"].human_by is None
+  result = self._decide("--source", "human", "--keep", "--doi", "10.1/one",
+                        "--by", " ")
+  assert result.exit_code == 2
+  assert "--by: empty name" in result.output
+@
 
 A machine decision must not replace a human one silently.  Recording an
 agent's verdict on a paper the author had kept under a theme used to
@@ -9607,8 +10320,12 @@ def test_a_human_decision_only_notes_the_flag(
   self, tmp_path, monkeypatch
 ):
   from dataclasses import asdict
+  import scholar.utils
   from scholar.review import load_session
 
+  # Both runs record the human's review; one clock, so its time is equal.
+  monkeypatch.setattr(scholar.utils, "utc_now_iso",
+                      lambda: "2026-11-20T09:00:00+00:00")
   outcomes = []
   for run, flag in (("with", ["--keep-trace"]), ("without", [])):
     self._make_session(tmp_path / run, monkeypatch)
@@ -9665,7 +10382,12 @@ are the agent's trace, which a human's later review is compared with,
 and a human's own words would overwrite what is to be compared.  Both
 are usage errors (status~2), refused before the session is loaded, and
 the message says which of the two applies.  So is [[--by]] without a
-reason: a name with nothing to attach it to is not a trace.
+reason for an agent: a name with nothing to attach it to is not a
+trace.  For a human, [[--by]] is accepted alone and names who decided
+in the human's review record (below); with [[--source llm]] it is
+refused like the reasons.  [[--strict-quotes]] without a reason is
+refused too, since it would have no quote to check
+(\cref{sec:decide-quote-check}).
 
 Most screens decide many records with one verdict but a reason of
 their own each.  One command per record would work, but each command
@@ -9716,7 +10438,7 @@ such decisions (\cref{sec:report-provenance} in the review module).
 
 <<validate the agent's reasons>>=
 traced = (reason is not None or reasons_file is not None
-          or by is not None)
+          or (by is not None and source != "human"))
 if traced and source == "llm":
     console.print(
         "[red]--reason, --reasons-file and --by record an agent's "
@@ -9726,7 +10448,7 @@ if traced and source == "llm":
     raise typer.Exit(2)
 if traced and source != "agent":
     console.print(
-        "[red]--reason, --reasons-file and --by record an agent's "
+        "[red]--reason and --reasons-file record an agent's "
         "reason (--source agent); a human's reason is not recorded "
         "there.[/red]"
     )
@@ -9740,10 +10462,17 @@ if reasons_file is not None and (doi or paper_id):
         "--paper-id.[/red]"
     )
     raise typer.Exit(2)
-if by is not None and reason is None and reasons_file is None:
+if (by is not None and source == "agent"
+        and reason is None and reasons_file is None):
     console.print(
         "[red]--by names who gave the reason; give --reason or "
         "--reasons-file too.[/red]"
+    )
+    raise typer.Exit(2)
+if strict_quotes and reason is None and reasons_file is None:
+    console.print(
+        "[red]--strict-quotes checks the quotes of a reason; give "
+        "--reason or --reasons-file too.[/red]"
     )
     raise typer.Exit(2)
 <<check the reason, the name and the reasons file>>
@@ -9804,6 +10533,12 @@ def checked_agent_reason(text: str) -> tuple[str, str | None]:
     stripped = text.strip()
     if not stripped:
         return stripped, "empty reason"
+    if not any(c.isalnum() for c in stripped):
+        return stripped, f"reason {stripped!r} has no letter or digit"
+    if is_placeholder_reason(stripped):
+        return stripped, (
+            f"reason {stripped!r} is a placeholder, not a reason"
+        )
     if len(stripped) > MAX_AGENT_REASON_CHARS:
         return stripped, (
             f"reason of {len(stripped)} characters, over the limit of "
@@ -9874,6 +10609,7 @@ if len(columns) > 3:
     continue
 paper = columns[0].strip()
 reason_text, problem = checked_agent_reason(columns[1])
+problem = problem or reason_column_shift(reason_text)
 line_problems = [problem] if problem else []
 if not paper:
     line_problems.insert(0, "empty id")
@@ -10945,6 +11681,7 @@ class TestSessionsDecideSources:
         assert completed.returncode == 0, completed.stdout + completed.stderr
         kept = load_session("headless").kept_papers()
         assert [d.source for d in kept] == [ReviewSource.HUMAN]
+        assert [d.human_decided_via for d in kept] == ["decide"]
 
     def test_agent_decision_stays_unreviewed(self, tmp_path, monkeypatch):
         from scholar.review import ReviewSource, load_session
@@ -11195,6 +11932,36 @@ class TestDecisionSourcesInViews:
         assert r"\emph{cited}: ml" in no_doi_row
 @
 
+[[sessions show]] says how many decisions of each source that claims a
+human carry a record of the review, as text and in the JSON, also when
+every one has it, which the report leaves unsaid.
+
+<<test functions>>=
+class TestShowCountsHumanRecords:
+    def test_text_and_json(self, tmp_path, monkeypatch):
+        import json
+
+        TestSessionsDecideCommand()._make_session(tmp_path, monkeypatch)
+        assert runner.invoke(app, [
+            "sessions", "decide", "headless", "--source", "human",
+            "--keep", "--doi", "10.1/withdoi", "--by", "the author",
+        ]).exit_code == 0
+        result = runner.invoke(app, ["sessions", "show", "headless"])
+        assert result.exit_code == 0, result.output
+        assert "human: 1 (1 with a record of the review)" in result.output
+        data = json.loads(runner.invoke(
+            app, ["sessions", "show", "headless", "-f", "json"]
+        ).stdout)
+        assert data["review_records"] == {
+            "human": 1, "llm_reviewed": 0, "agent_reviewed": 0,
+        }
+        by_title = {d["title"]: d for d in data["decisions"]}
+        assert by_title["With DOI"]["human_decided_via"] == "decide"
+        assert by_title["With DOI"]["human_by"] == "the author"
+        assert by_title["No DOI"]["human_decided_at"] is None
+        assert "human_by" in by_title["No DOI"]
+@
+
 
 Let's verify that [[sessions show]] renders the computed decision lists without
 crashing, even though the session stores them behind cached methods rather than
@@ -11412,6 +12179,351 @@ class TestSessionsCommand:
         assert data["search_records"][0]["limit"] == 50
 @
 
+
+\paragraph{Placeholders, shifted columns and quotes.}
+\label{sec:decide-quote-check}
+A reasons file is written by a screener's script, and a check of
+30\,000 such rows (\url{https://github.com/dbosk/scholarcli/issues/256})
+found what scripts get wrong: a reason left as the template's
+\enquote{PLACEHOLDER}, lines whose columns had shifted so that the
+reason column held a confidence or an id, a reason that quoted another
+record because the rows of the screener's output and of the file had
+slipped against each other, and paraphrases inside quote marks.  The
+first two are malformed lines, refused like the others before the
+session is loaded; the last two can only be seen against the record,
+so they are checked once the ids are resolved, before anything is
+saved.
+
+A placeholder is a reason whose whole text, case-folded and stripped of
+everything but letters and digits, is one of a short list.  Each entry
+is there because a screener's template or script leaves it when the
+real reason is missing: [[placeholder]] is what the issue found,
+[[todo]] and [[tbd]] mark a reason to be written later, [[xxx]] is the
+usual fill-in mark, [[reason]] is a template's own field name or a
+column header taken for a row, and [[n/a]] (folded to [[na]]) says
+that there is no reason.  The list is short on purpose: a real reason
+of one word (\enquote{Duplicate}) must pass, and a word that only
+\emph{might} be a placeholder is the screener's to judge.  A reason with
+no letter or digit at all (\enquote{-}, \enquote{...}) says nothing
+either and is refused as such.  The check
+applies to [[--reason]] as well, through [[checked_agent_reason]],
+since a placeholder typed on the command line is no more a reason.
+
+<<sessions command>>=
+REASON_PLACEHOLDERS = frozenset(
+    {"placeholder", "todo", "tbd", "xxx", "reason", "na"}
+)
+
+
+def is_placeholder_reason(text: str) -> bool:
+    """Whether `text` is a placeholder, not a reason (`REASON_PLACEHOLDERS`)."""
+    folded = "".join(c for c in text.casefold() if c.isalnum())
+    return folded in REASON_PLACEHOLDERS
+@
+
+A shifted column shows as a reason that is only a number (the
+confidence, one column too early) or that is itself a paper id: it
+starts with [[doi:]], [[hash:]] or [[10.]] and holds no space, as an
+id does.  A reason that starts so and goes on in words is a sentence
+(\enquote{doi:10.1/b is a duplicate of this record}), so the space is
+the test.  This applies to
+file lines only: a [[--reason]] has no columns to shift.
+
+<<sessions command>>=
+REASON_NUMBER = re.compile(r"[+-]?(?:\d+(?:[.,]\d*)?|[.,]\d+)")
+
+
+def reason_column_shift(reason: str) -> str | None:
+    """Describe a reasons-file reason that is a number or an id, if it is."""
+    if REASON_NUMBER.fullmatch(reason):
+        return (f"reason {reason!r} is only a number (a confidence in the "
+                "reason column? columns shifted)")
+    if (reason.casefold().startswith(("doi:", "hash:", "10."))
+            and not any(c.isspace() for c in reason)):
+        return f"reason {reason!r} is a paper id (columns shifted)"
+    return None
+@
+
+Once the session is loaded and every id resolved, each line's reason is
+checked against its own record with the review module's
+[[unmatched_quotes]] (\cref{sec:reason-quotes} there): a quote of three
+or more words that the record's title and abstract do not hold.  This is
+where a row mix-up is cheapest to catch, before thirty thousand
+decisions have been saved under the wrong reasons.  A [[--reason]],
+one reason for many records, gets the same check for every record it
+is given to.  The quotes not found are listed on standard error as
+\enquote{line~N, id: "quote"} (or the paper id alone for [[--reason]]),
+the first [[QUOTE_PROBLEMS_SHOWN]] of them, each cut at
+[[QUOTE_SHOWN_CHARS]] characters, and the rest counted.  The batch is
+then saved: a paraphrase is a weakness of the reason, not of the
+decision, and scripts written before the check must keep working.
+[[--strict-quotes]] refuses the batch instead, unsaved and with
+status~2 like the other refusals, for a screener who wants a mix-up to
+stop the run.  A record's id appears once per line, however many copies
+the session holds under it.
+
+<<sessions command>>=
+QUOTE_PROBLEMS_SHOWN = 20
+QUOTE_SHOWN_CHARS = 80
+
+
+def shown_quote(quote: str) -> str:
+    """`quote` on one line, cut at `QUOTE_SHOWN_CHARS`, in quote marks."""
+    quote = " ".join(quote.split())
+    if len(quote) > QUOTE_SHOWN_CHARS:
+        quote = quote[:QUOTE_SHOWN_CHARS - 1].rstrip() + "…"
+    return f'"{quote}"'
+
+
+def reason_quote_misses(decisions, trace_of: dict, reason) -> list[str]:
+    """The quotes of the agent's reasons not found in their records.
+
+    One `line N, ID: "quote"` (reasons file) or `ID: "quote"` (one
+    `--reason`) per quote, in the order of the decisions.
+    """
+    from scholar.review import unmatched_quotes
+
+    misses: list[str] = []
+    seen: set[tuple[str, str]] = set()
+    for decision in decisions:
+        entry = trace_of.get(id(decision))
+        given = entry.reason if entry is not None else reason
+        if given is None:
+            continue
+        where = (f"line {entry.line}, {entry.paper}" if entry is not None
+                 else decision.paper.id)
+        if (where, decision.paper.id) in seen:
+            continue
+        seen.add((where, decision.paper.id))
+        misses.extend(
+            f"{where}: {shown_quote(quote)}"
+            for quote in unmatched_quotes(given, decision.paper)
+        )
+    return misses
+<<check the quotes of the agent's reasons>>=
+quote_misses = reason_quote_misses(selected.values(), trace_of, reason)
+if quote_misses:
+    errors = Console(stderr=True)
+    errors.print(
+        "[yellow]Quotes not found in the record's title or abstract "
+        f"({len(quote_misses)}):[/yellow]"
+    )
+    for miss in quote_misses[:QUOTE_PROBLEMS_SHOWN]:
+        errors.print(f"  {escape(miss)}", soft_wrap=True, highlight=False)
+    if len(quote_misses) > QUOTE_PROBLEMS_SHOWN:
+        errors.print(
+            f"  ... and {len(quote_misses) - QUOTE_PROBLEMS_SHOWN} more"
+        )
+    if strict_quotes:
+        console.print(
+            "[red]--strict-quotes: a reason quotes words its record "
+            "does not hold.[/red]"
+        )
+        console.print("[yellow]No changes saved.[/yellow]")
+        raise typer.Exit(2)
+    errors.print(
+        "[yellow]Saved all the same; --strict-quotes refuses such a "
+        "batch.[/yellow]"
+    )
+@
+
+Let's check it with invented records that have abstracts: a reasons file
+whose second line quotes the first record (the row mix-up) is reported
+with its line and saved; [[--reason]] with a paraphrase is reported for
+every record it goes to; a quote that is found, or too short to check,
+is not reported; [[--strict-quotes]] refuses the batch and leaves the
+file as it was, and is refused without a reason before any session is
+loaded (a session name that does not exist gives the usage error, not
+\enquote{not found}); more than [[QUOTE_PROBLEMS_SHOWN]] quotes are
+counted.
+
+<<test functions>>=
+class TestDecideChecksTheQuotes:
+  <<decide quote check test methods>>
+<<decide quote check test methods>>=
+ABSTRACTS = {
+  "10.1/one": "Most students treated recursion as a loop.",
+  "10.1/two": "A compiler course with automated feedback on assignments.",
+}
+
+def _make_session(self, tmp_path, monkeypatch, extra=0):
+  monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+  from scholar.review import (
+    ReviewDecision, ReviewSession, save_session, session_file_path,
+  )
+
+  papers = [
+    Paper(title=f"Paper {doi}", authors=["A"], doi=doi, abstract=abstract)
+    for doi, abstract in self.ABSTRACTS.items()
+  ] + [
+    Paper(title=f"Extra {n}", authors=["A"], doi=f"10.1/extra-{n}",
+          abstract="Nothing quoted here.")
+    for n in range(extra)
+  ]
+  session = ReviewSession(
+    query="q", providers=["openalex"], timestamp=datetime(2026, 11, 20),
+    name="quotes", decisions=[
+      ReviewDecision(paper=paper, provider="openalex") for paper in papers
+    ],
+  )
+  save_session(session)
+  return session_file_path(session)
+
+def _decide(self, *args, name="quotes"):
+  return runner.invoke(app, [
+    "sessions", "decide", name, "--source", "agent", "--discard",
+    "--tag", "off-topic-false-hit", "-c", "0.8", *args,
+  ])
+
+def _file(self, tmp_path, text):
+  path = tmp_path / "reasons.tsv"
+  path.write_text(text, encoding="utf-8")
+  return str(path)
+
+def test_a_quote_from_another_record_is_reported_with_its_line(
+  self, tmp_path, monkeypatch
+):
+  from scholar.review import load_session
+
+  self._make_session(tmp_path, monkeypatch)
+  reasons = self._file(tmp_path, (
+    "doi:10.1/one\tSays “treated recursion as a loop”.\n"
+    "doi:10.1/two\tSays \"most students treated recursion\"; "
+    "\"automated feedback\" is short.\n"
+  ))
+  result = self._decide("--reasons-file", reasons)
+  assert result.exit_code == 0, result.output
+  assert "Quotes not found in the record's title or abstract (1):" \
+    in result.stderr
+  assert 'line 2, doi:10.1/two: "most students treated recursion"' \
+    in result.stderr
+  assert "line 1" not in result.stderr
+  assert "automated feedback" not in result.stderr
+  stored = {d.paper.doi: d.agent_reason
+            for d in load_session("quotes").decisions}
+  assert stored["10.1/two"].startswith("Says \"most students")
+
+def test_one_reason_is_checked_for_every_record(
+  self, tmp_path, monkeypatch
+):
+  self._make_session(tmp_path, monkeypatch)
+  result = self._decide(
+    "--doi", "10.1/one", "--doi", "10.1/two",
+    "--reason", 'Reports that "students see recursion as loops".',
+  )
+  assert result.exit_code == 0, result.output
+  for doi in ("10.1/one", "10.1/two"):
+    assert f'doi:{doi}: "students see recursion as loops"' in result.stderr
+
+def test_strict_quotes_refuses_the_batch_unsaved(
+  self, tmp_path, monkeypatch
+):
+  path = self._make_session(tmp_path, monkeypatch)
+  before = path.read_bytes()
+  reasons = self._file(
+    tmp_path, "doi:10.1/one\t\"a compiler course with automated\"\n"
+  )
+  result = self._decide("--reasons-file", reasons, "--strict-quotes")
+  assert result.exit_code == 2, result.output
+  assert 'line 1, doi:10.1/one: "a compiler course with automated"' \
+    in result.stderr
+  assert "No changes saved." in result.output
+  assert path.read_bytes() == before
+
+def test_strict_quotes_saves_a_batch_whose_quotes_are_found(
+  self, tmp_path, monkeypatch
+):
+  path = self._make_session(tmp_path, monkeypatch)
+  before = path.read_bytes()
+  reasons = self._file(
+    tmp_path, "doi:10.1/one\t\"treated recursion as a loop\"\n"
+  )
+  result = self._decide("--reasons-file", reasons, "--strict-quotes")
+  assert result.exit_code == 0, result.output
+  assert "Quotes not found" not in result.stderr
+  assert path.read_bytes() != before
+
+def test_strict_quotes_needs_a_reason(self, tmp_path, monkeypatch):
+  monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+  result = self._decide("--doi", "10.1/one", "--strict-quotes",
+                        name="no-such-session")
+  assert result.exit_code == 2, result.output
+  assert "--strict-quotes checks the quotes of a reason" in result.output
+
+def test_copies_under_one_id_are_listed_once(self, tmp_path, monkeypatch):
+  monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+  from scholar.review import ReviewDecision, ReviewSession, save_session
+
+  paper = Paper(title="Twice", authors=["A"], doi="10.1/twice",
+                abstract="Nothing quoted here.")
+  save_session(ReviewSession(
+    query="q", providers=["openalex"], timestamp=datetime(2026, 11, 20),
+    name="quotes", decisions=[
+      ReviewDecision(paper=paper, provider="openalex"),
+      ReviewDecision(paper=paper, provider="dblp"),
+    ],
+  ))
+  reasons = self._file(tmp_path, "10.1/twice\tSays \"this is not there\".\n")
+  result = self._decide("--reasons-file", reasons)
+  assert result.exit_code == 0, result.output
+  assert "(1):" in result.stderr
+  assert result.stderr.count('line 1, 10.1/twice: "this is not there"') == 1
+
+def test_more_than_twenty_quotes_are_counted(self, tmp_path, monkeypatch):
+  self._make_session(tmp_path, monkeypatch, extra=23)
+  reasons = self._file(tmp_path, "".join(
+    f"10.1/extra-{n}\tSays \"this is not there\".\n" for n in range(23)
+  ))
+  result = self._decide("--reasons-file", reasons)
+  assert result.exit_code == 0, result.output
+  stderr = result.stderr
+  assert "(23):" in stderr
+  assert "line 20, 10.1/extra-19:" in stderr
+  assert "line 21," not in stderr
+  assert "... and 3 more" in stderr
+@
+
+The malformed lines are refused by [[parse_reasons_file]] itself, which
+is a pure function, so it is tested directly; one command shows that a
+placeholder given with [[--reason]] is a usage error too, before the
+session is loaded.
+
+<<decide quote check test methods>>=
+def test_column_shifts_and_placeholders_are_bad_lines(self):
+  entries, problems = parse_reasons_file(
+    "doi:10.1/a\t0.9\n"
+    "doi:10.1/b\tdoi:10.1/c\n"
+    "doi:10.1/d\t10.1/e\n"
+    "doi:10.1/f\thash:0123abcd\n"
+    "doi:10.1/g\tPLACEHOLDER\n"
+    "doi:10.1/h\t[TODO]\n"
+    "doi:10.1/i\tN/A\n"
+    "doi:10.1/j\t10. Not an empirical study.\n"
+    "doi:10.1/k\tDuplicate\n"
+    "doi:10.1/l\t-0,5\n"
+    "doi:10.1/m\tdoi:10.1/b is a duplicate of this record\n"
+    "doi:10.1/n\tHash: id collision with another work\n"
+    "doi:10.1/o\t-\n"
+    "doi:10.1/p\t...\n"
+  )
+  assert [e.line for e in entries] == [8, 9, 11, 12]
+  numbered = {int(p.split(":")[0].split()[1]): p for p in problems}
+  assert sorted(numbered) == [1, 2, 3, 4, 5, 6, 7, 10, 13, 14]
+  assert all("has no letter or digit" in numbered[n] for n in (13, 14))
+  assert "is only a number" in numbered[1]
+  assert "is only a number" in numbered[10]
+  assert all("is a paper id" in numbered[n] for n in (2, 3, 4))
+  assert all("is a placeholder" in numbered[n] for n in (5, 6, 7))
+
+def test_a_placeholder_reason_option_is_refused(
+  self, tmp_path, monkeypatch
+):
+  monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+  result = self._decide("--doi", "10.1/one", "--reason", "TBD",
+                        name="no-such-session")
+  assert result.exit_code == 2, result.output
+  assert "--reason: reason 'TBD' is a placeholder" in result.output
+@
 
 \subsection{Correcting who decided}
 \label{sec:sessions-relabel}
@@ -15534,6 +16646,7 @@ def llm_classify(
         console.print(f"  LLM unreviewed: {stats['llm_unreviewed']}")
         console.print(f"  Pending: {stats['pending']}")
         <<report papers left pending by the classifier>>
+        <<report reasons quoting words not in the record>>
 
     except ValueError as e:
         console.print(f"[red]Error: {escape(str(e))}[/red]")
@@ -16313,6 +17426,133 @@ class TestLLMClassifyWithheld:
         assert "category tag" not in result.output
         assert "no answer for this paper" in result.output
         assert "Prompt version: 0123456789abcdef" in result.output
+@
+
+\subsection{Quotes in the classifier's reasons}
+\label{sec:llm-classify-quotes}
+
+The model gives a reason for each decision, stored as [[llm_reason]],
+and a reason that quotes the record is read as evidence.  A model can
+put its own paraphrase between quote marks, or words from another
+paper of the batch, just as an agent can
+(\url{https://github.com/dbosk/scholarcli/issues/256}).  So the run
+ends with one line when any decision it applied has a reason quoting
+three or more words that the record does not hold
+([[unmatched_quotes]], \cref{sec:reason-quotes} in the review module):
+the number of such decisions and the first [[LLM_QUOTE_MISSES_SHOWN]]
+of them, each as its paper id and its first quote not found.
+
+The quotes are compared with the title, the abstract and the full-text
+passages the model was shown ([[--full-text]]), which the batch hands
+back ([[LLMBatchResult.passages]]) because they are not stored: this
+run is the only place where a quote from a passage can be found.
+[[sessions show]] later checks against the title and abstract only, so
+such a quote is listed there as not found.  The reason checked is the
+stored one, cut at [[MAX_REASON_CHARS]]; a quote whose closing mark was
+cut off is no longer a quote.  Nothing is withheld or retried for it:
+the verdict may well be right, and the line tells the reviewer which
+reasons to read before trusting their quotes.
+
+<<report reasons quoting words not in the record>>=
+print_reason_quote_misses(console, updated, result.passages)
+<<llm command>>=
+LLM_QUOTE_MISSES_SHOWN = 3
+
+
+def print_reason_quote_misses(console, decisions, passages: dict) -> None:
+    """One line on the classifier's reasons quoting words not in the record."""
+    from scholar.review import unmatched_quotes
+
+    misses = []
+    for decision in decisions:
+        unmatched = unmatched_quotes(
+            decision.llm_reason, decision.paper,
+            passages.get(decision.paper.id, ()),
+        )
+        if unmatched:
+            misses.append(f"{decision.paper.id}: {shown_quote(unmatched[0])}")
+    if not misses:
+        return
+    shown = "; ".join(misses[:LLM_QUOTE_MISSES_SHOWN])
+    more = len(misses) - LLM_QUOTE_MISSES_SHOWN
+    console.print(
+        f"[yellow]Reasons quoting words not in the record "
+        f"({len(misses)}):[/yellow] {escape(shown)}"
+        + (f" (and {more} more; see sessions show)" if more > 0 else ""),
+        soft_wrap=True, highlight=False,
+    )
+@
+
+Let's run the command once with a fake model, through the [[globals()]]
+seam of the classifier tests, and with [[_gather_supporting_quotes]]
+replaced, since the real one downloads each paper's PDF: three papers,
+one reason quoting the abstract, one quoting a passage shown in this
+run, and one quoting words that are in neither.  Only the last is
+listed.
+
+<<test functions>>=
+class TestLLMClassifyChecksTheQuotes:
+  def test_the_run_lists_reasons_quoting_words_not_in_the_record(
+    self, tmp_path, monkeypatch
+  ):
+    from types import SimpleNamespace
+    import scholar.llm_review as llm_review
+    from scholar.review import (
+      ReviewDecision, ReviewSession, load_session, save_session,
+    )
+
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+    papers = [
+      Paper(title=f"Paper {n}", authors=["A"], doi=f"10.5555/llm-quote-{n}",
+            abstract="Most students treated recursion as a loop.")
+      for n in range(3)
+    ]
+    save_session(ReviewSession(
+      query="q", providers=["p"], timestamp=datetime(2026, 11, 20),
+      name="llm-quotes", research_context="Do novices misread recursion?",
+      decisions=[ReviewDecision(paper=p, provider="p") for p in papers],
+    ))
+    reasons = [
+      'The abstract says "treated recursion as a loop".',
+      'The full text says "tracing tables helped every student".',
+      'The abstract says "recursion was taught too late".',
+    ]
+    answer = json.dumps({"classifications": [
+      {"paper_index": n, "decision": "kept", "tags": ["recursion"],
+       "confidence": 0.8, "reasoning": reason}
+      for n, reason in enumerate(reasons)
+    ]})
+
+    class FakeModel:
+      model_id = "fake-model"
+
+      def prompt(self, prompt):
+        return SimpleNamespace(text=lambda: answer)
+
+    monkeypatch.setattr(
+      llm_review, "llm",
+      SimpleNamespace(get_model=lambda *_: FakeModel()), raising=False,
+    )
+    monkeypatch.setattr(
+      llm_review, "_gather_supporting_quotes",
+      lambda papers, claim, limit: [
+        [], [SimpleNamespace(page=3,
+                             text="Tracing tables helped every student.")],
+        [],
+      ],
+    )
+    result = runner.invoke(app, [
+      "llm", "classify", "llm-quotes", "--full-text", "--no-examples",
+      "--no-enrich",
+    ])
+    assert result.exit_code == 0, result.output
+    flat = " ".join(result.output.split())
+    assert ("Reasons quoting words not in the record (1): "
+            'doi:10.5555/llm-quote-2: "recursion was taught too late"') \
+      in flat
+    assert "llm-quote-1:" not in flat
+    assert [d.llm_reason for d in load_session("llm-quotes").decisions] \
+      == reasons
 @
 
 
