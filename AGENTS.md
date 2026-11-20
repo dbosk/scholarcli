@@ -1173,8 +1173,9 @@ marks a decision whose `llm_model` is set but whose source is not
 `CLASSIFIER_SOURCES` duplicates `llm_review.LLM_SOURCES` so `show`
 does not import llm_review and its caches, a test keeps them equal)
 with "(llm trace: earlier classifier call)" and JSON `"llm_trace":
-"earlier classifier call"` (key absent otherwise). The CSV
-has no classifier-field columns, so it is unchanged.
+"earlier classifier call"` (key absent otherwise). The
+per-decision CSV shows the kept trace in its classifier columns (#281,
+see LLM Screening Record).
 **Agent reasons (#249).** `ReviewDecision` has an agent trace,
 `agent_reason`, `agent_by`, `agent_decided_at` (UTC ISO), named once in
 `review.AGENT_AUDIT_FIELDS` (`agent_audit_of`; load, `decision_state`,
@@ -1208,7 +1209,7 @@ confidences exits 2, both unsaved. `--source agent` without a reason
 warns on stderr and records the decision. Shown in `sessions show`
 (a `reason (by): …` line, cut at `SHOW_REASON_CHARS` = 160; JSON:
 the three fields, `null` when unset), the per-decision CSV (three
-columns after `source_relabelled`, before the human record's;
+columns after the classifier's, before the human record's;
 `paper_id` stays last) and the report (one English sentence after
 the summary, `agent_reasons_sentence`: agent and agent_reviewed
 decisions with/without a reason). An older Scholar loads such files
@@ -1407,7 +1408,8 @@ in a reset's `trace`). Set only by `review.record_human_decision(d,
 via, by=None, at=None)` (raises unless decided with a source in
 `REVIEWED_BY_A_HUMAN` = human/llm_reviewed/agent_reviewed; `at`
 defaults to `_utcnow`), called by the TUI's keep/themes/discard/confirm
-in both screens (after `mark_as_reviewed`) and by `sessions decide`
+in both screens (after `mark_as_reviewed`; `by=app.reviewer`, set by
+`sessions resume --by` or the blind-mode name dialog, else None) and by `sessions decide`
 with a human source (`--source human` or the terminal default; one
 `utc_now_iso()` per run; `--by NAME` now accepted with human). The
 API (`ReviewDecision(source=HUMAN)`, `mark_as_reviewed` alone) sets
@@ -1630,9 +1632,67 @@ never changed (tested on the saved JSON). **Screener identity**
 the identity of the snapshot of a decision the same model made, else
 the latest-record rule hides the first verdict. Only `llm classify
 --second-screen` writes `via: "classify"`; snapshots are `"snapshot"`,
-`sessions screen` `"screen"`. Not yet built (later #253 PRs): the
-TUI's blind mode, report surfaces (LaTeX report, `llm synthesize`,
-audit caption), the screen sheet.
+`sessions screen` `"screen"`. Not yet built (later #253 PR E):
+report surfaces (LaTeX report, `llm synthesize`, audit caption), the
+screen sheet.
+**TUI blind review (#253 part D, closes #254's last point; tui.nw
+`sec:tui-blind-review`).** `scholar sessions resume S --blind [--by
+NAME]` (`PaperReviewApp(..., blind=True)`) starts blind mode in
+`on_mount` (`_start_blind_at_mount`) before the list is drawn:
+`blind_unbroken` True; needs review mode and `session.llm_samples`
+(else notice, off) and `app.reviewer` (`--by`, else
+`ReviewerNameModal`; empty/Escape → off; empty `--by` exits 2 before
+loading). Key `b` toggles during a run, only from the paper list
+(`len(screen_stack) > 1` → refused); switching on mid-run (or off and
+on) sets `blind_unbroken` False for the run: screenings then get
+`blind: False, blind_basis: None` (still `via: "tui"`), status bar
+"Blind (verdicts were shown earlier in this run): NAME" instead of
+"Blind: NAME". On selects the `llm_sample` filter. `blind_state(d,
+queue)`: None unless blind and `id(d)` in `blind_queue()` (= what
+`sampled_for_review` lists: every sample, band, census; not reset since
+draw); "own" if `made_by_reviewer` (`verdict_screener` kind human,
+name = reviewer; unreachable via the queue today, which holds only
+unreviewed machine decisions); "revealed" if `reviewer_screening` (a
+counted `origin: screen` human screening of that name, also one from
+`sessions screen`); else "hidden". Hidden: row shows `BLIND_MARK`
+("B"), no status/machine mark/confidence; detail screen omits tags +
+Themes/Motivations heading; `f` refused in blind mode
+(`<<refuse the decision filters in blind mode>>`: every status/source/
+example filter selects by decision; PR B's conflict filter `x` is in the
+same dialog, so refused too, tested), `F` (year, venue, citations, OA,
+pub type: `SearchFilters.matches` on the paper only) allowed; status
+bar counts via `status_counts()` leave hidden papers out and add
+"Hidden: N"; every tag dialog (normal and blind, both screens) takes
+`tag_choices(keep)`: outside blind mode the session's
+`all_themes/theme_counts` or `all_motivations/motivation_counts` as
+before, in blind mode only non-hidden papers' tags of that status;
+the blind dialog preselects nothing. `blind_verdict(d, status,
+ask_tags, done)` runs first in K/T/d of both screens: hidden →
+`record_blind_verdict` (`new_screening(kind="human", name=reviewer,
+blind=blind_unbroken, blind_basis="tui" if blind_unbroken else None,
+via="tui", sample_id=sample_holding(session, d))` via
+`record_screening`, decision untouched, notification with
+`revealed_verdict(d)`), the detail screen stays and shows a "Blind
+review" block (both verdicts, the machine's reason); "own" → warning,
+nothing recorded. `blind_refuses_confirm`: C on a hidden paper refused.
+After the reveal K/T/d/C are the normal paths (`mark_as_reviewed` +
+`record_human_decision(..., by=reviewer)`): the adjudication. Leaving
+between keeps the screening; the decision stays unreviewed and listed,
+revealed. The start notice (`BLIND_MODE_NOTICE`) adds, after a
+newline, `sample_giveaway(session, queued)`: one line per queued sample
+that tells something, "Sample <sample_id> (N listed paper(s)) holds
+<describe_sample_criteria of statuses+sources> only: their status is
+known." for a single-status sample, plus (or alone, "... was drawn by
+confidence ...") "It was drawn by confidence: the range of confidence
+of each of its papers is known." for a banded (`stratum`) or bounded
+draw; mixed samples get no line. The id is the one `llm sample` prints
+("Sample <id>"); the list does not show which sample drew a row.
+Saved by `sessions resume`'s `save_session`; PR A's merge sets aside a
+screening made while another process reset the paper
+(`TestBlindReview`, real subprocess, through `sessions resume
+--blind`). Not hidden: the session file, other commands, what the
+sample's criteria tell, and that queued papers are unreviewed machine
+decisions (prose, `sessions resume` help, notice).
 
 #### Agreement and conflicts (#253, part B)
 
@@ -1721,7 +1781,9 @@ only"; unknown-origin count) in one print, and JSON
 `double_screening` (`pairs`, `conflicts`, `unknown_origin`); neither
 without screenings (`TestSessionsConflicts.test_show_unchanged_without_screenings`).
 TUI filter `x` (`conflicts`): decisions with an unresolved conflict;
-a TUI confirm resolves (tested with a pilot).
+a TUI confirm resolves (tested with a pilot). A blind TUI screening
+that differs from the machine's is a status conflict, unresolved until
+the step-two confirm (`test_a_blind_verdict_is_a_conflict_until_confirmed`).
 
 ### Session Arguments
 
@@ -2430,6 +2492,11 @@ once in `review.LLM_AUDIT_FIELDS` (`llm_audit_of()`), which load, save,
 the append copy, `decision_state` and the concurrent merge all use; old
 files load them as `None` (unknown) and nothing fills them in later.
 A human review leaves them untouched (they are the model's record).
+The per-decision CSV has a column for each, in this order, after
+`source_relabelled` and before `agent_reason` (#281; the later columns
+moved five places, `paper_id` stays last): empty when unset,
+`llm_abstract_truncated` as `true`/`false`, the reason as stored (the
+`csv` module quotes commas, quote marks and line breaks).
 
 - **No invented values.** `parse_llm_response` returns one entry per
   paper; an unusable answer (no answer, decision not kept/discarded, a
@@ -2516,7 +2583,9 @@ A human review leaves them untouched (they are the model's record).
   pooled session (`ReviewSession.llm_samples`, merged by `sample_id`,
   which ends in uuid4 digits so two draws in one second never collide).
   `test_golden_draw` pins the drawn papers for seed 42.
-  The TUI filter `s` (`sampled_for_review`) queues the unreviewed ones;
+  The TUI filter `s` (`sampled_for_review`) queues the unreviewed ones
+  (blind mode, `sessions resume --blind` or `b`, hides their verdicts until the reviewer's own is
+  recorded as a screening, see Screenings);
   `sessions decide` reviews them. `--report [-f json]`
   (`sample_reports`): a sampled decision counts as reviewed when decided
   and no longer an unreviewed machine source, as changed when its
@@ -2697,6 +2766,14 @@ subprocess with a fake `XDG_CACHE_HOME`.
 
 1. Add `@app.command()` decorated function in `cli.py`
 2. Add tests in `test_cli.py`
+
+A chunk tangled into a command function must not use one of that
+function's parameters as a `for`, `with ... as` or `except ... as`
+name: Python has no block scope, so it overwrites the option for the
+rest of the command (#280: `sessions decide --keep-trace` printed a
+field name as the session's name). `TestNoLoopRebindsAParameter` in
+`cli.nw` parses `cli.py` and fails on any such binding; plain
+assignments (`by = by.strip()`) are allowed.
 
 ## Literate Programming
 
