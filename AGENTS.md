@@ -1401,8 +1401,8 @@ with its confidence, reason, time; `human`/`llm_reviewed`/
 `human_decided_at`, `confirmed_from` llm/agent/None, `confirmed_name`
 model/`agent_by` (no machine confidence or reason); unknown source →
 all None. `counted_screenings` = valid entries (`is_valid_screening`:
-dict with `id` and kept/discarded status) recorded strictly after the
-last reset's `at`; malformed entries are kept verbatim, skipped, one
+dict with `id` and kept/discarded status), not marked `set_aside_at`,
+recorded strictly after the last reset's `at`; malformed entries are kept verbatim, skipped, one
 WARNING per file (`warn_about_malformed_screenings`).
 **Not in `decision_state` nor `decision_verdict`** (on purpose, unlike
 `resets`): in the state a stale `screen` save would put an old decision
@@ -1412,27 +1412,42 @@ Instead: saved only when non-empty, loaded `[]`, copied by the append,
 united by `unite_screenings` in `merge_concurrent_changes` and in the
 fold (`<<fold [[absorbed]] into [[survivor]]>>`), which drops a second
 snapshot of a verdict already held under another id. `add_screening`
-dedups by `id`; on a shared id the record with the later
-`relabelled_at` wins. `is_unscreened` requires no screenings. Not in
-`MACHINE_AUDIT_FIELDS`. `relabel_source` replaces the screener fields
-of every counted snapshot of the old verdict with the new
-`verdict_screener`, stamps `relabelled_at`, and records the old kind as
-`screenings_kind` in the relabel record (only when one was corrected).
-`reset_decision` keeps the list and records `"screenings": n` (counted
-ones set aside) in the reset record when n > 0. `screenings_summary`
+dedups by `id`; two versions of one id become `merged_screening` (the
+later `relabelled_at`'s, with the earliest `set_aside_at` of either).
+`is_unscreened` requires no screenings. Not in `MACHINE_AUDIT_FIELDS`.
+`relabel_source` (via `correct_relabelled_snapshots`) replaces the
+screener fields of every counted snapshot of the old verdict with the
+new `verdict_screener`, stamps `relabelled_at`, keeps the replaced
+values under `before_relabel` (the first relabel's), and records the
+old kind as `screenings_kind` in the relabel record (only when one was
+corrected). `reset_decision` keeps the list and records
+`"screenings": n` (the counted ones it saw) in the reset record when
+n > 0. **Races** (`ConcurrentHistory.of(ours, theirs)` before the
+union, `settle_concurrent_screenings` after the decision is merged, in
+`merge_concurrent_changes`; the loop no longer `continue`s past it):
+screenings one side added while the other side added a reset get
+`set_aside_at` = that reset's `at`; snapshots one side added while the
+other relabelled are corrected from `relabelled_verdict_keys` (undoes
+the relabels: `from` source plus the record's `human`). The reset
+record's count is not changed afterwards. Tested with real
+subprocesses in both save orders (`TestScreeningRaces`). `screenings_summary`
 gives `sessions show`'s line ("Screenings: N on P paper(s), S of them
 snapshots of the decision; K set aside by a reset; M malformed,
 skipped."); `show -f json` adds `screenings` per decision when
 non-empty. Checked: the pre-change pipx build (1.29) loads such a file
 and drops the list on save. Size in indented JSON: ~670 bytes per
 screening, ~690 per snapshot, plus reasons.
-**`scholar sessions screen S --as agent|human|llm [--by NAME]
+**`scholar sessions screen S --as agent|human|llm --by NAME
 (--verdicts-file F | (--doi D|--paper-id ID)... --keep|--discard
 [--tag T]... [--reason TEXT]) [-c C] [--blind|--not-blind] [--sample
 ID] [--all-copies] [--dry-run] [--strict-quotes]`** (cli.nw
 `sec:sessions-screen`): `--as` defaults to human at a terminal, else
-exit 2; `--as llm` needs `--by` (the model); `-c` refused with
-`--as human` (also file confidences). Verdicts file lines
+exit 2; `--by` required for every kind (exit 2 before loading; the
+model for llm); a screener whose `(kind, name)` is that of a selected
+decided paper's `verdict_screener` is refused (exit 2, unsaved, papers
+named: a change of mind is a `decide`; self-agreement is not computed
+and a second record under one identity would hide the first); `-c`
+refused with `--as human` (also file confidences). Verdicts file lines
 `ID<TAB>kept|discarded<TAB>TAGS<TAB>REASON[<TAB>CONFIDENCE]` (TAGS
 comma-separated, may be empty for a keep): parsed by `parse_tab_file`
 with `VERDICTS_LAYOUT`; `parse_reasons_file` is the same function with
@@ -1447,7 +1462,9 @@ copies decided apart need `--all-copies`, `--sample` must be a
 `sample_id` or a banded sample's `criteria["stratum"]["group"]` (exit 2
 listing the held ids; membership of papers is not checked here). The
 quote check is decide's chunk (`<<check the quotes of the agent's
-reasons>>`, `--strict-quotes`). One `utc_now_iso()` per run =
+reasons>>`, `--strict-quotes`); its "Saved all the same" line prints
+only when `saving` (set before the chunk: decide True, screen
+`not dry_run`). One `utc_now_iso()` per run =
 `recorded_at` = `at`; `keep_copy_before_run(session, "pre-screen")`;
 `--dry-run` writes nothing. `--blind`/`--not-blind` → `blind`
 True/False, `blind_basis: "declared"`; neither → None. The decision is
