@@ -758,10 +758,10 @@ class ReviewDecision:
     def add_screening(self, record: dict) -> None:
         """Note a screening (`record_screening`), once by its `id`.
 
-        A record with the `id` of one already held replaces it only when
-        its `relabelled_at` is later (a snapshot a relabel corrected);
-        an entry without an id is compared whole. Kept in the order of
-        the `recorded_at` times, as `add_relabel` keeps its records.
+        Two versions of one `id` become one (`merged_screening`: the
+        later relabel's correction, a set-aside mark from either); an
+        entry without an id is compared whole. Kept in the order of the
+        `recorded_at` times, as `add_relabel` keeps its records.
         """
         key = record.get("id") if isinstance(record, dict) else None
         for index, held in enumerate(self.screenings):
@@ -769,9 +769,7 @@ class ReviewDecision:
             if key is None and held == record:
                 return
             if key is not None and held_key == key:
-                if (str(record.get("relabelled_at") or "")
-                        > str(held.get("relabelled_at") or "")):
-                    self.screenings[index] = record
+                self.screenings[index] = merged_screening(held, record)
                 return
         self.screenings.append(record)
         self.screenings.sort(key=_screening_order)
@@ -3566,7 +3564,7 @@ def record_screening(decision: ReviewDecision, record: dict) -> dict | None:
 @
 
 \paragraph{Which records count.}
-Two kinds of entries are kept but not counted.  An entry without an
+Three kinds of entries are kept but not counted.  An entry without an
 [[id]], or without a status that is [[kept]] or [[discarded]], comes
 from a hand edit or a writer that broke the format; it is kept as it
 is, so that a save never loses what was there, skipped by every reader,
@@ -3580,7 +3578,11 @@ list as history; [[counted_screenings]] keeps only those recorded after
 the last reset, comparing the times as times, as [[reset_since_draw]]
 does for samples (\cref{sec:llm-sample} in the LLM review module).  A
 screening recorded in the very second of the reset counts as set
-aside: the stored times have no finer grain to tell the order.
+aside: the stored times have no finer grain to tell the order.  The
+third kind is a screening made at the same time as a reset by another
+process, which the time cannot tell from one made after it; the merge
+marks it with [[set_aside_at]] (below), and a marked record is not
+counted either.
 
 <<review data structures>>=
 def is_valid_screening(record) -> bool:
@@ -3601,7 +3603,10 @@ def _iso_after(at: str, since: str) -> bool:
 
 def counted_screenings(decision: ReviewDecision) -> list[dict]:
     """The valid screenings of `decision` recorded since its last reset."""
-    valid = [r for r in decision.screenings if is_valid_screening(r)]
+    valid = [
+        r for r in decision.screenings
+        if is_valid_screening(r) and not r.get("set_aside_at")
+    ]
     if not decision.resets:
         return valid
     last = str(decision.resets[-1].get("at") or "")
@@ -3705,17 +3710,149 @@ says.  Nothing registers the list in [[MACHINE_AUDIT_FIELDS]] either,
 so a machine [[sessions decide]], with or without [[--force]], leaves
 the screenings alone; the next screening snapshots the new decision.
 
-A record's identity is its [[id]], and only one thing ever changes a
-stored record: a relabel's correction of a snapshot (below), which
-stamps the record with [[relabelled_at]].  So when two lists hold one
-[[id]] with different contents, [[add_screening]] keeps the one with
-the later stamp, and a process that loaded the session before the
-relabel cannot put the uncorrected snapshot back.  The reverse race, a
-[[sessions screen]] that snapshots the old source while a relabel of
-the same paper is between its load and its save, leaves that one
-snapshot uncorrected.  Both commands hold the session only for the
-milliseconds between their load and their save, so this is left as it
-is.
+A record's identity is its [[id]], and two things change a stored
+record: a relabel's correction of a snapshot (below), which stamps it
+with [[relabelled_at]], and the merge's mark [[set_aside_at]] on a
+screening made at the same time as a reset (next).  So when two lists
+hold one [[id]] with different contents, [[add_screening]] makes one
+record of the two ([[merged_screening]]): the version with the later
+relabel stamp, carrying a set-aside mark if either version has one.
+A process that loaded the session before the correction or the mark
+then cannot put the old version back, whichever saves last.
+
+<<review data structures>>=
+def merged_screening(held: dict, record: dict) -> dict:
+    """One record of two versions of a screening with the same `id`.
+
+    The version with the later `relabelled_at` (`held` on a tie), with
+    the earliest `set_aside_at` either version has.
+    """
+    newer = held
+    if (str(record.get("relabelled_at") or "")
+            > str(held.get("relabelled_at") or "")):
+        newer = record
+    asides = [r["set_aside_at"] for r in (held, record)
+              if r.get("set_aside_at")]
+    if not asides or newer.get("set_aside_at") == min(asides):
+        return newer
+    return {**newer, "set_aside_at": min(asides)}
+@
+
+\paragraph{Races with a reset or a relabel.}
+A screening is made against the decision the screener saw, and the
+snapshot records it.  When another process resets or relabels that
+decision between the screener's load and its save, the two saves are
+merged and each change stands, but the screening and the snapshot then
+describe a decision that is no longer there.  The window is short for
+[[sessions screen]], which holds the session for milliseconds, but a
+review that holds it for minutes (a blind review in the TUI, say) makes
+it the normal case.  The time rule of [[counted_screenings]] cannot
+settle it: the screener's [[recorded_at]] may well be later than the
+reset's [[at]], since both ran at once.
+
+The merge can, because it sees what each side added since both loaded
+the session ([[ConcurrentHistory]]): the screenings, resets and
+relabels in one side's list and not in the other's.  Anything this
+process loaded is in the file too (every save unites the lists), so
+what only one side holds is what that side added meanwhile.  A
+screening one side added while the other side added a reset was made
+against the decision before the reset, so it is marked
+[[set_aside_at]], with the reset's time, and no longer counted.  A
+snapshot one side added while the other side relabelled the decision
+claims the old source, so it is corrected as the relabel corrects its
+own snapshots ([[correct_relabelled_snapshots]]), from the verdict the
+decision had before each relabel ([[relabelled_verdict_keys]]).  This
+runs after the decision itself is merged, in whichever process saves
+second, so it does not matter which of the two that is.  When both
+processes changed the decision itself, ours is kept with a warning
+(below), and a relabel only the file holds may then match no snapshot;
+that is left with the warning.
+
+<<review data structures>>=
+@dataclass
+class ConcurrentHistory:
+    """What each of two versions of a decision added since both loaded it.
+
+    `mine_*` are in this process's version only, `their_*` in the
+    file's only: screening ids, reset records and relabel records.
+    """
+
+    mine_screenings: set[str]
+    their_screenings: set[str]
+    mine_resets: list[dict]
+    their_resets: list[dict]
+    mine_relabels: list[dict]
+    their_relabels: list[dict]
+
+    @classmethod
+    def of(cls, ours: ReviewDecision,
+           theirs: ReviewDecision) -> "ConcurrentHistory":
+        """Compare two versions of one decision, before they are united."""
+        def ids(decision):
+            return {r["id"] for r in decision.screenings
+                    if is_valid_screening(r)}
+
+        return cls(
+            mine_screenings=ids(ours) - ids(theirs),
+            their_screenings=ids(theirs) - ids(ours),
+            mine_resets=[r for r in ours.resets if r not in theirs.resets],
+            their_resets=[r for r in theirs.resets if r not in ours.resets],
+            mine_relabels=[r for r in ours.relabelled
+                           if r not in theirs.relabelled],
+            their_relabels=[r for r in theirs.relabelled
+                            if r not in ours.relabelled],
+        )
+
+
+def relabelled_verdict_keys(
+    decision: ReviewDecision, relabels: list[dict]
+) -> list[tuple]:
+    """The snapshot keys `decision`'s verdict had before each relabel.
+
+    Undoes `relabels`, newest first: each gives back its old source and
+    the human's record it cleared.
+    """
+    keys = []
+    state = decision
+    for record in sorted(relabels, key=lambda r: str(r.get("at") or ""),
+                         reverse=True):
+        human = record.get("human") or {}
+        state = replace(
+            state, source=ReviewSource(str(record.get("from"))),
+            **{name: human.get(name) for name in HUMAN_AUDIT_FIELDS},
+        )
+        keys.append(_snapshot_key(decision_snapshot(state, "")))
+    return keys
+
+
+def settle_concurrent_screenings(
+    decision: ReviewDecision, history: ConcurrentHistory
+) -> None:
+    """Settle one side's screenings against the other side's resets and
+    relabels, made at the same time (`ConcurrentHistory`)."""
+    for screenings, resets, relabels in (
+        (history.their_screenings, history.mine_resets,
+         history.mine_relabels),
+        (history.mine_screenings, history.their_resets,
+         history.their_relabels),
+    ):
+        if not screenings:
+            continue
+        if relabels:
+            correct_relabelled_snapshots(
+                decision, screenings,
+                relabelled_verdict_keys(decision, relabels),
+                max(str(r.get("at") or "") for r in relabels),
+            )
+        if resets:
+            at = max(str(r.get("at") or "") for r in resets)
+            for index, held in enumerate(decision.screenings):
+                if (is_valid_screening(held) and held["id"] in screenings
+                        and not held.get("set_aside_at")):
+                    decision.screenings[index] = {
+                        **held, "set_aside_at": at,
+                    }
+@
 
 An older Scholar reads a decision by the keys it knows, so it loads a
 file with screenings and drops the list when it next saves the
@@ -3746,31 +3883,57 @@ of this decision taken under the old source claims the same wrong
 origin as the source did, so it is corrected with it: every counted
 snapshot whose verdict and screener are those the decision had before
 the relabel takes the screener the relabelled decision gives
-([[verdict_screener]]), stamped with the relabel's time.  The old kind
-is kept in the relabel record as [[screenings_kind]], beside the
-human's record the relabel keeps there anyway, which holds the old
-name and time of a snapshot of kind [[human]].  Leaving the snapshot
-would keep, as a human's verdict, one the relabel has just declared an
-agent's.  A relabel of a decision without a snapshot writes the record
-it wrote before.
+([[verdict_screener]]), stamped with the relabel's time.  The values
+it replaces are kept in the snapshot, under [[before_relabel]]: the
+label was wrong, but what the snapshot claimed (a classifier's model,
+reason and prompt version, say, when an LLM call is relabelled as an
+agent's) is part of the record, as the relabel record keeps the old
+source.  A snapshot relabelled twice keeps what it claimed first.  The
+old kind is also noted in the relabel record as [[screenings_kind]].
+Leaving the snapshot would keep, as a human's verdict, one the relabel
+has just declared an agent's.  A relabel of a decision without a
+snapshot writes the record it wrote before.
 
 <<correct the snapshots of the relabelled verdict>>=
-new_screener = verdict_screener(decision)
-counted = [id(r) for r in counted_screenings(decision)]
-for index, held in enumerate(decision.screenings):
-    if (id(held) in counted and held.get("origin") == "decision"
-            and _snapshot_key(held) == old_verdict):
-        record["screenings_kind"] = held.get("kind")
-        decision.screenings[index] = {
-            **held, **new_screener, "relabelled_at": at,
-        }
+counted = {r["id"] for r in counted_screenings(decision)}
+if correct_relabelled_snapshots(decision, counted, [old_verdict], at):
+    record["screenings_kind"] = old_verdict[2]
+<<review data structures>>=
+def correct_relabelled_snapshots(
+    decision: ReviewDecision, ids: set[str], old_keys: list[tuple], at: str
+) -> int:
+    """Give the snapshots of a relabelled verdict the decision's screener.
+
+    The snapshots among `ids` whose `_snapshot_key` is one of
+    `old_keys` take `verdict_screener(decision)`, stamped with
+    `relabelled_at`; the values they claimed before are kept under
+    `before_relabel` (the first relabel's). Returns how many changed.
+    """
+    new_screener = verdict_screener(decision)
+    corrected = 0
+    for index, held in enumerate(decision.screenings):
+        if (is_valid_screening(held) and held["id"] in ids
+                and held.get("origin") == "decision"
+                and _snapshot_key(held) in old_keys):
+            decision.screenings[index] = {
+                **held, **new_screener, "relabelled_at": at,
+                "before_relabel": held.get("before_relabel") or {
+                    name: held.get(name) for name in SNAPSHOT_FIELDS
+                },
+            }
+            corrected += 1
+    return corrected
 @
 
 A reset keeps the screenings, as history; [[counted_screenings]] sets
 aside those recorded before it (above).  So that the history says so
 too, the reset record notes how many screenings it set aside, under
 [[screenings]], when there were any; a reset of a decision without
-screenings writes the record it wrote before.
+screenings writes the record it wrote before.  The count is of the
+screenings the reset saw.  Those another process recorded at the same
+time are marked by the merge (above), but the reset record is not
+changed afterwards: it is part of the decision's state, and two
+versions of one record would be united as two resets.
 
 <<count the screenings a reset sets aside>>=
 set_aside = len(counted_screenings(decision))
@@ -4023,6 +4186,36 @@ def test_a_relabel_corrects_the_snapshot(self):
   assert record_screening(decision, self._agent_verdict(
     recorded_at=self.LATER)) is None
 
+def test_a_relabel_keeps_what_the_snapshot_claimed(self):
+  decision = self._llm_call()
+  snapshot = record_screening(decision, self._agent_verdict())
+  relabel_source(decision, ReviewSource.AGENT_UNREVIEWED, self.LATER)
+  relabel_source(decision, ReviewSource.LLM_UNREVIEWED,
+                 "2026-11-20T12:00:00+00:00")
+  corrected = decision.screenings[0]
+  assert corrected["before_relabel"] == {
+    name: snapshot[name] for name in SNAPSHOT_FIELDS
+  }
+  assert corrected["before_relabel"]["reason"] == "Off topic."
+  assert corrected["before_relabel"]["prompt_version"] \
+    == "0123456789abcdef"
+  assert corrected["kind"] == "llm"
+  assert corrected["relabelled_at"] == "2026-11-20T12:00:00+00:00"
+
+def test_two_versions_of_a_record_keep_both_corrections(self):
+  decision = self._llm_call()
+  snapshot = record_screening(decision, self._agent_verdict())
+  marked = {**snapshot, "set_aside_at": self.LATER}
+  relabelled = {**snapshot, "kind": "agent",
+                "relabelled_at": "2026-11-20T12:00:00+00:00"}
+  decision.add_screening(marked)
+  decision.add_screening(snapshot)
+  assert decision.screenings[0] == marked
+  decision.add_screening(relabelled)
+  assert decision.screenings[0] == {**relabelled,
+                                    "set_aside_at": self.LATER}
+  assert counted_screenings(decision) == [decision.screenings[1]]
+
 def test_a_relabel_without_a_snapshot_writes_the_old_record(self):
   decision = self._llm_call(source=ReviewSource.HUMAN)
   record = relabel_source(decision, ReviewSource.AGENT_UNREVIEWED, self.AT)
@@ -4140,6 +4333,32 @@ def test_append_keeps_them(self, tmp_path, monkeypatch):
   assert appended.decisions[0].screenings == stored.screenings
   assert len(stored.screenings) == 2
 
+def test_append_copies_the_list(self, tmp_path, monkeypatch):
+  import scholar.review
+  from scholar.scholar import SearchResult
+
+  monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+  session = self._session("screen-copy")
+  record_screening(session.decisions[0], self._verdict())
+  save_session(session)
+  loaded = []
+  own = scholar.review.load_own_session
+
+  def keep_loaded(*args, **kwargs):
+    loaded.append(own(*args, **kwargs))
+    return loaded[-1]
+
+  monkeypatch.setattr(scholar.review, "load_own_session", keep_loaded)
+  paper = Paper(title="Screened", authors=["Ada Lovelace"], year=2021,
+                doi="10.5555/screen-screen-copy", sources=["openalex"])
+  appended = create_review_session([SearchResult(
+    query="q", provider="openalex", timestamp="t", papers=[paper],
+  )], "q", session_name="screen-copy")
+  [previous] = loaded
+  copied = appended.decisions[0].screenings
+  assert copied == previous.decisions[0].screenings
+  assert copied is not previous.decisions[0].screenings
+
 def test_two_screening_runs_are_united(self, tmp_path, monkeypatch):
   monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
   save_session(self._session("screen-two"))
@@ -4211,6 +4430,142 @@ def test_a_stale_save_keeps_the_corrected_snapshot(
   kinds = [(r["origin"], r["kind"]) for r in saved.screenings]
   assert kinds == [("decision", "agent"), ("screen", "agent"),
                    ("screen", "agent")]
+@
+
+The races are played in real processes, in both save orders, since
+that is how they happen: a [[sessions screen]] and a reset, or a
+relabel, that both loaded the session before either saved.  The
+screening is recorded an hour after the reset's time, so that only the
+mark, not the time rule, can set it aside.  Each process prints a line
+once it has loaded the session and waits for one before it changes
+anything; the test reads the saved file itself.
+
+<<test functions>>=
+class TestScreeningRaces:
+  """A screening and a reset or a relabel, saved in either order (#253)."""
+
+  <<screening race test methods>>
+
+<<screening race test methods>>=
+NAME = "screen-race"
+SCREEN = """
+  from scholar.review import (
+    load_session, new_screening, record_screening, save_session,
+  )
+  session = load_session("screen-race")
+  WAIT
+  record_screening(session.decisions[0], new_screening(
+    kind="agent", name="agent-2", status="kept", tags=["t"],
+    recorded_at="2026-11-20T11:00:00+00:00"))
+  save_session(session)
+"""
+RESET = """
+  from scholar.review import load_session, reset_decision, save_session
+  session = load_session("screen-race")
+  WAIT
+  reset_decision(session.decisions[0], "2026-11-20T10:00:00+00:00")
+  save_session(session)
+"""
+RELABEL = """
+  from scholar.review import (
+    ReviewSource, load_session, relabel_source, save_session,
+  )
+  session = load_session("screen-race")
+  WAIT
+  relabel_source(session.decisions[0], ReviewSource.AGENT_UNREVIEWED,
+                 "2026-11-20T10:00:00+00:00")
+  save_session(session)
+"""
+WAIT = 'import sys; print("loaded", flush=True); sys.stdin.readline()'
+
+def _first_save(self, source):
+  from scholar.scholar import isolated_registry
+
+  with isolated_registry():
+    decision = ReviewDecision(
+      paper=Paper(title="A Race", authors=["Ada Lovelace"], year=2021,
+                  doi="10.5555/screen-race"),
+      provider="openalex", status=DecisionStatus.DISCARDED,
+      tags=["off-topic"], source=source, llm_model="m-1",
+      llm_reason="Off topic.", llm_decided_at="2026-11-01T09:00:00+00:00",
+    )
+    if source is ReviewSource.HUMAN:
+      record_human_decision(decision, "decide", by="the author",
+                            at="2026-11-01T09:00:00+00:00")
+    save_session(ReviewSession(
+      query="q", providers=["openalex"], timestamp=datetime(2026, 11, 20),
+      name=self.NAME, decisions=[decision],
+    ))
+
+def _code(self, template, wait):
+  import textwrap
+
+  return textwrap.dedent(template).replace(
+    "WAIT", self.WAIT if wait else "")
+
+def _race(self, source, stale, other):
+  """`stale` loads and waits; `other` runs whole; then `stale` saves."""
+  import json
+  import subprocess
+  import sys
+  from scholar.review import _get_sessions_dir
+  from scholar.scholar import isolated_registry
+
+  self._first_save(source)
+  first = subprocess.Popen(
+    [sys.executable, "-c", self._code(stale, wait=True)],
+    stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+  )
+  try:
+    assert first.stdout.readline().strip() == "loaded"
+    subprocess.run([sys.executable, "-c", self._code(other, wait=False)],
+                   check=True, timeout=120)
+    first.communicate("go\n", timeout=120)
+  finally:
+    if first.poll() is None:
+      first.kill()
+  assert first.returncode == 0
+  path = _get_sessions_dir() / f"{self.NAME}.json"
+  saved = json.loads(path.read_text())["decisions"][0]
+  with isolated_registry():
+    return saved, load_session(self.NAME).decisions[0]
+
+def _assert_set_aside(self, saved, decision):
+  assert saved["status"] == "pending"
+  assert [r["origin"] for r in saved["screenings"]] \
+    == ["decision", "screen"]
+  assert all(r["set_aside_at"] == "2026-11-20T10:00:00+00:00"
+             for r in saved["screenings"])
+  assert counted_screenings(decision) == []
+
+def test_a_screening_saved_before_a_concurrent_reset(self):
+  saved, decision = self._race(ReviewSource.LLM_UNREVIEWED,
+                               self.RESET, self.SCREEN)
+  self._assert_set_aside(saved, decision)
+
+def test_a_screening_saved_after_a_concurrent_reset(self):
+  saved, decision = self._race(ReviewSource.LLM_UNREVIEWED,
+                               self.SCREEN, self.RESET)
+  self._assert_set_aside(saved, decision)
+
+def _assert_corrected(self, saved):
+  assert saved["source"] == "agent"
+  snapshot, screening = saved["screenings"]
+  assert (snapshot["origin"], snapshot["kind"], snapshot["name"]) \
+    == ("decision", "agent", None)
+  assert snapshot["relabelled_at"] == "2026-11-20T10:00:00+00:00"
+  assert snapshot["before_relabel"]["kind"] == "human"
+  assert snapshot["before_relabel"]["name"] == "the author"
+  assert (screening["kind"], screening["name"]) == ("agent", "agent-2")
+  assert "set_aside_at" not in snapshot
+
+def test_a_screening_saved_before_a_concurrent_relabel(self):
+  saved, _ = self._race(ReviewSource.HUMAN, self.RELABEL, self.SCREEN)
+  self._assert_corrected(saved)
+
+def test_a_screening_saved_after_a_concurrent_relabel(self):
+  saved, _ = self._race(ReviewSource.HUMAN, self.SCREEN, self.RELABEL)
+  self._assert_corrected(saved)
 @
 
 [[screenings_summary]] counts what [[sessions show]] prints, and says
@@ -11489,7 +11844,10 @@ All but the last two are also part of the decision's state, so this process's st
 is taken before the file's are added: otherwise the union itself would
 look like a change made here, and a process that changed nothing would
 keep its stale source over the file's corrected one.  Why the records
-of abstracts and the screenings are not part of it is said with them.  After the
+of abstracts and the screenings are not part of it is said with them,
+and so is why, once the decision is merged, the screenings one side
+added are settled against a reset or a relabel the other side made
+meanwhile ([[settle_concurrent_screenings]]).  After the
 decisions are merged, the tombstones of folded copies are united with
 the file's and applied ([[apply_tombstones]], \cref{sec:session-copies}),
 so that a copy that [[sessions reconcile]] folded after this process
@@ -11902,7 +12260,9 @@ def merge_concurrent_changes(
         paper_id = get_paper_id(decision.paper)
         theirs = paired.get(id(decision))
         mine = decision_state(decision)
+        history = None
         if theirs is not None:
+            history = ConcurrentHistory.of(decision, theirs)
             mine_new = [r for r in decision.abstract_set
                         if r not in theirs.abstract_set]
             their_new = [r for r in theirs.abstract_set
@@ -11923,24 +12283,24 @@ def merge_concurrent_changes(
                 decision.add_abstract_record(record)
             unite_screenings(decision, theirs.screenings)
         base_state = base_states.get(base_key_of(decision, base))
-        if theirs is None or base_state is None:
-            continue
-        if decision_state(theirs) in (base_state, mine):
-            continue
-        if mine == base_state:
-            decision.status = theirs.status
-            decision.tags = list(theirs.tags)
-            decision.source = theirs.source
-            decision.is_example = theirs.is_example
-            decision.llm_confidence = theirs.llm_confidence
-            for name, value in llm_audit_of(theirs).items():
-                setattr(decision, name, value)
-            for name, value in agent_audit_of(theirs).items():
-                setattr(decision, name, value)
-            for name, value in human_record_of(theirs).items():
-                setattr(decision, name, value)
-        else:
-            <<warn that both processes decided the paper>>
+        if (theirs is not None and base_state is not None
+                and decision_state(theirs) not in (base_state, mine)):
+            if mine == base_state:
+                decision.status = theirs.status
+                decision.tags = list(theirs.tags)
+                decision.source = theirs.source
+                decision.is_example = theirs.is_example
+                decision.llm_confidence = theirs.llm_confidence
+                for name, value in llm_audit_of(theirs).items():
+                    setattr(decision, name, value)
+                for name, value in agent_audit_of(theirs).items():
+                    setattr(decision, name, value)
+                for name, value in human_record_of(theirs).items():
+                    setattr(decision, name, value)
+            else:
+                <<warn that both processes decided the paper>>
+        if history is not None:
+            settle_concurrent_screenings(decision, history)
 
     for theirs in additions:
         held = get_registry().register(theirs.paper)
