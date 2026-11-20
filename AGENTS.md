@@ -1840,12 +1840,15 @@ screeners)} over records screened twice, `screen_sample` (the one
   agreement, Cohen's kappa (PI, BI)." plus PR B's bound sentence; PR B's
   kappa sentence once after all pairs; conflict counts ("… resolved by
   a human who decided after the latest screening; … had conflicts on
-  the category only.") and one `outcome_line` per pair and kind;
+  the category only."; one record: ", and it was resolved by a human
+  …" / ", and it is unresolved"; none: no resolution clause) and one
+  `outcome_line` per pair and kind;
   unknown-origin count. No interval.
 - **`llm synthesize`** summary (`summary_rows`): after the "Decided"
   rows, md `- Double screening (names): numbers`, LaTeX
   `\item[{Double screening: names}] numbers` (braced: names are user
-  text).
+  text); the LaTeX row writes negatives as `$-$` (`summary_rows(...,
+  minus=MINUS)` + `latex_text`), the Markdown row keeps the hyphen.
 - **Audit caption** (`audit_screening_sentence(decisions, strings,
   rows)`, in `build_audit_table_latex`'s `databases` join after
   `cited_rule`, i.e. after the reason/confidence sentence and the cited
@@ -1859,7 +1862,9 @@ screeners)} over records screened twice, `screen_sample` (the one
   screeners'} own declaration", "marked blind", "not blind",
   "blindness not recorded"; the report's declared phrase is "blind by
   the agent's own declaration, which Scholar cannot check"); per pair "Agreement on
-  kept/discarded between <model m-1> and <agent a-2>[ (same model)],
+  kept/discarded between <model m-1> and <agent a-2>[ (same model)]
+  (a same-model second screen: "model m-1 (second screen, same
+  model)", sv "(andra granskning, samma modell)"),
   over n records screened by both: P\,\% (Cohen's kappa K, prevalence
   index PI, bias index BI)." (or "undefined: reason"); "Status
   conflicts: s, of which r resolved by a human; category-only
