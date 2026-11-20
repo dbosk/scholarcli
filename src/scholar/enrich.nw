@@ -28,8 +28,8 @@ fields on a paper, making it useful for multiple scenarios:
 
 We prioritize Semantic Scholar (good coverage, fast API) with OpenAlex as
 fallback (broader coverage, always free).
-For abstracts that no search provider holds, Crossref and Europe PMC are
-asked last.
+For abstracts the other providers lack, Crossref and Europe PMC are
+asked before Scopus, whose quota is metered.
 
 \section{Module structure}
 
@@ -143,36 +143,36 @@ provider.
   Requires an API key.
 \item[Web of Science] High-quality bibliographic metadata.
   Requires an API key.
+\item[Crossref] The abstract the publisher deposited, if any, read
+  from the work record the currency check fetches anyway
+  (\cref{sec:crossref-abstract}).
+\item[Europe PMC] The abstract of a record its search finds under the
+  DOI (\cref{europepmc-module}).
 \item[Scopus] Abstracts for venues the others index poorly, but only
   where Elsevier serves its [[COMPLETE]] view, that is, on the
   subscribing institution's network or with its token
   (\cref{sec:scopus-doi-lookup}); elsewhere it declines after a single
   request.
-  It comes last of the search providers because its quota is weekly
-  and metered: we spend it only on what the free providers could not
-  supply.
-\item[Crossref] The abstract the publisher deposited, if any, read
-  from the work record the currency check fetches anyway
-  (\cref{sec:crossref-abstract}).
-\item[Europe PMC] Abstracts of the life-science literature PubMed
-  indexes (\cref{europepmc-module}).
+  It comes last because its quota is weekly and metered: we spend it
+  only on what the free services could not supply.
 \end{description}
 
-The last two are not search providers but per-DOI lookups, and they
-fill the abstract only.
-They come after the search providers, so that a search provider's
-abstract wins whenever there is one, and Crossref before Europe PMC:
-[[scholar enrich]] checks every paper's currency against Crossref
-anyway, and the abstract comes with the same cached response, so asking
-Crossref adds no request to the run (apart from one, once, for a record
-cached before abstracts were kept), while Europe PMC is a request of
-its own.
+Crossref and Europe PMC are not search providers but per-DOI lookups,
+and they fill the abstract only.
+They come after the other search providers, so that the abstract of a
+provider that also fills the other fields wins whenever there is one,
+and before Scopus, whose weekly quota they save.
+Crossref comes before Europe PMC: [[scholar enrich]] checks every
+paper's currency against Crossref anyway, and the abstract comes with
+the same cached response, so asking Crossref adds no request to the run
+(apart from one, once, for a record cached before abstracts were kept),
+while Europe PMC is a request of its own.
 
 <<constants>>=
 # Providers to try for DOI-based metadata enrichment (in priority order)
 ENRICHMENT_PROVIDERS = [
-    "s2", "arxiv", "openalex", "ieee", "wos", "scopus",
-    "crossref", "europepmc",
+    "s2", "arxiv", "openalex", "ieee", "wos",
+    "crossref", "europepmc", "scopus",
 ]
 
 # Global cache for enriched paper data (refs/cites)
@@ -333,6 +333,7 @@ def enrich_paper(
         fields = ENRICHABLE_FIELDS
 
     result = paper
+    plain_abstract = None  # an abstract service's text, already plain
 
     # Derive canonical arXiv DOI from arXiv URLs.
     # This stabilizes paper identity and enables DOI-based enrichment for
@@ -399,6 +400,7 @@ def enrich_paper(
                 # We want to keep our paper's existing data and fill in gaps.
                 try:
                     result = result.merge_with(enriched)
+                    <<note an abstract a service supplied>>
                     logger.info(
                         f"Successfully enriched paper from {provider_name}"
                     )
@@ -434,9 +436,108 @@ def enrich_paper(
         result = _fetch_refs_cites(result)
 
     # Fetched text carries provider markup like search results do.
-    return clean_paper_text(result)
+    return clean_fetched_text(result, paper, plain_abstract)
 
 
+@
+
+Fetched text carries the markup of the provider's system, as search
+results do, and is cleaned by [[clean_metadata_text]]
+(\cref{sec:clean-provider-text}).
+That function is not idempotent: it decodes entities and then removes
+the inline tags it knows, so text that is already plain and says
+[[<i>]]---an abstract about HTML, read from a JATS [[&lt;i&gt;]]---loses
+those characters each time it passes through.
+Two kinds of text are therefore left alone at the end of
+[[enrich_paper]].
+The fields the paper held when it came in were cleaned when they were
+ingested (or come from a session recorded before that, which the
+\LaTeX{} escapers clean on output), so only the fields this call
+changed are cleaned; a hand-entered abstract, or one an earlier run
+took from a service, is never cleaned again.
+And an abstract an abstract service supplied is plain text already
+([[markup_to_text]], \cref{sec:markup-to-text}), so it is not cleaned
+either.
+
+<<note an abstract a service supplied>>=
+if provider_name in ABSTRACT_SOURCE_FIELDS and enriched.abstract:
+    plain_abstract = result.abstract
+<<enrichment functions>>=
+def clean_fetched_text(
+    result: Paper, original: Paper, plain_abstract: str | None = None
+) -> Paper:
+    """Clean the title, venue and abstract `result` got since `original`.
+
+    Fields equal to `original`'s are left alone, and so is an abstract
+    equal to `plain_abstract`, a text that is plain already.
+    """
+    for name in ("title", "venue", "abstract"):
+        value = getattr(result, name, None)
+        if not isinstance(value, str):
+            continue
+        if value == getattr(original, name, None):
+            continue
+        if name == "abstract" and value == plain_abstract:
+            continue
+        setattr(result, name, clean_metadata_text(value))
+    return result
+@
+
+Let's verify that fetched markup is still cleaned, and that the two
+kinds of plain text keep a literal [[<i>]].
+
+<<test functions>>=
+class TestCleanFetchedText:
+    """enrich_paper cleans what it fetched, once (#260 review)."""
+
+    def _provider(self, **fields):
+        provider = MagicMock()
+        provider.get_paper_by_doi.return_value = Paper(
+            title="T", authors=["A"], doi="10.1/t", **fields,
+        )
+        return provider
+
+    def test_a_providers_markup_is_cleaned(self):
+        provider = self._provider(abstract="<i>Wet</i> &amp; dry.")
+        with patch("scholar.enrich.get_provider", return_value=provider):
+            paper = enrich_paper(
+                Paper(title="T", authors=["A"], doi="10.1/t"),
+                fields=["abstract"], providers=["s2"],
+            )
+        assert paper.abstract == "Wet & dry."
+
+    def test_a_held_abstract_is_not_cleaned_again(self):
+        provider = self._provider(keywords=["k"])
+        held = "Explains the <i> tag."
+        with patch("scholar.enrich.get_provider", return_value=provider):
+            paper = enrich_paper(
+                Paper(title="T", authors=["A"], doi="10.1/t", abstract=held),
+                fields=["abstract", "keywords"], providers=["s2"],
+            )
+        assert paper.keywords == ["k"]
+        assert paper.abstract == held
+
+    def test_a_services_literal_tag_survives(self, monkeypatch):
+        from scholar import crossref
+
+        monkeypatch.setattr(
+            "scholar.enrich.abstract_source", abstract_source
+        )
+        monkeypatch.setattr(crossref._client, "_cache", {})
+        record = {"message": {
+            "DOI": "10.1/t",
+            "abstract": "<jats:p>Explains the &lt;i&gt; tag.</jats:p>",
+        }}
+        response = MagicMock(status_code=200, headers={})
+        response.json.return_value = record
+        with patch.object(
+            crossref._client._session, "get", return_value=response
+        ):
+            paper = enrich_paper(
+                Paper(title="T", authors=["A"], doi="10.1/t"),
+                fields=["abstract"], providers=["crossref"],
+            )
+        assert paper.abstract == "Explains the <i> tag."
 @
 
 The loop goes on while any requested field is missing, so a paper that
@@ -663,8 +764,39 @@ class TestAbstractServices:
         assert any("1 answered by every database asked" in line
                    for line in lines)
 
-    def test_default_order_ends_with_the_services(self):
-        assert ENRICHMENT_PROVIDERS[-2:] == ["crossref", "europepmc"]
+    def test_default_order_puts_the_services_before_scopus(self):
+        assert ENRICHMENT_PROVIDERS[-3:] == [
+            "crossref", "europepmc", "scopus",
+        ]
+
+    def test_a_crossref_abstract_spares_scopus(self):
+        """The default order asks Scopus only what the services lack."""
+        scopus = MagicMock()
+        scopus.get_paper_by_doi.return_value = None
+        stack, _ = self._replay(
+            crossref=CROSSREF_WITH_ABSTRACT, europepmc=EUROPEPMC_HIT,
+        )
+        with stack, patch(
+            "scholar.enrich.get_provider",
+            side_effect=lambda name: scopus if name == "scopus" else None,
+        ):
+            paper = enrich_paper(self._paper(), fields=["abstract"])
+        assert paper.abstract.startswith("Despite")
+        scopus.get_paper_by_doi.assert_not_called()
+
+    def test_scopus_is_asked_when_the_services_have_none(self):
+        scopus = MagicMock()
+        scopus.get_paper_by_doi.return_value = None
+        outcome = LookupOutcome()
+        stack, _ = self._replay(
+            crossref=CROSSREF_WITHOUT_ABSTRACT, europepmc=EUROPEPMC_NO_HIT,
+        )
+        with stack, patch(
+            "scholar.enrich.get_provider",
+            side_effect=lambda name: scopus if name == "scopus" else None,
+        ):
+            enrich_paper(self._paper(), fields=["abstract"], outcome=outcome)
+        assert outcome.asked == ["crossref", "europepmc", "scopus"]
 
     def test_source_names_are_those_that_can_answer(self):
         names = enrichment_source_names()
@@ -2373,7 +2505,7 @@ from typing import Any, Callable, cast
 
 from scholar import Paper, crossref, europepmc, preprint, unpaywall
 from scholar.providers import get_provider
-from scholar.utils import clean_paper_text, derive_arxiv_doi
+from scholar.utils import clean_metadata_text, derive_arxiv_doi
 <<enrichment cache imports>>
 <<lookup outcome imports>>
 
