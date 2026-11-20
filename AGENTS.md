@@ -763,7 +763,15 @@ and caches under whichever delivered.
   versions left truncated files that were returned as hits forever).
   Downloads stream to a `temp_beside` file (`.<name>.<rand>.tmp`) and
   `os.replace` into place, so a broken response or Ctrl-C leaves
-  nothing. `find_quote_candidates` turns a `PdfiumError` into `[]`, or
+  nothing. The temp file is checked with `pdf_file_problem` first: a
+  body that is no readable PDF (encrypted, HTML served as PDF) is not
+  cached, the download fails with the reason, and the failure is
+  remembered for the process (`UNREADABLE_DOWNLOADS`, keyed by cache
+  path, memory only; other failures are not remembered). `get_pdf`
+  peeks with `usable_cached_pdf(..., warn=False)` so "Ignoring the
+  cached PDF" is logged once. `pdf clear` deletes `.*.tmp` files in
+  `pdfs/` older than an hour (`STALE_TEMP_SECONDS`, by mtime, under the
+  lock); `pdf info` counts them (`stale_temporary_files`). `find_quote_candidates` turns a `PdfiumError` into `[]`, or
   with `raise_errors=True` (what `pdf quote` passes) into a one-line
   `PDFUnreadableError` (a `PDFDownloadError`). **Change:** `pdf quote`
   now exits 1 with "Download failed: ..." when no PDF could be had; it

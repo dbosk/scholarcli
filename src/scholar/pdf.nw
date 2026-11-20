@@ -106,6 +106,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 
@@ -256,8 +257,21 @@ A download takes the lock only for the moment it puts its file in
 place, after the transfer (\cref{sec:pdf-download}), so that it never
 replaces an import.
 
+A process that dies while it writes (a crash, a kill; Ctrl-C is
+cleaned up) leaves its temporary file, [[.<hash>.pdf.<random>.tmp]]
+(\cref{sec:pdf-import-check}), which nothing would ever use.
+[[clear]] deletes those older than an hour, under the lock: a younger
+one may belong to a download still in progress, which takes the lock
+only for its rename.
+The age is taken from the file's modification time, that is from its
+last write, so a download that is still receiving data stays young
+however long it runs; an hour without a single write is not a
+download in progress.
+[[info]] counts them.
+
 <<pdf constants>>=
 PDF_CACHE_LOCK_NAME = "import"
+STALE_TEMP_SECONDS = 3600
 <<pdf cache functions>>=
 def pdf_cache_lock():
     """The lock import and clear share: `pdfs/.import.lock`."""
@@ -291,8 +305,23 @@ def clear_pdf_cache(include_imported: bool = False) -> int:
                 logger.warning("Failed to delete %s: %s", pdf_file.name, e)
         for record in orphaned_import_records():
             record.unlink(missing_ok=True)
+        for leftover in stale_temporary_files():
+            leftover.unlink(missing_ok=True)
     logger.info("Deleted %d cached PDF files", count)
     return count
+
+
+def stale_temporary_files() -> list[Path]:
+    """Temporary files in the PDF cache older than `STALE_TEMP_SECONDS`."""
+    cutoff = time.time() - STALE_TEMP_SECONDS
+    stale = []
+    for path in get_pdf_cache_dir().glob(".*.tmp"):
+        try:
+            if path.stat().st_mtime < cutoff:
+                stale.append(path)
+        except OSError:
+            pass
+    return stale
 
 
 def orphaned_import_records() -> list[Path]:
@@ -315,7 +344,8 @@ def get_pdf_cache_info() -> dict[str, int]:
         Dictionary with 'count' (number of files) and 'size_bytes'
         (total size); 'imported' and 'imported_bytes' for the part of
         them imported by hand; 'orphaned_records' for import records
-        that mark no file.
+        that mark no file; 'stale_temporary_files' for leftovers of
+        interrupted writes that a clear deletes.
     """
     cache_dir = get_pdf_cache_dir()
     info = {"count": 0, "size_bytes": 0, "imported": 0, "imported_bytes": 0}
@@ -330,6 +360,7 @@ def get_pdf_cache_info() -> dict[str, int]:
             info["imported"] += 1
             info["imported_bytes"] += size
     info["orphaned_records"] = len(orphaned_import_records())
+    info["stale_temporary_files"] = len(stale_temporary_files())
     return info
 @
 
@@ -1038,15 +1069,25 @@ and the reason, so the caller downloads again or tries the next
 candidate instead of handing PDFium a file it cannot read.
 This is what retires the truncated files that older versions of
 scholar left behind.
+A caller that only peeks, before a call that checks the same file
+again, passes [[warn=False]], so the warning appears once per call
+([[get_pdf]] before [[download_pdf]], \cref{sec:pdf-download}).
 
 <<pdf check functions>>=
-def usable_cached_pdf(path: Path) -> bool:
-    """Whether `path` exists and is a readable PDF to use as it is."""
+def usable_cached_pdf(path: Path, warn: bool = True) -> bool:
+    """
+    Whether `path` exists and is a readable PDF to use as it is.
+
+    An unreadable file is logged as ignored unless `warn` is false.
+    """
     if not path.exists():
         return False
     problem = pdf_file_problem(path)
     if problem:
-        logger.warning("Ignoring the cached PDF %s: %s", path.name, problem)
+        if warn:
+            logger.warning(
+                "Ignoring the cached PDF %s: %s", path.name, problem
+            )
         return False
     return True
 @
@@ -1114,6 +1155,23 @@ The body is streamed to a temporary file and renamed into place when it
 is complete, so a response that breaks off, or a Ctrl-C, leaves no
 file under the key.
 
+The temporary file is checked the same way before it is put in place.
+A body that PDFium cannot read (an encrypted publisher PDF, an HTML
+page served as [[application/pdf]]) is not cached and the download
+fails with the reason.
+Cached, it would never be a hit, so every call would fetch it again;
+and since the same body would come again, the failure is remembered
+for the rest of the process ([[UNREADABLE_DOWNLOADS]], keyed by the
+cache file, so a test's own cache directory is a key of its own): a
+batch that meets the paper again is told the reason without another
+request.
+It is remembered in memory only, not on disk: a later run tries again,
+in case the publisher serves something else by then.
+Only this failure is remembered.
+A refused status, a dropped connection or a timeout may well pass on
+the next try, and the TUI user who retries a download after a network
+hiccup should get a new request.
+
 <<pdf download functions>>=
 class PDFDownloadError(Exception):
     """
@@ -1126,6 +1184,10 @@ class PDFDownloadError(Exception):
 
 class PDFUnreadableError(PDFDownloadError):
     """A PDF was had but PDFium cannot read it."""
+
+
+UNREADABLE_DOWNLOADS: dict[Path, str] = {}
+"""Cache files whose download was not a readable PDF, with the reason."""
 
 
 def download_pdf(
@@ -1152,6 +1214,11 @@ def download_pdf(
         if progress_callback:
             progress_callback(f"Using cached PDF: {cache_path}")
         return cache_path
+    if cache_path in UNREADABLE_DOWNLOADS:
+        raise PDFDownloadError(
+            f"{UNREADABLE_DOWNLOADS[cache_path]} (tried earlier in this run)"
+            f"\nURL: {url}"
+        )
     
     logger.info("Downloading PDF from %s", url)
     if progress_callback:
@@ -1201,7 +1268,15 @@ with temp_beside(cache_path) as tmp:
             f.write(chunk)
         f.flush()
         os.fsync(f.fileno())
+    <<refuse a download that is not a readable PDF>>
     <<put the download in place unless an import is there>>
+<<refuse a download that is not a readable PDF>>=
+problem = pdf_file_problem(tmp)
+if problem:
+    reason = f"URL did not return a readable PDF: {problem}"
+    UNREADABLE_DOWNLOADS[cache_path] = reason
+    logger.warning("%s (%s)", reason, url)
+    raise PDFDownloadError(f"{reason}\nURL: {url}")
 @
 
 A download can take a while, and the user may import a PDF for the same
@@ -1374,13 +1449,16 @@ def get_pdf(
 The cached download and the imported PDF are looked up by the same
 keys [[download_pdf]] and [[download_doi_pdf]] use, so this only moves
 the two cache hits ahead of the first request.
+The look is quiet: when it finds an unreadable file, the download
+function that goes on to use that key looks again and logs it, and
+once is enough.
 
 <<use a copy on disk before any request>>=
 on_disk = [get_cached_doi_pdf_path(doi)] if doi else []
 if url:
     on_disk.append(get_cached_pdf_path(url))
 for path in on_disk:
-    if usable_cached_pdf(path):
+    if usable_cached_pdf(path, warn=False):
         logger.debug("PDF on disk for %s: %s", paper_title, path.name)
         if progress_callback:
             progress_callback(f"Using cached PDF: {path}")
@@ -1402,10 +1480,19 @@ want of the password, exactly as it refuses an encrypted PDF whose user
 password is not empty.
 (PDFium can write a blank PDF itself, but neither text nor encryption.)
 Two page widths give two PDFs with different content.
+A download is checked the same way before it is cached, so the
+stand-in responses of the download tests serve these bytes too
+([[pdf_document]]).
 
 <<test functions>>=
 def make_pdf(path, width=200, text=None, encrypted=False):
   """Write a real one-page PDF, optionally with a line of `text`."""
+  path.write_bytes(pdf_document(width, text, encrypted))
+  return path
+
+
+def pdf_document(width=200, text=None, encrypted=False):
+  """The bytes of a real one-page PDF, as `make_pdf` writes them."""
   content = b""
   if text:
     content = b"BT /F1 12 Tf 20 100 Td (%s) Tj ET" % text.encode()
@@ -1435,8 +1522,7 @@ def make_pdf(path, width=200, text=None, encrypted=False):
   data += b"trailer\n@<< /Size %d /Root 1 0 R %s>>\nstartxref\n%d\n%%%%EOF\n" % (
     len(objects) + 1, trailer, xref
   )
-  path.write_bytes(data)
-  return path
+  return data
 @
 
 <<test functions>>=
@@ -1450,13 +1536,13 @@ class TestPDFDownload:
         # Mock requests.get
         mock_response = MagicMock()
         mock_response.headers = {"content-type": "application/pdf"}
-        mock_response.iter_content.return_value = [b"PDF content"]
+        mock_response.iter_content.return_value = [pdf_document()]
         
         with patch("scholar.pdf.requests.get", return_value=mock_response):
             path = download_pdf("https://example.com/paper.pdf")
         
         assert path.exists()
-        assert path.read_bytes() == b"PDF content"
+        assert path.read_bytes() == pdf_document()
 
     def test_download_pdf_uses_cache(self, tmp_path, monkeypatch):
         """Second download uses cached file."""
@@ -1497,7 +1583,7 @@ class TestPDFDownload:
         
         mock_response = MagicMock()
         mock_response.headers = {"content-type": "application/pdf"}
-        mock_response.iter_content.return_value = [b"PDF"]
+        mock_response.iter_content.return_value = [pdf_document()]
         
         with patch("scholar.pdf.requests.get", return_value=mock_response):
             path = get_pdf(paper)
@@ -1510,7 +1596,7 @@ class TestPDFDownload:
         
         mock_response = MagicMock()
         mock_response.headers = {"content-type": "application/pdf"}
-        mock_response.iter_content.return_value = [b"PDF"]
+        mock_response.iter_content.return_value = [pdf_document()]
         
         with patch("scholar.pdf.requests.get", return_value=mock_response):
             path = get_pdf("https://example.com/paper.pdf")
@@ -1564,10 +1650,12 @@ class TestDOIDownload:
         self, tmp_path, monkeypatch
     ):
         monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path))
-        web = self.web({"https://a/": "login page", "https://b/": b"%PDF"})
+        web = self.web(
+            {"https://a/": "login page", "https://b/": pdf_document()}
+        )
         with self.candidates("https://a/", "https://b/"), \
              patch("scholar.pdf.requests.get", web):
-            assert download_doi_pdf("10.1/x").read_bytes() == b"%PDF"
+            assert download_doi_pdf("10.1/x").read_bytes() == pdf_document()
 
     def test_error_lists_every_attempt(self, tmp_path, monkeypatch):
         monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path))
@@ -1591,10 +1679,10 @@ class TestDOIDownload:
         paper = MagicMock(
             title="T", pdf_url="https://dead/", doi="10.1/x"
         )
-        web = self.web({"https://dead/": "gone", "https://b/": b"%PDF"})
+        web = self.web({"https://dead/": "gone", "https://b/": pdf_document()})
         with self.candidates("https://dead/", "https://b/"), \
              patch("scholar.pdf.requests.get", web) as get:
-            assert get_pdf(paper).read_bytes() == b"%PDF"
+            assert get_pdf(paper).read_bytes() == pdf_document()
 
     def test_paper_without_doi_reports_its_pdf_url_failure(
         self, tmp_path, monkeypatch
@@ -1663,6 +1751,63 @@ class TestDownloadsAreWhole:
     with patch("scholar.pdf.requests.get", return_value=response) as get:
       assert download_pdf(url).read_bytes() == whole
     get.assert_called_once()
+@
+
+A response that PDFium cannot read is not cached, and in one process it
+is asked for once: three calls for an encrypted publisher PDF make one
+request, all three fail with the reason, and nothing enters the cache.
+An HTML page served as a PDF fails saying so.
+
+<<test functions>>=
+class TestUnreadableDownloads:
+  """A download that is no readable PDF is refused, once per process."""
+
+  @staticmethod
+  def serving(body):
+    response = MagicMock()
+    response.headers = {"content-type": "application/pdf"}
+    response.iter_content.return_value = [body]
+    return response
+
+  def test_an_encrypted_pdf_is_asked_for_once(self, tmp_path, monkeypatch):
+    monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path))
+    url = "https://pub.example/locked.pdf"
+    response = self.serving(pdf_document(encrypted=True))
+    with patch("scholar.pdf.requests.get", return_value=response) as get:
+      for _ in range(3):
+        with pytest.raises(PDFDownloadError) as error:
+          download_pdf(url)
+        assert "the PDF is encrypted" in str(error.value)
+    assert get.call_count == 1
+    assert list(get_pdf_cache_dir().iterdir()) == []
+
+  def test_an_html_page_served_as_a_pdf(self, tmp_path, monkeypatch):
+    monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path))
+    page = b"<!DOCTYPE html><html><title>Checking your browser</title>"
+    with patch("scholar.pdf.requests.get", return_value=self.serving(page)):
+      with pytest.raises(PDFDownloadError) as error:
+        download_pdf("https://pub.example/a.pdf")
+    assert "HTML page" in str(error.value)
+    assert list(get_pdf_cache_dir().iterdir()) == []
+@
+
+A truncated copy under a paper's [[pdf_url]] is logged as ignored once
+per call, not once by [[get_pdf]] and again by [[download_pdf]].
+
+<<test functions>>=
+def test_an_ignored_copy_is_logged_once(tmp_path, monkeypatch, caplog):
+  import logging
+
+  monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path))
+  url = "https://pub.example/a.pdf"
+  get_cached_pdf_path(url).write_bytes(pdf_document()[:200])
+  paper = MagicMock(title="T", pdf_url=url, doi=None)
+  response = TestUnreadableDownloads.serving(pdf_document())
+  with patch("scholar.pdf.requests.get", return_value=response), \
+       caplog.at_level(logging.WARNING, logger="scholar.pdf"):
+    get_pdf(paper)
+  ignored = [r for r in caplog.records if "Ignoring the cached PDF" in r.message]
+  assert len(ignored) == 1
 @
 
 \section{Importing a PDF the user holds}
@@ -2280,6 +2425,30 @@ def test_a_retry_meets_the_download(self, tmp_path, monkeypatch):
     import_pdf(meant, url=url)
   assert "a downloaded PDF" in str(error.value)
   assert import_pdf(meant, url=url, replace=True).status == "replaced"
+@
+
+A temporary file left by an interrupted write is counted by [[info]]
+and deleted by [[clear]] once it is older than an hour; a younger one
+may be a download in progress and stays.
+The test sets the files' modification times instead of waiting.
+
+<<import pdf test methods>>=
+def test_clear_deletes_stale_temporary_files(self, tmp_path, monkeypatch):
+  import os
+  import time
+
+  monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path / "cache"))
+  cache_dir = get_pdf_cache_dir()
+  stale = cache_dir / ".0123456789abcdef.pdf.k3x9.tmp"
+  young = cache_dir / ".fedcba9876543210.pdf.q7w2.tmp"
+  for path in (stale, young):
+    path.write_bytes(b"%PDF-1.7 partial")
+  two_hours_ago = time.time() - 2 * 3600
+  os.utime(stale, (two_hours_ago, two_hours_ago))
+  assert get_pdf_cache_info()["stale_temporary_files"] == 1
+  clear_pdf_cache()
+  assert not stale.exists() and young.exists()
+  assert get_pdf_cache_info()["stale_temporary_files"] == 0
 @
 
 Import and clear share one lock for the directory, so a clear leaves
