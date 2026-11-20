@@ -1144,13 +1144,59 @@ is gone from the sample (see Samples: `reset_since_draw`);
 `first_made_by_llm` is False for any pending
 paper; after a full reset the classifier vocabulary (tags of decided
 papers) is empty, so pass `llm classify --tag`.
+**`scholar sessions set-abstract S (--paper-id ID | --doi D) --file F
+--from TEXT [--by NAME] [--replace] [--dry-run]`**, or `--abstracts-file
+F` (lines `ID<TAB>FROM<TAB>ABSTRACT`, exactly three columns, the
+`--reasons-file` conventions: `utf-8-sig`, lines end at `\n`, blank/`#`
+skipped, ID = paper id or DOI bare/`doi:`; `cli.parse_abstracts_file`,
+every bad line named, exit 2 before loading) (#258, cli.nw
+`sec:sessions-set-abstract`, review.nw `sec:set-abstract`) stores an
+abstract found by hand. `--file -` reads stdin; `--from` is required.
+`review.set_abstract(decisions, text, origin, at, by, replace)` cleans
+the text (`clean_abstract_text` = `clean_metadata_text` + white space
+collapsed; empty → exit 2; above `LONG_ABSTRACT_CHARS` = 10,000 only a
+stderr warning), sets `paper.abstract` on every decision holding the
+paper (one registry `Paper`) and records on each decision
+`ReviewDecision.abstract_set` = `[{"at", "from", "by", "chars",
+"previous"}]` (`previous` only when an abstract was replaced; `by` None
+unless given). A paper with an abstract is refused (exit 2, each named,
+unsaved) unless `--replace`; an unmatched selector exits 1 unsaved; two
+batch lines giving one paper different texts/origins exit 2. A possible
+or foldable copy (`cli.possible_twins` over `possible_copies` /
+`foldable_copies`, both directions) gets a stderr note naming it and
+`sessions reconcile`; the abstract is still set. `--dry-run` writes
+nothing; else `keep_copy_before_run(session, "pre-set-abstract")`, one
+`_utcnow()` time, `save_session`. The record is on the decision, not
+on `Paper` (no new paper-merge rule; an older Scholar keeps the
+abstract, drops the list): saved only when non-empty, old files `[]`,
+kept by the append copy (stored abstract wins via `stored_paper_with`),
+united in `merge_concurrent_changes`, but **not** in `decision_state`
+(it changes no decision: in the state, a `set-abstract` save would put
+a stale pending decision back over a decision another process saved
+meanwhile; tested). Not part of `is_unscreened` either, so a pending
+copy with a hand abstract still folds; the fold (`reconcile_copies`
+and `apply_tombstones`) keeps a copy's records only when its abstract
+is the one the survivor holds (`abstract_records_kept`), else drops
+them with a WARNING. The abstract itself follows the #206 paper merge
+(the setting process changed it, so its save keeps it). `enrich` never
+replaces it (`needs_enrichment`, `merge_with` keep stored values;
+tested), but a **preprint adoption** takes the preprint's own abstract
+(`preprint._adopt`); `hand_abstract_replaced(d)` (last record's
+`chars` != current length) then makes `sessions show` add ", since
+replaced" and the report not count it. The DOI-less hash id does not
+move (title and author only; tested). Shown by `sessions show` ("(abstract
+added by hand, from <from>)", `cli.abstract_mark`; JSON `abstract_set`
+when set), the report (`hand_abstracts_sentence`, one English sentence
+counting papers, nothing when zero) and the CSV column `abstract_from`
+(`from time [by NAME]; ...`, `review.abstract_from_cell`, after
+`reset_from`, before `paper_id`). The audit table is unchanged.
 Together these let scripted/agent-driven systematic reviews produce the same
 session record and `sessions export` audit trail as TUI reviews.
 
 ### Session Arguments
 
 Every command that takes a saved session (`sessions show/export/decide/
-relabel/reset/resume/reconcile/check`, `llm classify/status/context/
+relabel/reset/set-abstract/resume/reconcile/check`, `llm classify/status/context/
 synthesize/sample`, `enrich`, `verify`) opens it with
 `cli.open_session_argument` → `review.load_session_argument` →
 `resolve_session_argument` (#237, review.nw `sec:session-arguments`):
