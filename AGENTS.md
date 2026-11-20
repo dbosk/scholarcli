@@ -1559,9 +1559,17 @@ only when `saving` (set before the chunk: decide True, screen
 `recorded_at` = `at`; `keep_copy_before_run(session, "pre-screen")`;
 `--dry-run` writes nothing. `--blind`/`--not-blind` → `blind`
 True/False, `blind_basis: "declared"`; neither → None. The decision is
-never changed (tested on the saved JSON). Not yet built (later #253
-PRs): `llm classify --second-screen`, report surfaces (LaTeX report,
-`llm synthesize`, audit caption), the screen sheet.
+never changed (tested on the saved JSON). **Screener identity**
+(#253 C): `review.screener_identity(record)` = `(kind, name, via ==
+"classify")`; comparisons (agreement, conflicts) pair by it, not by
+`(kind, name)`: a classifier second screen keeps `name` = the model id
+(so "same model" = both kind llm with equal names) but must not share
+the identity of the snapshot of a decision the same model made, else
+the latest-record rule hides the first verdict. Only `llm classify
+--second-screen` writes `via: "classify"`; snapshots are `"snapshot"`,
+`sessions screen` `"screen"`. Not yet built (later #253 PR E):
+report surfaces (LaTeX report, `llm synthesize`, audit caption), the
+screen sheet.
 **TUI blind review (#253 part D, closes #254's last point; tui.nw
 `sec:tui-blind-review`).** `scholar sessions resume S --blind [--by
 NAME]` (`PaperReviewApp(..., blind=True)`) starts blind mode in
@@ -2416,6 +2424,59 @@ A human review leaves them untouched (they are the model's record).
   Nothing is withheld or retried for it. Later checks (`sessions show`,
   report) see only title and abstract (see Headless Review Sessions).
   Answers without a valid `paper_index` are skipped (never index 0).
+- **Second screen (#253 C).** `scholar llm classify S --second-screen
+  (--over all|machine | --sample ID) [-n N] [--rescreen]` (exactly one
+  selection, no default: exit 2 before loading; `second_screen_candidates`
+  raises `ValueError` for neither or both)
+  (`llm_review.second_screen_with_llm`, llm_review.nw
+  `sec:second-screen`; cli.nw `sec:llm-classify-second-screen`)
+  classifies *decided* papers (never pending) and stores each usable
+  answer as a screening (`kind` llm, `name` = the model's reported
+  `model_id`, status, tags, confidence, `reason` cut by
+  `truncate_reason`, `at` = batch time, `prompt_version` (the ordinary
+  one), `abstract_truncated`, `blind` True, `blind_basis` "prompt",
+  `sample_id`, `via` "classify") via `record_screening` (snapshot
+  first); never `apply_llm_decisions`, decisions untouched (tested on
+  `decision_state`/`human_record_of` and the saved JSON); with
+  enrichment on (as in an ordinary run) a missing abstract may be filled
+  and saved, and every copy under the paper's id gets the filled
+  `Paper`. Selection (`second_screen_candidates`): `all` every decided
+  paper,
+  `machine` = `is_unreviewed_machine`, `--sample` = a band's
+  `sample_id` (that band) or a banded draw's group id (`sample_group`,
+  all bands; each screening stores its band's id); sampled papers
+  `reset_since_draw` are skipped and counted. Session order, `-n` per
+  run (one request + the one retry, as classify); decisions with a
+  counted screening of identity `("llm", model, True)`
+  (`has_second_screen_by`) are skipped unless `--rescreen`; copies under
+  one id are shown once and all screened. `classify_papers_with_llm(...,
+  papers=)` classifies given decisions and takes examples and
+  themes/motivations from `visible` (shallow session copy without every
+  decision sharing a `same_work_keys` key with a screened paper: paper
+  id, `version_link_dois`, `work:<audit_work_key>` when the title part
+  is non-empty; no namesake guard, a hidden namesake costs an example;
+  copies the keys miss are not hidden); whether categories are offered
+  is read from the whole session. An unknown model (`UnknownModelError`,
+  a `KeyError`) becomes a `ValueError`: one line, exit 1 (the ordinary
+  run still prints a traceback). Prose cites Vembye 2025 Table 5 steps
+  1-5 (test with recall >= .75, specificity >= .8, which Scholar does
+  not run) and 9, Page 2021 E&E Box 3 (partial checks); a `machine` or
+  single-status sample selection makes agreement conditional on the
+  first screen. Tested: the prompt is byte-identical when the screened
+  papers' verdicts are flipped. Refused (exit 2, before loading, no
+  model call): `--include-llm-examples` with it, `--sample/--over/
+  --rescreen` without it, `--sample` with `--over`, bad `--over`;
+  unknown sample exit 2 (screen's chunk). Nothing left → exit 1. A
+  decision the same model made (unreviewed `llm`, `llm_model` = model)
+  is screened, never refused, and announced ("Same model as the first
+  screen for N paper(s)"; `SecondScreen.same_model`). Withheld answers
+  store nothing (no snapshot) and are listed under "No screening
+  stored, ..." (`print_withheld_papers(lead=)`); the quote line checks
+  the screenings' reasons (`print_reason_quote_misses(reason_of=)`).
+  Saved only when something was recorded, after
+  `keep_copy_before_run(session, "pre-screen")`. Dry run prints the
+  prompt, stores nothing (resolves the model, to skip what it
+  screened). Prints "Left to screen: N".
 - **Abstracts.** `MAX_ABSTRACT_CHARS` = 4000 for papers to classify
   (marked `[abstract truncated]` in the prompt), `EXAMPLE_ABSTRACT_CHARS`
   = 1000 for examples.
