@@ -1563,14 +1563,20 @@ source (CJK written against Latin: `\u5b66\u4e60Mac OS X...`), both
 escapers write `\scholarnonlatinsep{}` between them (`NONLATIN_SEP`,
 `_touches_text`; never next to a space or punctuation, so such output
 is byte-identical). `nonlatin_definition(marker, separator=True)`
-prepends `NONLATIN_SEP_DEFINITION` (empty under XeTeX/LuaTeX or when
-`\scholarnonlatin` is already defined, i.e. by a host; else `\ `),
-added by `latex_document`/`latex_fragment`/`nonlatin_bib_preamble`
-only when `uses_nonlatin_sep`; the fragment header then says how a
-host defines it. `uses_nonlatin` detects either macro; `cli._unescape_bib`
+prepends `NONLATIN_SEP_DEFINITION` (empty under XeTeX/LuaTeX, else
+`\ `; deliberately no test of whether `\scholarnonlatin` is defined:
+an earlier fragment or a cited scholar `.bib`'s `@preamble` defines it
+too, and the marker then ran into the Latin words), added by
+`latex_document`/`latex_fragment`/`nonlatin_bib_preamble` only when
+`uses_nonlatin_sep`; the fragment header then tells a host whose
+`\scholarnonlatin` prints the text to add
+`\newcommand{\scholarnonlatinsep}{}` (without it: a space where the
+scripts touch). `uses_nonlatin` detects either macro; `cli._unescape_bib`
 drops the separator before the wrapper; the `--cited-from` reader
-(bibtexparser decoding) already drops it. pdflatex prints
-"[non-Latin text] Mac OS X [non-Latin text]" (`TestNonLatinSeparatorCompiles`).
+(bibtexparser decoding) already drops it (pinned). pdflatex prints
+"[non-Latin text] Mac OS X [non-Latin text]", also after an earlier
+fragment and after a cited new or old-style `.bib`
+(`TestNonLatinSeparatorCompiles`).
 An audit row whose title keeps no letter outside such runs
 (`only_nonlatin_letters`) also prints `(paper id)` (`doi:…`, else the
 hash id; `audit_title_cell`, `AuditRow.nonlatin_title`), and
