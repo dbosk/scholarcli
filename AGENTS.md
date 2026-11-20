@@ -1011,7 +1011,7 @@ confidences exits 2, both unsaved. `--source agent` without a reason
 warns on stderr and records the decision. Shown in `sessions show`
 (a `reason (by): …` line, cut at `SHOW_REASON_CHARS` = 160; JSON:
 the three fields, `null` when unset), the per-decision CSV (three
-columns before `paper_id`) and the report (one English sentence after
+columns before `reset_from`; `paper_id` stays last) and the report (one English sentence after
 the summary, `agent_reasons_sentence`: agent and agent_reviewed
 decisions with/without a reason). An older Scholar loads such files
 and drops the fields on its next save (checked with the installed
@@ -1098,13 +1098,58 @@ its `to`; JSON `relabelled` when set) and the CSV column
 `paper_id`).
 A Scholar from before this loads such files but drops the list on its
 next save (checked under 528d933).
+**`scholar sessions reset S (--doi D|--paper-id ID|--source SRC|--all)
+[--dry-run] [--note TEXT] [--by NAME] [--all-copies]`** (#248, cli.nw
+`sec:sessions-reset`, review.nw `sec:reset-decision`) sets decided
+papers back to pending so a flawed screen can be redone in place
+(`llm classify` takes pending papers only) without re-running the
+searches. `review.reset_decision(decision, at, note, by)`: status →
+pending, tags → [], `llm_confidence` → None, `clear_machine_audit`,
+`is_example` → False, source → `human` (the default of an undecided
+paper; a pending `llm` would still get "(LLM, unreviewed)" from
+`unreviewed_mark`); paper, provider, `found_by`, `same_id_copies`,
+`relabelled`, records, rounds, samples, context untouched. Only
+unreviewed sources (`agent`, `llm`, unknown stored values) can be
+reset; `ValueError` otherwise. History in `ReviewDecision.resets`
+(`[{"at", "status", "tags", "source", "llm_confidence", "is_example",
+"trace", "note", "by"}]`; `trace` = the non-None fields of
+`MACHINE_AUDIT_FIELDS` read at call time, so newly registered audit
+fields are kept, omitted when empty; `add_reset` once each, sorted by
+`at`), persisted exactly like `relabelled` (saved when non-empty, old
+files `[]`, append copy, merge union after `mine`, in
+`decision_state`); checked: bc8ec8c loads such a file (as pending) and
+drops the list on save. A reset paper is not `is_unscreened`, so
+reconcile never folds it away. CLI: `--source` is repeatable/comma
+list, alone it selects every decision with that source, with
+`--doi/--paper-id/--all` it narrows; one form required, `--all` with
+explicit selectors refused (exit 2), unknown `--source` nobody holds
+exit 2; unmatched `--doi/--paper-id` exit 1 unsaved; a `--source`
+that matches nothing is not an error (a second run finds 0). Excluded
+and pending papers selected by id are named and skipped. Any selected
+`human`/`llm_reviewed`/`agent_reviewed` decision refuses the batch
+(exit 2, unsaved, first `RESET_REFUSAL_NAMES` = 20 named, the rest
+counted by source; no `--force`, leave them out with `--source`).
+Copies decided apart (`same_id_pairs`) need `--all-copies`. Prints
+`status by source: N`; `--dry-run` writes nothing (refusals still
+apply); else `keep_copy_before_run(session, "pre-reset")`, one
+`_utcnow()` time, `save_session`. Shown by `sessions show`
+("(reset from discarded by llm)", `cli.reset_mark`; the relabel mark
+is hidden on a still-pending reset paper and when the last relabel is
+older than the last reset, `relabel_after_reset`; JSON `resets`) and
+the CSV column `reset_from` (`status by source time [by NAME]; ...`,
+after the agent-trace columns, before `paper_id`). Effects: audit table and
+report show pending; a sampled decision reset at or after the draw
+is gone from the sample (see Samples: `reset_since_draw`);
+`first_made_by_llm` is False for any pending
+paper; after a full reset the classifier vocabulary (tags of decided
+papers) is empty, so pass `llm classify --tag`.
 Together these let scripted/agent-driven systematic reviews produce the same
 session record and `sessions export` audit trail as TUI reviews.
 
 ### Session Arguments
 
 Every command that takes a saved session (`sessions show/export/decide/
-relabel/resume/reconcile/check`, `llm classify/status/context/
+relabel/reset/resume/reconcile/check`, `llm classify/status/context/
 synthesize/sample`, `enrich`, `verify`) opens it with
 `cli.open_session_argument` → `review.load_session_argument` →
 `resolve_session_argument` (#237, review.nw `sec:session-arguments`):
@@ -1741,6 +1786,15 @@ A human review leaves them untouched (they are the model's record).
   x* = 2 for n <= 50 else 3), because plain Wilson coverage dips near
   p = 0, where disagreement rates live. The sentence says the rate
   covers only the reviewed part while some is unreviewed.
+  A sampled paper with a reset record (`ReviewDecision.resets`, #248)
+  whose `at` >= the sample's `drawn_at` (both UTC ISO with seconds;
+  `llm_review.reset_since_draw` compares them as datetimes, as strings
+  if either fails to parse) no longer holds the drawn decision: it is
+  counted as `SampleReport.reset_since_draw` (JSON `reset_since_draw`,
+  sentence "N sampled decisions were reset to pending after the draw
+  and are not counted"), never as reviewed, changed or unreviewed, is
+  part of the `counted` total for sessions not given, and is not queued
+  by `sampled_for_review`. A reset before the draw counts as usual.
   `LLMSample.sessions` are labels (`session_label`: name or query);
   since #231 `session_files` (same order, `session_file_path(s).name`,
   saved only when present; old samples load with None) records each

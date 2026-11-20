@@ -655,6 +655,11 @@ class ReviewDecision:
         relabelled: Each time the source was corrected without changing
             the decision (`{"from", "to", "at", "note", "by",
             "is_example"}`), oldest first; see `relabel_source`.
+        resets: Each time the decision was set back to pending, with
+            the decision it had (`{"at", "status", "tags", "source",
+            "llm_confidence", "is_example", "trace", "note", "by"}`,
+            `trace` only when the classifier left one), oldest first;
+            see `reset_decision`.
         baseline_key: The decision's key in its session's baseline,
             given when the session was loaded or saved (not saved
             itself); `None` for a decision made since. See
@@ -672,6 +677,7 @@ class ReviewDecision:
     found_by: list[tuple[str, str, str | None]] = field(default_factory=list)
     same_id_copies: list[dict] = field(default_factory=list)
     relabelled: list[dict] = field(default_factory=list)
+    resets: list[dict] = field(default_factory=list)
     baseline_key: str | None = field(default=None, compare=False, repr=False)
 
     def __post_init__(self):
@@ -684,6 +690,8 @@ class ReviewDecision:
             self.same_id_copies = []
         if self.relabelled is None:
             self.relabelled = []
+        if self.resets is None:
+            self.resets = []
 
     def add_relabel(self, record: dict) -> None:
         """Note a correction of the source (`relabel_source`), once.
@@ -694,6 +702,16 @@ class ReviewDecision:
         if record not in self.relabelled:
             self.relabelled.append(record)
             self.relabelled.sort(key=lambda r: str(r.get("at") or ""))
+
+    def add_reset(self, record: dict) -> None:
+        """Note a reset to pending (`reset_decision`), once.
+
+        Kept in the order of the `at` times, as `add_relabel` keeps its
+        records.
+        """
+        if record not in self.resets:
+            self.resets.append(record)
+            self.resets.sort(key=lambda r: str(r.get("at") or ""))
 
     def add_same_id_copy(self, copy: dict) -> None:
         """Note another work returned under this paper's id, once."""
@@ -1587,6 +1605,372 @@ def test_concurrent_relabels_are_united(self, tmp_path, monkeypatch):
     decision = load_session("relabel-both").decisions[0]
     assert decision.source is ReviewSource.LLM_UNREVIEWED
     assert [r["to"] for r in decision.relabelled] == ["agent", "llm"]
+@
+
+
+\subsection{Setting a decision back to pending}
+\label{sec:reset-decision}
+
+A screen can turn out flawed after the fact.  Issue~\#248
+(\url{https://github.com/dbosk/scholarcli/issues/248}) reports two
+sessions screened partly by title-only rules and by an [[llm classify]]
+run made before the classifier's record was kept
+(\cref{sec:llm-audit-fields}); the author wants to classify them again,
+with a recorded trace, and then have an agent check the calls.  But
+[[llm classify]] classifies pending papers only, and nothing set a
+decided paper back to pending.  Re-running the searches into a new
+session would change the hit counts and search dates the report states
+and spend provider quota; editing the file by hand bypasses
+[[save_session]], which the session-integrity work
+(\cref{sec:session-integrity}) exists to prevent.  [[reset_decision]]
+is the supported way: it sets one decision back to pending and keeps
+what it was in the decision's history.
+
+Which decisions may be reset?  Only those still waiting for a human:
+the unreviewed machine sources [[agent]] and [[llm]], and stored
+sources Scholar does not know, which count as unreviewed
+(\cref{sec:review-source}).  A [[human]], [[llm_reviewed]] or
+[[agent_reviewed]] decision is a human's decision or confirmation, and
+undoing it is the human's to do, where it is recorded as theirs: in
+the TUI, or with [[sessions decide --source human]].  A decision
+wrongly recorded as a human's is first corrected with [[sessions
+relabel]] (\cref{sec:relabel-source}), which makes the correction
+itself part of the record.  A pending paper has nothing to reset.
+
+The reset clears everything that belongs to the decision: the status
+becomes pending; the tags go, since a pending paper's tags would read
+as themes or motivations and are not a decision any more; the
+confidence goes; every field registered in [[MACHINE_AUDIT_FIELDS]]
+goes ([[clear_machine_audit]], \cref{sec:review-source}); and
+[[is_example]] is cleared, since a pending paper is no training
+example.  The source becomes [[human]], the default of a paper nobody
+has decided.  Every reader of the source takes a pending [[human]]
+paper for an unscreened one, while a pending [[llm]] paper would still
+be marked \enquote{LLM, unreviewed} in [[sessions show]] and the
+report, because [[unreviewed_mark]] does not look at the status.
+Everything else is a fact about the paper or the searches, not about
+the decision, and stays: the paper and its metadata, the provider,
+[[found_by]], [[same_id_copies]], [[relabelled]], and of course the
+session's search records, snowball rounds, LLM samples and research
+context.
+
+Each reset is recorded on the decision, in [[resets]], as
+[[{"at", "status", "tags", "source", "llm_confidence", "is_example",
+"trace", "note", "by"}]]: the UTC time; the status, tags, source,
+confidence and example flag the decision had; the classifier's trace,
+that is the fields of [[MACHINE_AUDIT_FIELDS]] that were set, by name
+(the key is left out when none was); and the caller's note and name
+for who asked ([[None]] when not given, as in a relabel record).  The
+trace is read from the registry rather than from a list of names here,
+so a machine audit field registered later, say an agent's reason, is
+kept in the history as soon as the reset clears it, without a change
+here.  A redone screen is then auditable: the old call, with its model
+and reason, stands beside the new one.  The list is kept in time
+order, like [[relabelled]], and nothing removes a record.
+
+<<review data structures>>=
+def reset_decision(
+    decision: ReviewDecision,
+    at: str,
+    note: str | None = None,
+    by: str | None = None,
+) -> dict:
+    """Set `decision` back to pending, keeping what it was in its history.
+
+    Only an unreviewed decision (source `agent`, `llm` or an unknown
+    stored value) can be reset. Status, tags, confidence, the machine
+    audit fields (`MACHINE_AUDIT_FIELDS`) and `is_example` are cleared
+    and the source becomes `human`, the default of an undecided paper.
+    The old values are recorded in `decision.resets` as `{"at",
+    "status", "tags", "source", "llm_confidence", "is_example",
+    "trace", "note", "by"}` (`trace` holds the audit fields that were
+    set, and is left out when none was) and returned.
+
+    Raises:
+        ValueError: For a pending paper, or a decision a human made or
+            confirmed (`human`, `llm_reviewed`, `agent_reviewed`).
+    """
+    if not decision.is_decided:
+        raise ValueError("a pending paper has no decision to reset")
+    if not decision.source.is_unreviewed:
+        raise ValueError(
+            f"a {decision.source.value} decision was made or confirmed "
+            "by a human; only a human can change it"
+        )
+    trace = {
+        name: getattr(decision, name, None)
+        for name in MACHINE_AUDIT_FIELDS
+        if getattr(decision, name, None) is not None
+    }
+    record = {
+        "at": at,
+        "status": decision.status.value,
+        "tags": list(decision.tags),
+        "source": decision.source.value,
+        "llm_confidence": decision.llm_confidence,
+        "is_example": decision.is_example,
+        **({"trace": trace} if trace else {}),
+        "note": note,
+        "by": by,
+    }
+    decision.status = DecisionStatus.PENDING
+    decision.tags = []
+    decision.llm_confidence = None
+    clear_machine_audit(decision)
+    decision.is_example = False
+    decision.source = ReviewSource.HUMAN
+    decision.add_reset(record)
+    return record
+@
+
+The history travels like the relabel records (\cref{sec:relabel-source}):
+saved only when non-empty, so the file of a session nobody reset is
+unchanged; loaded as empty from a file without the key; copied with the
+decision when search results are appended
+(\cref{sec:review-create-strict}); united with the file's by a save
+that merges another process's changes (\cref{sec:session-integrity}),
+after this process's decision state is taken, so that the union does
+not look like a change made here; and part of [[decision_state]], so
+that two copies with different histories are not taken for equal
+decisions.  A reset paper is also not \emph{unscreened}
+([[is_unscreened]], \cref{sec:session-copies}), since folding it into
+a copy would drop its history.  A Scholar from before this field loads
+a session with it, as a pending paper, and drops the list when it next
+saves the session (checked on November 19, 2026, by loading and saving
+a session with the key under commit bc8ec8c).
+
+What other parts of Scholar make of a reset paper follows from its
+being pending.  The audit table and the report list it as pending
+([[audit_reason]]).  A sampled decision reset after the draw is gone
+from the sample: [[llm sample --report]] counts it apart, never as
+reviewed, changed or unreviewed, and the TUI does not queue it
+([[reset_since_draw]], \cref{sec:llm-sample} in the LLM review module),
+since whatever the paper is decided next is a call the sample never
+drew.  [[first_made_by_llm]] does not count it,
+since a pending paper is no decision, whoever made the one it had
+(\cref{sec:llm-sample} in the LLM review module).  And [[llm classify]]
+classifies it like any other pending paper.  One consequence for a
+session reset as a whole: the classifier is told to choose from the
+tags of the session's decided papers (plus those given with [[--tag]]),
+so after every decision is reset the vocabulary has to be given again
+with [[llm classify --tag]].
+
+Let's check that a reset keeps the old decision in its history and
+clears the decision itself, that a registered audit field lands in the
+trace, that a human's decision or confirmation is refused, and that
+the history survives a save, a load, an append and a concurrent save
+by a process that loaded the session before the reset.
+
+<<test functions>>=
+class TestResetDecision:
+    """Setting a decision back to pending keeps it in the history (#248)."""
+
+    <<reset decision test methods>>
+
+<<reset decision test methods>>=
+AT = "2026-11-19T10:00:00+00:00"
+
+def _llm_call(self, doi="10.5555/reset", source=ReviewSource.LLM_UNREVIEWED):
+    return ReviewDecision(
+        paper=Paper(title="Reset", authors=["A"], doi=doi, year=2024),
+        provider="openalex", status=DecisionStatus.DISCARDED,
+        tags=["off-topic-false-hit"], source=source,
+        llm_confidence=0.8, llm_model="m-1",
+        llm_decided_at="2026-11-01T09:00:00+00:00",
+        llm_prompt_version="0123456789abcdef", llm_reason="Off topic.",
+        llm_abstract_truncated=False,
+        found_by=[("q", "openalex", "")],
+        relabelled=[{"from": "human", "to": "llm", "at": "2026-11-02"}],
+    )
+
+def test_the_decision_goes_into_the_history(self):
+    decision = self._llm_call()
+    record = reset_decision(decision, self.AT, note="redo", by="the author")
+    assert record == {
+        "at": self.AT, "status": "discarded",
+        "tags": ["off-topic-false-hit"], "source": "llm",
+        "llm_confidence": 0.8, "is_example": False,
+        "trace": {
+            "llm_model": "m-1",
+            "llm_decided_at": "2026-11-01T09:00:00+00:00",
+            "llm_prompt_version": "0123456789abcdef",
+            "llm_reason": "Off topic.", "llm_abstract_truncated": False,
+        },
+        "note": "redo", "by": "the author",
+    }
+    assert decision.resets == [record]
+    assert decision.status is DecisionStatus.PENDING
+    assert decision.tags == []
+    assert decision.source is ReviewSource.HUMAN
+    assert decision.llm_confidence is None
+    assert llm_audit_of(decision) == dict.fromkeys(LLM_AUDIT_FIELDS)
+    assert decision.found_by == [("q", "openalex", "")]
+    assert decision.provider == "openalex"
+    assert decision.relabelled != []
+    assert is_unscreened(decision) is False
+
+def test_an_agent_decision_without_trace_omits_it(self):
+    decision = ReviewDecision(
+        paper=Paper(title="Agent", authors=["B"]), provider="p",
+        status=DecisionStatus.KEPT, tags=["ml"],
+        source=ReviewSource.AGENT_UNREVIEWED, is_example=True,
+    )
+    record = reset_decision(decision, self.AT)
+    assert "trace" not in record
+    assert (record["source"], record["is_example"]) == ("agent", True)
+    assert decision.is_example is False
+
+def test_a_registered_audit_field_is_kept_in_the_trace(self, monkeypatch):
+    import scholar.review as review
+
+    monkeypatch.setattr(review, "MACHINE_AUDIT_FIELDS",
+                        review.MACHINE_AUDIT_FIELDS + ("agent_reason",))
+    decision = self._llm_call()
+    decision.agent_reason = "Checked the abstract."
+    record = reset_decision(decision, self.AT)
+    assert record["trace"]["agent_reason"] == "Checked the abstract."
+    assert record["trace"]["llm_model"] == "m-1"
+    assert decision.agent_reason is None
+
+@pytest.mark.parametrize("source", [
+    ReviewSource.HUMAN, ReviewSource.LLM_REVIEWED,
+    ReviewSource.AGENT_REVIEWED,
+])
+def test_a_human_decision_is_refused(self, source):
+    from dataclasses import asdict
+
+    decision = self._llm_call(source=source)
+    before = asdict(decision)
+    with pytest.raises(ValueError, match="only a human"):
+        reset_decision(decision, self.AT)
+    assert asdict(decision) == before
+
+def test_an_unknown_source_can_be_reset(self):
+    decision = self._llm_call(source=ReviewSource("manual"))
+    assert reset_decision(decision, self.AT)["source"] == "manual"
+    assert decision.status is DecisionStatus.PENDING
+
+def test_pending_is_refused(self):
+    pending = ReviewDecision(paper=Paper(title="P", authors=["A"]),
+                             provider="p")
+    with pytest.raises(ValueError, match="pending"):
+        reset_decision(pending, self.AT)
+    assert pending.resets == []
+
+def test_records_are_kept_in_time_order(self):
+    decision = self._llm_call()
+    late, early = {"at": "2026-11-19T12:00"}, {"at": "2026-11-19T09:00"}
+    for record in (late, early, late):
+        decision.add_reset(record)
+    assert decision.resets == [early, late]
+
+def test_history_is_part_of_the_decision_state(self):
+    fresh = ReviewDecision(paper=Paper(title="Reset", authors=["A"]),
+                           provider="openalex")
+    reset = self._llm_call()
+    reset.relabelled = []
+    reset_decision(reset, self.AT)
+    assert decision_state(fresh) != decision_state(reset)
+
+def test_a_reset_copy_is_not_folded_away(self):
+    from scholar.review import _fold_direction
+
+    bare = self._llm_call(doi=None)
+    reset_decision(bare, self.AT)
+    with_doi = ReviewDecision(
+        paper=Paper(title="Reset", authors=["A"], doi="10.1/r", year=2024),
+        provider="openalex", status=DecisionStatus.KEPT, tags=["ml"],
+    )
+    assert _fold_direction(bare, with_doi) is None
+
+def test_the_llm_screening_does_not_count_it(self):
+    from scholar.llm_review import llm_screening_sentence
+
+    session = ReviewSession(query="q", providers=["p"],
+                            timestamp=datetime(2026, 11, 19))
+    decision = self._llm_call(source=ReviewSource.AGENT_UNREVIEWED)
+    decision.relabelled = [{"from": "llm", "to": "agent", "at": "2026-11-02"}]
+    session.decisions = [decision]
+    assert llm_screening_sentence(session) is not None
+    reset_decision(decision, self.AT)
+    assert decision.relabelled[0]["from"] == "llm"
+    assert llm_screening_sentence(session) is None
+
+def test_the_audit_table_lists_it_as_pending(self):
+    decision = self._llm_call()
+    reset_decision(decision, self.AT)
+    _, order = audit_reason(decision, theme_names={},
+                            strings=AUDIT_STRINGS["en"])
+    assert order == AUDIT_ORDER_PENDING
+
+def _session(self, name):
+    session = ReviewSession(
+        query="q", providers=["openalex"], timestamp=datetime(2026, 11, 19),
+        name=name,
+    )
+    session.decisions.append(self._llm_call(f"10.5555/reset-{name}"))
+    return session
+
+def test_saved_only_when_non_empty(self, tmp_path, monkeypatch):
+    import json
+
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+    path = save_session(self._session("reset-file"))
+    assert "resets" not in json.loads(path.read_text())["decisions"][0]
+    session = load_session("reset-file")
+    assert session.decisions[0].resets == []
+    record = reset_decision(session.decisions[0], self.AT)
+    save_session(session)
+    assert json.loads(path.read_text())["decisions"][0]["resets"] \
+        == [record]
+    loaded = load_session("reset-file").decisions[0]
+    assert loaded.status is DecisionStatus.PENDING
+    assert loaded.resets == [record]
+
+def test_append_keeps_it(self, tmp_path, monkeypatch):
+    from scholar.scholar import SearchResult
+
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+    session = self._session("reset-append")
+    reset_decision(session.decisions[0], self.AT)
+    save_session(session)
+    stored = load_session("reset-append").decisions[0]
+    paper = Paper(title="Reset", authors=["A"], year=2024,
+                  doi="10.5555/reset-reset-append", sources=["openalex"])
+    appended = create_review_session([SearchResult(
+        query="q", provider="openalex", timestamp="t", papers=[paper],
+    )], "q", session_name="reset-append")
+    decision = appended.decisions[0]
+    assert decision.status is DecisionStatus.PENDING
+    assert decision.resets == stored.resets != []
+
+def test_concurrent_save_keeps_it(self, tmp_path, monkeypatch):
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+    save_session(self._session("reset-race"))
+    stale = load_session("reset-race")
+    resetter = load_session("reset-race")
+    record = reset_decision(resetter.decisions[0], self.AT)
+    save_session(resetter)
+    stale.decisions[0].paper.abstract = "Enriched."
+    save_session(stale)
+    decision = load_session("reset-race").decisions[0]
+    assert decision.status is DecisionStatus.PENDING
+    assert decision.llm_model is None
+    assert decision.resets == [record]
+    assert decision.paper.abstract == "Enriched."
+
+def test_concurrent_resets_are_united(self, tmp_path, monkeypatch):
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+    save_session(self._session("reset-both"))
+    first = load_session("reset-both")
+    second = load_session("reset-both")
+    reset_decision(first.decisions[0], "2026-11-19T09:00:00+00:00")
+    save_session(first)
+    second.decisions[0].source = ReviewSource.AGENT_UNREVIEWED
+    reset_decision(second.decisions[0], self.AT, note="second")
+    save_session(second)
+    decision = load_session("reset-both").decisions[0]
+    assert [r["source"] for r in decision.resets] == ["llm", "agent"]
 @
 
 
@@ -5295,6 +5679,7 @@ for result in results:
                 found_by=list(prev_dec.found_by),
                 same_id_copies=list(prev_dec.same_id_copies),
                 relabelled=list(prev_dec.relabelled),
+                resets=list(prev_dec.resets),
             )
         elif prev_record:
             <<rebuild the decision from the old decision store>>
@@ -6179,7 +6564,10 @@ with a pair depends on what the two decisions say:
   decision with a machine source or LLM audit fields
   ([[LLM_AUDIT_FIELDS]]) is a classifier's withheld answer, not an
   unscreened record, and is kept, and so is one that carries an
-  agent's reason ([[AGENT_AUDIT_FIELDS]]).  Two equal decisions can be folded
+  agent's reason ([[AGENT_AUDIT_FIELDS]]).  So is a pending decision that was
+  reset from an earlier decision ([[resets]],
+  \cref{sec:reset-decision}): it was screened once, and folding it
+  would drop the history that says so.  Two equal decisions can be folded
   too, and lose nothing by becoming one: [[decision_state]] compares the
   source and the audit fields as well, so an unreviewed machine
   decision is never \enquote{equal} to a human one, and no fold changes
@@ -6256,6 +6644,7 @@ def is_unscreened(decision: ReviewDecision) -> bool:
         and decision.llm_confidence is None
         and not any(llm_audit_of(decision).values())
         and not any(agent_audit_of(decision).values())
+        and not decision.resets
     )
 
 
@@ -8396,6 +8785,7 @@ def read_session_file(
                     found_by=found_by,
                     same_id_copies=list(dec_data.get("same_id_copies") or []),
                     relabelled=list(dec_data.get("relabelled") or []),
+                    resets=list(dec_data.get("resets") or []),
                 )
             )
         
@@ -8527,6 +8917,7 @@ data = {
                 if d.same_id_copies else {}
             ),
             **({"relabelled": d.relabelled} if d.relabelled else {}),
+            **({"resets": d.resets} if d.resets else {}),
             "paper": d.paper.to_dict(include_refs_cites=True),
         }
         for d in session.decisions
@@ -8752,8 +9143,9 @@ links to the searches that returned it ([[found_by]],
 a judgement, so the links the file holds for a paper are added to the
 links this process holds, whatever the decision rules decide.  The
 same goes for the other works a search returned under a paper's id
-([[same_id_copies]], \cref{sec:session-copies}) and for the
-corrections of its source ([[relabelled]], \cref{sec:relabel-source}).
+([[same_id_copies]], \cref{sec:session-copies}), for the
+corrections of its source ([[relabelled]], \cref{sec:relabel-source})
+and for its resets to pending ([[resets]], \cref{sec:reset-decision}).
 Those are also part of the decision's state, so this process's state
 is taken before the file's are added: otherwise the union itself would
 look like a change made here, and a process that changed nothing would
@@ -8791,6 +9183,7 @@ def decision_state(decision: ReviewDecision) -> tuple:
         *llm_audit_of(decision).values(),
         *agent_audit_of(decision).values(),
         tuple(tuple(sorted(r.items())) for r in decision.relabelled),
+        tuple(tuple(sorted(r.items())) for r in decision.resets),
     )
 @
 
@@ -9077,6 +9470,8 @@ def merge_concurrent_changes(
                 decision.add_same_id_copy(copy)
             for record in theirs.relabelled:
                 decision.add_relabel(record)
+            for record in theirs.resets:
+                decision.add_reset(record)
         base_state = base_states.get(base_key_of(decision, base))
         if theirs is None or base_state is None:
             continue
@@ -21810,12 +22205,16 @@ and [[decision_source]] says which machine it was.
 (\cref{sec:relabel-source}) as [[from->to time]] (with
 [[by NAME]] when the record names who), separated by
 semicolons, so that a spreadsheet that counts sources can see which of
-them were set after the decision, and from what.
+them were set after the decision, and from what.  [[reset_from]]
+lists the decisions the record had before it was set back to pending
+(\cref{sec:reset-decision}) as [[status by source time]] (again with
+[[by NAME]]), so that a row that is pending, or decided anew, still
+shows what the earlier screen said.
 [[agent_reason]], [[agent_by]] and [[agent_decided_at]] are the
 agent's trace (\cref{sec:agent-audit-fields}), empty when no reason
 was recorded, so that a spreadsheet can check an agent's verdicts
 record by record as it can read the classifier's confidence.  They go
-before [[paper_id]], which stays last.
+before [[reset_from]]; [[paper_id]] stays last.
 
 <<review report generation>>=
 def generate_csv_report(session: ReviewSession, output_path: Path) -> None:
@@ -21837,6 +22236,8 @@ def generate_csv_report(session: ReviewSession, output_path: Path) -> None:
       `from->to time [by NAME]`
     - agent_reason, agent_by, agent_decided_at: the reason an agent
       gave with `sessions decide --reason`, who gave it and when
+    - reset_from: each earlier decision the record was reset from, as
+      `status by source time [by NAME]`
 
     Args:
         session: The ReviewSession to report on.
@@ -21883,6 +22284,7 @@ def generate_csv_report(session: ReviewSession, output_path: Path) -> None:
                 "llm_change_direction",
                 "source_relabelled",
                 *AGENT_AUDIT_FIELDS,
+                "reset_from",
                 "paper_id",
             ]
         )
@@ -21917,6 +22319,12 @@ def generate_csv_report(session: ReviewSession, output_path: Path) -> None:
                     ),
                     *(value or "" for value
                       in agent_audit_of(decision).values()),
+                    "; ".join(
+                        f"{r.get('status')} by {r.get('source')} "
+                        f"{r.get('at')}"
+                        + (f" by {r['by']}" if r.get("by") else "")
+                        for r in decision.resets
+                    ),
                     get_paper_id(paper),
                 ]
             )
@@ -21988,9 +22396,9 @@ class TestCsvReportRelabelled:
         generate_csv_report(session, path)
         with path.open() as f:
             rows = list(csv.reader(f))
-        assert rows[0][-5:] == [
+        assert rows[0][-6:] == [
             "source_relabelled", "agent_reason", "agent_by",
-            "agent_decided_at", "paper_id",
+            "agent_decided_at", "reset_from", "paper_id",
         ]
         records = [dict(zip(rows[0], row)) for row in rows[1:]]
         assert records[0]["source_relabelled"] == (
@@ -22038,6 +22446,39 @@ class TestCsvReportAgentReason:
         ]
         assert rows[0]["paper_id"] == session.decisions[0].paper.id
 @
+
+A reset record names the decisions it had, oldest first, before the
+paper id:
+
+<<test functions>>=
+class TestCsvReportResetFrom:
+    def test_earlier_decisions_are_listed(self, tmp_path):
+        import csv
+
+        decision = ReviewDecision(
+            paper=Paper(title="Reset", authors=["A"], year=2024),
+            provider="p", status=DecisionStatus.DISCARDED, tags=["t"],
+            source=ReviewSource.LLM_UNREVIEWED,
+        )
+        reset_decision(decision, "2026-11-19T10:00:00+00:00")
+        decision.status = DecisionStatus.KEPT
+        decision.source = ReviewSource.AGENT_UNREVIEWED
+        reset_decision(decision, "2026-11-19T11:00:00+00:00",
+                       by="the author")
+        session = ReviewSession(
+            query="q", providers=["p"], timestamp=datetime(2026, 11, 19),
+        )
+        session.decisions = [decision]
+        path = tmp_path / "r.csv"
+        generate_csv_report(session, path)
+        [record] = list(csv.DictReader(path.open()))
+        assert record["reset_from"] == (
+            "discarded by llm 2026-11-19T10:00:00+00:00; "
+            "kept by agent 2026-11-19T11:00:00+00:00 by the author"
+        )
+        assert record["status"] == "pending"
+@
+
 
 \subsection{Testing Report Generation}
 
