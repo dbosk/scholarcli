@@ -804,12 +804,13 @@ switch them off with `scholar.enrich.abstract_source` → None
   space collapsed. Limit: plain text like `a<b and c>d` loses its
   middle. Both services return `None`, never `""`, for an abstract
   without text.
-- **No double cleaning**: `enrich_paper` ends with
-  `clean_fetched_text(result, paper, plain_abstract)`: only fields this
-  call changed go through `clean_metadata_text` (not idempotent: it
-  decodes, then strips `<i>`), and a service's abstract (already plain)
-  not at all; held fields (hand-entered, earlier runs) are never
-  re-cleaned. Old sessions' held markup is left to the LaTeX escapers.
+- **No double cleaning**: `enrich_paper` still cleans the whole paper
+  at the end (held title/venue/abstract included, so `enrich` repairs
+  old sessions' entities and mojibake), via
+  `clean_paper_text_except(result, plain_abstract)`: the one exception
+  is an abstract Crossref or Europe PMC supplied in that very call,
+  already plain (`clean_metadata_text` is not idempotent: it decodes
+  again, then strips `<i>`, so a JATS `&lt;i&gt;` would be lost).
 - **Crossref** (`crossref.nw` `sec:crossref-abstract`): no request of
   its own. `_fetch_work` (shared by `fetch_currency` and
   `fetch_abstract`) caches both the currency result and the raw JATS
@@ -837,7 +838,8 @@ switch them off with `scholar.enrich.abstract_source` → None
   out of the limiter's sight and ended in `RetryError`, so no cooldown):
   one 429 → `record_response` cooldown → later lookups refused without
   a request, tallied as failed (loopback tests). Unpaywall's session
-  still lists 429.
+  likewise (one 429 → cooldown → the next lookup refused without a
+  request, a failed open-access lookup).
 - **Europe PMC** (`europepmc.nw`, `EuropePMCClient`, cache
   `europepmc.pkl`, limiter `europepmc`): `GET
   https://www.ebi.ac.uk/europepmc/webservices/rest/search?query=DOI:"<doi>"
@@ -1991,8 +1993,8 @@ fixture has a quoted query, a `[`-row, `ĸ`, `CO₂`, a ligature. About
 strip inline tags (`<i>`, `<sup>`, …) and repair cp1252/Latin-1 mojibake
 by a checked round trip. Applied at ingest in `Search.execute`,
 `ReviewSession.add_papers_from_snowball` and at the end of
-`enrich_paper`, there only to the fields that call fetched
-(`clean_fetched_text`, #260); the LaTeX escapers apply it too, for sessions recorded
+`enrich_paper` (except an abstract an abstract service supplied in
+that call, `clean_paper_text_except`, #260); the LaTeX escapers apply it too, for sessions recorded
 earlier. A DOI-less paper's hash id derives from the cleaned title, so a
 record with markup ingested before this change gets a new id when it is
 searched again.
