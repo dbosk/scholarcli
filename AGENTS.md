@@ -2635,6 +2635,12 @@ Key test files:
 - `tests/test_scholar.py` - Data model tests
 - `tests/test_cli.py` - CLI integration tests
 
+A test that puts a stand-in module into `sys.modules` does it with
+`monkeypatch.setitem(sys.modules, name, module)`, never by assignment:
+an assigned fake stays for every later test in the process (#284: the
+rq test left a fake `llm` without `UnknownModelError`, and later tests
+passed or failed by order).
+
 Unit tests are offline by construction (`tests/conftest.py`, tangled from
 `cache.nw`): the autouse `isolate_cache` fixture unsets every provider
 key/option variable (`S2_API_KEY`, `OPENALEX_API_KEY`, `IEEE_API_KEY`,
