@@ -280,10 +280,10 @@ For a paper to serve as an example:
 \item It must be classified (kept or discarded), not pending
 \item It must have at least one tag (theme or motivation)
 \item A human must have made or confirmed the decision
-\item Papers where the user corrected an LLM decision are prioritized
-  (they represent edge cases the LLM got wrong)
 \item Its category, if it has one, must fit its decision
   (\cref{sec:example-category})
+\item Papers where the user corrected an LLM decision are prioritized
+  (they represent edge cases the LLM got wrong)
 \end{enumerate}
 
 The third rule is the one that keeps the classifier from teaching
@@ -324,10 +324,11 @@ def is_unreviewed_machine(decision: ReviewDecision) -> bool:
     return source_value(decision) in UNREVIEWED_MACHINE_SOURCES
 @
 
-The first three rules say which decisions may be examples at all.
-They are one function, because the count of records left out for
-their category (below) must be taken over exactly the decisions the
-examples are drawn from.
+The first three rules say which decisions are candidates at all; the
+fourth then removes some of them, and the fifth only orders what is
+left.  The candidates are one function, because the count of records
+left out for their category (below) must be taken over exactly the
+decisions the examples are drawn from.
 
 <<llm review example gathering>>=
 def example_candidates(
@@ -816,20 +817,29 @@ def test_nor_in_the_prompt(self):
 
 The last category tag is the decision's category, as in the audit
 table, so a record whose status change appended a fitting category is
-an example and one whose last category contradicts is not:
+an example and one whose last category contradicts is not.  The
+example the prompt shows carries that category only, beside its
+theme (\cref{sec:example-tags}):
 
 <<contradicting example test methods>>=
 def test_the_last_category_decides(self):
     session = self._session([
         self._decision("mended", DecisionStatus.DISCARDED,
-                       ["supports-claim", "off-topic-false-hit"]),
+                       ["supports-claim", "theory", "off-topic-false-hit"]),
         self._decision("stale", DecisionStatus.DISCARDED,
                        ["off-topic-false-hit", "supports-claim"]),
+        self._decision("new", DecisionStatus.PENDING, []),
     ])
     _, discarded = get_example_decisions(session)
     assert [d.paper.title for d in discarded] == ["Paper mended"]
     assert [d.paper.title for d in contradictory_examples(session)] \
         == ["Paper stale"]
+    prompt = classify_papers_with_llm(
+        session, enrich_missing=False, dry_run=True,
+    )
+    assert "Title: Paper mended" in prompt
+    assert "Tags: theory, off-topic-false-hit\n" in prompt
+    assert "Tags: supports-claim" not in prompt
 @
 
 Unreviewed machine decisions, examples only on request, are judged the
@@ -1041,8 +1051,7 @@ def _format_paper_for_prompt(
             abstract = abstract[:EXAMPLE_ABSTRACT_CHARS] + "..."
         lines.append(f"Abstract: {abstract}")
 
-    tags = [t for t in decision.tags if t.casefold() not in NOTE_TAGS]
-    lines.append(f"Tags: {', '.join(tags)}")
+    lines.append(f"Tags: {', '.join(example_tags(decision.tags))}")
 
     return "\n".join(lines)
 
@@ -1093,6 +1102,96 @@ def _format_paper_to_classify(
             lines.append(f'- p.{quote.page}: "{quote.text}"')
 
     return "\n".join(lines)
+@
+
+
+\subsection{Which tags an example shows}
+\label{sec:example-tags}
+
+An example shows its record's tags, so that the model sees which tags
+go with which papers.  Note tags are left out, since they are the
+reviewer's own (\cref{sec:classifier-categories}).  Of the category
+tags only the deciding one is shown, the last, which is the one the
+audit table reads and the one by which the example was judged to fit
+its decision (\cref{sec:example-category}).  The prompt demands
+exactly one category per paper, so an example showing two would
+teach what the parser then refuses; a record discarded with
+[[supports-claim]] and later [[off-topic-false-hit]] would appear
+under the discarded examples as \enquote{supports-claim,
+off-topic-false-hit}.  Since issue~\#195, [[sessions decide]] keeps one
+category per record ([[tags_after_decision]] in the review module), so
+a record with two was written before that, or by a path that adds
+tags without that rule.  The earlier category tags are dropped, the
+deciding one shown once, at its own place; themes, motivations and
+other tags stay in their order.  A record with one category tag or
+none therefore shows exactly the tags it showed before.
+
+Only the examples go through this: [[_format_paper_for_prompt]] is
+called for the kept and discarded examples alone, and the papers to
+classify are pending and show no tags.
+
+<<llm review prompt construction>>=
+def example_tags(tags: list[str]) -> list[str]:
+    """Return the tags an example shows in the prompt.
+
+    Note tags are left out, and of the category tags only the deciding
+    (last) one is kept; the other tags keep their order.
+    """
+    deciding = max(
+        (i for i, t in enumerate(tags) if t in AUDIT_CATEGORIES),
+        default=None,
+    )
+    return [
+        t for i, t in enumerate(tags)
+        if t.casefold() not in NOTE_TAGS
+        and (t not in AUDIT_CATEGORIES or i == deciding)
+    ]
+@
+
+A record with one category or none prints exactly as before, alone
+and in the prompt; one with two shows the deciding one only:
+
+<<test functions>>=
+class TestExampleTags:
+    <<example tags test methods>>
+
+<<example tags test methods>>=
+def _example(self, status, tags):
+    return ReviewDecision(
+        paper=Paper(title="Golden", authors=["A", "B"], year=2020,
+                    venue="V", abstract="Short.",
+                    doi="10.5555/example-tags"),
+        provider="p", status=status, tags=tags,
+    )
+
+GOLDEN = "Title: Golden\nAuthors: A, B\nYear: 2020\nVenue: V\n" \
+    "Abstract: Short.\nTags: "
+
+def test_one_category_or_none_prints_as_before(self):
+    one = self._example(DecisionStatus.KEPT,
+                        ["theory", "supports-claim", "recorded-not-cited"])
+    none = self._example(DecisionStatus.DISCARDED, ["theory", "ml"])
+    assert _format_paper_for_prompt(one) \
+        == self.GOLDEN + "theory, supports-claim"
+    assert _format_paper_for_prompt(none) == self.GOLDEN + "theory, ml"
+    prompt = build_classification_prompt(
+        papers_to_classify=[], kept_examples=[one],
+        discarded_examples=[none], category_tags=set(AUDIT_CATEGORIES),
+    )
+    assert "## Examples of KEPT Papers\n\n" + self.GOLDEN \
+        + "theory, supports-claim\n" in prompt
+    assert "## Examples of DISCARDED Papers\n\n" + self.GOLDEN \
+        + "theory, ml\n" in prompt
+
+def test_only_the_deciding_category_is_shown(self):
+    two = self._example(
+        DecisionStatus.KEPT,
+        ["qualifies-claim", "theory", "supports-claim", "ml"],
+    )
+    assert _format_paper_for_prompt(two) \
+        == self.GOLDEN + "theory, supports-claim, ml"
+    assert example_tags(["supports-claim", "x", "supports-claim"]) \
+        == ["x", "supports-claim"]
 @
 
 

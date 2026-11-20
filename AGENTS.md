@@ -1732,10 +1732,16 @@ than shown without a category (the prompt demands exactly one). Not
 vocabulary-dependent; no category tag, no check. The INFO log says
 "Left out N examples whose category does not fit their decision";
 `llm status` counts the confirmed ones with the same
-`contradictory_examples(session)` (row only when > 0, JSON
-`examples_left_out` always). The prompt version does not move (it
-hashes a fixed probe, not the session's examples). `sessions show`
-does not list such records.
+`contradictory_examples(session)` (row "Confirmed, not examples
+(category does not fit decision)" only when > 0, apart from "Training
+examples", which counts `is_example`; JSON `examples_left_out`
+always). An example shows `example_tags(tags)` (llm_review.nw
+`sec:example-tags`): no note tags and only the deciding category, so a
+pre-#195 record tagged `supports-claim, off-topic-false-hit` shows
+`off-topic-false-hit`; records with one category or none print as
+before. The prompt version does not move (it hashes a fixed probe,
+not the session's examples). `sessions show` does not list such
+records.
 
 ### Snowball and Tuxedo Subcommands (lazy)
 
