@@ -7255,6 +7255,84 @@ def test_the_classifier_sources_match_the_llm_module(self):
   assert CLASSIFIER_SOURCES == LLM_SOURCES
 @
 
+\paragraph{An agent's reason.}
+A decision that carries the agent's reason
+([[sessions decide --reason]], \cref{sec:sessions-decide}) shows it on
+a third line, with who gave it when the agent said: a reader scanning
+the agent's discards should see why each was discarded without opening
+the file.  The listing cuts a long reason at [[SHOW_REASON_CHARS]]
+characters, marked with an ellipsis, so one wordy reason does not push
+the list off the screen; the JSON form carries the three fields whole
+([[agent_reason]], [[agent_by]], [[agent_decided_at]], [[null]] when
+no reason was recorded), so a script never reads a cut reason.
+
+<<sessions command>>=
+SHOW_REASON_CHARS = 160
+
+
+def agent_reason_line(decision) -> str:
+    """The `sessions show` line with the agent's reason, or "" if none."""
+    reason = decision.agent_reason
+    if not reason:
+        return ""
+    if len(reason) > SHOW_REASON_CHARS:
+        reason = reason[:SHOW_REASON_CHARS - 1].rstrip() + "…"
+    by = f" ({decision.agent_by})" if decision.agent_by else ""
+    return f"\n    [dim]reason{escape(by)}: {escape(reason)}[/dim]"
+@
+
+Let's check both forms: the reason under its paper, cut when long,
+and the three fields in the JSON, [[null]] for a decision without a
+reason.
+
+<<test functions>>=
+class TestShowTheAgentsReason:
+  def test_text_and_json(self, tmp_path, monkeypatch):
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+    from scholar.review import (
+      DecisionStatus, ReviewDecision, ReviewSession, ReviewSource,
+      save_session,
+    )
+
+    def decided(title, **trace):
+      return ReviewDecision(
+        paper=Paper(title=title, authors=["A"], doi=f"10.1/{title}"),
+        provider="openalex", status=DecisionStatus.DISCARDED,
+        tags=["off-topic-false-hit"],
+        source=ReviewSource.AGENT_UNREVIEWED, **trace,
+      )
+
+    save_session(ReviewSession(
+      query="q", providers=["openalex"], timestamp=datetime(2026, 11, 19),
+      name="why", decisions=[
+        decided("explained", agent_reason="About [compilers].",
+                agent_by="agent-1",
+                agent_decided_at="2026-11-19T10:00:00+00:00"),
+        decided("wordy", agent_reason="w" * 500),
+        decided("silent"),
+      ],
+    ))
+    result = runner.invoke(app, ["sessions", "show", "why", "-f", "json"])
+    assert result.exit_code == 0, result.output
+    traces = {
+      d["title"]: (d["agent_reason"], d["agent_by"], d["agent_decided_at"])
+      for d in json.loads(result.output)["decisions"]
+    }
+    assert traces == {
+      "explained": ("About [compilers].", "agent-1",
+                   "2026-11-19T10:00:00+00:00"),
+      "wordy": ("w" * 500, None, None),
+      "silent": (None, None, None),
+    }
+    result = runner.invoke(app, ["sessions", "show", "why"])
+    assert result.exit_code == 0, result.output
+    flat = "".join(result.output.split())
+    assert "reason(agent-1):About[compilers]." in flat
+    assert "reason:" + "w" * (SHOW_REASON_CHARS - 1) + "…" in flat
+    assert "w" * SHOW_REASON_CHARS not in flat
+    assert flat.count("reason(") + flat.count("reason:") == 2
+@
+
 Each line under \enquote{Queries by provider:} also says what the search
 returned, as recorded in the session (\cref{sec:search-result-error}):
 the hit count, or a highlighted \enquote{failed} with the reason.  This
@@ -7365,6 +7443,7 @@ def session_paper_line(decision) -> str:
     return (
         f"  • {escape(paper.title or '')}{provider}{tags}{unreviewed}\n"
         f"    [dim]{escape(paper.id)}[/dim]"
+        + agent_reason_line(decision)
     )
 
 
@@ -7395,7 +7474,7 @@ def sessions_show(
     """
     import sys
     from scholar.review import (
-        decision_source_counts, decision_source_items,
+        agent_audit_of, decision_source_counts, decision_source_items,
     )
     from scholar.review import conflicting_copies, copy_conflict_line
     from scholar.review import alike_copies, possible_copies
@@ -7459,6 +7538,7 @@ def sessions_show(
                         {"llm_trace": EARLIER_TRACE_LABEL}
                         if earlier_classifier_trace(d) else {}
                     ),
+                    **agent_audit_of(d),
                 }
                 for d in session.decisions
             ],
@@ -8855,6 +8935,38 @@ def sessions_decide(
                  "human decision.",
         ),
     ] = False,
+    reason: Annotated[
+        Optional[str],
+        typer.Option(
+            "--reason",
+            help="With --source agent: the agent's reason for this "
+                 "decision, stored on every selected paper with --by "
+                 "and the time (at most 2000 characters).",
+        ),
+    ] = None,
+    by: Annotated[
+        Optional[str],
+        typer.Option(
+            "--by",
+            help="Who gave the --reason or --reasons-file reasons, e.g. "
+                 "the agent's name or role. Not guessed when left out.",
+        ),
+    ] = None,
+    reasons_file: Annotated[
+        Optional[Path],
+        typer.Option(
+            "--reasons-file",
+            help="With --source agent: select the papers and give each "
+                 "its own reason, one per line as ID<TAB>REASON or "
+                 "ID<TAB>REASON<TAB>CONFIDENCE. ID is doi:..., a bare "
+                 "DOI or a session paper id (no https://doi.org/ "
+                 "links). Columns are not quoted (not CSV): quote marks "
+                 "are stored as written, and a reason cannot hold a "
+                 "tab. Blank and # lines are skipped. Replaces "
+                 "--doi/--paper-id.",
+            exists=True, dir_okay=False, readable=True,
+        ),
+    ] = None,
 ) -> None:
     """
     Record keep/discard decisions in a saved session, without the TUI.
@@ -8895,6 +9007,23 @@ def sessions_decide(
     the corrector's own. `sessions show` marks the kept fields as an
     earlier classifier call.
 
+    --reason records why an agent decided (--source agent only; a
+    classifier's reason is recorded by `scholar llm classify`), with
+    --by naming the agent and the current time; every selected paper
+    gets the same reason. --reasons-file gives each paper its own: its
+    lines `ID<TAB>REASON` (ID a session paper id, or a DOI with or
+    without `doi:`) are the selection, so it cannot be combined with
+    --doi or --paper-id; an optional third column `<TAB>CONFIDENCE`
+    (0-1) overrides -c for that line. Tabs are not allowed in a
+    reason, and nothing is quoted: quote marks are stored as written.
+    Status, tags and -c apply to the whole file, so group the
+    lines by verdict. Any bad line, any id not in the session, or one
+    id given two reasons aborts the batch unsaved. Reasons are
+    stripped and must hold 1 to 2000 characters. An agent decision
+    without a reason is recorded, with a warning. A later agent or
+    LLM decision clears the reason (also with --keep-trace, which
+    keeps only the classifier's record).
+
     Examples:
         scholar sessions decide my-review --source human --keep \\
             --doi 10.1145/3568813 --tag misconceptions
@@ -8903,13 +9032,21 @@ def sessions_decide(
         scholar sessions decide my-review --source agent --discard \\
             --doi 10.1145/3568813 --tag off-topic-false-hit -c 0.8 \\
             --keep-trace
+        scholar sessions decide my-review --source agent --keep \\
+            --doi 10.1145/3568813 --tag misconceptions -c 0.9 \\
+            --reason "The abstract reports a misconception inventory." \\
+            --by screening-agent
+        scholar sessions decide my-review --source agent --discard \\
+            --tag off-topic-false-hit -c 0.8 --by screening-agent \\
+            --reasons-file discards.tsv
     """
     from scholar.review import (
-        AUDIT_CATEGORIES, CopyConflict, DecisionStatus, ReviewSource,
-        clear_machine_audit, copy_conflict_line,
+        AGENT_AUDIT_FIELDS, AUDIT_CATEGORIES, CopyConflict, DecisionStatus,
+        ReviewSource, clear_machine_audit, copy_conflict_line,
         same_id_pairs, save_session, tags_after_decision,
     )
     from scholar.llm_review import mark_as_reviewed
+    from scholar.utils import utc_now_iso
 
     console = Console()
     <<validate decide options>>
@@ -8925,6 +9062,7 @@ def sessions_decide(
 
     status = DecisionStatus.KEPT if keep else DecisionStatus.DISCARDED
     untag_seen: set[str] = set()
+    decided_at = utc_now_iso()
     for decision in selected.values():
         <<record one decision with its source>>
 
@@ -8951,9 +9089,10 @@ malformed invocation cannot depend on session state:
 if keep == discard:
     console.print("[red]Specify exactly one of --keep or --discard.[/red]")
     raise typer.Exit(1)
-if not doi and not paper_id:
+if not doi and not paper_id and reasons_file is None:
     console.print(
-        "[red]Select at least one paper with --doi or --paper-id.[/red]"
+        "[red]Select at least one paper with --doi, --paper-id or "
+        "--reasons-file.[/red]"
     )
     raise typer.Exit(1)
 <<settle who decided>>
@@ -8979,6 +9118,7 @@ if len(categories_given) > 1:
     raise typer.Exit(2)
 <<refuse a relayed verdict whose category does not fit>>
 <<validate the decide confidence>>
+<<validate the agent's reasons>>
 <<validate the kept trace>>
 @
 
@@ -9094,6 +9234,7 @@ if source in MACHINE_DECISION_SOURCES:
     if not keep_trace:
         clear_machine_audit(decision)
     decision.llm_confidence = confidence
+    <<record the agent's reason>>
 elif decision.source.is_unreviewed:
     mark_as_reviewed(
         decision,
@@ -9302,10 +9443,29 @@ elif keep_trace and source == "llm":
         "run's.[/red]"
     )
     raise typer.Exit(2)
-elif keep_trace and confidence is None:
+elif keep_trace and confidence is None and reasons_file is None:
     console.print(
         "[red]--keep-trace needs -c: state the confidence of this "
         "decision, since the kept trace's is the classifier's.[/red]"
+    )
+    raise typer.Exit(2)
+elif keep_trace and confidence is None:
+    <<refuse reasons-file lines without a confidence>>
+@
+
+A reasons file can give each line its own confidence
+([[<<validate the agent's reasons>>]], below), and a line that does
+states the corrector's number as [[-c]] would.  So with a reasons file
+and no [[-c]], the rule applies line by line: every line must carry a
+confidence, and the lines that do not are named.
+
+<<refuse reasons-file lines without a confidence>>=
+bare = [entry.line for entry in reason_lines if entry.confidence is None]
+if bare:
+    console.print(
+        "[red]--keep-trace needs a confidence: give -c, or a third "
+        "column on reasons-file line(s) "
+        f"{', '.join(map(str, bare))}.[/red]"
     )
     raise typer.Exit(2)
 @
@@ -9451,6 +9611,709 @@ def test_a_relayed_verdict_cannot_keep_the_trace(
   assert result.exit_code == 2
 @
 
+\paragraph{The agent's reason.}
+An agent that screens with [[--source agent]] used to leave its
+verdict and nothing that said why
+(\url{https://github.com/dbosk/scholarcli/issues/249}), while
+[[scholar llm classify]] stores the model's reason for every record.
+[[--reason TEXT]] stores the agent's, with [[--by NAME]] and the time
+of the run, in the decision's agent trace
+(\cref{sec:agent-audit-fields} in the review module).  [[--by]] is
+whatever the agent calls itself; left out, it stays empty, because a
+login or a host name guessed here would be an author's name on a
+record that an agent wrote.  One time stamp serves the whole run: the
+decisions of one command were made together, and a time per record
+would only measure how long the loop took.
+
+The options are for [[--source agent]] only.  A relayed classifier
+verdict ([[--source llm]]) has its reason recorded by the classifier,
+in [[llm_reason]]; an agent's reason under a classifier's source would
+be read as the model's.  A human's reason is out of scope: the fields
+are the agent's trace, which a human's later review is compared with,
+and a human's own words would overwrite what is to be compared.  Both
+are usage errors (status~2), refused before the session is loaded, and
+the message says which of the two applies.  So is [[--by]] without a
+reason: a name with nothing to attach it to is not a trace.
+
+Most screens decide many records with one verdict but a reason of
+their own each.  One command per record would work, but each command
+loads and saves the whole session, which for 30\,000 records is the
+slow part.  [[--reasons-file FILE]] gives each line its own reason:
+\begin{verbatim}
+doi:10.1145/3568813<TAB>Studies novices' misconceptions of recursion.
+10.1145/3568814<TAB>Teaching material, no evaluation.<TAB>0.7
+hash:0123456789abcdef<TAB>Survey of compilers, not of learners.
+\end{verbatim}
+The first column is the session's paper id or a DOI, with or without
+[[doi:]], as [[--paper-id]] and [[--doi]] take them; the lines of the
+file \emph{are} the selection, so the file cannot be combined with
+[[--doi]] or [[--paper-id]] (status~2), which would leave some
+selected papers without a reason.  Status, tags, [[--untag]] and [[-c]]
+apply to every line, so an agent groups its calls by verdict, one file
+per verdict.  The confidence is the one exception: an agent's
+confidence is usually per record, so an optional third column gives a
+line its own, which replaces [[-c]] for that line (a line without it
+takes [[-c]], or none).  A tab inside a reason is not allowed.  It
+could be split on the first two tabs, but a reason that happens to
+contain a tab followed by a number would then be read as a confidence
+without a word, so a fourth column is refused instead.  Blank lines
+and lines starting with [[#]] are skipped, so an agent can annotate
+its file.
+
+Every check that does not need the session is made before it is
+loaded, and every bad line is named, not only the first: a line
+without a tab, an empty id, a reason that is empty after stripping or
+longer than [[MAX_AGENT_REASON_CHARS]] (2000, see the review module
+for why), a confidence that is not a number between 0 and~1 (the range
+of [[-c]]), a fourth column, a file with no line at all.  Such a file
+is a malformed argument, so it is a usage error (status~2) and nothing
+is saved.  A reason given with [[--reason]] is checked the same way.
+A reason is stripped of surrounding whitespace, since an agent that
+writes a trailing newline has not said anything more, and is never
+truncated.  Once the session is loaded, an id that matches no decision
+aborts the batch like an unmatched [[--doi]] (status~1, every one
+named), and so does one paper given two different reasons or
+confidences, by repeating its line or by naming it once by id and once
+by DOI (status~2): which of the two is the agent's is not ours to
+guess.  The same line twice is harmless.
+
+An agent decision without a reason is still recorded, because scripts
+written before the option existed must keep working, but a one-line
+warning on standard error says that it carries none.  The report counts
+such decisions (\cref{sec:report-provenance} in the review module).
+
+<<validate the agent's reasons>>=
+traced = (reason is not None or reasons_file is not None
+          or by is not None)
+if traced and source == "llm":
+    console.print(
+        "[red]--reason, --reasons-file and --by record an agent's "
+        "reason (--source agent); a classifier's reason is recorded "
+        "by `scholar llm classify`.[/red]"
+    )
+    raise typer.Exit(2)
+if traced and source != "agent":
+    console.print(
+        "[red]--reason, --reasons-file and --by record an agent's "
+        "reason (--source agent); a human's reason is not recorded "
+        "there.[/red]"
+    )
+    raise typer.Exit(2)
+if reason is not None and reasons_file is not None:
+    console.print("[red]Give --reason or --reasons-file, not both.[/red]")
+    raise typer.Exit(2)
+if reasons_file is not None and (doi or paper_id):
+    console.print(
+        "[red]--reasons-file selects the papers itself; drop --doi and "
+        "--paper-id.[/red]"
+    )
+    raise typer.Exit(2)
+if by is not None and reason is None and reasons_file is None:
+    console.print(
+        "[red]--by names who gave the reason; give --reason or "
+        "--reasons-file too.[/red]"
+    )
+    raise typer.Exit(2)
+<<check the reason, the name and the reasons file>>
+if source == "agent" and reason is None and reasons_file is None:
+    Console(stderr=True).print(
+        "[yellow]No --reason: this agent decision records no reason "
+        "(see --reason and --reasons-file).[/yellow]"
+    )
+@
+
+The reason, the name and the file's lines are checked by two small
+functions, which return the problems instead of printing them, so that
+every problem of a file is reported in one run.  The file is read as
+bytes, so that Python's universal newlines do not turn a lone carriage
+return inside a reason into a line end (below), and decoded as
+[[utf-8-sig]], which drops a byte-order mark at its start: editors on
+Windows and spreadsheets write one, and read as plain UTF-8 it would
+stick to the first id, so the first line's paper would not be found
+(or a first comment line would not start with [[#]]).
+
+<<check the reason, the name and the reasons file>>=
+problems: list[str] = []
+reason_lines: list[ReasonLine] = []
+if reason is not None:
+    reason, problem = checked_agent_reason(reason)
+    if problem:
+        problems.append(f"--reason: {problem}")
+if by is not None:
+    by = by.strip()
+    if not by:
+        problems.append("--by: empty name")
+if reasons_file is not None:
+    try:
+        text = reasons_file.read_bytes().decode("utf-8-sig")
+    except (OSError, UnicodeDecodeError) as error:
+        problems.append(f"{reasons_file}: cannot be read ({error})")
+    else:
+        reason_lines, file_problems = parse_reasons_file(text)
+        problems.extend(f"{reasons_file}: {p}" for p in file_problems)
+        if not reason_lines and not file_problems:
+            problems.append(f"{reasons_file}: names no paper")
+for problem in problems:
+    console.print(f"[red]{escape(problem)}[/red]", soft_wrap=True)
+if problems:
+    console.print("[yellow]No changes saved.[/yellow]")
+    raise typer.Exit(2)
+@
+
+[[checked_agent_reason]] strips a reason and returns it with what is
+wrong with it, if anything.  The limit is the review module's, so that
+the CLI and the stored field cannot disagree.
+
+<<sessions command>>=
+def checked_agent_reason(text: str) -> tuple[str, str | None]:
+    """Strip an agent's reason; return it and its problem, if any."""
+    from scholar.review import MAX_AGENT_REASON_CHARS
+
+    stripped = text.strip()
+    if not stripped:
+        return stripped, "empty reason"
+    if len(stripped) > MAX_AGENT_REASON_CHARS:
+        return stripped, (
+            f"reason of {len(stripped)} characters, over the limit of "
+            f"{MAX_AGENT_REASON_CHARS}"
+        )
+    return stripped, None
+
+
+@dataclass(frozen=True)
+class ReasonLine:
+    """One line of a `--reasons-file`: which paper, why, how sure."""
+
+    line: int
+    paper: str
+    reason: str
+    confidence: float | None
+
+
+def parse_reasons_file(text: str) -> tuple[list[ReasonLine], list[str]]:
+    """Parse a `--reasons-file`: `ID<TAB>REASON[<TAB>CONFIDENCE]` lines.
+
+    Returns the valid lines and a problem per invalid line, naming its
+    number. Blank lines and lines starting with `#` are skipped.
+    """
+    entries: list[ReasonLine] = []
+    problems: list[str] = []
+    for number, raw in enumerate(text.split("\n"), start=1):
+        raw = raw.removesuffix("\r")
+        if not raw.strip() or raw.lstrip().startswith("#"):
+            continue
+        <<parse one line of a reasons file>>
+    return entries, problems
+@
+
+Only a newline ends a line, and a carriage return before it is dropped
+(a file saved on Windows).  [[str.splitlines]] would also split at a
+lone carriage return, a line separator (U+2028), a next-line
+character, a form feed and other
+characters that a reason copied from a PDF may hold: the reason would
+be cut in two, the second half read as a line without a tab, and every
+error after it would name a line number one higher than the editor
+shows.  Splitting at newlines alone keeps such characters inside the
+reason, where they are stored as they were written.
+
+A line has two or three columns.  The third is optional, and an empty
+one (a spreadsheet's export of an empty cell) counts as absent rather
+than as a bad number.  A fourth column comes from a tab inside the
+reason or from tabs after the confidence; the message names each extra
+column and what it holds, since an empty one (two trailing tabs) is
+otherwise invisible.  The file is not quoted, as a CSV file would be:
+quote marks are part of the reason and stored as written.
+
+<<parse one line of a reasons file>>=
+columns = raw.split("\t")
+if len(columns) < 2:
+    problems.append(f"line {number}: no tab between the id and the reason")
+    continue
+if len(columns) > 3:
+    extra = ", ".join(
+        f"{index} ({column!r})"
+        for index, column in enumerate(columns[3:], start=4)
+    )
+    problems.append(
+        f"line {number}: extra column {extra} after the confidence "
+        "(a line holds an id, a reason and an optional confidence; a "
+        "tab inside a reason starts a new column)"
+    )
+    continue
+paper = columns[0].strip()
+reason_text, problem = checked_agent_reason(columns[1])
+line_problems = [problem] if problem else []
+if not paper:
+    line_problems.insert(0, "empty id")
+confidence = None
+if len(columns) == 3 and columns[2].strip():
+    try:
+        confidence = float(columns[2])
+    except ValueError:
+        line_problems.append(
+            f"confidence {columns[2].strip()!r} is not a number"
+        )
+    else:
+        if not 0.0 <= confidence <= 1.0:
+            line_problems.append(
+                f"confidence {confidence} is not between 0 and 1"
+            )
+if line_problems:
+    problems.append(f"line {number}: {'; '.join(line_problems)}")
+    continue
+entries.append(ReasonLine(number, paper, reason_text, confidence))
+@
+
+Once the session is loaded, each line's id is looked up as
+[[--paper-id]] would look it up, and otherwise as a DOI: the paper id
+of a paper with a DOI is [[doi:]] and the DOI, so a DOI with the prefix
+that is not spelt as the id (other case, say) still finds its paper,
+and a bare DOI finds it as [[--doi]] does; a [[hash:]] id that is not
+in the session matches no DOI either.  A line selects every decision under its id, as [[--doi]] and
+[[--paper-id]] do, so a work held twice under one id gets the reason
+on both copies (with [[--all-copies]] when they are decided apart).
+
+<<sessions command>>=
+def decisions_named_by(value: str, by_id: dict, by_doi: dict) -> list:
+    """The decisions a `--reasons-file` id names: by paper id, else DOI."""
+    if value in by_id:
+        return by_id[value]
+    doi = value[4:] if value.lower().startswith("doi:") else value
+    return by_doi.get(doi.strip().lower(), [])
+@
+
+<<select decisions named in the reasons file>>=
+trace_of: dict[int, ReasonLine] = {}
+clashes: list[str] = []
+for entry in reason_lines:
+    matches = decisions_named_by(entry.paper, by_id, by_doi)
+    if not matches:
+        missing.append(f"reasons-file line {entry.line}: {entry.paper}")
+    for decision in matches:
+        earlier = trace_of.setdefault(id(decision), entry)
+        if (earlier.reason, earlier.confidence) \
+                != (entry.reason, entry.confidence):
+            clashes.append(
+                f"reasons-file lines {earlier.line} and {entry.line} "
+                f"give {decision.paper.id} different reasons or "
+                "confidences"
+            )
+        selected[id(decision)] = decision
+@
+
+The clashes are reported after the unmatched ids, which abort first.
+
+<<refuse a paper given two reasons>>=
+for clash in clashes:
+    console.print(f"[red]{escape(clash)}[/red]", soft_wrap=True)
+if clashes:
+    console.print("[yellow]No changes saved.[/yellow]")
+    raise typer.Exit(2)
+@
+
+The trace is recorded with the rest of a machine decision
+([[<<record one decision with its source>>]], above).  The decision
+first loses any earlier trace: [[clear_machine_audit]] clears the
+agent's fields with the classifier's, and with [[--keep-trace]], which
+keeps only the classifier's call, the agent's fields are cleared here,
+since the earlier reason explained a verdict this one replaces.  A
+line's own confidence then replaces the one [[-c]] gave.
+
+<<record the agent's reason>>=
+if keep_trace:
+    for name in AGENT_AUDIT_FIELDS:
+        setattr(decision, name, None)
+entry = trace_of.get(id(decision))
+if entry is not None and entry.confidence is not None:
+    decision.llm_confidence = entry.confidence
+given = entry.reason if entry is not None else reason
+if given is not None:
+    decision.agent_reason = given
+    decision.agent_by = by
+    decision.agent_decided_at = decided_at
+@
+
+Let's check the batch of the issue: a reasons file decides several
+records, each with its own reason and, where given, its own confidence,
+by paper id and by DOI in both spellings; [[--reason]] gives one reason
+to every selected record; and the session keeps what was given, with
+[[--by]] and one time for the run.
+
+<<test functions>>=
+class TestDecideRecordsTheAgentsReason:
+  <<decide reason test methods>>
+<<decide reason test methods>>=
+def _make_session(self, tmp_path, monkeypatch):
+  monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+  from scholar.review import (
+    ReviewDecision, ReviewSession, save_session, session_file_path,
+  )
+
+  session = ReviewSession(
+    query="q", providers=["openalex"], timestamp=datetime(2026, 11, 19),
+    name="reasons", decisions=[
+      ReviewDecision(paper=Paper(title=title, authors=["A"], doi=doi),
+                     provider="openalex")
+      for title, doi in (("One", "10.1/One"), ("Two", "10.1/two"),
+                         ("Three", None), ("Four", "10.1/four"))
+    ],
+  )
+  save_session(session)
+  return session, session_file_path(session)
+
+def _decide(self, *args):
+  return runner.invoke(app, ["sessions", "decide", "reasons", *args])
+
+def _file(self, tmp_path, text):
+  path = tmp_path / "reasons.tsv"
+  path.write_text(text, encoding="utf-8")
+  return str(path)
+
+def test_each_line_gets_its_reason_and_confidence(
+  self, tmp_path, monkeypatch
+):
+  from scholar.review import ReviewSource, load_session
+
+  session, _ = self._make_session(tmp_path, monkeypatch)
+  hashed = session.decisions[2].paper.id
+  reasons = self._file(tmp_path, (
+    "# discards of the first pass\n"
+    "doi:10.1/one\tAbout compilers, not learners.\n"
+    "\n"
+    f"{hashed}\t  No abstract; title only.  \t0.4\n"
+    "10.1/TWO\tTeaching material without evaluation.\t\n"
+  ))
+  result = self._decide("--source", "agent", "--discard",
+                        "--tag", "off-topic-false-hit", "-c", "0.9",
+                        "--by", "agent-7", "--reasons-file", reasons)
+  assert result.exit_code == 0, result.output
+  decisions = {d.paper.title: d for d in load_session("reasons").decisions}
+  assert {t: (d.agent_reason, d.llm_confidence)
+          for t, d in decisions.items()} == {
+    "One": ("About compilers, not learners.", 0.9),
+    "Two": ("Teaching material without evaluation.", 0.9),
+    "Three": ("No abstract; title only.", 0.4),
+    "Four": (None, None),
+  }
+  decided = [decisions[t] for t in ("One", "Two", "Three")]
+  assert {d.agent_by for d in decided} == {"agent-7"}
+  assert len({d.agent_decided_at for d in decided}) == 1
+  assert decided[0].agent_decided_at.endswith("+00:00")
+  assert {d.source for d in decided} == {ReviewSource.AGENT_UNREVIEWED}
+  assert decisions["Four"].agent_decided_at is None
+  assert "records no reason" not in " ".join(result.output.split())
+
+def test_one_reason_for_every_selected_paper(self, tmp_path, monkeypatch):
+  from scholar.review import load_session
+
+  self._make_session(tmp_path, monkeypatch)
+  result = self._decide("--source", "agent", "--keep", "--tag", "ml",
+                        "--doi", "10.1/one", "--doi", "10.1/two",
+                        "--reason", " Measures misconceptions. ")
+  assert result.exit_code == 0, result.output
+  decisions = load_session("reasons").kept_papers()
+  assert [(d.agent_reason, d.agent_by) for d in decisions] \
+    == [("Measures misconceptions.", None)] * 2
+@
+
+An agent decision without a reason is recorded, with the warning, and
+a later machine decision replaces the reason: with a new one, or with
+none when it gives none.  [[--keep-trace]] keeps the classifier's call
+but not the earlier agent's reason.  A human's later decision keeps it,
+as it keeps the classifier's.
+
+<<decide reason test methods>>=
+def test_without_a_reason_a_warning(self, tmp_path, monkeypatch):
+  from scholar.review import load_session
+
+  self._make_session(tmp_path, monkeypatch)
+  result = self._decide("--source", "agent", "--keep", "--tag", "ml",
+                        "--doi", "10.1/one")
+  assert result.exit_code == 0, result.output
+  assert "this agent decision records no reason" \
+    in " ".join(result.output.split())
+  assert load_session("reasons").kept_papers()[0].agent_reason is None
+
+def test_a_later_decision_replaces_the_reason(self, tmp_path, monkeypatch):
+  from scholar.review import load_session
+
+  self._make_session(tmp_path, monkeypatch)
+  first = ("--source", "agent", "--doi", "10.1/one")
+  steps = (
+    (("--keep", "--tag", "ml", "--reason", "First.", "--by", "a"),
+     ("First.", "a")),
+    (("--discard", "--tag", "off-topic-false-hit", "--reason",
+      "Second."), ("Second.", None)),
+    (("--discard", "--tag", "off-topic-false-hit"), (None, None)),
+    (("--keep", "--tag", "ml", "--reason", "Third.", "--by", "b"),
+     ("Third.", "b")),
+    (("--keep", "--tag", "ml", "-c", "0.5", "--keep-trace"),
+     (None, None)),
+  )
+  for args, expected in steps:
+    result = self._decide(*first, *args)
+    assert result.exit_code == 0, (args, result.output)
+    decision = load_session("reasons").decisions[0]
+    assert (decision.agent_reason, decision.agent_by) == expected, args
+  self._decide(*first, "--keep", "--tag", "ml", "--reason", "Kept.")
+  result = self._decide("--source", "human", "--doi", "10.1/one",
+                        "--discard", "--tag", "no-evidence")
+  assert result.exit_code == 0, result.output
+  assert load_session("reasons").decisions[0].agent_reason == "Kept."
+@
+
+Every refusal leaves the session file as it was.  The usage errors
+come before the session is loaded, so they are refused for a session
+that does not exist, too; an unmatched id and a paper given two
+reasons need the session.
+
+<<decide reason test methods>>=
+def _refused(self, path, result, code, message):
+  assert result.exit_code == code, result.output
+  assert message in " ".join(result.output.split()), result.output
+  assert path.read_bytes() == self._content
+
+def test_usage_errors(self, tmp_path, monkeypatch):
+  _, path = self._make_session(tmp_path, monkeypatch)
+  self._content = path.read_bytes()
+  good = self._file(tmp_path, "10.1/one\tFine.\n")
+  keep = ("--keep", "--tag", "ml")
+  cases = (
+    (("--source", "llm", "--doi", "10.1/one", "--reason", "Why."),
+     "recorded by `scholar llm classify`"),
+    (("--source", "human", "--doi", "10.1/one", "--reason", "Why."),
+     "a human's reason is not recorded"),
+    (("--source", "human", "--reasons-file", good),
+     "a human's reason is not recorded"),
+    (("--source", "agent", "--doi", "10.1/one", "--by", "a"),
+     "--by names who gave the reason"),
+    (("--source", "agent", "--reasons-file", good, "--reason", "Why."),
+     "not both"),
+    (("--source", "agent", "--reasons-file", good, "--doi", "10.1/one"),
+     "selects the papers itself"),
+    (("--source", "agent", "--doi", "10.1/one", "--reason", "  "),
+     "--reason: empty reason"),
+    (("--source", "agent", "--doi", "10.1/one", "--reason", "x" * 2001),
+     "reason of 2001 characters, over the limit of 2000"),
+    (("--source", "agent", "--doi", "10.1/one", "--reason", "Why.",
+      "--by", " "), "--by: empty name"),
+  )
+  for args, message in cases:
+    result = self._decide(*keep, *args)
+    self._refused(path, result, 2, message)
+    elsewhere = runner.invoke(app, [
+      "sessions", "decide", "no-such-session", *keep, *args,
+    ])
+    assert elsewhere.exit_code == 2, (args, elsewhere.output)
+  result = self._decide(*keep, "--source", "agent", "--doi", "10.1/one",
+                        "--reason", "x" * 2000)
+  assert result.exit_code == 0, result.output
+
+def test_a_bad_file_is_refused_line_by_line(self, tmp_path, monkeypatch):
+  _, path = self._make_session(tmp_path, monkeypatch)
+  self._content = path.read_bytes()
+  reasons = self._file(tmp_path, (
+    "10.1/one\tFine.\n"
+    "10.1/two no tab here\n"
+    "\tNo id.\n"
+    "10.1/four\t \n"
+    "10.1/one\tWith\ta tab\t0.5\n"
+    "10.1/two\tFine.\t1.5\n"
+    "10.1/two\tFine.\tsure\n"
+    f"10.1/four\t{'y' * 2001}\n"
+  ))
+  result = self._decide("--keep", "--tag", "ml", "--source", "agent",
+                        "--reasons-file", reasons)
+  output = " ".join(result.output.split())
+  for expected in (
+    "line 2: no tab between the id and the reason",
+    "line 3: empty id",
+    "line 4: empty reason",
+    "line 6: confidence 1.5 is not between 0 and 1",
+    "line 7: confidence 'sure' is not a number",
+    "line 8: reason of 2001 characters",
+  ):
+    assert expected in output, expected
+  self._refused(path, result, 2, "line 5: extra column 4 ('0.5')")
+  empty = self._file(tmp_path, "# nothing yet\n\n")
+  result = self._decide("--keep", "--tag", "ml", "--source", "agent",
+                        "--reasons-file", empty)
+  self._refused(path, result, 2, "names no paper")
+
+def test_unknown_ids_and_clashes_abort(self, tmp_path, monkeypatch):
+  session, path = self._make_session(tmp_path, monkeypatch)
+  self._content = path.read_bytes()
+  keep = ("--keep", "--tag", "ml", "--source", "agent")
+  unknown = self._file(tmp_path, (
+    "10.1/one\tFine.\n10.1/nowhere\tLost.\nhash:0000\tLost too.\n"
+  ))
+  result = self._decide(*keep, "--reasons-file", unknown)
+  self._refused(path, result, 1, "reasons-file line 2: 10.1/nowhere")
+  assert "reasons-file line 3: hash:0000" in result.output
+  for text in ("10.1/one\tFine.\ndoi:10.1/ONE\tOther.\n",
+               "10.1/one\tFine.\n10.1/one\tFine.\t0.3\n"):
+    result = self._decide(*keep, "--reasons-file",
+                          self._file(tmp_path, text))
+    self._refused(path, result, 2, "lines 1 and 2 give doi:10.1/one")
+  same = self._file(tmp_path, "10.1/one\tFine.\ndoi:10.1/one\tFine.\n")
+  result = self._decide(*keep, "--reasons-file", same)
+  assert result.exit_code == 0, result.output
+@
+
+Files come from editors and spreadsheets, not only from the agent's
+own code.  A file saved with a byte-order mark still decides its first
+line, whether that line is a paper or a comment.  Only a newline ends a
+line: a reason copied from a PDF may hold a line separator (U+2028), a
+next-line character or a form feed, which must stay in the stored
+reason and must not shift the line numbers of the errors, which an
+editor counts by newlines; a Windows line end is one line end.  Quote
+marks are not syntax, so they are stored as written.
+
+<<decide reason test methods>>=
+def test_a_bom_does_not_stick_to_the_first_id(self, tmp_path, monkeypatch):
+  from scholar.review import load_session
+
+  self._make_session(tmp_path, monkeypatch)
+  path = tmp_path / "bom.tsv"
+  for text in ("doi:10.1/one\tFirst line.\n",
+               "# a comment first\ndoi:10.1/one\tAfter a comment.\n"):
+    path.write_text(text, encoding="utf-8-sig")
+    result = self._decide("--keep", "--tag", "ml", "--source", "agent",
+                          "--reasons-file", str(path))
+    assert result.exit_code == 0, result.output
+    reason = text.splitlines()[-1].split("\t")[1]
+    assert load_session("reasons").decisions[0].agent_reason == reason
+
+def test_only_a_newline_ends_a_line(self, tmp_path, monkeypatch):
+  from scholar.review import load_session
+
+  _, path = self._make_session(tmp_path, monkeypatch)
+  self._content = path.read_bytes()
+  odd = "Two lines,\x85a page\x0cbreak\rand a return."
+  bad = self._file(tmp_path, (
+    f"10.1/one\t{odd}\n"
+    "10.1/two no tab here\n"
+  ))
+  result = self._decide("--keep", "--tag", "ml", "--source", "agent",
+                        "--reasons-file", bad)
+  self._refused(path, result, 2, "line 2: no tab between")
+  assert "line 3" not in result.output
+  good = tmp_path / "crlf.tsv"
+  good.write_bytes(
+    f'10.1/one\t{odd}\r\n10.1/two\t"Quoted", as written.\t0.5\r\n'
+    .encode("utf-8")
+  )
+  result = self._decide("--keep", "--tag", "ml", "--source", "agent",
+                        "--reasons-file", str(good))
+  assert result.exit_code == 0, result.output
+  decisions = {d.paper.title: d for d in load_session("reasons").decisions}
+  assert decisions["One"].agent_reason == odd
+  assert decisions["Two"].agent_reason == '"Quoted", as written.'
+  assert decisions["Two"].llm_confidence == 0.5
+
+def test_two_trailing_tabs_name_the_extra_column(
+  self, tmp_path, monkeypatch
+):
+  _, path = self._make_session(tmp_path, monkeypatch)
+  self._content = path.read_bytes()
+  for line_end in ("\n", "\r\n"):
+    result = self._decide(
+      "--keep", "--tag", "ml", "--source", "agent", "--reasons-file",
+      self._file(tmp_path, f"10.1/one\tFine.\t\t{line_end}"),
+    )
+    self._refused(path, result, 2, "line 1: extra column 4 ('')")
+@
+
+With [[--keep-trace]] the confidence comes from [[-c]] or from the
+line; a line with neither is refused, naming it, and a file whose lines
+all carry one needs no [[-c]].
+
+<<decide reason test methods>>=
+def test_keep_trace_takes_the_lines_confidence(self, tmp_path, monkeypatch):
+  from scholar.review import load_session
+
+  _, path = self._make_session(tmp_path, monkeypatch)
+  self._content = path.read_bytes()
+  args = ("--discard", "--tag", "off-topic-false-hit", "--source",
+          "agent", "--keep-trace", "--reasons-file")
+  partly = self._file(tmp_path, (
+    "10.1/one\tFine.\t0.6\n10.1/two\tFine.\n10.1/four\tAlso.\n"
+  ))
+  result = self._decide(*args, partly)
+  self._refused(path, result, 2, "reasons-file line(s) 2, 3")
+  fully = self._file(tmp_path, "10.1/one\tFine.\t0.6\n10.1/two\tOk.\t0\n")
+  result = self._decide(*args, fully)
+  assert result.exit_code == 0, result.output
+  confidences = [d.llm_confidence
+                 for d in load_session("reasons").discarded_papers()]
+  assert confidences == [0.6, 0.0]
+@
+
+[[sessions relabel]] corrects the source and nothing else
+(\cref{sec:relabel-source} in the review module), so the reason stays
+with the decision it explains.  [[sessions reset]] sets the decision
+back to pending and clears the fields, since no verdict is left for
+the reason to explain, but keeps them in the reset's history ([[trace]],
+which holds every field of [[MACHINE_AUDIT_FIELDS]] that was set,
+\cref{sec:reset-decision} in the review module), so the earlier
+screen's reason is not lost.  The help states the limit that the
+review module sets, and a test keeps the two equal.
+
+<<decide reason test methods>>=
+def test_relabel_keeps_the_reason(self, tmp_path, monkeypatch):
+  from scholar.review import ReviewSource, agent_audit_of, load_session
+
+  self._make_session(tmp_path, monkeypatch)
+  result = self._decide("--source", "agent", "--keep", "--tag", "ml",
+                        "--doi", "10.1/one", "--reason", "Fits.",
+                        "--by", "agent-1")
+  assert result.exit_code == 0, result.output
+  before = agent_audit_of(load_session("reasons").decisions[0])
+  result = runner.invoke(app, ["sessions", "relabel", "reasons", "--from",
+                               "agent", "--to", "llm", "--all"])
+  assert result.exit_code == 0, result.output
+  after = load_session("reasons").decisions[0]
+  assert after.source is ReviewSource.LLM_UNREVIEWED
+  assert agent_audit_of(after) == before
+  assert before["agent_reason"] == "Fits."
+
+def test_reset_keeps_the_reason_in_its_history(self, tmp_path, monkeypatch):
+  from scholar.review import (
+    AGENT_AUDIT_FIELDS, DecisionStatus, agent_audit_of, load_session,
+  )
+
+  self._make_session(tmp_path, monkeypatch)
+  result = self._decide("--source", "agent", "--keep", "--tag", "ml",
+                        "--doi", "10.1/one", "--reason", "Fits.",
+                        "--by", "agent-1")
+  assert result.exit_code == 0, result.output
+  trace = agent_audit_of(load_session("reasons").decisions[0])
+  result = runner.invoke(app, ["sessions", "reset", "reasons", "--doi",
+                               "10.1/one"])
+  assert result.exit_code == 0, result.output
+  after = load_session("reasons").decisions[0]
+  assert after.status is DecisionStatus.PENDING
+  assert agent_audit_of(after) == dict.fromkeys(AGENT_AUDIT_FIELDS)
+  assert after.resets[-1]["trace"] == trace
+  assert trace["agent_reason"] == "Fits."
+  assert trace["agent_by"] == "agent-1"
+
+def test_the_help_states_the_limit(self):
+  import click
+  import typer.main
+  from scholar.review import MAX_AGENT_REASON_CHARS
+
+  group = typer.main.get_command(app)
+  context = click.Context(group)
+  decide = group.get_command(context, "sessions") \
+    .get_command(context, "decide")
+  helps = {param.name: param.help for param in decide.params}
+  assert f"at most {MAX_AGENT_REASON_CHARS} characters" in helps["reason"]
+  assert "not quoted" in helps["reasons_file"]
+  assert "doi:..., a bare DOI or a session paper id" \
+    in helps["reasons_file"]
+@
+
 Selection collects matches into a dict keyed by the decision object,
 which both deduplicates (the same paper may be named by DOI \emph{and}
 id) and gives a stable count for the summary.  A DOI or an id selects
@@ -9483,12 +10346,14 @@ for value in paper_id or []:
         missing.append(f"paper id {value}")
     for decision in matches or []:
         selected[id(decision)] = decision
+<<select decisions named in the reasons file>>
 
 if missing:
     for entry in missing:
         console.print(f"[red]Not in session: {escape(entry)}[/red]")
     console.print("[yellow]No changes saved.[/yellow]")
     raise typer.Exit(1)
+<<refuse a paper given two reasons>>
 @
 
 Selecting every copy raises the question what a decision does to two

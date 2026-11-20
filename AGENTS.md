@@ -979,7 +979,44 @@ marks a decision whose `llm_model` is set but whose source is not
 does not import llm_review and its caches, a test keeps them equal)
 with "(llm trace: earlier classifier call)" and JSON `"llm_trace":
 "earlier classifier call"` (key absent otherwise). The CSV
-has no classifier-field columns, so it is unchanged. A machine
+has no classifier-field columns, so it is unchanged.
+**Agent reasons (#249).** `ReviewDecision` has an agent trace,
+`agent_reason`, `agent_by`, `agent_decided_at` (UTC ISO), named once in
+`review.AGENT_AUDIT_FIELDS` (`agent_audit_of`; load, `decision_state`,
+concurrent merge and `is_unscreened` use it; the append keeps the
+decision whole; saved only when set, `agent_audit_data`) and
+registered in `MACHINE_AUDIT_FIELDS`, so every later machine `decide`
+clears it; `--keep-trace` keeps only the LLM fields and clears the
+agent's. A human decide and `sessions relabel` keep it; `sessions
+reset` clears it and keeps it in `resets[-1]["trace"]`. `decide
+--source agent --reason TEXT [--by NAME]` gives every selected record
+that reason, `--by` (None if not given, never guessed) and one
+`utc_now_iso()` per run. `--reasons-file F` (lines
+`ID<TAB>REASON[<TAB>CONFIDENCE]`; ID = session paper id, else a DOI
+bare or `doi:`, `cli.decisions_named_by`, no `https://doi.org/`
+links, as for `--doi`; blank/`#` lines skipped; an empty third column
+= none; no tabs in a reason, a 4th column is refused naming each extra
+column; not quoted, not CSV: quote marks are stored as written; read
+as `utf-8-sig`, so a BOM is dropped; lines end only at `\n` (a `\r`
+before it is dropped), so U+2028, NEL, form feed stay in the reason
+and error line numbers match an editor) is the selection (exit 2 with `--doi`/`--paper-id` or
+`--reason`); its confidence overrides `-c` per line, and with
+`--keep-trace` and no `-c` every line needs one. Usage errors (exit 2,
+before loading): `--reason`/`--reasons-file`/`--by` with `--source
+llm` (the classifier's reason is `llm classify`'s) or `human` (out of
+scope), `--by` alone, any bad file line (all named:
+`cli.parse_reasons_file`), empty or > `review.MAX_AGENT_REASON_CHARS`
+(2000, stripped, never truncated) reason. After loading: an unknown id
+exits 1 (like `--doi`), one paper given two different reasons or
+confidences exits 2, both unsaved. `--source agent` without a reason
+warns on stderr and records the decision. Shown in `sessions show`
+(a `reason (by): …` line, cut at `SHOW_REASON_CHARS` = 160; JSON:
+the three fields, `null` when unset), the per-decision CSV (three
+columns before `reset_from`; `paper_id` stays last) and the report (one English sentence after
+the summary, `agent_reasons_sentence`: agent and agent_reviewed
+decisions with/without a reason). An older Scholar loads such files
+and drops the fields on its next save (checked with the installed
+pre-#249 pipx build). A machine
 `decide` never replaces a decided
 paper whose source is `human`, `llm_reviewed` or `agent_reviewed`:
 the batch is refused unsaved (exit 2, each conflict named) unless
@@ -1101,7 +1138,7 @@ apply); else `keep_copy_before_run(session, "pre-reset")`, one
 is hidden on a still-pending reset paper and when the last relabel is
 older than the last reset, `relabel_after_reset`; JSON `resets`) and
 the CSV column `reset_from` (`status by source time [by NAME]; ...`,
-between `source_relabelled` and `paper_id`). Effects: audit table and
+after the agent-trace columns, before `paper_id`). Effects: audit table and
 report show pending; a sampled decision reset at or after the draw
 is gone from the sample (see Samples: `reset_since_draw`);
 `first_made_by_llm` is False for any pending
