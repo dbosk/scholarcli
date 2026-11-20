@@ -18,7 +18,7 @@ and corrections) and the optional Retraction~Watch cross-check, with no API key.
 \section{Design overview}
 
 The check is one HTTP request per paper: [[GET https://api.crossref.org/works/
-{doi}]].  Two parts of the returned [[message]] interest us:
+{doi}]].  Three parts of the returned [[message]] interest us:
 \begin{description}
 \item[ [[updated-by]] ] A list of retraction/correction notices that target
   this work.  Each entry carries the notice's DOI, an update [[type]]
@@ -27,6 +27,10 @@ The check is one HTTP request per paper: [[GET https://api.crossref.org/works/
 \item[ [[relation]] ] A map of typed relationships to other works.  We read the
   ones that imply a newer canonical version exists, so a superseded preprint can
   be flagged.
+\item[ [[abstract]] ] The work's abstract, when the publisher deposited one.
+  Enrichment uses it for papers the search providers left without an
+  abstract (\cref{sec:crossref-abstract}); it comes with the same response,
+  so it costs no request of its own.
 \end{description}
 
 We deliberately query the work \emph{itself} rather than searching Crossref for
@@ -59,14 +63,19 @@ Currency and retraction checks against Crossref.
 Looks up a paper's DOI in the Crossref REST API and reports retraction or
 correction notices ("updated-by") and superseding-version relations. Used by
 ``scholar verify`` and ``scholar enrich`` to warn against citing withdrawn or
-stale work. Results are cached per DOI; no API key is required.
+stale work. The same response gives ``scholar enrich`` the work's abstract,
+when the publisher deposited one. Results are cached per DOI; no API key is
+required.
 """
 
 <<imports>>
 <<constants>>
 <<the crossref client>>
 <<currency normalization helpers>>
+<<abstract cache key>>
+<<abstract normalization helpers>>
 <<module-level currency interface>>
+<<module-level abstract interface>>
 @
 
 
@@ -271,7 +280,26 @@ def fetch_currency(self, doi: str | None) -> dict | None:
     if cache_key in self._cache:
         logger.debug("crossref: cache hit for DOI %s", doi)
         return self._cache[cache_key]
+    if not self._fetch_work(doi):
+        return None
+    return self._cache[cache_key]
+@
 
+The request itself is shared with the abstract lookup
+(\cref{sec:crossref-abstract}): both read the same work record, so
+[[_fetch_work]] asks once and caches what each of them reads from the
+answer ([[_remember_work]]).
+It reports only whether Crossref answered---with the record or with a
+404---or the lookup failed, in which case nothing is cached and
+[[last_lookup_error]] says why.
+
+<<crossref client methods>>=
+def _fetch_work(self, doi: str) -> bool:
+    """Ask Crossref for `doi`'s record and cache what we read from it.
+
+    Returns True when Crossref answered (with the record, or a 404),
+    False when the lookup failed; then `last_lookup_error` says why.
+    """
     try:
         self._limiter.acquire()
         url = f"{CROSSREF_WORKS_URL}/{quote(doi, safe='')}"
@@ -286,40 +314,60 @@ def fetch_currency(self, doi: str | None) -> dict | None:
 
         if response.status_code == 404:
             # DOI unknown to Crossref: cache the miss to avoid re-lookups.
-            self._cache[cache_key] = None
-            return None
+            self._remember_work(doi, None)
+            return True
         if response.status_code == 429:
             logger.warning("crossref: rate limited for DOI %s", doi)
             self.last_lookup_error = network.http_status_reason(429)
-            return None
+            return False
 
         response.raise_for_status()
-        message = response.json().get("message", {})
-        result = {
-            "updated_by": _normalize_updated_by(message),
-            "newer_versions": _normalize_newer_versions(message),
-            "preprints": _normalize_preprints(message),
-        }
-        self._cache[cache_key] = result
-        return result
+        self._remember_work(doi, response.json().get("message", {}))
+        return True
 
     except RateLimited as e:
         self.last_lookup_error = e.reason
-        return None
+        return False
     except requests.exceptions.HTTPError as e:
         logger.warning(
             "crossref: lookup error for %s: %s",
             doi, network.redact_secrets(e),
         )
         self.last_lookup_error = network.request_failure_reason(e)
-        return None
+        return False
     except Exception as e:
         logger.warning(
             "crossref: lookup failed for %s: %s",
             doi, network.redact_secrets(e),
         )
         self.last_lookup_error = network.request_failure_reason(e)
-        return None
+        return False
+@
+
+A 404 leaves [[None]] in both entries: Crossref has no record, so it
+holds neither notices nor an abstract for the DOI.
+The abstract entry keeps the text as Crossref sent it, markup and all,
+and the text is cleaned when it is read (\cref{sec:crossref-abstract});
+how it is cleaned can then change without asking Crossref again.
+
+<<crossref client methods>>=
+def _remember_work(self, doi: str, message: dict | None) -> None:
+    """Cache the currency result and the raw abstract of `doi`'s record.
+
+    `message` is the work record, or None when Crossref has none.
+    """
+    currency = None
+    abstract = None
+    if message is not None:
+        currency = {
+            "updated_by": _normalize_updated_by(message),
+            "newer_versions": _normalize_newer_versions(message),
+            "preprints": _normalize_preprints(message),
+        }
+        raw = message.get("abstract")
+        abstract = raw if isinstance(raw, str) and raw.strip() else None
+    self._cache[("currency", CURRENCY_CACHE_VERSION, doi)] = currency
+    self._cache[abstract_cache_key(doi)] = abstract
 @
 
 Let's verify the happy path, the encoding requirement, and each
@@ -717,6 +765,354 @@ class TestNormalizePreprints:
 
     def test_no_relation_is_empty(self):
         assert _normalize_preprints({}) == []
+@
+
+
+\section{Reading a work's abstract}
+\label{sec:crossref-abstract}
+
+The work record we fetch for the currency check can carry the work's
+abstract as well.
+Crossref's REST API documentation says so in as many words: the API
+exposes \enquote{funding data, license information, post-publication
+updates, ORCID and ROR IDs, and abstracts}
+(\url{https://www.crossref.org/documentation/retrieve-metadata/rest-api/},
+read 2026-11-20), and its Swagger description lists [[abstract]] as a
+string field of a work (\url{https://api.crossref.org/swagger-docs},
+version 4.10.3, read 2026-11-20).
+Members deposit it: \enquote{You can include JATS-formatted abstracts
+with your metadata records. All abstracts registered with us will be
+included in the metadata distributed through our metadata outputs}
+(\url{https://www.crossref.org/documentation/principles-practices/best-practices/abstracts/},
+read 2026-11-20).
+So the field is present only when the publisher deposited an abstract,
+and then it is JATS XML, not plain text.
+A recorded response shows both (2026-11-20, [[GET
+https://api.crossref.org/works/10.7717%2Fpeerj.4375]] and
+[[.../10.1109%2FCVPR.2016.90]], no [[mailto]] sent): the first record
+holds its abstract as one [[<jats:p>]] element, the second has no
+[[abstract]] key at all.
+
+The terms differ from the rest of the record.
+The same REST API page says that \enquote{almost none of the metadata is
+subject to copyright, and you may use it for any purpose. Some abstracts
+contained in the metadata may be subject to copyright by publishers or
+authors.}
+Scholar stores an abstract in the user's own session for screening, as
+it stores those the search providers return; the session's
+[[Paper.sources]] names Crossref among the sources of the record.
+
+Enrichment (\cref{enrich-module}) asks Crossref for an abstract only
+for papers the search providers left without one.
+No second request is needed for that: the abstract is read from the
+same response as the currency check, cached in an entry of its own
+beside the currency result ([[_remember_work]] above).
+We chose that side entry over adding an [[abstract]] key to the
+currency result and bumping [[CURRENCY_CACHE_VERSION]].
+A bump would orphan every cached currency result, and since the
+currency check runs on every paper of every [[scholar enrich]], the
+next run would ask Crossref again for every DOI of the session,
+including the papers that have had an abstract all along.
+With a side entry the currency results keep serving; a DOI cached
+before the abstract was kept has a currency result but no abstract
+entry, and only when enrichment asks for its abstract---a paper still
+without one---is it fetched again, which refreshes both entries.
+The entry is keyed apart from the currency results, so it cannot be
+mistaken for one; it holds the raw text or [[None]], built-in types
+only, like the rest of the cache file.
+
+<<abstract cache key>>=
+def abstract_cache_key(doi: str) -> tuple:
+    """The cache key of `doi`'s abstract as Crossref sent it."""
+    return ("abstract", doi)
+@
+
+\subsection{From JATS to plain text}
+
+A JATS abstract is a small XML document: paragraphs ([[<jats:p>]]),
+possibly sections with titles, and inline elements such as
+[[<jats:italic>]] or [[<jats:sub>]].
+We want the words as a reader sees them.
+Two kinds of element are therefore treated differently.
+Block elements separate pieces of text, so each becomes a space;
+removing them outright would glue the last word of one paragraph to the
+first of the next.
+Inline elements sit inside a word as often as between words
+([[H<jats:sub>2</jats:sub>O]]), so they are removed without a
+trace.
+A title [[Abstract]] at the very start is a heading that repeats what
+the field is, and it is dropped; any other title (a structured
+abstract's \enquote{Background}, \enquote{Methods}) is part of the
+text and stays.
+The recorded abstract above has no such title; the rule is ours, a
+guard for records that carry one.
+The character entities of the XML ([[&lt;]], [[&amp;]]) are decoded
+after the tags are gone, so that a decoded [[<]] is never taken for the
+start of a tag, and white space is collapsed last.
+
+This is done here rather than in [[clean_metadata_text]], which every
+title, venue and abstract passes through (\cref{sec:clean-provider-text}).
+That function removes a fixed list of inline HTML tags and keeps
+everything else; turning block elements into spaces, or dropping a
+heading, is right for a JATS abstract but not something to do to every
+title.
+The text still passes through [[clean_metadata_text]] at the end of
+[[enrich_paper]], like every other provider's.
+
+<<constants>>=
+# A leading <title>Abstract</title> repeats the field's name.
+JATS_LEADING_ABSTRACT_TITLE = re.compile(
+    r"^\s*<(?:jats:)?title\b[^>]*>\s*abstract\s*</(?:jats:)?title\s*>",
+    re.IGNORECASE,
+)
+# Block elements separate text; they become spaces.
+JATS_BLOCK_TAGS = re.compile(
+    r"</?\s*(?:jats:)?(?:p|sec|title|list|list-item|label|caption"
+    r"|disp-quote|def-list|def-item|term|def)\b[^>]*>",
+    re.IGNORECASE,
+)
+# Every other element (inline) is removed without a trace.
+XML_TAGS = re.compile(r"<[^>]+>")
+<<abstract normalization helpers>>=
+def jats_to_text(raw: str) -> str:
+    """Return the plain text of a JATS-marked abstract.
+
+    Drops a leading `<title>Abstract</title>`, turns block elements
+    into spaces, removes inline elements, decodes entities and
+    collapses white space.
+    """
+    text = JATS_LEADING_ABSTRACT_TITLE.sub("", raw)
+    text = JATS_BLOCK_TAGS.sub(" ", text)
+    text = XML_TAGS.sub("", text)
+    text = html.unescape(text)
+    return " ".join(text.split())
+@
+
+Let's verify each rule on small made-up abstracts, since the point is
+what happens to each kind of element.
+
+<<test functions>>=
+class TestJatsToText:
+    """jats_to_text keeps the words and drops the markup (#260)."""
+
+    def test_paragraphs_are_separated_by_a_space(self):
+        raw = "<jats:p>First part.</jats:p><jats:p>Second part.</jats:p>"
+        assert jats_to_text(raw) == "First part. Second part."
+
+    def test_inline_elements_leave_no_space(self):
+        raw = "<jats:p>H<jats:sub>2</jats:sub>O is <jats:italic>wet" \
+              "</jats:italic>.</jats:p>"
+        assert jats_to_text(raw) == "H2O is wet."
+
+    def test_leading_abstract_title_is_dropped(self):
+        raw = "<jats:title>Abstract</jats:title><jats:p>Text.</jats:p>"
+        assert jats_to_text(raw) == "Text."
+
+    def test_section_titles_stay(self):
+        raw = (
+            "<jats:sec><jats:title>Background</jats:title>"
+            "<jats:p>Why.</jats:p></jats:sec>"
+        )
+        assert jats_to_text(raw) == "Background Why."
+
+    def test_entities_are_decoded_after_the_tags_are_gone(self):
+        raw = "<jats:p>p &lt; 0.05 &amp; n&gt;3</jats:p>"
+        assert jats_to_text(raw) == "p < 0.05 & n>3"
+
+    def test_white_space_is_collapsed(self):
+        raw = "\n  <jats:p>A\n   line</jats:p>\n"
+        assert jats_to_text(raw) == "A line"
+@
+
+\subsection{Looking an abstract up}
+
+[[fetch_abstract]] follows the contract of [[fetch_currency]]: the text
+when Crossref answered with one, [[None]] otherwise, and
+[[last_lookup_error]] set exactly when the lookup failed, so that the
+enrichment tally (\cref{sec:enrich-lookup-tally}) can tell a record
+without an abstract from a lookup that did not happen.
+A cached abstract entry is an answer, whether text or [[None]];
+without one we fetch the record, which also refreshes the currency
+result.
+
+<<crossref client methods>>=
+def fetch_abstract(self, doi: str | None) -> str | None:
+    """Return the plain-text abstract Crossref holds for `doi`, or None.
+
+    None when there is no DOI, Crossref has no record or no abstract
+    for it, or the lookup failed; the last sets `last_lookup_error`.
+    """
+    self.last_lookup_error = None
+    if not doi:
+        return None
+    key = abstract_cache_key(doi)
+    if key not in self._cache and not self._fetch_work(doi):
+        return None
+    raw = self._cache.get(key)
+    return jats_to_text(raw) if raw else None
+@
+
+Enrichment asks every source the same question, [[get_paper_by_doi]],
+and merges the answer into the paper (\cref{enrich-module}).
+Our answer is a paper with the DOI and the abstract and nothing else:
+the record holds a title and authors too, but the search providers
+have filled those already, and this lookup is there for the abstract.
+Its [[sources]] name Crossref, so the merge records where the abstract
+came from.
+An empty text would fill nothing, so it is no answer.
+
+<<crossref client methods>>=
+def get_paper_by_doi(self, doi: str | None) -> Paper | None:
+    """Return a paper holding only `doi` and its Crossref abstract.
+
+    None when Crossref has no abstract for the DOI or the lookup
+    failed (see `fetch_abstract`).
+    """
+    abstract = self.fetch_abstract(doi)
+    if not abstract:
+        return None
+    return Paper(
+        title="", authors=[], doi=doi, abstract=abstract,
+        sources=[self.name],
+    )
+@
+
+The module exposes the lookup over its shared client, and the client
+itself for the enrichment loop, which reads [[last_lookup_error]] from
+the object it asked.
+
+<<module-level abstract interface>>=
+def fetch_abstract(doi: str | None) -> str | None:
+    """Look up the plain-text abstract of a DOI (see CrossrefClient)."""
+    return _client.fetch_abstract(doi)
+
+
+def enrichment_source() -> "CrossrefClient":
+    """The shared client, as an abstract source for `scholar.enrich`."""
+    return _client
+@
+
+The tests replay the two recorded records, trimmed to the fields the
+code reads ([[abstract]], [[updated-by]] and [[relation]], of which the
+records hold no notice and no relation we read, so they are left out)
+plus the DOI and title; the abstract is cut to its first two sentences.
+They check what the overview promised: the abstract arrives as plain
+text, one request serves both the abstract and the currency check in
+either order, a record without an abstract is an answer and is cached,
+a currency result cached before the abstract was kept costs one
+request for the abstract and none for the currency, and a failure is
+neither cached nor silent.
+
+<<test functions>>=
+# Recorded 2026-11-20 from https://api.crossref.org/works/10.7717%2Fpeerj.4375
+# (no mailto), trimmed; the abstract (CC BY 4.0) cut to two sentences.
+RECORDED_WORK_WITH_ABSTRACT = {
+    "DOI": "10.7717/peerj.4375",
+    "title": [
+        "The state of OA: a large-scale analysis of the prevalence and "
+        "impact of Open Access articles"
+    ],
+    "abstract": (
+        "<jats:p>Despite growing interest in Open Access (OA) to "
+        "scholarly literature, there is an unmet need for large-scale, "
+        "up-to-date, and reproducible studies assessing the prevalence "
+        "and characteristics of OA. We address this need using oaDOI, an "
+        "open online service that determines OA status for 67 million "
+        "articles.</jats:p>"
+    ),
+}
+# Recorded 2026-11-20 from https://api.crossref.org/works/10.1109%2FCVPR.2016.90
+# (no mailto), trimmed; the record has no "abstract" key.
+RECORDED_WORK_WITHOUT_ABSTRACT = {
+    "DOI": "10.1109/cvpr.2016.90",
+    "title": ["Deep Residual Learning for Image Recognition"],
+}
+
+
+class TestCrossrefAbstract:
+    """Crossref's abstract comes from the currency check's response."""
+
+    DOI = "10.7717/peerj.4375"
+
+    def _recorded(self, message=RECORDED_WORK_WITH_ABSTRACT):
+        return patch.object(
+            _client._session, "get",
+            return_value=_mock_response(200, message),
+        )
+
+    def test_recorded_abstract_is_plain_text(self):
+        with self._recorded():
+            paper = _client.get_paper_by_doi(self.DOI)
+        assert paper.abstract.startswith("Despite growing interest in Open")
+        assert paper.abstract.endswith("for 67 million articles.")
+        assert "<" not in paper.abstract
+        assert paper.doi == self.DOI
+        assert paper.sources == ["crossref"]
+        assert _client.last_lookup_error is None
+
+    def test_one_request_serves_abstract_then_currency(self):
+        with self._recorded() as get:
+            assert fetch_abstract(self.DOI)
+            assert fetch_currency(self.DOI) == {
+                "updated_by": [], "newer_versions": [], "preprints": [],
+            }
+        assert get.call_count == 1
+
+    def test_one_request_serves_currency_then_abstract(self):
+        with self._recorded() as get:
+            fetch_currency(self.DOI)
+            assert fetch_abstract(self.DOI).startswith("Despite")
+        assert get.call_count == 1
+
+    def test_cache_holds_the_raw_text(self):
+        """Built-in types only; cleaned when read, so no re-fetch."""
+        with self._recorded():
+            fetch_abstract(self.DOI)
+        raw = _client._cache[abstract_cache_key(self.DOI)]
+        assert raw == RECORDED_WORK_WITH_ABSTRACT["abstract"]
+
+    def test_record_without_abstract_is_a_cached_answer(self):
+        doi = "10.1109/CVPR.2016.90"
+        with self._recorded(RECORDED_WORK_WITHOUT_ABSTRACT) as get:
+            assert _client.get_paper_by_doi(doi) is None
+            assert last_lookup_error() is None
+            assert fetch_abstract(doi) is None
+        assert get.call_count == 1
+
+    def test_not_found_is_a_cached_answer(self):
+        with patch.object(
+            _client._session, "get", return_value=_mock_response(404)
+        ) as get:
+            assert fetch_abstract("10.1/missing") is None
+            assert last_lookup_error() is None
+            assert fetch_abstract("10.1/missing") is None
+        assert get.call_count == 1
+
+    def test_older_currency_entry_costs_one_request_for_the_abstract(self):
+        """A DOI cached before abstracts were kept is fetched once."""
+        _client._cache[("currency", CURRENCY_CACHE_VERSION, self.DOI)] = {
+            "updated_by": [], "newer_versions": [], "preprints": [],
+        }
+        with self._recorded() as get:
+            fetch_currency(self.DOI)
+            assert get.call_count == 0
+            assert fetch_abstract(self.DOI).startswith("Despite")
+            assert fetch_abstract(self.DOI).startswith("Despite")
+        assert get.call_count == 1
+
+    def test_failure_is_neither_cached_nor_silent(self):
+        with patch.object(
+            _client._session, "get",
+            side_effect=requests.exceptions.ConnectionError("down"),
+        ):
+            assert _client.get_paper_by_doi(self.DOI) is None
+        assert _client.last_lookup_error == (
+            "connection failed (ConnectionError)"
+        )
+        assert abstract_cache_key(self.DOI) not in _client._cache
+        with self._recorded() as get:
+            assert fetch_abstract(self.DOI)
+        assert get.call_count == 1
 @
 
 
@@ -1140,11 +1536,14 @@ class TestCurrencyStatus:
 \section{Imports}
 
 The module needs the HTTP stack the other providers use, the shared cache
-helpers, the contact-email resolver, [[replace]] for immutable annotation, and
-[[quote]] for DOI encoding.
+helpers, the contact-email resolver, [[replace]] for immutable annotation,
+[[quote]] for DOI encoding, and [[re]] and [[html]] for turning a JATS
+abstract into plain text.
 
 <<imports>>=
+import html
 import logging
+import re
 from dataclasses import replace
 from urllib.parse import quote
 
