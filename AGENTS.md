@@ -1486,8 +1486,11 @@ not in `SCREENING_KINDS`, counted by `unknown_origin_count`, never
 paired); unnamed = `(kind, None, ...)`, one screener per kind,
 labelled "unnamed agent"; second screen labelled "llm (m), second
 screen". `--pair` form `kind[+second]:name` or bare `kind[+second]`
-(`screener_spec`/`parse_screener_spec`, first colon splits; a pair of
-one screener with itself exits 2). `same_model(a, b)` (kind llm, one
+(`screener_spec`/`parse_screener_spec`, first colon splits;
+`parse_screener_pair` splits `A,B` at the one comma followed by a kind
+[+second] and `:` or the end, so names may hold commas; none or
+several such commas, or one screener twice → ValueError, exit 2).
+`pair_header` prints `Pair --pair <shlex-quoted A,B>`, copyable. `same_model(a, b)` (kind llm, one
 name): header line "same model: m" plus both sides' prompt versions
 ("none recorded"), show line "(same model)". `screener_verdicts(decision)`: latest counted
 record per screener by `at` else `recorded_at` (ties: later in list);
@@ -1530,12 +1533,19 @@ decided, source not `is_unreviewed`, `human_decided_at` not older
 than the latest counted screening's `recorded_at`.
 `conflict_outcome` → `a`/`b`/`neither` (status: decision status;
 category: `audit_category(decision.tags)`). **Text**:
-`agreement_block` (table, measures, then at most the design's three
-sentences: the "Most records were discarded by both ..." one only when
-x22 > N/2; bearing worded "judged (not) bearing"), `agreement_data`
+`agreement_block` (table, measures, then two sentences, always: "X of
+N records were discarded by both, so observed agreement is at least
+X/N (P %) whatever the screeners did with the rest; positive agreement
+counts only records at least one screener kept." and "For the same
+observed agreement, kappa is lower the more one verdict dominates. No
+verbal label is given for kappa."; bearing worded "judged (not)
+bearing"), `agreement_data`
 (JSON, `interval` only for samples, category without kappa keys),
 `pair_header`, `ScreeningOverview.of(decisions)` (None without any
 decision with screenings; `lines()`, `data()`, `conflict_counts()`).
+`conflict_counts(entries)`/`conflict_counts_line`: one definition for
+show and `sessions conflicts` (a paper with any status conflict counts
+as status, else "category only").
 **CLI** (cli.nw `sec:sessions-agreement`, `sec:sessions-conflicts`):
 `scholar sessions agreement S [S...] [--sample ID] [--pair A,B] [-f
 table|json]` (sessions deduped by file; `--sample` reads
@@ -1545,7 +1555,8 @@ sample exit 2, missing session exit 1); `scholar sessions conflicts S
 table|json]` (both kind flags exit 2; outcome counts per pair and kind
 over resolved conflicts; one print). `sessions show` adds the
 overview's lines after the "Screenings:" line (one per pair: records,
-kept/discarded agreement, kappa, status conflicts (resolved); then
+kept/discarded agreement, kappa with "(prevalence index …, bias index
+…)" or undefined with its reason, status conflicts (resolved); then
 "Screening conflicts: N status (R resolved by a human), C category
 only"; unknown-origin count) in one print, and JSON
 `double_screening` (`pairs`, `conflicts`, `unknown_origin`); neither
