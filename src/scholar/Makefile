@@ -10,6 +10,7 @@ MODULES+=	unpaywall.py
 MODULES+=	europepmc.py
 MODULES+=	preprint.py
 MODULES+=	enrich.py
+MODULES+=	abstract_check.py
 MODULES+=	cli.py
 MODULES+=	tui.py
 MODULES+=	notes.py
@@ -47,6 +48,9 @@ __init__.py: scholar.nw
 	${NOTANGLE.py}
 
 __main__.py: cli.nw
+	${NOTANGLE.py}
+
+abstract_check.py: enrich.nw
 	${NOTANGLE.py}
 
 INCLUDE_MAKEFILES=../../makefiles
