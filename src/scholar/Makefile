@@ -15,6 +15,7 @@ MODULES+=	notes.py
 MODULES+=	pdf.py
 MODULES+=	review.py
 MODULES+=	llm_review.py
+MODULES+=	agreement.py
 MODULES+=	__main__.py
 
 DOC+=		scholar.tex
@@ -33,6 +34,7 @@ DOC+=		notes.tex
 DOC+=		pdf.tex
 DOC+=		review.tex
 DOC+=		llm_review.tex
+DOC+=		agreement.tex
 
 .PHONY: all clean distclean
 
