@@ -895,33 +895,73 @@ switch them off with `scholar.enrich.abstract_source` → None
 - `cache clear --provider europepmc`, `providers limits` (imports
   europepmc), conftest `fresh_rate_limiters` imports it too (#131).
 
+### Abstracts stored as paragraphs (#290)
+
+WoS Expanded gives a multi-paragraph abstract as a list (XML `<p>`s);
+the provider joins it since 311e42e (2026-03-03), but older sessions
+and pickled WoS cache entries can hold the list. `utils.join_paragraphs`
+(utils.nw `sec:abstract-paragraphs`): list/tuple → non-empty parts as
+strings joined by `"\n\n"` (`PARAGRAPH_JOINER`, as the provider), empty
+→ None, anything else unchanged. Applied by the WoS provider, by
+`Paper.__post_init__` (sessions repaired on load, saved back as text,
+like `normalize_venue`) and by `clean_paper_text` (unpickled cache
+hits skip `__post_init__`). Title/venue/identifiers: not changed (title
+feeds the DOI-less id); the calibration tool counts any non-text field.
+
 ### Doubtful Abstracts (#287)
 
 A service's abstract field can hold a disclosure statement, a keywords
 line, a table fragment, ... Flag, never drop.
 - **Check** `scholar.abstract_check.doubtful_abstract(text) -> reason |
   None` (enrich.nw `sec:doubtful-abstracts`; its own module, tangled
-  from enrich.nw, stdlib only, so `sessions show` and the report do not
-  import providers or the Crossref cache). `DOUBTFUL_OPENINGS`: per
-  kind (the reason string) a few regexes matched only at the START of
-  the text, after `TEXT_START` (white space, inline tags, footnote
-  marks/quotes, a leading "Abstract"; `[` kept). Kinds:
-  conflict-of-interest statement, data-availability statement, funding
-  statement, acknowledgements, keywords line, author address or
+  from enrich.nw, stdlib + `scholar.utils` only, so `sessions show` and
+  the report do not import providers or the Crossref cache). Order:
+  (1) `is_table_of_contents` (front-matter heading at the start and
+  "Chapter 1"/"Part I"/"1. X" within `FRONT_MATTER_CHARS` = 300) →
+  "table of contents"; (2) `DOUBTFUL_OPENINGS`: per kind (the reason
+  string) a few regexes matched only at the START of the text, after
+  `TEXT_START` (white space, inline tags, footnote marks/quotes, a
+  leading "Abstract"; `[` kept); (3) `first_sentence_statement`: the
+  first sentence (≤ 300 chars) whose first "is/are (word) available"
+  is within `AVAILABLE_WITHIN` = 120 chars, no `;` before it, and that
+  names supplementary material → supplementary-material note, or says
+  "available (up)on (word) request" → data-availability statement
+  (a repository alone is not a sign); (4) a statement from (2)/(3) is
+  NOT doubtful when `abstract_follows`: later an `ABSTRACT_HEADING`
+  (Abstract, Background, Objective(s), Purpose, Introduction, Aim(s),
+  Methods; capitalised or caps, after space/punctuation, then `:`/`.`)
+  with ≥ 100 chars after it (not for table/reference fragments,
+  `NOT_RESCUED`; the TOC returns before); (5) `TOO_SHORT` = "fewer than
+  100 characters" (`MIN_ABSTRACT_CHARS`, after collapsing white space).
+  Kinds of (2): conflict-of-interest statement (incl. disclosure prose:
+  Dr/Prof/Professor + 1-3 capitalised names, or "the author(s)", +
+  has received honoraria/consulting|speaker|personal fees/grants/
+  research support, serves as … editor, is an employee of, reports
+  grants/fees), data-availability statement, funding statement,
+  acknowledgements (heading), opens with thanks ("We (would like to)
+  thank", "The authors are grateful"), keywords line, author address or
   correspondence, supplementary-material note, table fragment,
-  reference-list fragment; then `TOO_SHORT` = "fewer than 100
-  characters" (`MIN_ABSTRACT_CHARS`, after collapsing white space). A
-  word that can be a topic ("Disclosure of HIV status", "Funding
-  agencies", "Correspondence analysis", "Email-based", "Table tennis")
-  is a heading only with `heading()` evidence: a delimiter (`: .` en/em
-  dash, ` - `), the end of the text, or a capitalised run-in word from
-  a short case-sensitive list. All patterns and the floor are scholar's
-  own choice, uncalibrated: run `python -m scholar.abstract_check
-  FILE.json ...` (reads the JSON only, never the data dir; dedups by
-  paper id; skips hand-given abstracts; prints counts by reason and
-  each flagged text's first 80 characters) on copies of real sessions
-  before tuning. Not covered: an article's opening paragraph, non-English
-  boilerplate. 10,000 abstracts take about 0.1 s (test allows 1 s).
+  reference-list fragment ("References"/"Bibliography" heading, or
+  "[1] " with "[2]" within `REFERENCE_ENTRY_CHARS` = 200, so numbered
+  paragraphs are not lists). A word that can be a topic ("Disclosure of
+  HIV status", "Funding agencies", "Correspondence analysis",
+  "Email-based", "Table tennis") is a heading only with `heading()`
+  evidence: a delimiter (`: .` en/em dash, ` - `), the end of the text,
+  or a capitalised run-in word from a short case-sensitive list. A list
+  or tuple is judged joined (`join_paragraphs`); other non-text values
+  are not judged. All patterns and thresholds are scholar's own choice.
+  `python -m scholar.abstract_check FILE.json ...` (reads the JSON
+  only, never the data dir; dedups by paper id; skips hand-given
+  abstracts; prints counts by reason, "Stored values that are not text:
+  FIELD N" over `TEXT_FIELDS`, and each flagged text's first 80
+  characters). Calibration 2026-11-20 (developer's sessions, scholar's
+  own measurement): 147,108 abstracts, 667 flagged (0.45 %), 649 by the
+  floor; false positives (a disclosure line or a keywords line before a
+  real abstract, numbered-paragraph articles) led to (4) and the "[2]"
+  rule; enrich.nw `sec:abstract-check-calibration` describes the shapes
+  (no real texts in the repo). Not covered: free-form statements, an
+  article's opening paragraph, non-English boilerplate. 10,000
+  abstracts of ~1,000 characters take about 0.3 s (test allows 1 s).
 - **enrich** (`sec:replace-doubtful-abstract`): `needs_enrichment(p,
   fields, judge_abstract=False)`, `enrich_paper(..., judge_abstract=
   False)`, `enrich_papers(..., judge_abstracts=[bool per paper])`.
