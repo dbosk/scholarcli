@@ -1140,7 +1140,8 @@ Each paper list prints in one Rich call without the highlighter
 (`print_paper_lines`, #273; 10,000 decisions: ~26 s → ~10 s piped):
 the piped text is byte-identical (pinned by `TestShowPinnedOutput` at
 80 and 200 columns), on a terminal numbers and URLs in titles and ids
-are no longer coloured.
+are no longer coloured. The paper line escapes the stored provider
+too (`open[alex]` printed as `(open)` before).
 `--source human|agent|llm` says who decided (#162). It defaults to
 `human` only when stdin is a terminal; otherwise (scripts, agents) a
 missing `--source` exits 2 before loading the session. `agent` (an AI
