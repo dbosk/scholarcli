@@ -1,0 +1,1934 @@
+\chapter{Agreement between screeners}
+\label{agreement-module}
+
+A review that screens its records twice keeps the second screener's
+verdicts beside the decisions, as \emph{screenings}
+(\cref{sec:screenings} in the review module): a classifier's call
+checked by an agent, say, or an agent's checked by a second human.  The
+record alone answers neither of the two questions a double screen is
+for (\url{https://github.com/dbosk/scholarcli/issues/253}): how often
+did the screeners agree, and where did they not?  This chapter answers
+both from the stored screenings, without changing anything: the
+decision stays the outcome, and nothing here writes to a session.
+
+The chapter has five parts, each used by the next.
+\begin{description}
+\item[Screeners] (\cref{sec:agreement-screeners}) who a screening is
+  from, and which of a screener's verdicts of a paper counts.
+\item[The agreement table] (\cref{sec:agreement-table}) the counts of a
+  pair of screeners' verdicts, and the measures of agreement computed
+  from them, with the sources that define them.
+\item[Three questions] (\cref{sec:agreement-questions}) kept or
+  discarded, bearing on the claim or not, and the category; the pairs
+  of screeners a set of records holds.
+\item[Samples] (\cref{sec:agreement-samples}) the agreement over a
+  stored random sample, the one case with an interval.
+\item[Conflicts] (\cref{sec:agreement-conflicts}) the papers where two
+  screeners disagree, and whether a human has settled them.
+\end{description}
+The chapter ends with the text the commands print
+(\cref{sec:agreement-text}).  Three commands read it: [[sessions
+agreement]] prints the tables, [[sessions conflicts]] lists the
+conflicts, and [[sessions show]] adds a few summary lines (all in the
+CLI module); the TUI has a filter for the unresolved conflicts.
+
+<<[[agreement.py]]>>=
+"""
+Agreement between the screeners of a review, and their conflicts.
+
+Reads the screenings stored beside each decision (`ReviewDecision.
+screenings`) and computes, per pair of screeners, the table of their
+verdicts with observed, positive and negative agreement and Cohen's
+kappa; lists the papers where they disagree. Changes nothing.
+"""
+<<agreement imports>>
+<<agreement screeners>>
+<<agreement table>>
+<<agreement questions>>
+<<agreement samples>>
+<<agreement conflicts>>
+<<agreement text>>
+@
+
+The tests read the module whole.
+
+<<test [[agreement.py]]>>=
+"""Tests for the agreement module."""
+import json
+from datetime import datetime
+
+import pytest
+
+from scholar.agreement import *
+from scholar.review import (
+  DecisionStatus, LLMSample, ReviewDecision, ReviewSession, ReviewSource,
+  new_screening, record_human_decision, record_screening,
+)
+from scholar.scholar import Paper
+
+<<test functions>>
+@
+
+<<agreement imports>>=
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+import re
+import shlex
+from itertools import combinations
+from typing import Iterable
+
+from scholar.notes import get_paper_id
+from scholar.review import (
+    AUDIT_CATEGORIES,
+    AUDIT_ORDER_BEARING,
+    SCREENING_KINDS,
+    ReviewDecision,
+    _iso_after,
+    audit_category,
+    counted_screenings,
+    screener_identity,
+)
+@
+
+
+\section{Screeners and their verdicts}
+\label{sec:agreement-screeners}
+
+A screener is who made a screening, as the review module tells
+screeners apart ([[screener_identity]], \cref{sec:screenings}): its
+kind ([[llm]], [[agent]] or [[human]]), its name as stored in the
+record, and whether the record is a classifier's second screen that
+Scholar ran.  The last part keeps a model's second screen apart from
+the snapshot of a decision the same model made, which has the same
+kind and name; the review module says why a same-model second screen
+is recorded rather than refused.  Two records with the same identity
+are the same screener, wherever in the session they are; a name is
+matched as written, so two sessions pooled into one report share a
+screener only when they spell it alike.  The prompt version of a
+classifier is not part of it: a model asked with a revised prompt is
+the same screener, and the text lists the prompt versions that occur
+instead.  This module uses that one function wherever it compares
+screeners, so that a pair, a group and a label never disagree on who
+is who.
+
+A screener without a name is a screener of its own: an agent that
+gave no name, or a snapshot of a decision made before names were kept
+(\cref{sec:screenings} in the review module: [[sessions screen]]
+requires a name, but a snapshot copies whatever the decision holds).
+All unnamed screeners of one kind are one screener, since nothing tells
+them apart, and the text calls it \enquote{unnamed agent}.  A snapshot
+whose kind is not known, of a decision with a source Scholar does not
+know, is no screener at all; it is counted, as a verdict of unknown
+origin, but never paired.
+
+<<agreement screeners>>=
+Screener = tuple  # screener_identity: (kind, name or None, second screen)
+
+
+def screener_of(record: dict) -> Screener | None:
+    """The screener of a screening record, or None if its kind is unknown."""
+    if record.get("kind") not in SCREENING_KINDS:
+        return None
+    return screener_identity(record)
+@
+
+The commands name a screener on the command line ([[--pair]]) as
+[[kind:name]], or as the kind alone for the unnamed one, and the text
+prints that form beside each pair so that it can be copied.  A
+classifier's second screen adds [[+second]] to the kind
+([[llm+second:model-x]]): the kind is one of a few fixed words, so the
+mark cannot be confused with a name, which may hold anything, a colon
+included; only the first colon separates.
+
+<<agreement screeners>>=
+SECOND_SCREEN_MARK = "+second"
+
+
+def screener_spec(screener: Screener) -> str:
+    """How `--pair` names `screener`: `kind[+second]:name`, or no name."""
+    kind, name, second = screener
+    kind += SECOND_SCREEN_MARK if second else ""
+    return f"{kind}:{name}" if name is not None else kind
+
+
+def parse_screener_spec(text: str) -> Screener:
+    """The screener that `kind[+second]:name` (or no `:name`) names.
+
+    Raises:
+        ValueError: The kind is not one of `SCREENING_KINDS`, or the name
+            after the colon is empty.
+    """
+    kind, colon, name = text.strip().partition(":")
+    second = kind.endswith(SECOND_SCREEN_MARK)
+    if second:
+        kind = kind[: -len(SECOND_SCREEN_MARK)]
+    if kind not in SCREENING_KINDS:
+        raise ValueError(
+            f"{text!r} names no screener kind (give one of "
+            f"{', '.join(SCREENING_KINDS)}, as kind:name)"
+        )
+    if colon and not name:
+        raise ValueError(f"{text!r} has an empty name after the colon")
+    return (kind, name if colon else None, second)
+@
+
+[[--pair]] takes two screeners separated by a comma, and a name may
+hold a comma (\enquote{Doe, Jane}).  The separating comma is the one
+followed by a kind, with or without the second-screen mark, and then a
+colon or the end: a kind is one of a few fixed words, so such a comma
+is rarely inside a name.  When more than one comma qualifies, or none,
+the pair is refused with a message rather than split by guess.  A
+screener compared with itself would agree on every record, so a pair
+of one screener twice is refused too.  The header of a pair prints the
+option as it would be typed, quoted for the shell
+(\cref{sec:agreement-text}), so a name with a comma or a space can be
+copied.
+
+<<agreement screeners>>=
+_PAIR_SEPARATOR = re.compile(
+    r",(?=\s*(?:" + "|".join(SCREENING_KINDS) + r")(?:"
+    + re.escape(SECOND_SCREEN_MARK) + r")?(?::|$))"
+)
+
+
+def parse_screener_pair(text: str) -> tuple:
+    """The two screeners `--pair A,B` names.
+
+    Splits at the one comma followed by a kind (`llm`, `agent`, `human`,
+    optionally `+second`) and then `:` or the end, so names may hold
+    commas.
+
+    Raises:
+        ValueError: No such comma or more than one, a side
+            `parse_screener_spec` refuses, or one screener twice.
+    """
+    commas = [m.start() for m in _PAIR_SEPARATOR.finditer(text)]
+    if len(commas) != 1:
+        raise ValueError(
+            "give two screeners as A,B, each kind:name or a bare kind"
+            + (" (more than one comma could separate them)"
+               if len(commas) > 1 else "")
+        )
+    pair = (parse_screener_spec(text[: commas[0]]),
+            parse_screener_spec(text[commas[0] + 1:]))
+    if pair[0] == pair[1]:
+        raise ValueError("give two different screeners")
+    return pair
+@
+
+\paragraph{Which verdict counts.}
+A screener can screen a paper more than once, and only the latest
+verdict counts: a screener who changed their mind meant the second
+one.  Latest is by the time of the verdict ([[at]]), else by the time
+Scholar stored it, and on equal times the record stored later wins
+(the list is kept in that order).  Only the screenings the review
+module counts are read ([[counted_screenings]]): a reset sets aside
+every screening made before it, since the decision it compared with is
+gone, and malformed entries are skipped there.  The earlier verdicts
+stay in the record; self-agreement is not computed.
+
+The decision itself is not a verdict here.  Its first verdict is in the
+list as a snapshot, taken when the first screening was recorded, and
+that snapshot is the first screener's verdict; the decision may since
+have been adjudicated, and comparing the second screener with an
+outcome they helped bring about would make the two look more in
+agreement than they were.  That is why the snapshot exists
+(\cref{sec:screenings}).
+
+<<agreement screeners>>=
+def _verdict_time(record: dict) -> str:
+    """When a verdict was made: its `at`, else when it was stored."""
+    return str(record.get("at") or record.get("recorded_at") or "")
+
+
+def screener_verdicts(decision: ReviewDecision) -> dict[Screener, dict]:
+    """The latest counted verdict of each screener of `decision`."""
+    latest: dict[Screener, dict] = {}
+    for record in counted_screenings(decision):
+        screener = screener_of(record)
+        if screener is None:
+            continue
+        held = latest.get(screener)
+        if held is None or not _iso_after(
+            _verdict_time(held), _verdict_time(record)
+        ):
+            latest[screener] = record
+    return latest
+
+
+def unknown_origin_count(decisions: Iterable[ReviewDecision]) -> int:
+    """How many counted verdicts of `decisions` have no known screener."""
+    return sum(
+        1
+        for decision in decisions
+        if decision.screenings
+        for record in counted_screenings(decision)
+        if screener_of(record) is None
+    )
+@
+
+\paragraph{What a screener is called.}
+The text names a screener by kind and name: \enquote{llm (m-1)},
+\enquote{agent (agent-2)}, \enquote{unnamed agent}; a classifier's
+second screen adds \enquote{second screen}, \enquote{llm (m-1),
+second screen}, so that it reads apart from the model's first call.
+One case needs more.  A snapshot of a decision that a human made,
+confirmed or changed has kind [[human]] (\cref{sec:screenings}): the
+status is the human's.
+When the human confirmed a machine's call, though, the verdict is not
+that of a human screening the paper alone, and a report that called it
+\enquote{a human screener} would claim more independence than there
+was.  Such a snapshot carries [[confirmed_from]], and a screener whose
+records are all such snapshots is called \enquote{the human-confirmed
+decision}, with the human's name and the machine that proposed it when
+they are known and the same throughout.  A human screener with some
+such records and some of their own says how many of its records are
+the human-confirmed decision.
+
+[[ScreenerProfile]] gathers what the text needs about each screener
+over a set of records, once: how many records it screened, how many of
+those are confirmed snapshots and by whom proposed, and the prompt
+versions of its verdicts.
+
+<<agreement screeners>>=
+@dataclass
+class ScreenerProfile:
+    """What the text says about one screener over a set of records."""
+
+    screener: Screener
+    records: int = 0
+    confirmed: int = 0
+    proposers: set = field(default_factory=set)
+    prompt_versions: set = field(default_factory=set)
+
+    def add(self, record: dict) -> None:
+        """Count one verdict of this screener."""
+        self.records += 1
+        if record.get("origin") == "decision" and record.get("confirmed_from"):
+            self.confirmed += 1
+            self.proposers.add(
+                (record.get("confirmed_from"), record.get("confirmed_name"))
+            )
+        if record.get("prompt_version"):
+            self.prompt_versions.add(record["prompt_version"])
+
+    @property
+    def label(self) -> str:
+        """The screener's name in the text."""
+        kind, name, second = self.screener
+        base = f"{kind} ({name})" if name is not None else f"unnamed {kind}"
+        if second:
+            base += ", second screen"
+        if not self.confirmed:
+            return base
+        if self.confirmed < self.records:
+            return (
+                f"{base} ({self.confirmed} of {self.records} records the "
+                "human-confirmed decision)"
+            )
+        details = [f"by {name}"] if name is not None else []
+        if len(self.proposers) == 1:
+            (machine, machine_name), = self.proposers
+            details.append(
+                f"proposed by {machine}"
+                + (f" {machine_name}" if machine_name else "")
+            )
+        return "the human-confirmed decision" + (
+            f" ({'; '.join(details)})" if details else ""
+        )
+
+
+def screener_profiles(
+    records: Iterable[dict[Screener, dict]],
+) -> dict[Screener, ScreenerProfile]:
+    """A profile of each screener in `records` (maps of `screener_verdicts`)."""
+    profiles: dict[Screener, ScreenerProfile] = {}
+    for verdicts in records:
+        for screener, record in verdicts.items():
+            profiles.setdefault(screener, ScreenerProfile(screener)).add(record)
+    return profiles
+@
+
+Let's check the pairing rule on invented records: a screener's later
+verdict replaces its earlier one, a reset sets aside what came before
+it, a snapshot of unknown origin is no screener, and two unnamed agents
+are one.
+
+<<test functions>>=
+class TestScreenerVerdicts:
+  """The latest counted verdict per screener (#253)."""
+
+  <<screener verdicts test methods>>
+
+<<screener verdicts test methods>>=
+def _decision(self, **kwargs):
+  values = dict(status=DecisionStatus.DISCARDED, tags=["t"],
+                source=ReviewSource.LLM_UNREVIEWED, llm_model="m-1",
+                llm_decided_at="2020-01-01T09:00:00+00:00")
+  values.update(kwargs)
+  return ReviewDecision(paper=Paper(title="P", authors=["A"],
+                                    doi="10.5555/agree-1"),
+                        provider="p", **values)
+
+def _screen(self, decision, status, at, name="agent-2", kind="agent"):
+  record_screening(decision, new_screening(
+    kind=kind, name=name, status=status, tags=["t"], recorded_at=at))
+
+def test_the_latest_verdict_counts(self):
+  decision = self._decision()
+  self._screen(decision, "kept", "2020-01-02T10:00:00+00:00")
+  self._screen(decision, "discarded", "2020-01-03T10:00:00+00:00")
+  verdicts = screener_verdicts(decision)
+  assert set(verdicts) == {("llm", "m-1", False), ("agent", "agent-2", False)}
+  assert verdicts[("agent", "agent-2", False)]["status"] == "discarded"
+  assert verdicts[("llm", "m-1", False)]["origin"] == "decision"
+
+def test_a_reset_sets_aside_the_earlier_verdicts(self):
+  decision = self._decision()
+  self._screen(decision, "kept", "2020-01-02T10:00:00+00:00")
+  decision.resets.append({"at": "2020-01-03T00:00:00+00:00"})
+  assert screener_verdicts(decision) == {}
+
+def test_unknown_origin_is_counted_not_paired(self):
+  decision = self._decision()
+  self._screen(decision, "kept", "2020-01-02T10:00:00+00:00")
+  decision.screenings[0]["kind"] = None
+  assert set(screener_verdicts(decision)) == {("agent", "agent-2", False)}
+  assert unknown_origin_count([decision]) == 1
+
+def test_unnamed_screeners_of_one_kind_are_one(self):
+  decision = self._decision(source=ReviewSource.HUMAN,
+                            status=DecisionStatus.PENDING)
+  self._screen(decision, "kept", "2020-01-02T10:00:00+00:00", name=None)
+  self._screen(decision, "discarded", "2020-01-03T10:00:00+00:00",
+               name=None)
+  verdicts = screener_verdicts(decision)
+  assert list(verdicts) == [("agent", None, False)]
+  assert verdicts[("agent", None, False)]["status"] == "discarded"
+  assert ScreenerProfile(("agent", None, False)).label == "unnamed agent"
+@
+
+A snapshot of a confirmed classifier call is called the
+human-confirmed decision, never a human screener, and the spec on the
+command line round-trips.  A model's second screen of its own decision
+is a screener apart from the snapshot of that decision: two
+identities, one pair, and the header says it is the same model, with
+both sides' prompt versions.
+
+<<screener verdicts test methods>>=
+def test_a_confirmed_snapshot_is_the_human_confirmed_decision(self):
+  decision = self._decision(source=ReviewSource.LLM_REVIEWED)
+  record_human_decision(decision, "tui", by="the author",
+                        at="2020-01-01T12:00:00+00:00")
+  self._screen(decision, "kept", "2020-01-02T10:00:00+00:00")
+  profiles = screener_profiles([screener_verdicts(decision)])
+  assert profiles[("human", "the author", False)].label == (
+    "the human-confirmed decision (by the author; proposed by llm m-1)")
+  assert profiles[("agent", "agent-2", False)].label == "agent (agent-2)"
+
+def test_specs_round_trip(self):
+  for screener in (("llm", "m:1", False), ("agent", None, False),
+                   ("human", "Ann", False), ("llm", "m-1", True)):
+    assert parse_screener_spec(screener_spec(screener)) == screener
+  for bad in ("robot:x", "agent:", ""):
+    with pytest.raises(ValueError):
+      parse_screener_spec(bad)
+
+def test_a_pair_splits_before_a_kind(self):
+  doe = ("human", "Doe, Jane", False)
+  agent = ("agent", "a-2", False)
+  assert parse_screener_pair("human:Doe, Jane,agent:a-2") == (doe, agent)
+  assert parse_screener_pair("agent,human:Doe, Jane") == (
+    ("agent", None, False), doe)
+  assert parse_screener_pair("llm+second:m,llm:m") == (
+    ("llm", "m", True), ("llm", "m", False))
+  for bad in ("agent:a-2", "agent:a-2,agent:a-2", "agent,robot:x",
+              "agent:x,agent:y,human"):
+    with pytest.raises(ValueError):
+      parse_screener_pair(bad)
+
+def test_the_header_prints_what_pair_accepts(self):
+  doe = ScreenerProfile(("human", "Doe, Jane", False))
+  unnamed = ScreenerProfile(("agent", None, False))
+  header = pair_header(doe, unnamed, 0)[0]
+  assert header == "Pair --pair 'human:Doe, Jane,agent'"
+  value = header.split("--pair ", 1)[1]
+  import shlex
+  [unquoted] = shlex.split(value)
+  assert parse_screener_pair(unquoted) == (doe.screener, unnamed.screener)
+
+def test_a_same_model_second_screen_is_a_screener_of_its_own(self):
+  decision = self._decision(llm_prompt_version="0123456789abcdef")
+  record_screening(decision, new_screening(
+    kind="llm", name="m-1", status="kept", tags=["t"],
+    recorded_at="2020-01-02T10:00:00+00:00", prompt_version="fedcba98",
+    blind=True, blind_basis="prompt", via="classify"))
+  verdicts = screener_verdicts(decision)
+  assert set(verdicts) == {("llm", "m-1", False), ("llm", "m-1", True)}
+  assert screener_pairs([verdicts]) == [
+    (("llm", "m-1", False), ("llm", "m-1", True))]
+  profiles = screener_profiles([verdicts])
+  first, second = (profiles[("llm", "m-1", s)] for s in (False, True))
+  assert second.label == "llm (m-1), second screen"
+  assert pair_header(first, second, 1) == [
+    "Pair --pair llm:m-1,llm+second:m-1",
+    "  A = llm (m-1); B = llm (m-1), second screen",
+    "  1 records screened by A, 1 by B, 1 by both",
+    "  same model: m-1",
+    "  prompt versions of A: 0123456789abcdef",
+    "  prompt versions of B: fedcba98",
+  ]
+  [line, _] = ScreeningOverview.of([decision]).lines()
+  assert "vs llm (m-1), second screen (same model): 1 records" in line
+@
+
+
+\section{The agreement table}
+\label{sec:agreement-table}
+
+Two screeners who both screened the same $N$ records, each kept or
+discarded, give a two-by-two table: $x_{11}$ records both kept,
+$x_{12}$ kept by the first and discarded by the second, $x_{21}$ the
+other way round, and $x_{22}$ discarded by both.  Everything this
+section prints is computed from these four counts, and the counts are
+printed too, so that a reader can compute any other measure from them.
+What is printed, and what is not, follows what the sources read for the
+design of the issue back; each is cited here with the part read.
+
+\paragraph{Observed agreement.}
+The share of records on which the two agree,
+$P_o = (x_{11} + x_{22})/N$ (Shankar and Bangdiwala,
+\enquote{Observer agreement paradoxes in 2x2 tables: comparison of
+agreement measures}, \emph{BMC Medical Research Methodology} 14:100,
+2014, \url{https://doi.org/10.1186/1471-2288-14-100}, Background).  It
+is the plainest measure and the one a reader can check by hand, but it
+says little on its own when one verdict is rare: \enquote{assume that
+you have
+10 relevant records per 1000 records.  You could then reach a raw
+agreement of 99\% simply by excluding all records} (Vembye, Christensen,
+M\o lgaard and Schytt, \enquote{Generative pretrained transformer models
+can function as highly reliable second screeners of titles and abstracts
+in systematic reviews: A proof of concept and common guidelines},
+\emph{Psychological Methods}, 2025,
+\url{https://doi.org/10.1037/met0000769}, p.~9 of the accepted
+manuscript).
+
+\paragraph{Positive and negative agreement.}
+So the agreement on the two verdicts is also given apart, as the
+proportions of specific agreement: positive agreement
+$P_{\mathrm{pos}} = a / [(A^+ + B^+)/2]$ and negative agreement
+$P_{\mathrm{neg}} = d / [(A^- + B^-)/2]$, where $a$ counts the records
+both rated positive, $d$ those both rated negative, and $A^+$, $B^+$
+each rater's positive count (Tan, Yeh, Adusumilli and Travis,
+\enquote{Quantifying Interrater Agreement and Reliability Between
+Thoracic Pathologists: Paradoxical Behavior of Cohen's Kappa in the
+Presence of a High Prevalence of the Histopathologic Feature in Lung
+Cancer}, \emph{JTO Clinical and Research Reports} 5(1):100618, 2024,
+\url{https://doi.org/10.1016/j.jtocrr.2023.100618}, Methods).  With
+\enquote{kept} as positive, $a = x_{11}$, $d = x_{22}$,
+$A^+ + B^+ = 2x_{11} + x_{12} + x_{21}$ and $A^- + B^- = 2x_{22} +
+x_{12} + x_{21}$, so
+\[
+  P_{\mathrm{pos}} = \frac{2x_{11}}{2x_{11} + x_{12} + x_{21}},
+  \qquad
+  P_{\mathrm{neg}} = \frac{2x_{22}}{2x_{22} + x_{12} + x_{21}}.
+\]
+Positive agreement leaves out the records both screeners discarded, so
+it answers how far the two agree on what to keep.  The pair goes back
+to Cicchetti and Feinstein, who suggested two separate indexes
+\enquote{to quantify agreement in the positive and negative
+decisions}; their paper was not
+read, so this is a citation of a citation, through Shankar and
+Bangdiwala (Background).  A proportion with nothing to count, when
+neither screener kept a record, is undefined, not zero.
+
+\paragraph{Cohen's kappa.}
+Kappa compares the observed agreement with the agreement chance would
+give: $\kappa = (P_o - P_e)/(1 - P_e)$, with $P_e$ the chance-expected
+agreement (Shankar and Bangdiwala, Background).  For two categories,
+Vach and Gerke write $P_e$ with the two screeners' shares of positive
+verdicts $\pi_A$ and $\pi_B$ as $e = \pi_A\pi_B + (1 - \pi_A)(1 -
+\pi_B)$ (Vach and Gerke, \enquote{Gwet's AC1 is not a substitute for
+Cohen's kappa -- A comparison of basic properties}, \emph{MethodsX}
+10:102212, 2023, \url{https://doi.org/10.1016/j.mex.2023.102212},
+Methods), here $\pi_A = (x_{11} + x_{12})/N$ and $\pi_B = (x_{11} +
+x_{21})/N$.
+
+Kappa's value depends on how common each verdict is: its
+\enquote{behavior is subject to changes in prevalence}, and with
+imbalanced marginals it can be low although the observed agreement is
+high (Shankar and Bangdiwala, Background and Results; their scenario~3,
+$x = 90, 5, 5, 0$, has $P_o = 0.90$ and $\kappa = -0.05$).  Whether
+that is a fault is disputed.  Shankar and Bangdiwala recommend another
+measure, their B-statistic (Discussion and Conclusions), and
+Wongpakaran and co-authors prefer Gwet's AC1 (cited below); Vach and
+Gerke answer that for a fixed agreement rate kappa falls as the
+prevalence moves from 0.5, \enquote{which is in accordance with the aim
+to take into account that high agreement rates get more likely}
+(Discussion), and that Gwet's AC1, proposed as an alternative to kappa
+and \enquote{becoming increasingly popular}, \enquote{should not be
+seen as a substitute for Cohen's kappa} (Abstract).  Scholar prints kappa,
+whose dependence on prevalence Vach and Gerke defend as intended, but
+never alone: with the
+counts, the specific agreement above, and two indices that show the
+imbalance.  The \emph{prevalence index} $\mathrm{PI} = (x_{11} -
+x_{22})/N$ and the \emph{bias index} $\mathrm{BI} = (x_{12} -
+x_{21})/N$ were proposed by Byrt and co-authors to be reported with
+kappa (Shankar and Bangdiwala, Background and Methods; Byrt's paper
+was not read, so this too is a citation of a citation).  AC1, the
+prevalence- and bias-adjusted kappa (which is $2P_o - 1$, a rescaled
+observed agreement) and the other alternatives are not computed.
+
+Kappa has no value when $P_e = 1$: then both screeners gave a single
+verdict throughout, the same one, and the formula divides by zero.
+When only one of them did, the formula gives exactly 0 whatever the
+agreement: with $\pi_A = 1$, say, $P_o = \pi_B = P_e$.  A 0 there
+would read as agreement no better than chance, while it only says that
+one screener never used one of the verdicts.  Where a marginal count
+was zero, in their data with two raters in full agreement, Wongpakaran
+and co-authors report that kappa \enquote{gave a `0' value} and that
+SPSS could not compute it at all (Wongpakaran, Wongpakaran, Wedding
+and Gwet, \enquote{A comparison of Cohen's Kappa and Gwet's AC1 when
+calculating inter-rater reliability coefficients: a study conducted
+with personality disorder
+samples}, \emph{BMC Medical Research Methodology} 13:61, 2013,
+\url{https://doi.org/10.1186/1471-2288-13-61}, Results).  So Scholar
+calls kappa undefined whenever a screener gave only one verdict, and
+says which case it is; it never prints 0 for it.
+
+\paragraph{What is not printed.}
+Kappa gets no verbal label (\enquote{moderate}, \enquote{good}): the
+published scales disagree, Landis and Koch, Altman and Fleiss drawing
+different cut points and words (Wongpakaran and co-authors, Table~7:
+0.41--0.60 is \enquote{Moderate} for Landis and Koch and for Altman,
+while Fleiss's 0.40--0.75 is \enquote{Intermediate to Good}), and no
+source read validates any of them.  Kappa gets no interval either: the
+one source read that gives an analytical interval, for the two-by-two
+case only (Reichenheim, \enquote{Confidence intervals for the kappa
+statistic}, \emph{The Stata Journal} 4(4):421--428, 2004, p.~421),
+was found in the design of the issue not to reproduce its own worked
+example (p.~424) with its equation~(1) as printed, so it is left out
+until the original it names, by Fleiss, Cohen and Everitt, is read.  No
+interval is given for the specific agreement, for which no source was
+read.  And for more than two categories only the table and the observed
+agreement are given: the sources read state kappa for two categories
+only.
+
+[[AgreementTable]] holds a pair's counts for one question, in a square
+table: row $i$, column $j$ of [[cells]] counts the records the first
+screener put in the $i$th category and the second in the $j$th, with
+the categories in
+[[labels]] order, the positive one first.  Everything else is computed
+from the cells when asked, so a table is never out of step with its
+counts.  [[without_category]] counts the records both screened that
+this question could not use (below), and [[interval]] holds the
+interval of the observed agreement, which only a sample gets
+(\cref{sec:agreement-samples}).
+
+<<agreement table>>=
+@dataclass(frozen=True)
+class AgreementTable:
+    """Two screeners' verdicts of the same records, counted.
+
+    `cells[i][j]` counts the records screener `a` put in `labels[i]`
+    and screener `b` in `labels[j]`; for two labels the first is the
+    positive verdict (kept, bearing). `without_category` counts the
+    records both screened that the question could not use; `interval`
+    is the 95% interval of the observed agreement, for a sample only.
+    """
+
+    a: Screener
+    b: Screener
+    question: str
+    labels: tuple
+    cells: tuple
+    without_category: int = 0
+    interval: tuple | None = None
+
+    <<agreement table measures>>
+@
+
+The observed agreement needs only the diagonal.
+
+<<agreement table measures>>=
+@property
+def n(self) -> int:
+    """How many records both screeners judged on this question."""
+    return sum(sum(row) for row in self.cells)
+
+@property
+def agreeing(self) -> int:
+    """How many of them the two put in the same category."""
+    return sum(self.cells[i][i] for i in range(len(self.labels)))
+
+@property
+def observed(self) -> float | None:
+    """The observed agreement, or None without records."""
+    return self.agreeing / self.n if self.n else None
+
+@property
+def is_binary(self) -> bool:
+    """Whether the table is two by two (the only case with kappa)."""
+    return len(self.labels) == 2
+@
+
+The specific agreement follows the formulas above.  The indices are
+signed, as defined: a negative prevalence index says that the negative
+verdict was the more common one.
+
+<<agreement table measures>>=
+def _specific(self, both: int) -> float | None:
+    if not self.is_binary:
+        return None
+    off_diagonal = self.cells[0][1] + self.cells[1][0]
+    denominator = 2 * both + off_diagonal
+    return 2 * both / denominator if denominator else None
+
+@property
+def positive_agreement(self) -> float | None:
+    """Positive agreement; None if undefined or not two by two."""
+    return self._specific(self.cells[0][0]) if self.is_binary else None
+
+@property
+def negative_agreement(self) -> float | None:
+    """Negative agreement; None if undefined or not two by two."""
+    return self._specific(self.cells[1][1]) if self.is_binary else None
+
+@property
+def prevalence_index(self) -> float | None:
+    """(x11 - x22) / N; None without records or not two by two."""
+    if not self.is_binary or not self.n:
+        return None
+    return (self.cells[0][0] - self.cells[1][1]) / self.n
+
+@property
+def bias_index(self) -> float | None:
+    """(x12 - x21) / N; None without records or not two by two."""
+    if not self.is_binary or not self.n:
+        return None
+    return (self.cells[0][1] - self.cells[1][0]) / self.n
+@
+
+Kappa is computed only when both screeners used both verdicts; the
+reason it is not is a sentence the text prints as it is.
+
+<<agreement table measures>>=
+@property
+def kappa_undefined_reason(self) -> str | None:
+    """Why kappa has no value, or None when it has one."""
+    if not self.is_binary:
+        return "not computed for more than two categories"
+    if not self.n:
+        return "no records screened by both"
+    (x11, x12), (x21, x22) = self.cells
+    one_verdict = [
+        positives in (0, self.n) for positives in (x11 + x12, x11 + x21)
+    ]
+    if all(one_verdict):
+        return "both screeners gave only one verdict"
+    if any(one_verdict):
+        return "one screener gave only one verdict"
+    return None
+
+@property
+def chance_agreement(self) -> float | None:
+    """The chance-expected agreement P_e, two by two only."""
+    if not self.is_binary or not self.n:
+        return None
+    (x11, x12), (x21, _) = self.cells
+    pi_a, pi_b = (x11 + x12) / self.n, (x11 + x21) / self.n
+    return pi_a * pi_b + (1 - pi_a) * (1 - pi_b)
+
+@property
+def kappa(self) -> float | None:
+    """Cohen's kappa, or None when `kappa_undefined_reason` says why."""
+    if self.kappa_undefined_reason is not None:
+        return None
+    expected = self.chance_agreement
+    return (self.observed - expected) / (1 - expected)
+@
+
+The table is checked against the sources' own numbers.  Shankar and
+Bangdiwala's scenarios 1 to 3 (their Table~2 for the cells and the
+indices, Table~3 for $P_o$, $P_e$ and kappa, all to two decimals, three
+for $P_e = 0.905$) cover a balanced table and the two imbalanced ones of
+the first paradox; their bias index is $(x_{12} - x_{21})/N$ with the
+cells in our order (scenario~1: $0.03$).  Tan and co-authors' lepidic
+and acinar patterns (Results: 50 sections, $P_{\mathrm{pos}} = 18 /
+22.5$ and $P_{\mathrm{neg}} = 23 / 27.5$; $41/44$ and $3/6$) check the
+specific agreement; the split of their disagreements between the two
+off-diagonal cells is not given and does not matter.  Then the undefined
+cases.
+
+<<test functions>>=
+class TestAgreementTable:
+  """The measures against the sources' worked numbers (#253)."""
+
+  <<agreement table test methods>>
+
+<<agreement table test methods>>=
+def _table(self, x11, x12, x21, x22):
+  return AgreementTable(
+    ("llm", "m", False), ("agent", "a", False), "status",
+                        ("kept", "discarded"), ((x11, x12), (x21, x22)))
+
+def test_shankar_and_bangdiwala_scenarios(self):
+  for cells, (po, pe, kappa, bi, pi) in {
+    (40, 9, 6, 45): (0.85, 0.50, 0.70, 0.03, -0.05),
+    (80, 10, 5, 5): (0.85, 0.78, 0.32, 0.05, 0.75),
+    (90, 5, 5, 0): (0.90, 0.905, -0.05, 0.0, 0.90),
+    (45, 15, 25, 15): (0.60, 0.54, 0.13, -0.10, 0.30),
+  }.items():
+    table = self._table(*cells)
+    assert table.n == 100
+    assert table.observed == pytest.approx(po)
+    assert round(table.chance_agreement, 3) == pytest.approx(pe, abs=5e-3)
+    assert round(table.kappa, 2) == pytest.approx(kappa)
+    assert table.bias_index == pytest.approx(bi)
+    assert table.prevalence_index == pytest.approx(pi)
+
+def test_tan_specific_agreement(self):
+  lepidic = self._table(18, 5, 4, 23)
+  assert lepidic.positive_agreement == pytest.approx(18 / 22.5)
+  assert lepidic.negative_agreement == pytest.approx(23 / 27.5)
+  acinar = self._table(41, 6, 0, 3)
+  assert acinar.positive_agreement == pytest.approx(41 / 44)
+  assert acinar.negative_agreement == pytest.approx(3 / 6)
+@
+
+When a screener used one verdict only, kappa is undefined with the
+reason, never 0, although the formula would give 0; when nobody kept a
+record, positive agreement is undefined; and a four-category table has
+the observed agreement only.
+
+<<agreement table test methods>>=
+def test_one_verdict_leaves_kappa_undefined(self):
+  one = self._table(0, 0, 12, 88)
+  assert one.kappa is None
+  assert one.kappa_undefined_reason == "one screener gave only one verdict"
+  both = self._table(0, 0, 0, 100)
+  assert both.kappa is None
+  assert both.kappa_undefined_reason == (
+    "both screeners gave only one verdict")
+  assert both.positive_agreement is None
+  assert both.negative_agreement == 1.0
+
+def test_four_categories_have_observed_agreement_only(self):
+  cells = ((3, 1, 0, 0), (0, 2, 0, 0), (0, 0, 4, 1), (0, 0, 0, 9))
+  table = AgreementTable(
+    ("llm", "m", False), ("agent", "a", False), "category",
+                         tuple(AUDIT_CATEGORIES), cells)
+  assert table.observed == pytest.approx(18 / 20)
+  assert (table.kappa, table.positive_agreement,
+          table.prevalence_index) == (None, None, None)
+  assert table.kappa_undefined_reason == (
+    "not computed for more than two categories")
+@
+
+
+\section{Three questions over a set of records}
+\label{sec:agreement-questions}
+
+Two screeners can agree on more than kept or discarded, and a review
+that classifies its records asks two more questions of them.  Each
+question reads one value from a verdict:
+\begin{description}
+\item[ [[status]] ] kept or discarded, the verdict itself.
+\item[ [[bearing]] ] whether the record bears on the claim: its
+  category ([[audit_category]] of the tags, the rule of the audit table)
+  is one of those the audit table counts as bearing, [[supports-claim]]
+  and [[qualifies-claim]] ([[AUDIT_ORDER_BEARING]]), or one of the
+  others.  It is a two-category question, so kappa applies.
+\item[ [[category]] ] the category itself, one of the four in
+  [[AUDIT_CATEGORIES]]: a four-by-four table and its observed agreement.
+\end{description}
+A verdict without a category has no value for the last two questions:
+a human screening may carry none (\cref{sec:sessions-screen} in the CLI
+module), and old decisions have none.  A record whose verdict from
+either screener lacks a value drops out of that question and is
+counted as [[without_category]], so the text can say how many records
+the numbers leave out.
+
+<<agreement questions>>=
+QUESTIONS: dict[str, tuple] = {
+    "status": ("kept", "discarded"),
+    "bearing": ("bearing", "not bearing"),
+    "category": tuple(AUDIT_CATEGORIES),
+}
+
+
+def verdict_value(record: dict, question: str) -> str | None:
+    """What a verdict answers to `question` (`QUESTIONS`), or None."""
+    if question == "status":
+        return record.get("status")
+    category = audit_category(list(record.get("tags") or []))
+    if category is None or question == "category":
+        return category
+    if AUDIT_CATEGORIES[category] <= AUDIT_ORDER_BEARING:
+        return "bearing"
+    return "not bearing"
+@
+
+[[screening_agreement]] counts one pair's table over a set of records.
+A record is one decision: copies of one work kept apart under one id
+are counted as records each, as the per-decision CSV counts them, and
+the records of pooled sessions are counted side by side.  The records
+come as the maps [[screener_verdicts]] gives, computed once by the
+caller, since a report asks several questions of several pairs over the
+same records.
+
+<<agreement questions>>=
+def screening_agreement(
+    records: Iterable[dict[Screener, dict]],
+    a: Screener,
+    b: Screener,
+    question: str = "status",
+) -> AgreementTable:
+    """The table of screeners `a` and `b` on `question` over `records`.
+
+    `records` holds one `screener_verdicts` map per record; records
+    without a verdict of both screeners are left out, and those where
+    either verdict has no value for the question are counted in
+    `without_category`.
+    """
+    labels = QUESTIONS[question]
+    index = {label: i for i, label in enumerate(labels)}
+    cells = [[0] * len(labels) for _ in labels]
+    without = 0
+    for verdicts in records:
+        if a not in verdicts or b not in verdicts:
+            continue
+        row = index.get(verdict_value(verdicts[a], question))
+        column = index.get(verdict_value(verdicts[b], question))
+        if row is None or column is None:
+            without += 1
+            continue
+        cells[row][column] += 1
+    return AgreementTable(
+        a, b, question, labels, tuple(tuple(r) for r in cells), without
+    )
+@
+
+The pairs a set of records holds are every two screeners with at least
+one record in common, in a fixed order (by kind, as listed in
+[[SCREENING_KINDS]], then by name, the unnamed first), so that the same
+session always prints its pairs alike.  The snapshot's screener counts
+like any other: the decision's first verdict is one side of most pairs.
+
+<<agreement questions>>=
+def _screener_order(screener: Screener) -> tuple:
+    kind, name, second = screener
+    return (SCREENING_KINDS.index(kind), name is not None, name or "", second)
+
+
+def screener_pairs(
+    records: Iterable[dict[Screener, dict]],
+) -> list[tuple[Screener, Screener]]:
+    """Every pair of screeners with a record in common, in a fixed order."""
+    pairs: set = set()
+    for verdicts in records:
+        ordered = sorted(verdicts, key=_screener_order)
+        pairs.update(combinations(ordered, 2))
+    return sorted(
+        pairs, key=lambda p: (_screener_order(p[0]), _screener_order(p[1]))
+    )
+@
+
+Let's check the questions on three invented records screened by a
+classifier and an agent, plus one only the agent screened: the agent's
+verdict without a category drops out of the category questions and is
+counted, and the record only one screened is in no table.
+
+<<test functions>>=
+class TestScreeningAgreement:
+  """Counting a pair's table on each question (#253)."""
+
+  <<screening agreement test methods>>
+
+<<screening agreement test methods>>=
+def _verdicts(self, llm, agent):
+  def record(kind, name, verdict):
+    status, *tags = verdict
+    return {"kind": kind, "name": name, "status": status, "tags": tags,
+            "origin": "screen"}
+  verdicts = {}
+  if llm:
+    verdicts[("llm", "m-1", False)] = record("llm", "m-1", llm)
+  if agent:
+    verdicts[("agent", "a-2", False)] = record("agent", "a-2", agent)
+  return verdicts
+
+def test_status_bearing_and_category(self):
+  records = [
+    self._verdicts(("kept", "supports-claim"), ("kept", "qualifies-claim")),
+    self._verdicts(("discarded", "off-topic-false-hit"),
+                   ("kept", "adjacent-subtopic")),
+    self._verdicts(("discarded", "off-topic-false-hit"), ("discarded",)),
+    self._verdicts(None, ("kept", "supports-claim")),
+  ]
+  llm, agent = ("llm", "m-1", False), ("agent", "a-2", False)
+  status = screening_agreement(records, llm, agent, "status")
+  assert status.cells == ((1, 0), (1, 1))
+  bearing = screening_agreement(records, llm, agent, "bearing")
+  assert bearing.cells == ((1, 0), (0, 1))
+  assert bearing.without_category == 1
+  category = screening_agreement(records, llm, agent, "category")
+  assert category.n == 2 and category.agreeing == 0
+  assert category.cells[0][1] == 1 and category.cells[3][2] == 1
+  assert screener_pairs(records) == [(llm, agent)]
+@
+
+
+\section{Agreement over a sample}
+\label{sec:agreement-samples}
+
+Every number above describes the records the two screeners screened,
+and nothing more.  Those records are seldom a sample of anything
+Scholar can name: a second screener checks the classifier's discards,
+or the papers the author found doubtful, and the agreement over them
+says nothing about the records nobody checked twice.  So the text gives
+no interval for them, as the sampler gives none for a census
+(\cref{sec:llm-sample} in the LLM review module).
+
+A review sample drawn with [[llm sample]] is different: its papers were
+drawn at random from a named population, and the share of them on which
+the two screeners agree is a binomial proportion, agreeing records out
+of those drawn.  For it the text gives the 95\,\% modified Wilson
+interval of Brown, Cai and DasGupta, which the sample's own report
+already uses, for the reasons given there ([[modified_wilson_interval]],
+\cref{sec:llm-sample} in the LLM review module); it is the one interval
+the sources read back.  It covers the observed agreement only.
+
+Which papers count follows the sample's own report
+([[sample_reports]]), so that the two never describe different sets: a
+sample is stored in every session it pooled, and its papers are looked
+up by id in each; papers of sessions not given count as not found,
+unless their files can still be read ([[pooled_sample_sessions]]); and
+a paper reset to pending after the draw ([[reset_since_draw]]) no
+longer holds the decision the sample drew, so it is left out and
+counted apart.  A stratified sample is stored as one sample per
+confidence band, tied by a group id (\cref{sec:llm-sample-bands} in the
+LLM review module); asked for the group, the text gives one block per
+band and no line for the whole, since no estimator for a proportion of
+agreeing records over the bands was read.  A band taken whole (a
+census) gets no interval, as in the sample's report.
+
+The interval assumes that the agreement was observed on the drawn
+papers.  When some of them lack a verdict from one of the two
+screeners, or, for the category questions, a category, the records
+with both are the part some selection left, not a random sample, so the
+interval is withheld and the text says how many are missing.  The
+sample's own report does otherwise: it gives an interval over its
+reviewed part and says that it covers only that part.  There the
+missing papers wait for the one reviewer the sample was drawn for.
+Here a paper lacks a verdict because a screener chose not to screen
+it, or gave no category, and either choice may go with how hard the
+paper was to judge, which is what agreement measures; so the papers
+left would not stand for the drawn ones, and no caveat would make the
+interval theirs.  Papers
+reset since the draw or not found are counted apart and do not withhold
+it, as in the sample's own report.
+
+<<agreement samples>>=
+@dataclass
+class SampleBand:
+    """The papers of one stored sample (or band) and their verdicts."""
+
+    sample_id: str
+    criteria: dict
+    drawn_at: str
+    size: int
+    records: list = field(default_factory=list)
+    reset_since_draw: int = 0
+    not_found: int = 0
+
+    @property
+    def census(self) -> bool:
+        """Whether the band took its whole population."""
+        return bool(self.criteria.get("census"))
+
+    @property
+    def counted(self) -> int:
+        """The drawn papers found and not reset since the draw."""
+        return len(self.records)
+@
+
+[[sample_bands]] gathers the bands of the sample [[sample_id]] (a
+sample's id or a stratified sample's group id) from [[sessions]], which
+the caller has already completed with the pooled ones.  A sample stored
+twice in one session is read once there, as in the sample's report.
+
+<<agreement samples>>=
+def _belongs(sample, sample_id: str) -> bool:
+    stratum = sample.criteria.get("stratum")
+    return sample.sample_id == sample_id or (
+        isinstance(stratum, dict) and stratum.get("group") == sample_id
+    )
+
+
+def sample_bands(sessions, sample_id: str) -> list[SampleBand]:
+    """The bands of the stored sample `sample_id` over `sessions`.
+
+    One band for a plain sample, one per confidence band for the group
+    id of a stratified one, in band order; empty if no session holds it.
+    """
+    from scholar.llm_review import reset_since_draw
+
+    bands: dict[str, SampleBand] = {}
+    for session in sessions:
+        current = {get_paper_id(d.paper): d for d in session.decisions}
+        seen: set[str] = set()
+        for sample in session.llm_samples:
+            if not _belongs(sample, sample_id) or sample.sample_id in seen:
+                continue
+            seen.add(sample.sample_id)
+            band = bands.setdefault(sample.sample_id, SampleBand(
+                sample.sample_id, dict(sample.criteria), sample.drawn_at,
+                sample.size,
+            ))
+            for entry in sample.papers:
+                decision = current.get(entry.get("paper_id"))
+                if decision is None:
+                    band.not_found += 1
+                elif reset_since_draw(decision, sample.drawn_at):
+                    band.reset_since_draw += 1
+                else:
+                    band.records.append(screener_verdicts(decision))
+    for band in bands.values():
+        found = band.counted + band.not_found + band.reset_since_draw
+        band.not_found += max(0, band.size - found)
+    return sorted(
+        bands.values(),
+        key=lambda b: (b.criteria.get("stratum") or {}).get("band", 0),
+    )
+@
+
+[[band_agreement]] counts a pair's table over a band and adds the
+interval when it applies; [[interval_withheld]] says why it does not,
+in words the text prints.
+
+<<agreement samples>>=
+def interval_withheld(table: AgreementTable, band: SampleBand) -> str | None:
+    """Why `table` over `band` has no interval, or None when it has one."""
+    if band.census:
+        return "a census of its population, no interval"
+    missing = band.counted - table.n
+    if missing:
+        return (
+            f"no interval: {missing} of the {band.counted} sampled papers "
+            "lack a verdict or a category of one of the two screeners"
+        )
+    if not table.n:
+        return "no interval: no sampled paper screened by both"
+    return None
+
+
+def band_agreement(
+    band: SampleBand, a: Screener, b: Screener, question: str = "status"
+) -> AgreementTable:
+    """`screening_agreement` over `band`, with the interval if it applies."""
+    from dataclasses import replace
+
+    from scholar.llm_review import modified_wilson_interval
+
+    table = screening_agreement(band.records, a, b, question)
+    if interval_withheld(table, band) is not None:
+        return table
+    return replace(
+        table, interval=modified_wilson_interval(table.agreeing, table.n)
+    )
+@
+
+Let's check the sample's interval: on a sample whose every drawn paper
+two screeners screened, it is [[modified_wilson_interval]] of the
+agreeing papers; a paper reset since the draw is left out and counted;
+the papers of a session not given are counted as not found; one
+lacking the agent's verdict withholds the interval; a census gets
+none; and a stratified sample gives one band per stored band.
+
+<<test functions>>=
+class TestSampleAgreement:
+  """The interval over a stored random sample (#253)."""
+
+  <<sample agreement test methods>>
+
+<<sample agreement test methods>>=
+DRAWN = "2020-02-01T00:00:00+00:00"
+
+def _session(self, statuses, screened=None, criteria=None,
+             sample_id="s-1"):
+  decisions = []
+  for i, (machine, agent) in enumerate(statuses):
+    decision = ReviewDecision(
+      paper=Paper(title=f"T{i}", authors=["A"],
+                  doi=f"10.5555/agree-sample-{i}"),
+      provider="p", status=DecisionStatus(machine), tags=["t"],
+      source=ReviewSource.LLM_UNREVIEWED, llm_model="m-1",
+      llm_decided_at="2020-01-01T00:00:00+00:00")
+    if agent:
+      record_screening(decision, new_screening(
+        kind="agent", name="a-2", status=agent, tags=["t"],
+        recorded_at="2020-03-01T00:00:00+00:00"))
+    decisions.append(decision)
+  session = ReviewSession(query="q", providers=["p"],
+                          timestamp=datetime(2020, 1, 1),
+                          decisions=decisions)
+  session.llm_samples = [LLMSample(
+    sample_id=sample_id, seed=1, drawn_at=self.DRAWN,
+    criteria=dict(criteria or {}), sessions=["q"], population=100,
+    population_digest="d", size=len(decisions),
+    papers=[{"paper_id": d.paper.id, "status": d.status.value,
+             "source": "llm", "confidence": 0.9} for d in decisions])]
+  return session
+
+def test_the_interval_is_the_modified_wilson_interval(self):
+  from scholar.llm_review import modified_wilson_interval
+
+  session = self._session(
+    [("discarded", "discarded")] * 18 + [("discarded", "kept")] * 2)
+  [band] = sample_bands([session], "s-1")
+  table = band_agreement(band, ("llm", "m-1", False), ("agent", "a-2", False))
+  assert (table.n, table.agreeing) == (20, 18)
+  assert table.interval == modified_wilson_interval(18, 20)
+
+def test_reset_papers_are_left_out_and_counted(self):
+  session = self._session([("discarded", "discarded")] * 5)
+  session.decisions[0].resets.append({"at": "2020-02-02T00:00:00+00:00"})
+  [band] = sample_bands([session], "s-1")
+  assert (band.counted, band.reset_since_draw) == (4, 1)
+  table = band_agreement(band, ("llm", "m-1", False), ("agent", "a-2", False))
+  assert table.n == 4 and table.interval is not None
+
+def test_papers_of_sessions_not_given_are_not_found(self):
+  session = self._session([("discarded", "discarded")] * 3)
+  session.llm_samples[0].size = 5
+  [band] = sample_bands([session], "s-1")
+  assert (band.counted, band.not_found) == (3, 2)
+
+def test_a_missing_verdict_withholds_the_interval(self):
+  session = self._session([("discarded", "discarded")] * 4
+                          + [("discarded", None)])
+  [band] = sample_bands([session], "s-1")
+  table = band_agreement(band, ("llm", "m-1", False), ("agent", "a-2", False))
+  assert table.interval is None
+  assert interval_withheld(table, band).startswith(
+    "no interval: 1 of the 5 sampled papers")
+
+def test_a_census_has_no_interval(self):
+  session = self._session([("discarded", "discarded")] * 3,
+                          criteria={"census": True})
+  [band] = sample_bands([session], "s-1")
+  assert band_agreement(band, ("llm", "m-1", False),
+                        ("agent", "a-2", False)).interval is None
+
+def test_one_block_per_band(self):
+  first = self._session([("discarded", "discarded")] * 2,
+                        sample_id="g/band=1",
+                        criteria={"stratum": {"group": "g", "band": 1}})
+  second = self._session([("kept", "kept")] * 2, sample_id="g/band=0",
+                         criteria={"stratum": {"group": "g", "band": 0}})
+  first.llm_samples += second.llm_samples
+  first.decisions += second.decisions
+  bands = sample_bands([first], "g")
+  assert [b.sample_id for b in bands] == ["g/band=0", "g/band=1"]
+@
+
+
+\section{Conflicts and their resolution}
+\label{sec:agreement-conflicts}
+
+A conflict is a paper on which two screeners disagree, read from their
+latest counted verdicts as above.  Two kinds are kept apart, because
+they ask different things of the adjudicator:
+\begin{description}
+\item[A status conflict] one kept the paper and the other discarded
+  it.  The outcome, kept or discarded, depends on how it is settled.
+\item[A category conflict] both kept, or both discarded, but they put
+  the paper in different categories (both gave one).  The outcome's
+  status stands either way; the category changes what the audit table
+  says of the paper.
+\end{description}
+A verdict without a category is never in a category conflict: there is
+nothing to disagree with.  A paper with three screeners can be in
+several conflicts, one per pair that disagrees.
+
+<<agreement conflicts>>=
+@dataclass(frozen=True)
+class Conflict:
+    """Two screeners' disagreeing verdicts of one paper."""
+
+    a: Screener
+    b: Screener
+    kind: str  # "status" or "category"
+    verdict_a: dict
+    verdict_b: dict
+
+
+def conflicts(
+    decision: ReviewDecision,
+    verdicts: dict[Screener, dict] | None = None,
+) -> list[Conflict]:
+    """The status and category conflicts among `decision`'s screeners.
+
+    `verdicts` is `screener_verdicts(decision)` when the caller has it.
+    """
+    if verdicts is None:
+        verdicts = screener_verdicts(decision)
+    found = []
+    for a, b in combinations(sorted(verdicts, key=_screener_order), 2):
+        first, second = verdicts[a], verdicts[b]
+        if first.get("status") != second.get("status"):
+            found.append(Conflict(a, b, "status", first, second))
+            continue
+        categories = (
+            verdict_value(first, "category"),
+            verdict_value(second, "category"),
+        )
+        if None not in categories and categories[0] != categories[1]:
+            found.append(Conflict(a, b, "category", first, second))
+    return found
+@
+
+\paragraph{When a conflict is resolved.}
+Nothing new is stored when a conflict is settled.  The decision is the
+adjudicated outcome, the screenings are what the adjudicator had to
+weigh, and the human's record on the decision
+(\cref{sec:human-review-record} in the review module) says who decided
+and when.  So a conflict counts as resolved when a human has decided
+the paper after the screenings: the decision is decided, its source is
+not one that waits for a human ([[is_unreviewed]]), and the human's
+record is not older than the latest counted screening of the paper.  A
+human decision made before the second screening does not resolve it:
+that human never saw the second verdict, and the conflict stays open
+until a human decides again (in the TUI, or with [[sessions decide
+--source human]]).  The latest screening, not only the conflicting
+pair's, is the bar, so a third verdict recorded after the human
+decided opens the question again.  Decisions made before the human's
+record was kept have none and stay unresolved: Scholar cannot tell
+whether their human saw the screenings.
+
+<<agreement conflicts>>=
+def conflict_resolved(decision: ReviewDecision) -> bool:
+    """Whether a human decided `decision` after its latest screening."""
+    if not decision.is_decided or decision.source.is_unreviewed:
+        return False
+    decided_at = decision.human_decided_at
+    if not decided_at:
+        return False
+    latest = max(
+        (str(r.get("recorded_at") or "") for r in counted_screenings(decision)),
+        default="",
+    )
+    return not _iso_after(latest, decided_at)
+@
+
+How a resolved conflict came out is the outcome's value compared with
+each side's: equal to the first screener's verdict, to the second's, or
+to neither.  For a status conflict a decided outcome always equals one
+side, since there are two verdicts; for a category conflict the
+adjudicator may choose a third category, or none.
+
+<<agreement conflicts>>=
+def conflict_outcome(decision: ReviewDecision, conflict: Conflict) -> str:
+    """`a`, `b` or `neither`: which side's verdict the outcome took."""
+    question = conflict.kind
+    outcome = (
+        decision.status.value
+        if question == "status"
+        else audit_category(list(decision.tags))
+    )
+    if outcome == verdict_value(conflict.verdict_a, question):
+        return "a"
+    if outcome == verdict_value(conflict.verdict_b, question):
+        return "b"
+    return "neither"
+@
+
+Let's check both kinds on one paper with three screeners, and that
+such a paper is counted once, as a status conflict; the resolution
+rule against the decision's status and source and against the time the
+latest screening was recorded (not the time its verdict was made); and
+the outcome of a resolved conflict.
+
+<<test functions>>=
+class TestConflicts:
+  """Status and category conflicts and their resolution (#253)."""
+
+  <<conflicts test methods>>
+
+<<conflicts test methods>>=
+def _decision(self):
+  decision = ReviewDecision(
+    paper=Paper(title="C", authors=["A"], doi="10.5555/conflict-1"),
+    provider="p", status=DecisionStatus.DISCARDED,
+    tags=["off-topic-false-hit"], source=ReviewSource.LLM_UNREVIEWED,
+    llm_model="m-1", llm_decided_at="2020-01-01T00:00:00+00:00")
+  for name, status, tag in (("a-2", "kept", "adjacent-subtopic"),
+                            ("a-3", "discarded", "adjacent-subtopic")):
+    record_screening(decision, new_screening(
+      kind="agent", name=name, status=status, tags=[tag],
+      recorded_at="2020-01-02T00:00:00+00:00"))
+  return decision
+
+def test_status_and_category_conflicts(self):
+  found = {(c.a, c.b): c.kind for c in conflicts(self._decision())}
+  assert found == {
+    (("llm", "m-1", False), ("agent", "a-2", False)): "status",
+    (("llm", "m-1", False), ("agent", "a-3", False)): "category",
+    (("agent", "a-2", False), ("agent", "a-3", False)): "status",
+  }
+
+def test_a_missing_category_is_no_conflict(self):
+  decision = self._decision()
+  decision.screenings[-1]["tags"] = []
+  kinds = [c.kind for c in conflicts(decision)]
+  assert kinds == ["status", "status"]
+
+def test_resolved_only_by_a_human_after_the_screenings(self):
+  decision = self._decision()
+  assert not conflict_resolved(decision)
+  decision.source = ReviewSource.HUMAN
+  record_human_decision(decision, "decide",
+                        at="2020-01-01T12:00:00+00:00")
+  assert not conflict_resolved(decision)
+  record_human_decision(decision, "decide",
+                        at="2020-01-03T00:00:00+00:00")
+  assert conflict_resolved(decision)
+  decision.source = ReviewSource.AGENT_UNREVIEWED
+  assert not conflict_resolved(decision)
+  decision.source = ReviewSource.HUMAN
+  decision.status = DecisionStatus.PENDING
+  assert not conflict_resolved(decision)
+  decision.status = DecisionStatus.DISCARDED
+  decision.status = DecisionStatus.KEPT
+  status = [c for c in conflicts(decision) if c.kind == "status"]
+  assert [conflict_outcome(decision, c) for c in status] == ["b", "a"]
+
+def test_a_paper_with_both_kinds_counts_as_status(self):
+  decision = self._decision()
+  counts = conflict_counts([(decision, conflicts(decision), False)])
+  assert counts == {"status": 1, "status_resolved": 0, "category_only": 0}
+  assert conflict_counts_line(counts) == (
+    "Screening conflicts: 1 status (0 resolved by a human), 0 category "
+    "only")
+
+def test_the_bar_is_when_the_screening_was_recorded(self):
+  decision = self._decision()
+  record_screening(decision, new_screening(
+    kind="agent", name="a-4", status="kept", tags=["adjacent-subtopic"],
+    at="2020-01-02T12:00:00+00:00",
+    recorded_at="2020-01-04T00:00:00+00:00"))
+  decision.source = ReviewSource.HUMAN
+  record_human_decision(decision, "decide",
+                        at="2020-01-03T00:00:00+00:00")
+  assert not conflict_resolved(decision)
+@
+
+
+\section{What the commands print}
+\label{sec:agreement-text}
+
+\paragraph{The block of a pair.}
+For each pair and question, the text prints the table with the
+screeners as rows and columns, then the measures, as in the design of
+the issue.  The screeners are called A and B in the table, and named
+once above it, so that two screeners of one kind are never confused.
+The block of the category question has the four-by-four table and the
+observed agreement only.  A question no record could answer (no
+categories on either side) prints one line saying so.
+
+After each two-by-two block the text adds two sentences, and no
+others: they are the only interpretation Scholar gives, each backed by
+the sources cited in \cref{sec:agreement-table}.  The first is
+arithmetic, true of every table: the $x_{22}$ records both screeners
+rejected count as agreement whatever happened to the others, so the
+observed agreement is at least $x_{22}/N$, which is why it says little
+when one verdict is rare (Vembye and co-authors, p.~9); and positive
+agreement leaves those records out (Tan and co-authors' formula).  It
+states the bound with the numbers rather than a judgement such as
+\enquote{high}: a table with $x_{22}$ above half of $N$ can still have
+an observed agreement near that half and a negative kappa.  The second
+says that for the same observed agreement kappa is lower the more one
+verdict dominates (Vach and Gerke, Discussion) and that it gets no
+verbal label (Wongpakaran and co-authors, Table~7).  For the bearing
+question the same sentences are said of bearing and not bearing.
+
+<<agreement text>>=
+VERDICT_WORDS: dict[str, tuple] = {
+    "status": ("kept", "discarded", "kept"),
+    "bearing": ("bearing", "not bearing", "judged bearing"),
+}
+QUESTION_TITLES: dict[str, str] = {
+    "status": "Kept/discarded",
+    "bearing": "Bearing on the claim (supports or qualifies) or not",
+    "category": "Category",
+}
+CATEGORY_SHORT: dict[str, str] = {
+    "supports-claim": "supports",
+    "qualifies-claim": "qualifies",
+    "adjacent-subtopic": "adjacent",
+    "off-topic-false-hit": "off-topic",
+}
+
+
+def interpretive_sentences(table: AgreementTable) -> list[str]:
+    """The two sentences printed after a two-by-two block."""
+    if not table.is_binary or not table.n:
+        return []
+    verb = VERDICT_WORDS[table.question][2]
+    negative_verb = "discarded" if table.question == "status" else (
+        "judged not bearing"
+    )
+    both, n = table.cells[1][1], table.n
+    return [
+        f"{both} of {n} records were {negative_verb} by both, so observed "
+        f"agreement is at least {both}/{n} ({_percent(both / n)}) "
+        "whatever the screeners did with the rest; positive agreement "
+        f"counts only records at least one screener {verb}.",
+        "For the same observed agreement, kappa is lower the more one "
+        "verdict dominates. No verbal label is given for kappa.",
+    ]
+@
+
+The numbers are formatted as in the design: the observed agreement as
+a percentage with one decimal, the others with two.  An undefined
+measure prints \enquote{undefined} with its reason, never a number.
+
+<<agreement text>>=
+def _number(value: float | None) -> str:
+    return "undefined" if value is None else f"{value:.2f}"
+
+
+def _percent(value: float | None) -> str:
+    return "undefined" if value is None else f"{100 * value:.1f} %"
+
+
+def _table_lines(table: AgreementTable) -> list[str]:
+    names = [
+        CATEGORY_SHORT.get(label, label) for label in table.labels
+    ]
+    row_width = max(len(f"A {n}") for n in names) + 2
+    heads = [f"B {n}" for n in names]
+    widths = [max(len(h), 5) for h in heads]
+    lines = [
+        " " * (row_width + 2)
+        + "  ".join(h.rjust(w) for h, w in zip(heads, widths))
+    ]
+    for name, row in zip(names, table.cells):
+        lines.append(
+            f"  {('A ' + name).ljust(row_width)}"
+            + "  ".join(str(c).rjust(w) for c, w in zip(row, widths))
+        )
+    return lines
+@
+
+[[agreement_block]] gives the lines of one table.  The interval of a
+sample, or the reason there is none, follows the observed agreement on
+its line.
+
+<<agreement text>>=
+def agreement_block(
+    table: AgreementTable, *, interval_note: str | None = None
+) -> list[str]:
+    """The lines `sessions agreement` prints for one pair and question."""
+    title = QUESTION_TITLES[table.question]
+    if not table.n:
+        return [
+            f"{title}: no record has a value from both screeners"
+            + (
+                f" ({table.without_category} without a category)"
+                if table.without_category else ""
+            )
+            + "."
+        ]
+    lines = [f"{title}, {table.n} records screened by both:"]
+    lines += _table_lines(table)
+    observed = f"  observed agreement  {_percent(table.observed)}"
+    if table.interval is not None:
+        low, high = table.interval
+        observed += f"  (95 % CI {100 * low:.1f}-{100 * high:.1f})"
+    elif interval_note:
+        observed += f"  ({interval_note})"
+    lines.append(observed)
+    if table.is_binary:
+        <<the measures of a two-by-two table>>
+    if table.without_category:
+        lines.append(
+            f"  {table.without_category} records without a category from "
+            "one or both screeners, not compared"
+        )
+    if table.is_binary:
+        lines += interpretive_sentences(table)
+    return lines
+@
+
+<<the measures of a two-by-two table>>=
+either = table.n - table.cells[1][1]
+positive_word = VERDICT_WORDS[table.question][2]
+lines.append(
+    f"  positive agreement  {_number(table.positive_agreement)}"
+    f"  (records either {positive_word}: {either})"
+)
+lines.append(f"  negative agreement  {_number(table.negative_agreement)}")
+if table.kappa is None:
+    lines.append(
+        f"  Cohen's kappa       undefined ({table.kappa_undefined_reason})"
+    )
+else:
+    lines.append(
+        f"  Cohen's kappa       {table.kappa:.2f}"
+        f"  (prevalence index {table.prevalence_index:.2f}, "
+        f"bias index {table.bias_index:.2f})"
+    )
+@
+
+The JSON gives the same numbers unrounded, with [[null]] where the text
+says \enquote{undefined}: the cells, $n$, every rate, kappa or
+[[kappa_undefined_reason]], and [[interval]] only for a sample.  The
+category question has no specific agreement, kappa or indices, so
+those keys are left out of it rather than given as [[null]], which
+would read as \enquote{undefined here}.
+
+<<agreement text>>=
+def screener_data(profile: ScreenerProfile) -> dict:
+    """A screener as JSON: kind, name, label, `--pair` form, counts."""
+    kind, name, second = profile.screener
+    return {
+        "kind": kind,
+        "name": name,
+        "second_screen": second,
+        "label": profile.label,
+        "spec": screener_spec(profile.screener),
+        "records": profile.records,
+        "human_confirmed": profile.confirmed,
+        "prompt_versions": sorted(profile.prompt_versions),
+    }
+
+
+def agreement_data(table: AgreementTable, *, sample: bool = False) -> dict:
+    """One table's numbers as JSON."""
+    data = {
+        "question": table.question,
+        "labels": list(table.labels),
+        "cells": [list(row) for row in table.cells],
+        "n": table.n,
+        "agreeing": table.agreeing,
+        "observed_agreement": table.observed,
+        "without_category": table.without_category,
+    }
+    if table.is_binary:
+        data.update(
+            positive_agreement=table.positive_agreement,
+            negative_agreement=table.negative_agreement,
+            kappa=table.kappa,
+            kappa_undefined_reason=table.kappa_undefined_reason,
+            prevalence_index=table.prevalence_index,
+            bias_index=table.bias_index,
+        )
+    if sample:
+        data["interval"] = (
+            list(table.interval) if table.interval is not None else None
+        )
+    return data
+@
+
+\paragraph{A pair's header.}
+Above a pair's blocks the text names the two screeners, with the form
+[[--pair]] takes, how many records each screened and how many both
+did (the design's edge case: a paper only one screened is in no table,
+and the reader should see how many there are), and the prompt versions
+of a classifier's verdicts.  When both are the same model (kind
+[[llm]] and one name: the model's first call and its second screen),
+the header says \enquote{same model} and lists the prompt versions of
+both sides, also when none was recorded: the two screens are not
+independent in the way two models' would be, and the prompt versions
+are what may tell the two runs apart.  The design of the issue decided
+to report such a pair, not to refuse it.
+
+<<agreement text>>=
+def pair_header(
+    a: ScreenerProfile, b: ScreenerProfile, both: int
+) -> list[str]:
+    """The lines naming a pair above its blocks."""
+    lines = [
+        "Pair --pair " + shlex.quote(
+            f"{screener_spec(a.screener)},{screener_spec(b.screener)}"
+        ),
+        f"  A = {a.label}; B = {b.label}",
+        f"  {a.records} records screened by A, {b.records} by B, "
+        f"{both} by both",
+    ]
+    same = same_model(a.screener, b.screener)
+    if same:
+        lines.append(f"  same model: {a.screener[1]}")
+    for side, profile in (("A", a), ("B", b)):
+        if profile.prompt_versions or same:
+            lines.append(
+                f"  prompt versions of {side}: "
+                + (", ".join(sorted(profile.prompt_versions))
+                   or "none recorded")
+            )
+    return lines
+
+
+def same_model(a: Screener, b: Screener) -> bool:
+    """Whether two screeners are one classifier model (kind llm, one name)."""
+    return a[0] == b[0] == "llm" and a[1] is not None and a[1] == b[1]
+
+
+def records_in_common(records, a: Screener, b: Screener) -> int:
+    """How many of `records` both screeners screened."""
+    return sum(1 for v in records if a in v and b in v)
+@
+
+\paragraph{The summary for [[sessions show]].}
+[[sessions show]] prints every paper of a session, which is slow on a
+large one (\url{https://github.com/dbosk/scholarcli/issues/273}), so
+the double screen adds a few lines only, computed in one pass:
+one line per pair with the kept/discarded numbers and the pair's
+status conflicts, then one line counting the papers in conflict.  A
+paper counts as in a status conflict when any pair disagrees on its
+status, and as category only when its only conflicts are of category.
+A session without screenings gets no line and no JSON key, so the
+display of every other session stays as it was.
+
+The papers in conflict are counted one way wherever they are counted
+([[conflict_counts]], used by [[sessions show]] and [[sessions
+conflicts]]): a paper is in a status conflict when any pair disagrees
+on its status, and \enquote{category only} when all its conflicts are
+of category, so no paper is counted twice.
+
+<<agreement text>>=
+def conflict_counts(entries) -> dict:
+    """Count `(decision, conflicts, resolved)` entries by kind.
+
+    `status`: papers with a status conflict, `status_resolved` of them
+    resolved; `category_only`: papers whose conflicts are all of category.
+    """
+    status = [resolved for _, found, resolved in entries
+              if any(c.kind == "status" for c in found)]
+    category = sum(1 for _, found, _ in entries
+                   if all(c.kind == "category" for c in found))
+    return {"status": len(status), "status_resolved": sum(status),
+            "category_only": category}
+
+
+def conflict_counts_line(counts: dict) -> str:
+    """The line that counts the papers in conflict."""
+    return (
+        f"Screening conflicts: {counts['status']} status "
+        f"({counts['status_resolved']} resolved by a human), "
+        f"{counts['category_only']} category only"
+    )
+@
+
+[[ScreeningOverview]] holds that pass: the verdicts of every decision,
+the screeners' profiles, the pairs, and the conflicts of each decision
+with whether it is resolved.
+
+<<agreement text>>=
+@dataclass
+class ScreeningOverview:
+    """The double screen of a set of decisions, computed once."""
+
+    decisions: list
+    verdicts: list
+    profiles: dict
+    pairs: list
+    conflicts: list  # (decision, [Conflict], resolved) per decision
+    unknown_origin: int
+
+    @classmethod
+    def of(cls, decisions) -> "ScreeningOverview | None":
+        """The overview of `decisions`, or None if none has screenings."""
+        screened = [d for d in decisions if d.screenings]
+        if not screened:
+            return None
+        verdicts = [screener_verdicts(d) for d in screened]
+        found = []
+        for decision, held in zip(screened, verdicts):
+            listed = conflicts(decision, held)
+            if listed:
+                found.append(
+                    (decision, listed, conflict_resolved(decision))
+                )
+        return cls(
+            screened, verdicts, screener_profiles(verdicts),
+            screener_pairs(verdicts), found,
+            unknown_origin_count(screened),
+        )
+
+    <<screening overview methods>>
+@
+
+Per pair the line gives the records both screened, the observed
+agreement, kappa (or why there is none) and the pair's status conflicts
+with how many are resolved, as the design's example has it.
+
+<<screening overview methods>>=
+def pair_conflicts(self, a, b, kind: str = "status") -> tuple[int, int]:
+    """How many papers pair (a, b) conflicts on, and how many resolved."""
+    hits = [
+        resolved
+        for _, listed, resolved in self.conflicts
+        if any(c.kind == kind and (c.a, c.b) == (a, b) for c in listed)
+    ]
+    return len(hits), sum(hits)
+
+def conflict_counts(self) -> dict:
+    """Papers in a status conflict (and resolved), and category only."""
+    return conflict_counts(self.conflicts)
+
+def lines(self) -> list[str]:
+    """The lines `sessions show` prints."""
+    lines = []
+    for a, b in self.pairs:
+        table = screening_agreement(self.verdicts, a, b, "status")
+        kappa = (
+            f"kappa {table.kappa:.2f} (prevalence index "
+            f"{table.prevalence_index:.2f}, bias index "
+            f"{table.bias_index:.2f})"
+            if table.kappa is not None
+            else f"kappa undefined ({table.kappa_undefined_reason})"
+        )
+        count, resolved = self.pair_conflicts(a, b)
+        same = " (same model)" if same_model(a, b) else ""
+        lines.append(
+            f"Double screening: {self.profiles[a].label} vs "
+            f"{self.profiles[b].label}{same}: {table.n} records, "
+            "kept/discarded "
+            f"agreement {_percent(table.observed)}, {kappa}; {count} "
+            f"status conflicts ({resolved} resolved)"
+        )
+    if self.pairs:
+        lines.append(conflict_counts_line(self.conflict_counts()))
+    if self.unknown_origin:
+        lines.append(
+            f"{self.unknown_origin} verdict(s) of unknown origin not "
+            "compared"
+        )
+    return lines
+
+def data(self) -> dict:
+    """The numbers of `lines` as JSON."""
+    pairs = []
+    for a, b in self.pairs:
+        count, resolved = self.pair_conflicts(a, b)
+        pairs.append({
+            "a": screener_data(self.profiles[a]),
+            "b": screener_data(self.profiles[b]),
+            "status": agreement_data(
+                screening_agreement(self.verdicts, a, b, "status")
+            ),
+            "status_conflicts": count,
+            "status_conflicts_resolved": resolved,
+        })
+    return {"pairs": pairs, "conflicts": self.conflict_counts(),
+            "unknown_origin": self.unknown_origin}
+@
+
+Let's check the summary on a session of invented records: two papers
+screened twice, one in a status conflict that a human resolved after
+the screening; the lines name the pair, the agreement and the
+conflicts, and a session without screenings has no overview.
+
+<<test functions>>=
+class TestScreeningOverview:
+  """The lines `sessions show` adds (#253)."""
+
+  <<screening overview test methods>>
+
+<<screening overview test methods>>=
+def _decision(self, i, agent_status):
+  decision = ReviewDecision(
+    paper=Paper(title=f"O{i}", authors=["A"], doi=f"10.5555/overview-{i}"),
+    provider="p", status=DecisionStatus.DISCARDED, tags=["t"],
+    source=ReviewSource.LLM_UNREVIEWED, llm_model="m-1",
+    llm_decided_at="2020-01-01T00:00:00+00:00")
+  record_screening(decision, new_screening(
+    kind="agent", name="a-2", status=agent_status, tags=["t"],
+    recorded_at="2020-01-02T00:00:00+00:00"))
+  return decision
+
+def test_lines_and_data(self):
+  agreed, disputed = self._decision(0, "discarded"), self._decision(1, "kept")
+  disputed.source = ReviewSource.LLM_REVIEWED
+  disputed.status = DecisionStatus.KEPT
+  record_human_decision(disputed, "tui", at="2020-01-03T00:00:00+00:00")
+  overview = ScreeningOverview.of([agreed, disputed])
+  assert overview.lines() == [
+    "Double screening: llm (m-1) vs agent (a-2): 2 records, "
+    "kept/discarded agreement 50.0 %, kappa undefined (one screener "
+    "gave only one verdict); 1 status conflicts (1 resolved)",
+    "Screening conflicts: 1 status (1 resolved by a human), "
+    "0 category only",
+  ]
+  [pair] = overview.data()["pairs"]
+  assert pair["status"]["cells"] == [[0, 0], [1, 1]]
+  assert pair["status"]["kappa"] is None
+
+def test_nothing_without_screenings(self):
+  plain = ReviewDecision(paper=Paper(title="X", authors=["A"]),
+                         provider="p")
+  assert ScreeningOverview.of([plain]) is None
+@
+
+Finally the block itself, on Shankar and Bangdiwala's scenario~1: the
+table, the measures as formatted, and the sentences (the first only
+when most records are in the negative cell).
+
+<<test functions>>=
+class TestAgreementBlock:
+  """The printed block of a pair (#253)."""
+
+  <<agreement block test methods>>
+
+<<agreement block test methods>>=
+def test_scenario_one(self):
+  table = AgreementTable(
+    ("llm", "m", False), ("agent", "a", False), "status",
+                         ("kept", "discarded"), ((40, 9), (6, 45)))
+  lines = agreement_block(table, interval_note="no interval: x")
+  assert lines[0] == "Kept/discarded, 100 records screened by both:"
+  assert lines[2].split() == ["A", "kept", "40", "9"]
+  assert lines[4] == "  observed agreement  85.0 %  (no interval: x)"
+  assert lines[5].split()[-1] == "55)"
+  assert "Cohen's kappa       0.70" in lines[7]
+  assert "prevalence index -0.05, bias index 0.03" in lines[7]
+  assert lines[8] == (
+    "45 of 100 records were discarded by both, so observed agreement is "
+    "at least 45/100 (45.0 %) whatever the screeners did with the rest; "
+    "positive agreement counts only records at least one screener kept.")
+  assert lines[9] == (
+    "For the same observed agreement, kappa is lower the more one verdict "
+    "dominates. No verbal label is given for kappa.")
+  assert len(lines) == 10
+
+def test_the_bound_holds_when_agreement_is_low(self):
+  table = AgreementTable(
+    ("llm", "m", False), ("agent", "a", False), "status",
+    ("kept", "discarded"), ((0, 24), (25, 51)))
+  assert table.observed == pytest.approx(0.51)
+  [first, _] = interpretive_sentences(table)
+  assert first.startswith(
+    "51 of 100 records were discarded by both, so observed agreement is "
+    "at least 51/100 (51.0 %)")
+  bearing = AgreementTable(
+    ("llm", "m", False), ("agent", "a", False), "bearing",
+    ("bearing", "not bearing"), ((1, 0), (0, 2)))
+  assert interpretive_sentences(bearing)[0] == (
+    "2 of 3 records were judged not bearing by both, so observed "
+    "agreement is at least 2/3 (66.7 %) whatever the screeners did with "
+    "the rest; positive agreement counts only records at least one "
+    "screener judged bearing.")
+
+def test_category_block_has_no_kappa(self):
+  cells = ((1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 0, 0), (0, 0, 0, 2))
+  table = AgreementTable(
+    ("llm", "m", False), ("agent", "a", False), "category",
+                         tuple(AUDIT_CATEGORIES), cells)
+  text = "\n".join(agreement_block(table))
+  assert "observed agreement  100.0 %" in text
+  assert "kappa" not in text and "positive" not in text
+@
