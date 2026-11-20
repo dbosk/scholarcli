@@ -680,7 +680,8 @@ enrich: Annotated[
         "--enrich", "-e",
         help=(
             "Fetch missing abstracts/metadata/keywords via DOI lookup. "
-            "Default order: Semantic Scholar, arXiv, OpenAlex, IEEE, WoS. "
+            "Default order: Semantic Scholar, arXiv, OpenAlex, IEEE, WoS, "
+            "then Crossref and Europe PMC (abstracts only), Scopus last. "
             "Unconfigured providers are skipped. "
             "Only works for papers with DOIs."
         ),
@@ -692,7 +693,8 @@ enrich_providers: Annotated[
         "--enrich-providers",
         help=(
             "Comma-separated provider names to use for enrichment. "
-            "Overrides the default order."
+            "Overrides the default order. An unknown name or an empty "
+            "value is a usage error, checked even without --enrich."
         ),
     ),
 ] = None,
@@ -1014,6 +1016,7 @@ else:
     provider_names = expand_provider_names(provider)
 
 <<refuse what a semantic search cannot do>>
+providers_for_enrich = parse_enrich_providers(enrich_providers)
 
 effective_limit = UNLIMITED_PROVIDER_LIMIT if limit == 0 else limit
 limit_label = "unlimited" if limit == 0 else str(limit)
@@ -1906,11 +1909,6 @@ if enrich and merged_results:
     from rich.progress import Progress
 
     enrich_fields = ["abstract", "pdf_url", "keywords"]
-    providers_for_enrich = (
-        [p.strip() for p in enrich_providers.split(",") if p.strip()]
-        if enrich_providers
-        else None
-    )
 
     # Enrich every result set. With --dedup there is a single merged set;
     # with --no-dedup there may be one per provider, all of which need it.
@@ -2780,8 +2778,10 @@ def enrich(
             "--enrich-providers",
             help=(
                 "Comma-separated provider names to use for enrichment. "
-                "Overrides the default order. Putting openalex first "
-                "makes the most of its batched DOI lookups."
+                "Overrides the default order (s2, arxiv, openalex, ieee, "
+                "wos, crossref, europepmc, scopus). Putting openalex first "
+                "makes the most of its batched DOI lookups. An unknown "
+                "name or an empty value is a usage error."
             ),
         ),
     ] = None,
@@ -2826,7 +2826,9 @@ def enrich(
 
     Looks up papers by DOI in available providers to fill in missing
     abstracts/metadata. Providers requiring API keys (IEEE, WoS) are used
-    only when configured. Also looks up open-access status and PDF links
+    only when configured. Abstracts the other providers lack are asked of
+    Crossref and Europe PMC before Scopus. Also looks up open-access
+    status and PDF links
     via Unpaywall (requires SCHOLAR_EMAIL) and checks Crossref for
     retractions. When no PDF can be found, a preprint version may be
     adopted in place of the published entry (see --preprint-search).
@@ -2877,6 +2879,95 @@ def parse_enrich_fields(value: str | None) -> list[str]:
     return names
 @
 
+\subsection{Choosing the sources}
+\label{sec:enrich-provider-names}
+
+[[--enrich-providers]] names the sources to ask and their order, for
+[[scholar enrich]] and for [[scholar search --enrich]] alike.
+A name nothing answers to used to be passed on and skipped without a
+word, so a typo gave a run that asked fewer sources than the user
+thought.
+It is now a usage error, like an unknown field, naming the valid
+choices: the registered providers with a DOI lookup and the abstract
+services Crossref and Europe PMC ([[enrichment_source_names]],
+\cref{sec:enrichment-providers}).
+Without the option the enrichment's own default order applies, which
+[[None]] stands for.
+An empty value is an error too, not the default order: it names no
+source, and a script that builds the list and ends up with none should
+hear so.
+[[scholar search]] checks the value as soon as the providers are known,
+also without [[--enrich]], where it would otherwise be ignored: a typo
+is then reported before the search spends any requests, and the next
+run with [[--enrich]] does not meet it.
+Both help texts say so.
+
+<<enrich command>>=
+def parse_enrich_providers(value: str | None) -> list[str] | None:
+    """Return the source names in an `--enrich-providers` value.
+
+    None (the default order) when not given. Raises
+    `typer.BadParameter` (exit status 2) for a name no source has.
+    """
+    if value is None:
+        return None
+    from scholar.enrich import enrichment_source_names
+
+    valid = enrichment_source_names()
+    names = [name.strip() for name in value.split(",") if name.strip()]
+    unknown = [name for name in names if name not in valid]
+    if unknown or not names:
+        raise typer.BadParameter(
+            f"unknown source(s): {', '.join(unknown) or '(none given)'}; "
+            f"choose from {', '.join(valid)}",
+            param_hint="'--enrich-providers'",
+        )
+    return names
+@
+
+Let's verify both commands refuse a misspelt name before they do
+anything, and that the two services are accepted.
+The [[enrich]] run names a session that does not exist and the search
+names a query: a usage error must come first, so neither is reached.
+
+<<test functions>>=
+class TestEnrichProviderNames:
+  """--enrich-providers is checked against the sources (#260)."""
+
+  def test_services_and_providers_are_accepted(self):
+    assert parse_enrich_providers("s2, crossref,europepmc") == [
+      "s2", "crossref", "europepmc",
+    ]
+    assert parse_enrich_providers(None) is None
+
+  @pytest.mark.parametrize("value", ["s2,crosref", "dblp", " , "])
+  def test_unknown_names_are_refused(self, value):
+    with pytest.raises(typer.BadParameter) as error:
+      parse_enrich_providers(value)
+    assert "europepmc" in str(error.value)
+
+  def test_enrich_refuses_before_loading(self):
+    result = runner.invoke(app, [
+      "enrich", "no-such-session", "--enrich-providers", "s2,crosref",
+    ])
+    assert result.exit_code == 2
+    assert "Session not found" not in result.stdout
+
+  def test_search_refuses_before_searching(self):
+    with patch("scholar.Search.execute") as execute:
+      result = runner.invoke(app, [
+        "search", "q", "--enrich", "--enrich-providers", "europmc",
+      ])
+    assert result.exit_code == 2
+    execute.assert_not_called()
+
+  def test_search_checks_an_empty_value_without_enrich(self):
+    with patch("scholar.Search.execute") as execute:
+      result = runner.invoke(app, ["search", "q", "--enrich-providers", ""])
+    assert result.exit_code == 2
+    execute.assert_not_called()
+@
+
 \subsection{Enriching session papers}
 
 We load the session, choose the decisions to work on, enrich them chunk
@@ -2892,6 +2983,7 @@ cover every selected paper.
 <<enrich session papers>>=
 console = Console()
 enrich_fields = parse_enrich_fields(fields)
+providers_for_enrich = parse_enrich_providers(enrich_providers)
 
 session_data = open_session_argument(session)
 if session_data is None:
@@ -2925,12 +3017,6 @@ scope = "pending papers" if pending_only else "papers"
 papers_to_enrich = [
     d.paper for d in selected if needs_enrichment(d.paper, enrich_fields)
 ]
-
-providers_for_enrich = (
-    [p.strip() for p in enrich_providers.split(",") if p.strip()]
-    if enrich_providers
-    else None
-)
 
 of_what = f"{len(selected)} " + ("pending papers" if pending_only else "total")
 if papers_to_enrich:
@@ -3279,6 +3365,9 @@ provider whose limiter is in a cooldown and whose cache holds the
 answer \enquote{no such paper} for the second paper's DOI.
 The first paper's lookup is thus refused before any request, the way a
 throttled run's is, and the second is answered, the way a 404 is.
+The abstract services Crossref and Europe PMC
+(\cref{sec:enrichment-providers}) are switched off here; the next tests
+are theirs.
 For the open-access tally the real Unpaywall client is used the same
 way, and the preprint fallback, which would ask OpenAlex and Crossref,
 finds nothing.
@@ -3305,7 +3394,7 @@ class TestEnrichLookupTally:
     with patch(
       "scholar.enrich.get_provider",
       lambda name: provider if name == "s2" else None,
-    ), patch(
+    ), patch("scholar.enrich.abstract_source", lambda name: None), patch(
       "scholar.crossref.annotate_papers",
       side_effect=lambda papers, **kw: list(papers),
     ):
@@ -3477,6 +3566,95 @@ def test_declining_scopus_is_not_a_failure(self, tmp_path, monkeypatch):
   )
   assert "failed lookup" not in out
   assert "Run again" not in out
+@
+
+The abstract services take part in a real run like any database
+(\url{https://github.com/dbosk/scholarcli/issues/260}).
+In the next test no search provider is configured, so the default order
+reaches Crossref and Europe PMC, whose real clients run with empty
+caches and with their HTTP requests answered at the session:
+Crossref with a record holding an abstract for the first paper and a
+failed connection for the second, Europe PMC with \enquote{no record}.
+The Crossref check of the same run is the real one too.
+So the command must fill the first abstract from Crossref and read the
+record once for both the abstract and the currency check, ask Europe
+PMC for the second paper only, and count the second paper's Crossref
+failure in the tally, by name.
+
+<<test functions>>=
+class TestEnrichAbstractServices:
+  """`scholar enrich` asks Crossref and Europe PMC for abstracts (#260)."""
+
+  def test_run_fills_counts_and_shares_the_request(
+    self, tmp_path, monkeypatch,
+  ):
+    import requests
+    from scholar import crossref, europepmc
+
+    name = TestEnrichSelectionAndSaving._session(tmp_path, monkeypatch, 2)
+    monkeypatch.setattr(crossref._client, "_cache", {})
+    monkeypatch.setattr(europepmc._client, "_cache", {})
+    crossref_urls = []
+
+    def crossref_get(url, **kwargs):
+      crossref_urls.append(url)
+      if url.endswith("c137-1"):
+        raise requests.exceptions.ConnectionError("down")
+      response = Mock(status_code=200, headers={})
+      response.json.return_value = {"message": {
+        "DOI": "10.1/c137-0",
+        "abstract": "<jats:p>Found at <jats:italic>Crossref</jats:italic>."
+                    "</jats:p>",
+      }}
+      return response
+
+    def europepmc_get(url, params=None, **kwargs):
+      response = Mock(status_code=200, headers={})
+      response.json.return_value = {
+        "hitCount": 0, "resultList": {"result": []},
+      }
+      europepmc_queries.append(params["query"])
+      return response
+
+    europepmc_queries = []
+    with patch("scholar.enrich.get_provider", lambda name: None), \
+        patch.object(crossref._client._session, "get", crossref_get), \
+        patch.object(europepmc._client._session, "get", europepmc_get):
+      result = runner.invoke(app, ["enrich", name, "--fields", "abstract"])
+    assert result.exit_code == 0, result.stdout
+    out = result.stdout
+    saved = TestEnrichSelectionAndSaving._saved(name)
+    first = saved["10.1/c137-0"].paper
+    assert first.abstract == "Found at Crossref."
+    assert "crossref" in first.sources
+    assert saved["10.1/c137-1"].paper.abstract is None
+    # one record read for the abstract and the currency check of c137-0;
+    # c137-1 failed, and the currency check asked again
+    assert sum(url.endswith("c137-0") for url in crossref_urls) == 1
+    assert europepmc_queries == ['DOI:"10.1/c137-1"']
+    assert "Still without an abstract: 1 of 2 papers." in out
+    assert "crossref: connection failed (ConnectionError) (1)" in out
+    assert "Run again to retry the failed lookups." in out
+@
+
+The services' caches can be cleared by name like a provider's, and
+[[providers limits]] lists Europe PMC's limiter with the other clients'.
+
+<<test functions>>=
+class TestEuropePMCCacheAndLimits:
+  """Europe PMC is a lookup cache and a limiter like the others (#260)."""
+
+  def test_cache_clear_accepts_europepmc(self):
+    assert "europepmc" in cache_provider_names()
+    result = runner.invoke(app, ["cache", "clear", "--provider", "europepmc"])
+    assert result.exit_code == 0, result.output
+
+  def test_limits_list_europepmc(self):
+    result = runner.invoke(
+      app, ["providers", "limits"], env={"COLUMNS": "200"}
+    )
+    assert result.exit_code == 0, result.output
+    assert "europepmc" in result.output
 @
 
 [[scholar verify]] counts the failed checks the same way, on stderr, so
@@ -4700,10 +4878,11 @@ provider has absorbed, and when a spent budget comes back.
 One row per \emph{quota group}, not per provider---the eight
 OpenAlex-backed providers share one budget and appear as one
 [[openalex]] row, which is the truthful unit of accounting.
-The Crossref and Unpaywall clients are rate-limited too
-(\cref{crossref-module,unpaywall-module}), but they are not providers,
-so [[all_status]] knows them only once their modules are loaded.
-We import both here, so their rows appear---with their declared
+The Crossref, Unpaywall and Europe PMC clients are rate-limited too
+(\cref{crossref-module,unpaywall-module,europepmc-module}), but they are
+not providers, so [[all_status]] knows them only once their modules are
+loaded.
+We import all three here, so their rows appear---with their declared
 limits---even in a process that has not used them yet.
 
 The [[--reset]] escape hatch deletes the persisted state.
@@ -4713,7 +4892,7 @@ key starts a fresh budget the file knows nothing about.
 When the user \emph{knows} the quota is back, resetting beats waiting.
 
 <<display provider limits>>=
-from scholar import crossref, ratelimit, unpaywall  # noqa: F401 (limiters)
+from scholar import crossref, europepmc, ratelimit, unpaywall  # noqa: F401
 
 console = Console()
 
@@ -5558,7 +5737,7 @@ network lack the abstracts Scopus returns on it, and the Scopus
 provider points the user here (\cref{sec:scopus-cache-doubt}).
 The names are those of the search and lookup caches that
 [[cache info]] lists, that is the registered providers plus the
-[[crossref]] and [[unpaywall]] lookup caches; the LLM caches it also
+[[crossref]], [[europepmc]] and [[unpaywall]] lookup caches; the LLM caches it also
 lists are cleared only by [[--include-llm]].
 We check them against that set, since a typo would otherwise clear
 nothing and look like success, and exit with status 2 (a usage error)
@@ -5572,7 +5751,7 @@ def cache_provider_names() -> list[str]:
     """Names accepted by `cache clear --provider`, sorted."""
     from scholar.providers import PROVIDERS
 
-    return sorted(set(PROVIDERS) | {"crossref", "unpaywall"})
+    return sorted(set(PROVIDERS) | {"crossref", "europepmc", "unpaywall"})
 @
 
 \subsection{Keeping the LLM caches}
@@ -8541,12 +8720,17 @@ either form and only the second keeps a surname of several words
 whole; the matcher tries both.  The year comes from [[year]], else
 from the start of [[date]] ([[date = {2024-05-01}]]), so an entry
 with [[year = {n.d.}]] still
-has one for the namesake guard.  An entry with neither a title nor a
+has one for the namesake guard.  The [[edition]] field is handed over
+as written, white space collapsed: the second chance of the matcher
+compares it with an edition the session's title names (\enquote{3rd
+edition}), and reads it there, so that [[3]], [[3rd]] and
+[[third]] are one edition.  An entry with neither a title nor a
 DOI cannot match a work and is skipped, by key, on standard error.  An
 entry that two files share (same key and work) is matched once; two
 works under one key in two files are two entries.  The summary line
 counts the matches by DOI and by title, so the author sees how much of
-the match rests on the weaker key.
+the match rests on the weaker key, and the matches by the title without
+edition or chapter number apart, as the weakest.
 
 <<match the works the text cites>>=
 cited_entries = None
@@ -8599,10 +8783,11 @@ def _bib_author_forms(entry) -> tuple[list[str], list[str]]:
 
 
 def _cited_bib_papers(paths: list[Path]) -> tuple[list, list[str], int]:
-    """Read the `.bib` files as `(key, readings)` pairs.
+    """Read the `.bib` files as `(key, readings, edition)` tuples.
 
     `readings` are the entry's papers: authors given name first, and
-    surname first when that names another surname.  Also returns the
+    surname first when that names another surname; `edition` is the
+    entry's `edition` field as written, or None.  Also returns the
     keys of entries with neither title nor DOI, which are skipped, and
     the number of blocks that could not be parsed.  An entry with the
     same key and work in two files is read once.
@@ -8648,26 +8833,34 @@ def _cited_bib_papers(paths: list[Path]) -> tuple[list, list[str], int]:
             as_written = replace(paper, authors=surname_first)
             if audit_work_key(as_written) != audit_work_key(paper):
                 readings.append(as_written)
-            entries.append((entry.key, readings))
+            edition = " ".join(str(_bib_value(entry, "edition") or "").split())
+            entries.append((entry.key, readings, edition or None))
     return entries, skipped, failed
 
 
 def _match_cited_bibs(paths: list[Path], session) -> list:
     """Match the `.bib` entries to the session's works; report the count."""
-    from scholar.review import CHECK_BY_DOI, match_cited_entries
+    from scholar.review import (
+        CHECK_BY_DOI, CHECK_BY_LOOSE_TITLE, match_cited_entries,
+    )
 
     entries, skipped, failed = _cited_bib_papers(paths)
     cited = match_cited_entries(entries, session)
     by_doi = sum(1 for e in cited if e.matched_by == CHECK_BY_DOI)
+    loose = [e for e in cited if e.matched_by == CHECK_BY_LOOSE_TITLE]
     by_title = sum(
-        1 for e in cited if e.matched_by not in (None, CHECK_BY_DOI)
+        1 for e in cited
+        if e.matched_by not in (None, CHECK_BY_DOI, CHECK_BY_LOOSE_TITLE)
     )
+    by_loose = f", {len(loose)} by {CHECK_BY_LOOSE_TITLE}" if loose else ""
+    unmatched = len(cited) - by_doi - by_title - len(loose)
     err = Console(stderr=True)
     err.print(
         f"Cited in {escape(', '.join(p.name for p in paths))}: "
         f"{len(cited)} entries, {by_doi} matched by DOI, {by_title} by "
-        f"title, {len(cited) - by_doi - by_title} not in the session."
+        f"title{by_loose}, {unmatched} not in the session."
     )
+    <<list the entries matched on a loose title>>
     if skipped:
         err.print(
             f"Skipped {len(skipped)} entries without title or DOI: "
@@ -8679,6 +8872,39 @@ def _match_cited_bibs(paths: list[Path], session) -> list:
             "files; their entries are not matched.[/yellow]"
         )
     return cited
+@
+
+An entry found only once edition and chapter number were set aside
+(\cref{sec:audit-cited-entries} in the review module, issue~\#272) is
+counted under its own kind, and listed with the session title it
+matched, so that the author sees each loosened match and can tell a
+wrong one at a glance.  An entry whose loosened title fitted several
+works was matched to none of them; it is listed too, with those works'
+titles, since it also appears among the works the session does not
+hold and the author should know why.  The kind is added to the count
+line only when some entry was matched that way, and nothing is listed
+otherwise, so a bibliography whose entries all match by DOI or work
+key prints exactly what it printed before.
+
+<<list the entries matched on a loose title>>=
+if loose:
+    err.print(f"Matched by {CHECK_BY_LOOSE_TITLE} (key: bib -> session):")
+    for entry in loose:
+        err.print(
+            f"  {escape(entry.key)}: {escape(entry.title)} -> "
+            f"{escape(' | '.join(entry.loose_titles))}"
+        )
+ambiguous = [e for e in cited if e.ambiguous]
+if ambiguous:
+    err.print(
+        f"[yellow]Not matched: by {CHECK_BY_LOOSE_TITLE} the entry fits "
+        "several works (key: bib -> session):[/yellow]"
+    )
+    for entry in ambiguous:
+        err.print(
+            f"  {escape(entry.key)}: {escape(entry.title)} -> "
+            f"{escape(' | '.join(entry.ambiguous))}"
+        )
 @
 
 After the export, the entries where the text and the screening
@@ -9039,6 +9265,105 @@ class TestSessionsExportCitedFrom:
     assert not (tmp_path / "rep.csv").exists()
 @
 
+The second chance is checked end to end on a session of invented
+records (issue~\#272): a chapter heading without authors, a book with
+its edition in the title, and a heading and a book that reduce to the
+same title.  The bibliography cites the first two the way a text
+does, by the plain title with the [[edition]] field, cites the book
+again as another edition, and cites the shared title.  The rows of the
+first two must be cited, the count line must name the kind, and each
+loosened and each ambiguous entry must be listed.  A bibliography whose
+entries all match by DOI or work key, one of them with an [[edition]]
+field, must print the count line as before and nothing more.
+
+<<test functions>>=
+class TestSessionsExportCitedLooseTitles:
+  """--cited-from without edition or chapter number (#272)."""
+
+  def _save(self, monkeypatch, tmp_path):
+    from datetime import datetime
+    from scholar import review
+    from scholar.scholar import Paper
+
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+    session = review.ReviewSession(
+      query="q", providers=["openalex"], timestamp=datetime(2026, 1, 1),
+      name="loose",
+    )
+    session.decisions = [
+      review.ReviewDecision(
+        paper=Paper(title=title, authors=authors, year=year, doi=doi),
+        provider="openalex", status=review.DecisionStatus.KEPT,
+        tags=["ml"],
+      )
+      for title, authors, year, doi in (
+        ("7 THE QUIET LEDGER", [], 2019, None),
+        ("Gardening with Lichens, 3rd edition", ["Tove Rask"], 2015, None),
+        ("4 RIVERS OF SALT", [], 2018, None),
+        ("Rivers of Salt, 2nd edition", ["Una Vik"], 2018, None),
+        ("Tidal Ledgers", ["Pia Lund"], 2014, "10.9/tidal"),
+      )
+    ]
+    review.save_session(session)
+
+  def _export(self, tmp_path, text):
+    bib = tmp_path / "refs.bib"
+    bib.write_text(text)
+    return runner.invoke(
+      app, ["sessions", "export", "loose", "-f", "table", "--cited-from",
+            str(bib), "-o", str(tmp_path / "tab")],
+    )
+
+  def test_loosened_matches_are_cited_counted_and_listed(
+      self, monkeypatch, tmp_path):
+    self._save(monkeypatch, tmp_path)
+    result = self._export(tmp_path,
+      "@incollection{holt2019,\n  title = {The Quiet Ledger},\n"
+      "  author = {Holt, Mira},\n  year = {2019},\n"
+      "  doi = {10.9/ledger},\n}\n\n"
+      "@book{rask2015,\n  title = {Gardening with {Lichens}},\n"
+      "  author = {Rask, Tove},\n  year = {2015},\n  edition = {3},\n}\n\n"
+      "@book{rask2015b,\n  title = {Gardening with Lichens},\n"
+      "  author = {Rask, Tove},\n  year = {2015},\n  edition = {4},\n}\n\n"
+      "@book{vik2018,\n  title = {Rivers of Salt},\n"
+      "  author = {Vik, Una},\n  year = {2018},\n}\n\n"
+      "@article{lund2014,\n  title = {Tidal Ledgers},\n"
+      "  author = {Lund, Pia},\n  year = {2014},\n}\n"
+    )
+    assert result.exit_code == 0, result.output
+    content = (tmp_path / "tab.tex").read_text()
+    assert r"7 THE QUIET LEDGER & 2019 & OA & \emph{cited}: ml" in content
+    assert r"Gardening with Lichens, 3rd edition & 2015 & OA & " \
+      r"\emph{cited}: ml" in content
+    assert "4 RIVERS OF SALT & 2018 & OA & kept, not cited" in content
+    stderr = " ".join(result.stderr.split())
+    assert "Cited in refs.bib: 5 entries, 0 matched by DOI, 1 by title, " \
+      "2 by title without edition or chapter number, 2 not in the " \
+      "session." in stderr
+    assert "Matched by title without edition or chapter number " \
+      "(key: bib -> session): " \
+      "holt2019: The Quiet Ledger -> 7 THE QUIET LEDGER " \
+      "rask2015: Gardening with Lichens -> " \
+      "Gardening with Lichens, 3rd edition" in stderr
+    assert "Not matched: by title without edition or chapter number the " \
+      "entry fits several works (key: bib -> session): vik2018: Rivers " \
+      "of Salt -> 4 RIVERS OF SALT | Rivers of Salt, 2nd edition" in stderr
+    assert "does not hold: rask2015b: Gardening with Lichens " \
+      "vik2018: Rivers of Salt" in stderr
+
+  def test_all_matched_prints_as_before(self, monkeypatch, tmp_path):
+    self._save(monkeypatch, tmp_path)
+    result = self._export(tmp_path,
+      "@incollection{ledger,\n  title = {7 THE QUIET LEDGER},\n"
+      "  year = {2019},\n  edition = {2},\n}\n\n"
+      "@article{lund2014,\n  title = {Other},\n  author = {Lund, Pia},\n"
+      "  doi = {10.9/TIDAL},\n}\n"
+    )
+    assert result.exit_code == 0, result.output
+    assert " ".join(result.stderr.split()) == "Cited in refs.bib: 2 " \
+      "entries, 1 matched by DOI, 1 by title, 0 not in the session."
+@
+
 \paragraph{Writing the export all or nothing.}
 \label{sec:sessions-export-atomic}
 An export of several files is only useful as a set: the [[.tex]] cites
@@ -9235,7 +9560,7 @@ class TestSessionsExport:
         assert r"\begin{longtable}" in content
         assert r"\label{tab:sok-A}" in content
         assert r"\emph{citerad}: maskin" in content
-        assert "stöder påståendet (0.93)" in content
+        assert "stöder påståendet (0,93)" in content
         assert "ej klassad" in content
 
     def test_table_bearing_only(self, monkeypatch, tmp_path):
@@ -21661,7 +21986,10 @@ entry describes:
   undone, which have one meaning each ([[\&]] is [[&]],
   [[\textquotedbl{}]] the double quote; the braces are gone by now),
   and the [[\scholarnonlatin]] wrapper dropped, which keeps the run
-  it wraps as it was (\cref{sec:non-latin-text} in the review module);
+  it wraps as it was (\cref{sec:non-latin-text} in the review module).
+  Its separator [[\scholarnonlatinsep]], written where a run touches a
+  letter, stands for no character of the title and is dropped too,
+  first, since the wrapper's name is the beginning of its name;
 \item an existing note of a DOI-less paper whose title, escaped as the
   formatter escapes it, is the entry's title ([[_noted_titles]]), and
   whose id that title and a spelling of the entry's first author give.
@@ -21699,11 +22027,14 @@ def _bib_field_text(value: str) -> str:
 def _unescape_bib(text: str) -> str:
     """Undo the one-meaning escapes of `escape_bibtex` in a brace-free field.
 
-    Those are the `BIBTEX_SPECIALS` and the `\\scholarnonlatin` wrapper.
+    Those are the `BIBTEX_SPECIALS`, the `\\scholarnonlatin` wrapper and
+    its separator `\\scholarnonlatinsep`.
     """
-    from scholar.review import BIBTEX_SPECIALS, NONLATIN_MACRO
+    from scholar.review import (
+        BIBTEX_SPECIALS, NONLATIN_MACRO, NONLATIN_SEP_MACRO,
+    )
 
-    text = text.replace(NONLATIN_MACRO, "")
+    text = text.replace(NONLATIN_SEP_MACRO, "").replace(NONLATIN_MACRO, "")
     for char, escaped in BIBTEX_SPECIALS.items():
         text = text.replace(_bib_field_text(escaped), char)
     return text
@@ -22856,6 +23187,41 @@ class TestProvPaperId:
         assert CliRunner().invoke(
             app, ["prov", "import", str(bib)]).exit_code == 0
         assert self._notes()[paper.id].title == self.LOSSY
+@
+
+A title whose run touches a Latin word carries the separator in the
+[[.bib]] (\cref{sec:non-latin-text} in the review module); undoing the
+escapes must give the title back as it was, without the separator's
+name left over.  The [[--cited-from]] reader decodes \LaTeX{} with
+bibtexparser instead; it already drops the separator, and the second
+test pins that:
+
+<<test functions>>=
+class TestUnescapeNonLatinSeparator:
+    """`_unescape_bib` drops `\\scholarnonlatinsep` too (#262)."""
+
+    def test_the_title_comes_back(self):
+        from scholar.cli import _bib_field_text, _unescape_bib
+        from scholar.review import escape_bibtex
+        title = "\u5b66\u4e60Mac OS X\u7cfb\u7edf"
+        field = _bib_field_text(escape_bibtex(title))
+        assert "scholarnonlatinsep" in field
+        assert _unescape_bib(field) == title
+
+    def test_the_cited_from_reader_drops_it_too(self, tmp_path):
+        from scholar.cli import _cited_bib_papers
+        from scholar.review import format_bibtex_entry
+        from scholar import Paper
+        title = "\u5b66\u4e60Mac OS X\u7cfb\u7edf"
+        paper = Paper(title=title, authors=["Ann Smith"], year=2024)
+        entry = format_bibtex_entry(paper, "smith2024")
+        assert "scholarnonlatinsep" in entry
+        bib = tmp_path / "cited.bib"
+        bib.write_text(entry + "\n", encoding="utf-8")
+        entries, _, unparsable = _cited_bib_papers([bib])
+        assert unparsable == 0
+        [(key, [read], _edition)] = entries
+        assert (key, read.title) == ("smith2024", title)
 @
 
 
