@@ -2902,6 +2902,7 @@ if session_data is None:
 <<enrich and save chunk by chunk>>
 <<report open-access findings during enrich>>
 <<warn on currency issues during enrich>>
+<<report the papers still without an abstract>>
 <<report how many papers gained metadata>>
 @
 
@@ -2988,15 +2989,20 @@ through [[sys.exit(130)]] and runs its exit handler.
 The work of the chunk in progress is lost either way, apart from what
 the providers cached.
 The papers already processed are in [[originals]] and [[processed]],
-which the reports below use.
+and the outcomes of their lookups in [[lookup_outcomes]]
+(\cref{sec:enrich-lookup-tally}), which the reports below use.
 
 <<enrich and save chunk by chunk>>=
+from collections import Counter
+
 from rich.progress import Progress
 from scholar.notes import get_paper_id, migrate_paper_id
 from scholar.review import keep_copy_before_run
 
 originals: list = []
 processed: list = []
+lookup_outcomes: list = []
+crossref_failures: Counter = Counter()
 adopted_any = False
 pre_run_copy = (
     keep_copy_before_run(session_data, "pre-enrich") if selected else None
@@ -3012,6 +3018,7 @@ except KeyboardInterrupt:
         f"[yellow]Interrupted: saved {len(processed)} of {len(selected)} "
         f"{scope}; run again to continue.[/yellow]"
     )
+    <<report the papers still without an abstract>>
     <<say where the pre-run copy is>>
     raise typer.Exit(130)
 @
@@ -3053,10 +3060,11 @@ the old id are moved by the time the session names the new one.
 
 <<enrich, check and save one chunk>>=
 from scholar.enrich import enrich_papers
-from scholar.crossref import annotate_papers
+from scholar.crossref import annotate_papers, noting_failures
 from scholar.review import save_session
 
 before = [decision.paper for decision in chunk]
+chunk_outcomes: list = []
 after = enrich_papers(
     before,
     fields=enrich_fields,
@@ -3065,14 +3073,18 @@ after = enrich_papers(
         task, completed=start + current
     ),
     preprint_search=preprint_search,
+    outcomes=chunk_outcomes,
 )
-after = annotate_papers(after)
+after = annotate_papers(
+    after, progress_callback=noting_failures(crossref_failures)
+)
 for decision, paper in zip(chunk, after):
     decision.paper = paper
 <<record preprint adoptions during enrich>>
 save_session(session_data)
 originals.extend(before)
 processed.extend(after)
+lookup_outcomes.extend(chunk_outcomes)
 @
 
 [[signal.signal]] may only be called from the main thread, and the
@@ -3151,6 +3163,7 @@ elif unpaywall.is_configured():
         f"[cyan]Open access: {len(open_papers)} of {len(checked)} checked "
         f"{scope} ({len(with_pdf)} with PDF link).[/cyan]"
     )
+    <<say why open-access statuses are still unknown>>
 else:
     console.print(
         "[dim]Unpaywall lookup skipped: set SCHOLAR_EMAIL to enable "
@@ -3182,6 +3195,309 @@ if warnings:
         console.print(text)
 else:
     console.print("[green]No retractions or corrections found.[/green]")
+<<say how many currency checks failed>>
+@
+
+\enquote{No retractions or corrections found} speaks only for the
+papers Crossref answered for.
+A check that failed leaves its paper unchecked
+([[annotate_papers]], \cref{crossref-module}), and a run whose checks
+all failed, as they do in an environment without a CA bundle, used to
+end with that line and nothing else.
+So the chunks count the failed checks per reason ([[noting_failures]]
+wraps the check's progress callback, \cref{sec:crossref-check-failures})
+and the report adds [[check_failure_lines]] after it: how many papers'
+checks failed, why, and that running again retries them.
+The run itself goes on, as it always did; the tally is what makes the
+failures visible.
+
+<<say how many currency checks failed>>=
+from scholar.crossref import check_failure_lines
+
+for line in check_failure_lines(crossref_failures, scope):
+    console.print(escape(line), style="yellow", soft_wrap=True)
+@
+
+\subsection{Why lookups found nothing}
+\label{sec:enrich-lookup-tally}
+
+A paper still without an abstract after the run is either one that no
+database asked has an abstract for, or one whose lookup failed and may
+succeed on another run; a review that excludes records for lack of an
+abstract must not treat the second kind as the first
+(\url{https://github.com/dbosk/scholarcli/issues/259}).
+The command therefore collects the outcome of every paper's lookups
+([[LookupOutcome]], \cref{sec:enrich-lookup-outcomes}) beside the
+papers themselves, chunk by chunk, and ends with their tally
+([[abstract_tally_lines]]): how many papers still lack an abstract, how
+many of those every database asked answered for, how many had no DOI,
+and how many had a failed lookup, per database and reason, with a hint
+to run again only when there are such.
+The interrupt path prints the same tally over the papers saved so far,
+since those are the ones a second run would continue from; without an
+abstract among [[--fields]] no lookup was made for one and nothing is
+said.
+The lines are printed escaped and soft-wrapped: a reason is the
+service's or the limiter's text and may hold brackets, which [[rich]]
+would read as markup.
+
+<<report the papers still without an abstract>>=
+if "abstract" in enrich_fields and processed:
+    from scholar.enrich import abstract_tally_lines, tally_lookups
+
+    lookup_tally = tally_lookups(processed, lookup_outcomes)
+    for line in abstract_tally_lines(lookup_tally, scope):
+        console.print(
+            escape(line),
+            style="yellow" if lookup_tally.with_failure else "cyan",
+            soft_wrap=True,
+        )
+@
+
+The open-access tally above counts the checked papers only.
+The others are unknown for one of three reasons, which
+[[open_access_tally_lines]] tells apart: no DOI to look up, no record in
+Unpaywall, or a failed lookup, counted per reason
+(\cref{unpaywall-module}).
+Only the last is worth a second run, and only then is the hint given.
+
+<<say why open-access statuses are still unknown>>=
+from scholar.enrich import open_access_tally_lines, tally_lookups
+
+for line in open_access_tally_lines(
+    tally_lookups(processed, lookup_outcomes), scope
+):
+    console.print(escape(line), style="cyan", soft_wrap=True)
+@
+
+Let's verify both tallies through the real command and the real
+enrichment.
+The stand-ins are at the network's edge, as in the tests of
+\cref{sec:enrich-chunks}: the Crossref check passes the papers
+through, and the providers are reduced to one real Semantic Scholar
+provider whose limiter is in a cooldown and whose cache holds the
+answer \enquote{no such paper} for the second paper's DOI.
+The first paper's lookup is thus refused before any request, the way a
+throttled run's is, and the second is answered, the way a 404 is.
+For the open-access tally the real Unpaywall client is used the same
+way, and the preprint fallback, which would ask OpenAlex and Crossref,
+finds nothing.
+
+<<test functions>>=
+class TestEnrichLookupTally:
+  """`scholar enrich` says why papers still lack an abstract (#259)."""
+
+  REASON = "cooldown for the tally test"
+
+  @staticmethod
+  def _throttled_s2(monkeypatch, answered_doi):
+    from scholar.providers import SemanticScholarProvider
+
+    provider = SemanticScholarProvider(api_key=None)
+    monkeypatch.setattr(provider, "_cache", {("doi", answered_doi): None})
+    provider._limiter.record_limit_hit(
+      retry_after=3600, reason=TestEnrichLookupTally.REASON
+    )
+    return provider
+
+  @staticmethod
+  def _invoke(args, provider):
+    with patch(
+      "scholar.enrich.get_provider",
+      lambda name: provider if name == "s2" else None,
+    ), patch(
+      "scholar.crossref.annotate_papers",
+      side_effect=lambda papers, **kw: list(papers),
+    ):
+      return runner.invoke(app, ["enrich", *args])
+
+  <<enrich lookup tally test methods>>
+@
+
+A refused and an answered lookup end in different rows, the old lines
+stay, and the hint to run again is there:
+
+<<enrich lookup tally test methods>>=
+def test_refused_and_answered_are_told_apart(self, tmp_path, monkeypatch):
+  name = TestEnrichSelectionAndSaving._session(tmp_path, monkeypatch, 2)
+  s2 = self._throttled_s2(monkeypatch, "10.1/c137-1")
+  result = self._invoke([name, "--fields", "abstract"], s2)
+  assert result.exit_code == 0, result.stdout
+  out = result.stdout
+  assert "Still without an abstract: 2 of 2 papers." in out
+  assert "1 answered by every database asked" in out
+  assert "1 with a failed lookup, by database and reason:" in out
+  assert f"s2: {self.REASON}" in out
+  assert "Run again to retry the failed lookups." in out
+  assert "Enriched 0 papers." in out
+@
+
+An interruption prints the tally of the papers saved before it.
+The provider is wrapped so that the second paper's lookup is where the
+interruption happens:
+
+<<enrich lookup tally test methods>>=
+def test_interrupt_prints_the_tally(self, tmp_path, monkeypatch):
+  monkeypatch.setattr("scholar.cli.ENRICH_SAVE_EVERY", 1)
+  name = TestEnrichSelectionAndSaving._session(tmp_path, monkeypatch, 2)
+  s2 = self._throttled_s2(monkeypatch, "10.1/unused")
+
+  class InterruptedAtSecond:
+    @property
+    def last_lookup_error(self):
+      return s2.last_lookup_error
+
+    def get_paper_by_doi(self, doi):
+      if doi == "10.1/c137-1":
+        raise KeyboardInterrupt
+      return s2.get_paper_by_doi(doi)
+
+  result = self._invoke(
+    [name, "--fields", "abstract"], InterruptedAtSecond()
+  )
+  assert result.exit_code == 130
+  out = result.stdout
+  assert "Interrupted: saved 1 of 2 papers" in out
+  assert "Still without an abstract: 1 of 1 papers." in out
+  assert f"s2: {self.REASON}" in out
+@
+
+The open-access part separates a DOI Unpaywall answered for without a
+record (a cached 404) from one whose lookup was refused:
+
+<<enrich lookup tally test methods>>=
+def test_open_access_unknown_reasons(self, tmp_path, monkeypatch):
+  from scholar import unpaywall
+
+  name = TestEnrichSelectionAndSaving._session(tmp_path, monkeypatch, 2)
+  monkeypatch.setenv("SCHOLAR_EMAIL", "tests@example.org")
+  monkeypatch.setitem(unpaywall._client._cache, ("oa", "10.1/c137-1"), None)
+  unpaywall._client._limiter.record_limit_hit(
+    retry_after=3600, reason=self.REASON
+  )
+  monkeypatch.setattr(
+    "scholar.preprint.find_preprint", lambda paper, search=False: None
+  )
+  result = self._invoke([name, "--fields", "pdf_url"], None)
+  assert result.exit_code == 0, result.stdout
+  out = result.stdout
+  assert "Open access: 0 of 0 checked papers (0 with PDF link)." in out
+  assert (
+    "Open-access status unknown for 2 papers: 1 not in Unpaywall, "
+    "1 with a failed lookup." in out
+  )
+  assert f"unpaywall: {self.REASON}" in out
+  assert "Still without an abstract" not in out
+@
+
+Last, the failure reported from a real run: an environment that can
+make no HTTPS request at all.
+[[REQUESTS_CA_BUNDLE]] pointing at a file that does not exist makes
+every request through [[requests]] raise the same [[OSError]] in
+[[HTTPAdapter.cert_verify]], before a connection is opened, so the
+whole run is real down to that point: Semantic Scholar and OpenAlex
+(fresh providers with empty caches, OpenAlex's batch included),
+Unpaywall and the Crossref check.
+Each service must be named with that reason in the tallies, the run
+must finish (exit 0), and the papers must be saved as never checked by
+Crossref.
+
+<<enrich lookup tally test methods>>=
+def test_broken_tls_setup_is_named_for_every_service(
+  self, tmp_path, monkeypatch
+):
+  from scholar import crossref, unpaywall
+  from scholar.providers import OpenAlexProvider, SemanticScholarProvider
+
+  bundle = "/nonexistent/scholar-test/ca.pem"
+  name = TestEnrichSelectionAndSaving._session(tmp_path, monkeypatch, 2)
+  monkeypatch.setenv("REQUESTS_CA_BUNDLE", bundle)
+  monkeypatch.setenv("SCHOLAR_EMAIL", "tests@example.org")
+  monkeypatch.setattr(unpaywall._client, "_cache", {})
+  monkeypatch.setattr(crossref._client, "_cache", {})
+  monkeypatch.setattr(
+    "scholar.preprint.find_preprint", lambda paper, search=False: None
+  )
+  providers = {
+    "s2": SemanticScholarProvider(api_key=None),
+    "openalex": OpenAlexProvider(api_key=None),
+  }
+  for provider in providers.values():
+    monkeypatch.setattr(provider, "_cache", {})
+  with patch("scholar.enrich.get_provider", providers.get):
+    result = runner.invoke(app, [
+      "enrich", name, "--fields", "abstract,pdf_url",
+      "--enrich-providers", "s2,openalex",
+    ])
+  assert result.exit_code == 0, result.stdout
+  out = result.stdout
+  reason = (
+    "Could not find a suitable TLS CA certificate bundle, invalid path: "
+    + bundle
+  )
+  for service in ("s2", "openalex", "unpaywall", "crossref"):
+    assert f"{service}: {reason} (2)" in out, service
+  assert "2 with a failed lookup, by database and reason:" in out
+  assert "Crossref check failed for 2 papers" in out
+  saved = TestEnrichSelectionAndSaving._saved(name)
+  assert [d.paper.updated_by for d in saved.values()] == [None, None]
+@
+
+A database that declines is information, not a failure.
+Off campus Scopus has no abstracts to give and asks nothing
+(\cref{sec:scopus-doi-lookup}); a run there must still read the papers
+every other database answered for as settled, name Scopus once with
+its reason, and not tell the user to run again.
+
+<<enrich lookup tally test methods>>=
+def test_declining_scopus_is_not_a_failure(self, tmp_path, monkeypatch):
+  from scholar.providers import ScopusProvider, SemanticScholarProvider
+
+  name = TestEnrichSelectionAndSaving._session(tmp_path, monkeypatch, 2)
+  monkeypatch.setenv("SCOPUS_VIEW", "standard")
+  s2 = SemanticScholarProvider(api_key=None)
+  monkeypatch.setattr(s2, "_cache", {
+    ("doi", "10.1/c137-0"): None, ("doi", "10.1/c137-1"): None,
+  })
+  providers = {"s2": s2, "scopus": ScopusProvider(api_key="dummy")}
+  with patch("scholar.enrich.get_provider", providers.get), patch(
+    "scholar.crossref.annotate_papers",
+    side_effect=lambda papers, **kw: list(papers),
+  ):
+    result = runner.invoke(app, [
+      "enrich", name, "--fields", "abstract",
+      "--enrich-providers", "s2,scopus",
+    ])
+  assert result.exit_code == 0, result.stdout
+  out = result.stdout
+  assert "2 answered by every database asked" in out
+  assert (
+    "scopus not asked: SCOPUS_VIEW=standard has no abstracts (2 papers)"
+    in out
+  )
+  assert "failed lookup" not in out
+  assert "Run again" not in out
+@
+
+[[scholar verify]] counts the failed checks the same way, on stderr, so
+that its [[--json]] output stays a clean array:
+
+<<enrich lookup tally test methods>>=
+def test_verify_counts_failed_checks(self, tmp_path, monkeypatch):
+  from scholar import crossref
+
+  name = TestEnrichSelectionAndSaving._session(tmp_path, monkeypatch, 2)
+  monkeypatch.setattr(crossref._client, "_cache", {})
+  crossref._client._limiter.record_limit_hit(
+    retry_after=3600, reason=self.REASON
+  )
+  result = runner.invoke(app, ["verify", name, "--json"])
+  assert result.exit_code == 0
+  assert [p["status"] for p in json.loads(result.stdout)] == [
+    "unknown", "unknown",
+  ]
+  assert "Crossref check failed for 2 papers" in result.stderr
+  assert f"crossref: {self.REASON} (2)" in result.stderr
 @
 
 Finally we count the papers that gained an abstract or a PDF link.
@@ -3244,8 +3560,15 @@ consumer can pipe it straight into a parser.  A missing session is therefore an
 error on stderr plus a non-zero exit, never a stray line on stdout.
 
 <<verify session currency>>=
+from collections import Counter
+
 from scholar.review import save_session
-from scholar.crossref import annotate_papers, currency_status
+from scholar.crossref import (
+    annotate_papers,
+    check_failure_lines,
+    currency_status,
+    noting_failures,
+)
 from rich.progress import Progress
 
 console = Console()
@@ -3263,8 +3586,20 @@ papers = [decision.paper for decision in session_data.decisions]
 for decision, paper in zip(session_data.decisions, checked):
     decision.paper = paper
 save_session(session_data)
+<<say on stderr how many checks failed>>
 
 <<output the currency report>>
+@
+
+A paper whose check failed reads \enquote{unknown} in the report, like
+one without a DOI, so the failures are counted as [[enrich]] counts
+them (\cref{sec:crossref-check-failures}) and said once, per reason.
+They go to [[err_console]] in both modes: they are a diagnostic of the
+run, like the progress bar, and the [[--json]] output must stay pure.
+
+<<say on stderr how many checks failed>>=
+for line in check_failure_lines(crossref_failures, "papers"):
+    err_console.print(escape(line), style="yellow", soft_wrap=True)
 @
 
 The progress bar is attached to [[err_console]] for the same reason: a Rich
@@ -3280,7 +3615,11 @@ with Progress(console=err_console) as progress:
     def update_progress(done: int, total: int) -> None:
         progress.update(task, completed=done)
 
-    checked = annotate_papers(papers, progress_callback=update_progress)
+    crossref_failures: Counter = Counter()
+    checked = annotate_papers(
+        papers,
+        progress_callback=noting_failures(crossref_failures, update_progress),
+    )
 @
 
 The JSON shape mirrors what a verification checklist needs: the DOI and title to
@@ -3392,7 +3731,7 @@ class TestEnrichCommand:
     @staticmethod
     def _fake_enrich(
         papers, fields=None, providers=None, progress_callback=None,
-        preprint_search=False,
+        preprint_search=False, outcomes=None,
     ):
         """Stand in for enrich_papers: mark everything gold OA with a PDF."""
         from dataclasses import replace

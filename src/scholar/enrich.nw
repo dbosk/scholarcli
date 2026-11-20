@@ -43,6 +43,7 @@ with better coverage like Semantic Scholar and OpenAlex.
 
 <<imports>>
 <<constants>>
+<<lookup outcomes>>
 <<enrichment functions>>
 @
 
@@ -173,6 +174,9 @@ requested explicitly by passing them in the [[fields]] parameter.
 
 Callers can also override which providers to try (and in what order) by passing
 provider names in [[providers]].
+A caller that needs to know why a field stayed empty---an answer
+without it, or a failed lookup---passes a [[LookupOutcome]] in
+[[outcome]] (\cref{sec:enrich-lookup-outcomes}).
 
 After the providers have had their turn, and whenever [[pdf_url]] is among
 the requested fields, we ask Unpaywall (\cref{unpaywall-module}) for the
@@ -210,6 +214,7 @@ def enrich_paper(
     providers: list[str] | None = None,
     fetch_refs_cites: bool = False,
     preprint_search: bool = False,
+    outcome: LookupOutcome | None = None,
 ) -> Paper:
     """
     Enrich a paper by fetching missing fields from other providers.
@@ -234,6 +239,8 @@ def enrich_paper(
         preprint_search: If True, the preprint fallback may also search
             preprint servers by title and authors; authoritative
             DOI-based preprint links are followed regardless.
+        outcome: If given, filled with the providers asked, the lookups
+            that failed and why, and a failed Unpaywall lookup.
 
     Returns:
         A new Paper with enriched fields, or the original if enrichment
@@ -292,6 +299,7 @@ def enrich_paper(
                     continue
 
                 enriched = cast(Any, provider).get_paper_by_doi(doi)
+                <<note the outcome of the provider's lookup>>
                 if enriched is None:
                     logger.debug(
                         f"{provider_name} returned no data for DOI {result.doi}"
@@ -329,6 +337,7 @@ def enrich_paper(
     # Open-access status and a fallback PDF link from Unpaywall
     if "pdf_url" in fields and result.doi:
         result = unpaywall.annotate_paper(result)
+        <<note the outcome of the open-access lookup>>
 
     # Still no PDF: try to adopt a preprint version instead.
     if "pdf_url" in fields and not result.pdf_url:
@@ -1336,6 +1345,7 @@ def enrich_papers(
     providers: list[str] | None = None,
     progress_callback: Callable[[int, int], None] | None = None,
     preprint_search: bool = False,
+    outcomes: list[LookupOutcome] | None = None,
 ) -> list[Paper]:
     """
     Enrich multiple papers.
@@ -1348,6 +1358,8 @@ def enrich_papers(
         progress_callback: Called with (current, total) after each paper.
         preprint_search: Passed through to `enrich_paper`: allow the
             preprint fallback to search preprint servers by title.
+        outcomes: If given, one `LookupOutcome` per paper is appended
+            to it, in the order of `papers`.
 
     Returns:
         List of enriched papers in the same order.
@@ -1363,12 +1375,16 @@ def enrich_papers(
     enriched_count = 0
 
     for i, paper in enumerate(papers):
+        outcome = LookupOutcome() if outcomes is not None else None
         result = enrich_paper(
             paper,
             fields,
             providers=providers,
             preprint_search=preprint_search,
+            outcome=outcome,
         )
+        if outcomes is not None:
+            outcomes.append(outcome)
         if result != paper:  # Paper was enriched
             enriched_count += 1
         enriched.append(result)
@@ -1443,6 +1459,599 @@ class TestEnrichPapers:
         assert result[2].title == "Third"
 @
 
+\section{What the lookups answered}
+\label{sec:enrich-lookup-outcomes}
+
+A paper that leaves enrichment without an abstract may have two quite
+different histories.
+Every provider asked may have answered, and none holds an abstract for
+the DOI; or a lookup may have failed, refused by a rate limiter or
+answered with an error, and the abstract may be there for the asking.
+A review that excludes records for lack of an abstract needs to tell
+the two apart, since the second kind should be looked up again before
+it is excluded
+(\url{https://github.com/dbosk/scholarcli/issues/259}).
+[[enrich_paper]] used to log both as \enquote{returned no data} at
+debug level, and [[scholar enrich]] reported neither.
+
+The providers now say which it was: every [[get_paper_by_doi]] leaves
+the reason a lookup failed in [[last_lookup_error]], and [[None]] there
+when the service answered (\cref{sec:lookup-outcome}).
+Unpaywall's client does the same for the open-access lookup
+(\cref{unpaywall-module}).
+Enrichment collects these into one [[LookupOutcome]] per paper: the
+providers it asked, in order, the failed ones with their reasons, the
+providers that declined to ask, with theirs, and the reason the
+open-access lookup failed, if it did.
+A provider declines when it has nothing it could ask with: no key, or
+Scopus without its [[COMPLETE]] view ([[last_lookup_declined]],
+\cref{sec:lookup-outcome}).
+That is neither an answer nor a failure, and it is kept apart from
+both: a declining provider is not among those asked, so a paper every
+asked provider answered for still reads as settled, and it is not a
+failure, so it does not ask the user to run again from a network where
+it would decline again.
+A provider skipped because [[is_available]] says it is not configured,
+or not reached because an earlier one filled every requested field, is
+neither asked nor declined.
+
+The record is optional.
+[[enrich_paper]] fills one only when given one ([[outcome=]]), and
+[[enrich_papers]] appends one per paper to a list only when given a
+list ([[outcomes=]]); the return values are the papers, as before, so
+the TUI and [[search --enrich]], which pass neither, are unchanged.
+Nothing of it is stored in the session.
+The outcome belongs to the run: a lookup refused today may be answered
+tomorrow, and a stored \enquote{failed} would then be stale without
+anything to say so.
+The command that collects the outcomes reports them before it ends
+(\cref{sec:enrich-lookup-tally}).
+
+<<lookup outcomes>>=
+@dataclass
+class LookupOutcome:
+    """What enriching one paper asked, and which lookups failed.
+
+    `asked` lists the providers asked for the DOI, in order; `failed`
+    maps those whose lookup failed to the reason. `open_access_error`
+    is the reason the Unpaywall lookup failed, if it did. `declined`
+    maps the providers that declined to ask (and are not in `asked`)
+    to their reason.
+    """
+
+    asked: list[str] = field(default_factory=list)
+    failed: dict[str, str] = field(default_factory=dict)
+    open_access_error: str | None = None
+    declined: dict[str, str] = field(default_factory=dict)
+<<lookup outcome imports>>=
+from collections import Counter
+from dataclasses import dataclass, field
+@
+
+The reasons are read the way [[provider_outcome]] reads a search's
+[[last_error]] (\cref{sec:provider-protocol}): as optional
+attributes, accepted only if they are non-empty strings.
+A provider from elsewhere has no such attribute, and the [[MagicMock]]
+providers of the tests answer every attribute with another mock; both
+read as \enquote{answered}, which is what they reported before this
+existed.
+
+<<lookup outcomes>>=
+def lookup_error(source) -> str | None:
+    """Return why `source`'s last DOI lookup failed; None if it answered.
+
+    Reads the optional `last_lookup_error` attribute; anything but a
+    non-empty string reads as "answered".
+    """
+    return _as_reason(getattr(source, "last_lookup_error", None))
+
+
+def lookup_declined(source) -> str | None:
+    """Return why `source` declined its last DOI lookup, or None.
+
+    Reads the optional `last_lookup_declined` attribute, as
+    `lookup_error` reads its own.
+    """
+    return _as_reason(getattr(source, "last_lookup_declined", None))
+
+
+def _as_reason(value) -> str | None:
+    """Return `value` if it is a non-empty string, else None."""
+    return value if isinstance(value, str) and value else None
+@
+
+The provider loop notes the outcome right after the call, before it
+decides what to do with the answer, so a provider whose record is then
+skipped as not matching still counts as asked and answered.
+
+<<note the outcome of the provider's lookup>>=
+if outcome is not None:
+    declined = lookup_declined(provider)
+    if declined is not None:
+        outcome.declined[provider_name] = declined
+    else:
+        outcome.asked.append(provider_name)
+        error = lookup_error(provider)
+        if error is not None:
+            outcome.failed[provider_name] = error
+@
+
+Unpaywall is reached through the module's shared client, so its reason
+is read from the module, right after the lookup that set it.
+
+<<note the outcome of the open-access lookup>>=
+if outcome is not None:
+    outcome.open_access_error = _as_reason(unpaywall.last_lookup_error())
+@
+
+Let's verify that the two histories are told apart.
+The providers are real: a Semantic Scholar provider whose cache holds
+the answer \enquote{no such paper} for one DOI, and whose limiter is in
+a cooldown, so that the lookup of any other DOI is refused before a
+request is made.
+That is the refusal a throttled run meets, and the cached answer is
+the one a 404 leaves; neither needs the network.
+The cache is replaced by an empty dictionary first, so that nothing
+this test stores reaches the shared cache of the process.
+
+<<test functions>>=
+class TestLookupOutcome:
+    """enrich_paper tells a failed lookup from an answer (#259)."""
+
+    @staticmethod
+    def _throttled_s2(monkeypatch, answered_doi):
+        from scholar.providers import SemanticScholarProvider
+
+        provider = SemanticScholarProvider(api_key=None)
+        monkeypatch.setattr(provider, "_cache", {("doi", answered_doi): None})
+        provider._limiter.record_limit_hit(
+            retry_after=3600, reason="cooldown for the test"
+        )
+        return provider
+
+    def test_refused_and_not_found_give_different_outcomes(
+        self, monkeypatch
+    ):
+        s2 = self._throttled_s2(monkeypatch, "10.1/answered")
+        monkeypatch.setattr(
+            "scholar.enrich.get_provider",
+            lambda name: s2 if name == "s2" else None,
+        )
+        papers = [
+            Paper(title="Refused", authors=["a"], doi="10.1/refused"),
+            Paper(title="Answered", authors=["a"], doi="10.1/answered"),
+        ]
+        outcomes = []
+        enriched = enrich_papers(
+            papers, fields=["abstract"], outcomes=outcomes
+        )
+        assert [p.abstract for p in enriched] == [None, None]
+        refused, answered = outcomes
+        assert refused.asked == ["s2"]
+        assert "cooldown for the test" in refused.failed["s2"]
+        assert answered.asked == ["s2"]
+        assert answered.failed == {}
+
+    def test_mock_providers_read_as_answered(self):
+        """A MagicMock, or a provider without the attribute, answered."""
+
+        class Bare:
+            def get_paper_by_doi(self, doi):
+                return None
+
+        providers = {"s2": MagicMock(), "openalex": Bare()}
+        providers["s2"].get_paper_by_doi.return_value = None
+        outcome = LookupOutcome()
+        with patch("scholar.enrich.get_provider", providers.get):
+            enrich_paper(
+                Paper(title="T", authors=["a"], doi="10.1/t"),
+                fields=["abstract"],
+                providers=["s2", "openalex"],
+                outcome=outcome,
+            )
+        assert outcome.asked == ["s2", "openalex"]
+        assert outcome.failed == {}
+
+    def test_no_collector_no_change(self):
+        """Without `outcomes` the batch returns the papers as before."""
+        papers = [Paper(title="T", authors=["a"], doi="10.1/t")]
+        assert enrich_papers(papers, fields=["abstract"]) == papers
+@
+
+A provider that declines is recorded apart, and is not among those
+asked.
+The Scopus provider here is the real one under [[SCOPUS_VIEW=standard]],
+which declines every DOI lookup without a request; the Semantic Scholar
+one answers from its cache, as in the test above.
+
+<<test functions>>=
+class TestDeclinedLookup:
+    """A declining provider is neither asked nor failed (#259)."""
+
+    def test_declined_is_recorded_apart(self, monkeypatch):
+        from scholar.providers import ScopusProvider, SemanticScholarProvider
+
+        monkeypatch.setenv("SCOPUS_VIEW", "standard")
+        s2 = SemanticScholarProvider(api_key=None)
+        monkeypatch.setattr(s2, "_cache", {("doi", "10.1/d"): None})
+        providers = {"s2": s2, "scopus": ScopusProvider(api_key="dummy")}
+        outcome = LookupOutcome()
+        with patch("scholar.enrich.get_provider", providers.get):
+            enrich_paper(
+                Paper(title="T", authors=["a"], doi="10.1/d"),
+                fields=["abstract"],
+                providers=["s2", "scopus"],
+                outcome=outcome,
+            )
+        assert outcome.asked == ["s2"]
+        assert outcome.failed == {}
+        assert outcome.declined == {
+            "scopus": "SCOPUS_VIEW=standard has no abstracts"
+        }
+@
+
+The open-access lookup is told apart the same way.
+Here the Unpaywall client is the real one with a contact address set
+and a cooldown on its limiter.
+No provider is configured and the preprint fallback is kept offline,
+both by the fixtures of \cref{sec:enrich-testing}, so that only
+Unpaywall is reached.
+After the refused lookup, a DOI whose 404 the client has cached must
+read as answered again: the client resets its reason on every lookup.
+
+<<test functions>>=
+class TestOpenAccessLookupOutcome:
+    """A refused Unpaywall lookup is noted, an answered one is not."""
+
+    def test_refused_then_answered(self, monkeypatch):
+        monkeypatch.setenv("SCHOLAR_EMAIL", "tests@example.org")
+        monkeypatch.setitem(
+            unpaywall._client._cache, ("oa", "10.1/oa-unknown"), None
+        )
+        unpaywall._client._limiter.record_limit_hit(
+            retry_after=3600, reason="unpaywall cooldown for the test"
+        )
+        refused, answered = LookupOutcome(), LookupOutcome()
+        for doi, outcome in (
+            ("10.1/oa-refused", refused), ("10.1/oa-unknown", answered),
+        ):
+            enrich_paper(
+                Paper(title="T", authors=["a"], doi=doi),
+                fields=["pdf_url"],
+                outcome=outcome,
+            )
+        assert refused.asked == []
+        assert "unpaywall cooldown for the test" in refused.open_access_error
+        assert answered.open_access_error is None
+@
+
+\subsection{Counting the outcomes}
+
+The command wants a tally, not a list of outcomes, and the tally is
+easier to test away from the command.
+[[tally_lookups]] counts, over the papers a run processed, those still
+without an abstract, and sorts them into four kinds:
+\begin{description}
+\item[Answered] every provider asked answered, and none had an
+  abstract: there is none in any database asked.
+\item[Failed] at least one lookup failed; these are counted again per
+  provider and reason, one count per paper, so a paper both Semantic
+  Scholar and OpenAlex refused counts once in each row.
+\item[Without a DOI] nothing could be asked.
+\item[None asked] the paper has a DOI, but no provider was asked:
+  each declined, or none is configured.
+\end{description}
+A paper is answered when every provider that was asked answered;
+providers that declined do not count against it.
+They are reported apart, one line per provider and reason with the
+number of papers still without an abstract that it declined for, and
+without the hint to run again.
+A paper whose lookups failed but which got its abstract elsewhere is
+not counted: the failure cost it nothing.
+
+The open-access status gets the same treatment over the papers whose
+status is still unknown after the run: without a DOI, not in Unpaywall
+(it answered, but with no record), or a failed lookup, counted per
+reason.
+A paper that has a status from an earlier run keeps it when the lookup
+fails ([[annotate_paper]] leaves it unchanged), so it is not counted.
+
+The outcomes are matched to the papers by position, as
+[[enrich_papers]] appends them; a paper without an outcome, because
+the caller did not collect one, reads as one with nothing asked.
+
+<<lookup outcomes>>=
+@dataclass
+class LookupTally:
+    """Why the papers of a run still lack an abstract or an OA status."""
+
+    papers: int = 0
+    without_abstract: int = 0
+    all_answered: int = 0
+    with_failure: int = 0
+    without_doi: int = 0
+    none_asked: int = 0
+    failures: Counter = field(default_factory=Counter)
+    declined: Counter = field(default_factory=Counter)
+    oa_undetermined: int = 0
+    oa_without_doi: int = 0
+    oa_not_found: int = 0
+    oa_failed: int = 0
+    oa_failures: Counter = field(default_factory=Counter)
+
+
+def tally_lookups(
+    papers: list[Paper], outcomes: list[LookupOutcome | None]
+) -> LookupTally:
+    """Count why `papers` still lack an abstract or an open-access status.
+
+    `outcomes[i]` is the outcome of enriching `papers[i]`; a missing
+    one reads as nothing asked. `failures` and `declined` count papers
+    per `(provider, reason)`, `oa_failures` per reason.
+    """
+    tally = LookupTally(papers=len(papers))
+    for index, paper in enumerate(papers):
+        outcome = outcomes[index] if index < len(outcomes) else None
+        outcome = outcome or LookupOutcome()
+        <<count a paper still without an abstract>>
+        <<count a paper whose open-access status is unknown>>
+    return tally
+<<count a paper still without an abstract>>=
+if needs_enrichment(paper, ["abstract"]):
+    tally.without_abstract += 1
+    tally.declined.update(outcome.declined.items())
+    if outcome.failed:
+        tally.with_failure += 1
+        tally.failures.update(outcome.failed.items())
+    elif outcome.asked:
+        tally.all_answered += 1
+    elif not paper.doi:
+        tally.without_doi += 1
+    else:
+        tally.none_asked += 1
+<<count a paper whose open-access status is unknown>>=
+if paper.oa_status is None:
+    tally.oa_undetermined += 1
+    if not paper.doi:
+        tally.oa_without_doi += 1
+    elif outcome.open_access_error:
+        tally.oa_failed += 1
+        tally.oa_failures[outcome.open_access_error] += 1
+    else:
+        tally.oa_not_found += 1
+@
+
+The text says the counts in the order a user acts on them: what is
+settled (no abstract anywhere asked), what cannot be asked, and last
+what failed, by provider and reason with the most frequent first,
+followed by the one thing to do about it.
+The hint to run again appears only when something failed: the other
+kinds would get the same answer again.
+A count of zero is left out, except the first line's, which says that
+nothing is missing.
+[[scope]] is the command's word for what it processed (\enquote{papers}
+or \enquote{pending papers}).
+
+<<lookup outcomes>>=
+def abstract_tally_lines(tally: LookupTally, scope: str) -> list[str]:
+    """Describe the papers still without an abstract, one line each."""
+    lines = [
+        f"Still without an abstract: {tally.without_abstract} of "
+        f"{tally.papers} {scope}."
+    ]
+    if tally.all_answered:
+        lines.append(
+            f"  {tally.all_answered} answered by every database asked: "
+            "no abstract in any of them."
+        )
+    if tally.without_doi:
+        lines.append(
+            f"  {tally.without_doi} without a DOI: no database could "
+            "be asked."
+        )
+    if tally.none_asked:
+        lines.append(
+            f"  {tally.none_asked} with a DOI that no database was "
+            "asked about: each one declined or was unavailable."
+        )
+    lines.extend(
+        f"  {provider} not asked: {reason} ({_papers(count)})"
+        for (provider, reason), count in _most_frequent(tally.declined)
+    )
+    if tally.with_failure:
+        lines.append(
+            f"  {tally.with_failure} with a failed lookup, by database "
+            "and reason:"
+        )
+        lines.extend(
+            f"    {provider}: {reason} ({count})"
+            for (provider, reason), count in _most_frequent(tally.failures)
+        )
+        lines.append(f"  {RUN_AGAIN_HINT}")
+    return lines
+
+
+def open_access_tally_lines(tally: LookupTally, scope: str) -> list[str]:
+    """Describe the papers whose open-access status is still unknown.
+
+    Returns no lines when every paper has a status.
+    """
+    if not tally.oa_undetermined:
+        return []
+    parts = [
+        f"{count} {what}"
+        for count, what in (
+            (tally.oa_without_doi, "without a DOI"),
+            (tally.oa_not_found, "not in Unpaywall"),
+            (tally.oa_failed, "with a failed lookup"),
+        )
+        if count
+    ]
+    lines = [
+        f"Open-access status unknown for {tally.oa_undetermined} "
+        f"{scope}: {', '.join(parts)}."
+    ]
+    if tally.oa_failed:
+        lines.extend(
+            f"  unpaywall: {reason} ({count})"
+            for reason, count in _most_frequent(tally.oa_failures)
+        )
+        lines.append(f"  {RUN_AGAIN_HINT}")
+    return lines
+
+
+def _papers(count: int) -> str:
+    """Return "1 paper" or "N papers"."""
+    return f"{count} paper" if count == 1 else f"{count} papers"
+
+
+def _most_frequent(counts: Counter) -> list:
+    """Return the items of `counts`, most frequent first, then by key."""
+    return sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+<<lookup outcome imports>>=
+from scholar.network import RUN_AGAIN_HINT
+@
+
+The hint is the network module's ([[RUN_AGAIN_HINT]],
+\cref{sec:request-failure-reason}), so that the Crossref check's lines,
+which [[scholar verify]] prints without this module, end the same way.
+
+Let's verify the text on outcomes made by hand: two papers whose
+lookups failed (one refused by Semantic Scholar alone, one by both
+Semantic Scholar and OpenAlex), one that every provider answered, one
+without a DOI, and one that got its abstract despite a failed lookup.
+
+<<test functions>>=
+class TestLookupTally:
+    """The tally that ends `scholar enrich` (#259)."""
+
+    REFUSED = "rate limited (HTTP 429)"
+
+    def _tally(self):
+        papers = [
+            Paper(title="A", authors=["a"], doi="10.1/a"),
+            Paper(title="B", authors=["a"], doi="10.1/b"),
+            Paper(title="C", authors=["a"], doi="10.1/c"),
+            Paper(title="D", authors=["a"]),
+            Paper(title="E", authors=["a"], doi="10.1/e", abstract="Got it."),
+        ]
+        outcomes = [
+            LookupOutcome(["s2", "openalex"], {"s2": self.REFUSED}),
+            LookupOutcome(
+                ["s2", "openalex"],
+                {"s2": self.REFUSED, "openalex": "HTTP 503"},
+            ),
+            LookupOutcome(["s2", "openalex"]),
+            LookupOutcome(),
+            LookupOutcome(["s2", "openalex"], {"s2": self.REFUSED}),
+        ]
+        return tally_lookups(papers, outcomes)
+
+    def test_failed_and_answered_are_counted_apart(self):
+        tally = self._tally()
+        assert (tally.papers, tally.without_abstract) == (5, 4)
+        assert (tally.with_failure, tally.all_answered) == (2, 1)
+        assert (tally.without_doi, tally.none_asked) == (1, 0)
+        assert tally.failures == {
+            ("s2", self.REFUSED): 2, ("openalex", "HTTP 503"): 1,
+        }
+
+    def test_text(self):
+        assert abstract_tally_lines(self._tally(), "papers") == [
+            "Still without an abstract: 4 of 5 papers.",
+            "  1 answered by every database asked: no abstract in any "
+            "of them.",
+            "  1 without a DOI: no database could be asked.",
+            "  2 with a failed lookup, by database and reason:",
+            "    s2: rate limited (HTTP 429) (2)",
+            "    openalex: HTTP 503 (1)",
+            "  Run again to retry the failed lookups.",
+        ]
+
+    def test_no_hint_without_failures(self):
+        tally = tally_lookups(
+            [Paper(title="A", authors=["a"], doi="10.1/a")],
+            [LookupOutcome(["s2"])],
+        )
+        lines = abstract_tally_lines(tally, "pending papers")
+        assert lines == [
+            "Still without an abstract: 1 of 1 pending papers.",
+            "  1 answered by every database asked: no abstract in any "
+            "of them.",
+        ]
+
+    def test_missing_outcome_reads_as_nothing_asked(self):
+        tally = tally_lookups(
+            [Paper(title="A", authors=["a"], doi="10.1/a")], []
+        )
+        assert (tally.none_asked, tally.with_failure) == (1, 0)
+
+    def test_declined_is_information_not_failure(self):
+        declined = {"scopus": "SCOPUS_VIEW=standard has no abstracts"}
+        papers = [
+            Paper(title="A", authors=["a"], doi="10.1/a"),
+            Paper(title="B", authors=["a"], doi="10.1/b"),
+            Paper(title="C", authors=["a"], doi="10.1/c"),
+        ]
+        outcomes = [
+            LookupOutcome(["s2"], declined=dict(declined)),
+            LookupOutcome(["s2"], declined=dict(declined)),
+            LookupOutcome(declined=dict(declined)),
+        ]
+        tally = tally_lookups(papers, outcomes)
+        assert (tally.all_answered, tally.with_failure) == (2, 0)
+        assert tally.none_asked == 1
+        assert abstract_tally_lines(tally, "papers") == [
+            "Still without an abstract: 3 of 3 papers.",
+            "  2 answered by every database asked: no abstract in any "
+            "of them.",
+            "  1 with a DOI that no database was asked about: each one "
+            "declined or was unavailable.",
+            "  scopus not asked: SCOPUS_VIEW=standard has no abstracts "
+            "(3 papers)",
+        ]
+
+    def test_declined_line_for_one_paper(self):
+        tally = tally_lookups(
+            [Paper(title="A", authors=["a"], doi="10.1/a")],
+            [LookupOutcome(["s2"], declined={"ieee": "IEEE_API_KEY not set"})],
+        )
+        assert abstract_tally_lines(tally, "papers")[-1] == (
+            "  ieee not asked: IEEE_API_KEY not set (1 paper)"
+        )
+
+    def test_open_access_text(self):
+        papers = [
+            Paper(title="A", authors=["a"], doi="10.1/a"),
+            Paper(title="B", authors=["a"], doi="10.1/b"),
+            Paper(title="C", authors=["a"]),
+            Paper(title="D", authors=["a"], doi="10.1/d", oa_status="green"),
+        ]
+        outcomes = [
+            LookupOutcome(open_access_error=self.REFUSED),
+            LookupOutcome(),
+            LookupOutcome(),
+            LookupOutcome(open_access_error=self.REFUSED),
+        ]
+        lines = open_access_tally_lines(
+            tally_lookups(papers, outcomes), "papers"
+        )
+        assert lines == [
+            "Open-access status unknown for 3 papers: 1 without a DOI, "
+            "1 not in Unpaywall, 1 with a failed lookup.",
+            "  unpaywall: rate limited (HTTP 429) (1)",
+            "  Run again to retry the failed lookups.",
+        ]
+
+    def test_no_open_access_lines_when_all_known(self):
+        tally = tally_lookups(
+            [Paper(title="A", authors=["a"], doi="10.1/a", oa_status="gold")],
+            [LookupOutcome()],
+        )
+        assert open_access_tally_lines(tally, "papers") == []
+@
+
+
 <<imports>>=
 import logging
 from typing import Any, Callable, cast
@@ -1451,6 +2060,7 @@ from scholar import Paper, preprint, unpaywall
 from scholar.providers import get_provider
 from scholar.utils import clean_paper_text, derive_arxiv_doi
 <<enrichment cache imports>>
+<<lookup outcome imports>>
 
 logger = logging.getLogger(__name__)
 @

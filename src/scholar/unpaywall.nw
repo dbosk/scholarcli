@@ -159,6 +159,7 @@ class UnpaywallClient:
         self._limiter = limiter_for(self)
         self._session = self._create_session()
         self._warned_unconfigured = False
+        self.last_lookup_error: str | None = None
 
     @property
     def email(self) -> str | None:
@@ -226,6 +227,31 @@ a session of fifty papers would otherwise produce fifty identical warnings.
 The same reasoning silences the per-DOI warning while the rate limiter
 refuses: it has logged the cooldown or spent quota once already.
 
+[[None]] thus covers three cases a caller may want to tell apart:
+nothing to ask (no DOI, no email), Unpaywall's answer that it has no
+record of the DOI (404), and a lookup that failed (429, the limiter,
+an error).
+Only the last can be retried, and [[scholar enrich]] counts it
+(\cref{sec:enrich-lookup-tally}).
+Rather than change the return value, which every caller reads as
+\enquote{undetermined}, the client keeps the reason in
+[[last_lookup_error]], as the search providers do for their DOI
+lookups (\cref{sec:lookup-outcome}) and in their words: it is reset
+first thing and set on exactly the uncached failure paths.
+
+The reasons are worded by [[network.request_failure_reason]]
+(\cref{sec:request-failure-reason}), never by quoting a [[requests]]
+exception: its text names the request URL, and the URL carries the
+contact address as a parameter, while the reason is printed in a tally
+that may be pasted anywhere.
+The session's [[Retry]] also means that a throttled or failing
+Unpaywall seldom reaches the 429 branch: once the retries for a listed
+status are spent, [[requests]] raises [[RetryError]], which the reason
+names in words.
+The warnings logged for a failure do quote the exception, since they
+are the place to read the whole story, but through
+[[network.redact_secrets]], which hides the [[email]] parameter.
+
 <<unpaywall client methods>>=
 def fetch_oa(self, doi: str | None) -> dict | None:
     """Return open-access metadata for ``doi``, or ``None`` if undetermined.
@@ -234,8 +260,9 @@ def fetch_oa(self, doi: str | None) -> dict | None:
     ``oa_url``, ``pdf_url``, ``host_type``, ``version`` and ``license``.
     Returns ``None`` when the DOI is missing, no contact email is
     configured, the DOI is not found, the request is rate-limited, or it
-    fails.
+    fails. The last two set `last_lookup_error` to the reason.
     """
+    self.last_lookup_error = None
     if not doi:
         return None
     if not self.is_configured():
@@ -268,6 +295,7 @@ def fetch_oa(self, doi: str | None) -> dict | None:
             return None
         if response.status_code == 429:
             logger.warning("unpaywall: rate limited for DOI %s", doi)
+            self.last_lookup_error = network.http_status_reason(429)
             return None
 
         response.raise_for_status()
@@ -275,13 +303,22 @@ def fetch_oa(self, doi: str | None) -> dict | None:
         self._cache[cache_key] = result
         return result
 
-    except RateLimited:
+    except RateLimited as e:
+        self.last_lookup_error = e.reason
         return None
     except requests.exceptions.HTTPError as e:
-        logger.warning("unpaywall: lookup error for %s: %s", doi, e)
+        logger.warning(
+            "unpaywall: lookup error for %s: %s",
+            doi, network.redact_secrets(e),
+        )
+        self.last_lookup_error = network.request_failure_reason(e)
         return None
     except Exception as e:
-        logger.warning("unpaywall: lookup failed for %s: %s", doi, e)
+        logger.warning(
+            "unpaywall: lookup failed for %s: %s",
+            doi, network.redact_secrets(e),
+        )
+        self.last_lookup_error = network.request_failure_reason(e)
         return None
 @
 
@@ -510,6 +547,49 @@ for path in seen:
         ]
 @
 
+The reasons left in [[last_lookup_error]] are checked the same way:
+an answer leaves none, also after a failure; a 429 leaves the rate
+limit; and the exceptions that quote the request URL, the address in
+it included, leave words of our own.
+The exceptions are injected at the session's [[get]], as above,
+because a real exhausted [[Retry]] waits out its back-off first.
+
+<<test functions>>=
+class TestLookupErrorReason:
+    """`last_lookup_error` tells a failed lookup from an answer (#259)."""
+
+    URL = "https://api.unpaywall.org/v2/10.1%2Fx?email=someone@example.org"
+
+    def test_answer_after_failure_leaves_none(self):
+        with patch.object(
+            _client._session, "get", return_value=_mock_response(429)
+        ):
+            assert fetch_oa("10.1/busy") is None
+        assert last_lookup_error() == "rate limited (HTTP 429)"
+        _client._cache[("oa", "10.1/known")] = None
+        assert fetch_oa("10.1/known") is None
+        assert last_lookup_error() is None
+
+    @pytest.mark.parametrize("failure, reason", [
+        (requests.exceptions.RetryError(URL), network.RETRIES_SPENT),
+        (requests.exceptions.ConnectionError(URL),
+         "connection failed (ConnectionError)"),
+    ])
+    def test_reason_never_quotes_the_url(self, failure, reason):
+        with patch.object(_client._session, "get", side_effect=failure):
+            assert fetch_oa("10.1/x") is None
+        assert last_lookup_error() == reason
+
+    def test_warning_hides_the_address(self, caplog):
+        """The logged exception text has the address redacted."""
+        failure = requests.exceptions.ConnectionError(self.URL)
+        with patch.object(_client._session, "get", side_effect=failure):
+            with caplog.at_level("WARNING", logger="scholar.unpaywall"):
+                assert fetch_oa("10.1/x") is None
+        assert "email=[redacted]" in caplog.text
+        assert "someone@example.org" not in caplog.text
+@
+
 
 \section{Normalizing the Unpaywall record}
 
@@ -610,6 +690,11 @@ def is_configured() -> bool:
 def fetch_oa(doi: str | None) -> dict | None:
     """Look up open-access metadata for a single DOI (see UnpaywallClient)."""
     return _client.fetch_oa(doi)
+
+
+def last_lookup_error() -> str | None:
+    """Why the shared client's last lookup failed; None if it did not."""
+    return _client.last_lookup_error
 @
 
 \subsection{Annotating a paper}
