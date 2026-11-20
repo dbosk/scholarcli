@@ -987,7 +987,8 @@ concurrent merge and `is_unscreened` use it; the append keeps the
 decision whole; saved only when set, `agent_audit_data`) and
 registered in `MACHINE_AUDIT_FIELDS`, so every later machine `decide`
 clears it; `--keep-trace` keeps only the LLM fields and clears the
-agent's. A human decide and `sessions relabel` keep it. `decide
+agent's. A human decide and `sessions relabel` keep it; `sessions
+reset` clears it and keeps it in `resets[-1]["trace"]`. `decide
 --source agent --reason TEXT [--by NAME]` gives every selected record
 that reason, `--by` (None if not given, never guessed) and one
 `utc_now_iso()` per run. `--reasons-file F` (lines
