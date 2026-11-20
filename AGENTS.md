@@ -1275,7 +1275,8 @@ in a reset's `trace`). Set only by `review.record_human_decision(d,
 via, by=None, at=None)` (raises unless decided with a source in
 `REVIEWED_BY_A_HUMAN` = human/llm_reviewed/agent_reviewed; `at`
 defaults to `_utcnow`), called by the TUI's keep/themes/discard/confirm
-in both screens (after `mark_as_reviewed`) and by `sessions decide`
+in both screens (after `mark_as_reviewed`; `by=app.reviewer`, set by
+`sessions resume --by` or the blind-mode name dialog, else None) and by `sessions decide`
 with a human source (`--source human` or the terminal default; one
 `utc_now_iso()` per run; `--by NAME` now accepted with human). The
 API (`ReviewDecision(source=HUMAN)`, `mark_as_reviewed` alone) sets
@@ -1469,8 +1470,41 @@ only when `saving` (set before the chunk: decide True, screen
 `--dry-run` writes nothing. `--blind`/`--not-blind` → `blind`
 True/False, `blind_basis: "declared"`; neither → None. The decision is
 never changed (tested on the saved JSON). Not yet built (later #253
-PRs): agreement numbers, conflicts, `llm classify --second-screen`, the
-TUI's blind mode, report surfaces, the screen sheet.
+PRs): agreement numbers, conflicts, `llm classify --second-screen`,
+report surfaces, the screen sheet.
+**TUI blind review (#253 part D, closes #254's last point; tui.nw
+`sec:tui-blind-review`).** Key `b` in the paper list (free in list and
+detail screen) toggles `PaperReviewApp.blind`; on needs review mode,
+`session.llm_samples` non-empty and `app.reviewer` (from `scholar
+sessions resume S --by NAME`, else `ReviewerNameModal` asks; empty or
+Escape leaves it off; empty `--by` exits 2 before loading). On selects
+the `llm_sample` filter, status bar adds "Blind: NAME". `blind_state(d,
+queue)`: None unless blind and `id(d)` in `blind_queue()` (= what
+`sampled_for_review` lists: every sample, band, census; not reset since
+draw); "own" if `made_by_reviewer` (`verdict_screener` kind human,
+name = reviewer; unreachable via the queue today, which holds only
+unreviewed machine decisions); "revealed" if `reviewer_screening` (a
+counted `origin: screen` human screening of that name, also one from
+`sessions screen`); else "hidden", in any filter view. Hidden: row
+shows `BLIND_MARK` ("B") instead of status mark, no machine
+mark/confidence; detail screen omits tags + Themes/Motivations heading;
+the T/d dialogs start empty. `blind_verdict(d, status, ask_tags, done)`
+runs first in K/T/d of both screens: hidden → `record_blind_verdict`
+(`new_screening(kind="human", name=reviewer, blind=True,
+blind_basis="tui", via="tui", sample_id=sample_holding(session, d))`
+via `record_screening`, decision untouched, notification with
+`revealed_verdict(d)`), the detail screen stays and shows a "Blind
+review" block (both verdicts, the machine's reason); "own" → warning,
+nothing recorded. `blind_refuses_confirm`: C on a hidden paper refused.
+After the reveal K/T/d/C are the normal paths (`mark_as_reviewed` +
+`record_human_decision(..., by=reviewer)`): the adjudication. Leaving
+between keeps the screening; the decision stays unreviewed and listed,
+revealed. Saved by `sessions resume`'s `save_session`; PR A's merge
+sets aside a blind screening made while another process reset the paper
+(`TestBlindReview`, real subprocess, through `sessions resume`). Only
+Scholar's own screens are hidden; a `--discarded`-only sample tells its
+status, a banded draw its confidence band (prose, `sessions resume`
+help, `BLIND_MODE_NOTICE`).
 
 ### Session Arguments
 
@@ -2133,7 +2167,9 @@ A human review leaves them untouched (they are the model's record).
   pooled session (`ReviewSession.llm_samples`, merged by `sample_id`,
   which ends in uuid4 digits so two draws in one second never collide).
   `test_golden_draw` pins the drawn papers for seed 42.
-  The TUI filter `s` (`sampled_for_review`) queues the unreviewed ones;
+  The TUI filter `s` (`sampled_for_review`) queues the unreviewed ones
+  (blind mode `b` hides their verdicts until the reviewer's own is
+  recorded as a screening, see Screenings);
   `sessions decide` reviews them. `--report [-f json]`
   (`sample_reports`): a sampled decision counts as reviewed when decided
   and no longer an unreviewed machine source, as changed when its

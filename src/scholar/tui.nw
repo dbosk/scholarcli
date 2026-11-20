@@ -28,6 +28,9 @@ The interface provides:
 \item[LLM review support] Filter and confirm LLM decisions ([[l]]/[[L]] for
   filtering, [[C]] to confirm), integrating with LLM-assisted classification
   from the CLI.
+\item[Blind review] Screen the papers of a review sample without seeing
+  the machine's verdict first ([[b]]), recorded as a second screener's
+  verdict (\cref{sec:tui-blind-review}).
 \end{description}
 
 The TUI supports two operational modes:
@@ -102,10 +105,12 @@ from simple widgets to complex screens, culminating in the main application:
 <<tui paper list widget>>
 <<tui abstract helpers>>
 <<tui notes helpers>>
+<<tui blind review helpers>>
 <<tui abstract screen>>
 <<tui discard modal>>
 <<tui sort modal>>
 <<tui filter modal>>
+<<tui reviewer name modal>>
 <<tui search filters modal>>
 <<tui main app>>
 <<tui report generation>>
@@ -295,11 +300,13 @@ class PaperListItem(ListItem):
         index: int,
         review_mode: bool = True,
         paper_has_note: bool | None = None,
+        hidden: bool = False,
     ) -> None:
         super().__init__()
         self.decision = decision
         self.index = index
         self.review_mode = review_mode
+        self.hidden = hidden
         # Pre-computed note status (None means check at render time)
         self._paper_has_note = paper_has_note
 
@@ -342,6 +349,7 @@ class PaperListItem(ListItem):
                 status_indicator = "[dim]○[/dim]"
         else:
             status_indicator = " "
+        <<hide the verdict of a row in blind mode>>
 
         # Format authors (truncate if too many)
         authors = ", ".join(paper.authors[:3])
@@ -416,9 +424,11 @@ detailed abstract view.
 Every keep, discard and confirmation in either screen is a human's
 decision, so each also keeps the record of the human's review
 ([[record_human_decision]] with the channel [[tui]],
-\cref{sec:human-review-record} in the review module): the time, and no
-name, since the TUI does not ask for one and a login guessed here would
-put a name on a record its owner never made.  The record is written
+\cref{sec:human-review-record} in the review module): the time, and the
+reviewer's name only when the reviewer gave one, with [[--by]] of
+[[sessions resume]] or on entering blind mode
+(\cref{sec:tui-blind-review}); a login guessed here would put a name on
+a record its owner never made.  The record is written
 after [[mark_as_reviewed]], because it describes the decision that
 stands, whose source must by then be a human's or a reviewed one.  A
 decision recorded through the Python API, by contrast, gets no record,
@@ -594,7 +604,8 @@ class AbstractScreen(Screen[None]):
                     yield Static("[dim]No notes. Press [bold yellow]n[/bold yellow] to add notes.[/dim]")
             
             # Show tags (themes for kept, motivations for discarded)
-            if self.decision.tags:
+            blind = self.app.blind_state(self.decision)
+            if self.decision.tags and blind != "hidden":
                 yield Static("")
                 if self.decision.status == DecisionStatus.KEPT:
                     yield Static("[bold green]─── Themes ───[/bold green]")
@@ -604,6 +615,7 @@ class AbstractScreen(Screen[None]):
                     yield Static("[bold yellow]─── Tags ───[/bold yellow]")
                 tags_text = ", ".join(self.decision.tags)
                 yield Static(tags_text, markup=False)
+            <<show the blind review of the paper>>
             
             # Show references if paper has them
             if paper.references:
@@ -862,6 +874,9 @@ class AbstractScreen(Screen[None]):
         if not self.review_mode:
             self.notify("Keep/discard disabled in notes mode", severity="warning")
             return
+        if self.app.blind_verdict(self.decision, DecisionStatus.KEPT,
+                                  ask_tags=False, done=self._after_blind):
+            return
 
         # Check if changing an LLM decision
         was_llm = self.decision.source.is_unreviewed
@@ -880,7 +895,7 @@ class AbstractScreen(Screen[None]):
                 new_status=DecisionStatus.KEPT,
                 new_tags=[],
             )
-        record_human_decision(self.decision, "tui")
+        record_human_decision(self.decision, "tui", by=self.app.reviewer)
 
         self.dismiss(None)
     
@@ -888,6 +903,9 @@ class AbstractScreen(Screen[None]):
         """Keep with themes---open theme selection modal."""
         if not self.review_mode:
             self.notify("Keep/discard disabled in notes mode", severity="warning")
+            return
+        if self.app.blind_verdict(self.decision, DecisionStatus.KEPT,
+                                  ask_tags=True, done=self._after_blind):
             return
 
         # Capture LLM state before modal opens
@@ -909,7 +927,7 @@ class AbstractScreen(Screen[None]):
                         new_status=DecisionStatus.KEPT,
                         new_tags=result,
                     )
-                record_human_decision(self.decision, "tui")
+                record_human_decision(self.decision, "tui", by=self.app.reviewer)
 
                 self.dismiss(None)
 
@@ -928,6 +946,9 @@ class AbstractScreen(Screen[None]):
         """Open motivation selection modal."""
         if not self.review_mode:
             self.notify("Keep/discard disabled in notes mode", severity="warning")
+            return
+        if self.app.blind_verdict(self.decision, DecisionStatus.DISCARDED,
+                                  ask_tags=True, done=self._after_blind):
             return
 
         # Capture LLM state before modal opens
@@ -949,7 +970,7 @@ class AbstractScreen(Screen[None]):
                         new_status=DecisionStatus.DISCARDED,
                         new_tags=result,
                     )
-                record_human_decision(self.decision, "tui")
+                record_human_decision(self.decision, "tui", by=self.app.reviewer)
 
                 self.dismiss(None)
 
@@ -973,16 +994,22 @@ class AbstractScreen(Screen[None]):
             self.notify("Not an unreviewed LLM or agent decision",
                         severity="warning")
             return
+        if self.app.blind_refuses_confirm(self.decision):
+            return
 
         # Mark as reviewed without changing the decision
         from scholar.llm_review import mark_as_reviewed
         machine = machine_name(self.decision.source)
         mark_as_reviewed(self.decision, user_agrees=True)
-        record_human_decision(self.decision, "tui")
+        record_human_decision(self.decision, "tui", by=self.app.reviewer)
         self.notify(
             f"Confirmed {machine} decision: {self.decision.status.value}"
         )
         self.dismiss(None)
+
+    def _after_blind(self) -> None:
+        """Show the paper again, its verdict revealed."""
+        self.refresh(recompose=True)
 
     def action_scroll_down(self) -> None:
         """Scroll the abstract view down."""
@@ -2041,10 +2068,12 @@ class PaperReviewApp(App):
         Binding("n", "edit_notes", "Notes"),
         Binding("a", "add_all_references", "+Refs"),
         Binding("A", "add_all_citations", "+Cites"),
+        Binding("b", "toggle_blind", "Blind"),
     ]
     
     def __init__(self, session: ReviewSession, review_mode: bool = True,
-                 search_filters: SearchFilters | None = None) -> None:
+                 search_filters: SearchFilters | None = None,
+                 reviewer: str | None = None) -> None:
         super().__init__()
         self.theme = "textual-light"
         self.session = session
@@ -2052,6 +2081,8 @@ class PaperReviewApp(App):
         self.current_index = 0
         self.current_filter = "all"
         self.search_filters = search_filters
+        self.reviewer = reviewer
+        self.blind = False
     
     def compose(self) -> ComposeResult:
         yield Header()
@@ -2115,6 +2146,8 @@ class PaperReviewApp(App):
     
     <<app methods for unreadable notes>>
 
+    <<app methods for blind review>>
+
     def _refresh_list(self) -> None:
         """Refresh the paper list display."""
         list_view = self.query_one("#paper-list", ListView)
@@ -2125,11 +2158,14 @@ class PaperReviewApp(App):
         papers_with_notes = set(notes or ())
 
         filtered = self.get_filtered_decisions()
+        queue = self.blind_queue()
         for i, decision in enumerate(filtered):
             paper_id = get_paper_id(decision.paper)
             paper_has_note = paper_id in papers_with_notes
+            hidden = self.blind_state(decision, queue) == "hidden"
             list_view.append(
-                PaperListItem(decision, i, self.review_mode, paper_has_note)
+                PaperListItem(decision, i, self.review_mode, paper_has_note,
+                              hidden)
             )
 
         # Restore selection and focus after UI updates complete.
@@ -2175,6 +2211,7 @@ class PaperReviewApp(App):
                 f"Pending: {pending} | "
                 f"Total: {total}"
                 f"{filter_text}"
+                f"{self.blind_status_text()}"
             )
         else:
             # Notes mode - simpler status
@@ -2240,6 +2277,9 @@ class PaperReviewApp(App):
             return
         decision = self.get_current_decision()
         if decision:
+            if self.blind_verdict(decision, DecisionStatus.KEPT,
+                                  ask_tags=False, done=self._after_blind):
+                return
             # Check if changing an LLM decision
             was_llm = decision.source.is_unreviewed
             was_discarded = decision.status == DecisionStatus.DISCARDED
@@ -2257,7 +2297,7 @@ class PaperReviewApp(App):
                     new_status=DecisionStatus.KEPT,
                     new_tags=[],
                 )
-            record_human_decision(decision, "tui")
+            record_human_decision(decision, "tui", by=self.reviewer)
 
             self._refresh_list()
             self._update_status()
@@ -2269,6 +2309,9 @@ class PaperReviewApp(App):
             return
         decision = self.get_current_decision()
         if decision:
+            if self.blind_verdict(decision, DecisionStatus.KEPT,
+                                  ask_tags=True, done=self._after_blind):
+                return
             self.push_screen(
                 TagSelectionModal(
                     title=f"Themes: {decision.paper.title[:50]}...",
@@ -2303,7 +2346,7 @@ class PaperReviewApp(App):
                         new_status=DecisionStatus.KEPT,
                         new_tags=result,
                     )
-                record_human_decision(decision, "tui")
+                record_human_decision(decision, "tui", by=self.reviewer)
         self._refresh_list()
         self._update_status()
         self.query_one("#paper-list", ListView).focus()
@@ -2315,6 +2358,9 @@ class PaperReviewApp(App):
             return
         decision = self.get_current_decision()
         if decision:
+            if self.blind_verdict(decision, DecisionStatus.DISCARDED,
+                                  ask_tags=True, done=self._after_blind):
+                return
             self.push_screen(
                 TagSelectionModal(
                     title=f"Motivations: {decision.paper.title[:50]}...",
@@ -2349,7 +2395,7 @@ class PaperReviewApp(App):
                         new_status=DecisionStatus.DISCARDED,
                         new_tags=result,
                     )
-                record_human_decision(decision, "tui")
+                record_human_decision(decision, "tui", by=self.reviewer)
         self._refresh_list()
         self._update_status()
         self.query_one("#paper-list", ListView).focus()
@@ -2366,12 +2412,14 @@ class PaperReviewApp(App):
             self.notify("Not an unreviewed LLM or agent decision",
                         severity="warning")
             return
+        if self.blind_refuses_confirm(decision):
+            return
 
         # Mark as reviewed without changing the decision
         from scholar.llm_review import mark_as_reviewed
         machine = machine_name(decision.source)
         mark_as_reviewed(decision, user_agrees=True)
-        record_human_decision(decision, "tui")
+        record_human_decision(decision, "tui", by=self.reviewer)
         self.notify(f"Confirmed {machine} decision: {decision.status.value}")
         self._refresh_list()
         self._update_status()
@@ -2980,6 +3028,863 @@ each paper matches the filter criteria:
 # Local filtering is now handled by filter_decisions() from scholar.review
 # which uses SearchFilters.matches() to check each paper.
 # See get_filtered_decisions() for the implementation.
+@
+
+\section{Blind review of a sample}
+\label{sec:tui-blind-review}
+
+The sample filter (\cref{FilterModal}) lists the papers of a review
+sample that still wait for a human, each with the machine's verdict
+beside it: the status mark, the classifier's or agent's mark with its
+confidence, and on the detail screen its tags under \enquote{Themes} or
+\enquote{Motivations}.  A reviewer who reads \enquote{discarded, 90\,\%}
+before reading the abstract checks that verdict; they do not screen the
+paper themselves.  Such a check is what the sample's report counts, and
+it has its use, but it is not a second screen: PRISMA~2020 asks a
+review to report \enquote{whether multiple reviewers worked
+independently (that is, were unaware of each other's decisions)} (Page
+et~al., PRISMA 2020 explanation and elaboration, BMJ 2021, n160,
+item~8, doi:10.1136/bmj.n160), and a reviewer who saw the verdict was
+not unaware of it.  Blind mode lets the reviewer give their own verdict
+first (\url{https://github.com/dbosk/scholarcli/issues/254},
+\url{https://github.com/dbosk/scholarcli/issues/253}).
+
+\paragraph{The whole.}
+Blind mode is switched on and off with [[b]] in the paper list, a key
+neither the list nor the detail screen used.  Switching it on selects
+the sample filter, since that is where its work is, and the status bar
+says \enquote{Blind:} with the reviewer's name for as long as it is on.
+While it is on, every paper the sample filter lists that the reviewer
+has not yet screened is \emph{hidden}: its row shows a blue [[B]] in
+place of the status mark and no machine mark or confidence, its detail
+screen shows no tags, and the tag dialogs of [[T]] and [[d]] start with
+nothing selected instead of the decision's tags, and without counts.  The TUI shows no
+reason and no screenings of a paper outside blind mode, so there is
+nothing more to hide.  A hidden paper is then reviewed in two steps.
+\begin{enumerate}
+\item The reviewer keeps or discards it as usual ([[K]], [[T]] with
+  themes, [[d]] with motivations).  That verdict is stored as a
+  screening of the decision (\cref{sec:screenings} in the review
+  module): kind [[human]], the reviewer's name, [[blind]] true on the
+  ground [[tui]], the channel [[tui]] and the sample that drew the
+  paper.  The decision itself is not changed.  [[record_screening]]
+  first snapshots the machine's verdict, so what the machine said stays
+  on record whatever the decision becomes.
+\item The hidden verdict is revealed: a notification says what the
+  machine decided, and the detail screen, where the reviewer stays,
+  shows it in full, with the machine's reason.  The reviewer now
+  confirms it ([[C]]) or changes it ([[K]], [[T]], [[d]]) through the
+  existing paths, which record the human's decision as always.  That
+  decision is the adjudication of the two verdicts.
+\end{enumerate}
+A reviewer who leaves the paper between the two steps keeps the
+screening, and the decision stays unreviewed: the sample filter lists
+the paper again, now revealed, until the decision is confirmed or
+changed.  [[C]] on a paper still hidden is refused: the reviewer would
+confirm a verdict they have not seen.
+
+\paragraph{Which papers.}
+Blind mode hides exactly the papers the sample filter lists
+([[sampled_for_review]]): the unreviewed decisions drawn in any sample
+of the session, a band of a banded draw and a census included, and not
+reset since the draw.  It hides them in whatever view the reviewer
+chooses while it is on, not only in the sample filter, so that turning
+to \enquote{All papers} does not show the verdicts.  Every other paper
+is shown and decided as without blind mode.  A paper counts as screened
+by the reviewer when its decision holds a counted screening
+([[counted_screenings]]) by a human of the reviewer's name, whether made
+here or with [[sessions screen]]: once the reviewer's verdict is on
+record, hiding the other one protects nothing.
+
+\paragraph{A name first.}
+A screening is one screener's verdict, told apart from another's by
+kind and name, and [[sessions screen]] refuses to record one without a
+name.  The TUI must not either: an unnamed human screening would have
+the identity of the snapshot of any unnamed human decision, and a
+comparison of screeners, which takes one verdict per identity, would
+read the two as one screener's.  So blind mode cannot be switched on
+without the reviewer's name.  It comes from [[--by]] of [[sessions
+resume]], the option every command that records a person's act already
+uses ([[sessions decide]], [[screen]], [[relabel]], [[reset]]); without
+it, switching blind mode on asks for the name in a dialog, and leaving
+the dialog empty or with Escape leaves blind mode off.  The dialog makes
+blind mode work wherever the TUI opens ([[search --review]] has no
+[[--by]]), and it is asked once per run.  An environment variable was
+rejected: it is read silently, so a name set for one reviewer would end
+up on another reviewer's screenings.  The name, once given, is also the
+[[human_by]] of every decision the reviewer makes in that run
+(\cref{sec:abstract-llm-handling}): the confirmation that adjudicates a
+blind screening is the same person's act and should carry the same
+name.
+
+A reviewer may not screen a decision they made themselves (same kind
+and name as the snapshot the decision gives, [[verdict_screener]]), the
+rule [[sessions screen]] enforces for the reasons given there: such a
+record would be the same screener twice, and would replace the first
+verdict in any comparison.  Blind mode says so and records nothing for
+that paper.  Through the sample filter this cannot arise today, since a
+sample queues only unreviewed machine decisions, whose screener is a
+machine; the check is there so that it stays true if the samples ever
+queue more.
+
+\paragraph{What Scholar can promise.}
+Blind mode hides what Scholar's own screens show and nothing else.  It
+cannot know whether the reviewer read the session file, ran [[sessions
+show]], or remembers the paper; [[blind_basis]] [[tui]] says how the
+screening was made, not more.  Nor can it hide what the sample itself
+tells: a sample drawn from discards only ([[llm sample --discarded]])
+tells the reviewer that every paper in it was discarded, and a banded
+draw tells the band of confidence each paper was drawn from.  A sample
+that is to be screened blind for status is drawn from both statuses
+([[--discarded --kept]]).  The tag dialogs offer the session's tags,
+the machine's among them, since the reviewer needs that vocabulary to
+choose from; a tag that only this paper holds is therefore offered
+too.  The help of [[sessions resume]] and the
+notice shown when blind mode is switched on say the first part of this
+in a sentence.
+
+\paragraph{Other processes.}
+The TUI holds the session open for as long as the review lasts, and
+another process may meanwhile reset or relabel a sampled decision.  The
+TUI saves through [[save_session]] like every other command, and its
+merge settles such screenings (\cref{sec:screenings}): one made while
+another process reset the decision is set aside, one whose snapshot
+names a source another process relabelled is corrected.  The test at
+the end of this section checks the first through the save of
+[[sessions resume]].
+
+\subsection{The reviewer and their screenings}
+
+Three questions about a decision recur below: whether the reviewer made
+it, which verdict the reviewer has already given, and which sample drew
+it.  They need no running application, so they are functions.
+
+[[made_by_reviewer]] compares the screener of the decision's verdict
+with a human of the reviewer's name, the comparison [[sessions screen]]
+makes; a pending paper has no verdict, so nobody made it.
+
+<<tui blind review helpers>>=
+def made_by_reviewer(decision: ReviewDecision, reviewer: str | None) -> bool:
+    """Whether the human `reviewer` made the verdict of `decision`."""
+    screener = verdict_screener(decision)
+    return decision.is_decided and \
+        (screener["kind"], screener["name"]) == ("human", reviewer)
+@
+
+[[reviewer_screening]] returns the reviewer's latest counted verdict,
+or [[None]].  A screening set aside by a reset does not count: after a
+reset the decision is a new one, and the reviewer has not screened it.
+
+<<tui blind review helpers>>=
+def reviewer_screening(
+    decision: ReviewDecision, reviewer: str | None
+) -> dict | None:
+    """The human `reviewer`'s latest counted screening of `decision`."""
+    own = [
+        r for r in counted_screenings(decision)
+        if r.get("origin") == "screen" and r.get("kind") == "human"
+        and r.get("name") == reviewer
+    ]
+    return own[-1] if own else None
+@
+
+The screening names the sample that drew the paper, so that a report
+can compare the verdicts made for one sample.  A banded draw is several
+samples, one per band (\cref{sec:llm-sample-bands} in the LLM review
+module), and the paper's own band is named, by its own id.  The samples
+are searched in the order the sample filter lists them, and a sample
+whose drawn decision has been reset since does not count, as in
+[[sampled_for_review]].
+
+<<tui blind review helpers>>=
+def sample_holding(
+    session: ReviewSession, decision: ReviewDecision
+) -> str | None:
+    """The id of the first sample that drew `decision`, or None."""
+    from scholar.llm_review import reset_since_draw
+
+    paper_id = get_paper_id(decision.paper)
+    for sample in session.llm_samples:
+        if any(e.get("paper_id") == paper_id for e in sample.papers) \
+                and not reset_since_draw(decision, sample.drawn_at):
+            return sample.sample_id
+    return None
+@
+
+What is revealed is said in one line, used by the notification and the
+detail screen: the status, the machine and its name (the model for a
+classifier), the confidence and the tags.
+
+<<tui blind review helpers>>=
+def revealed_verdict(decision: ReviewDecision) -> str:
+    """The verdict blind mode hid, in one line."""
+    machine = machine_name(decision.source) or "human"
+    name = {"LLM": decision.llm_model, "agent": decision.agent_by}.get(
+        machine
+    )
+    text = f"{decision.status.value} by {machine}"
+    if name:
+        text += f" {name}"
+    if decision.llm_confidence is not None and decision.source.is_machine:
+        text += f" ({int(decision.llm_confidence * 100)}%)"
+    if decision.tags:
+        text += f": {', '.join(decision.tags)}"
+    return text
+@
+
+<<tui imports>>=
+from scholar.review import (
+    counted_screenings, new_screening, record_screening, verdict_screener,
+)
+@
+
+Let's verify the helpers on decisions built in code.  The reviewer
+made a confirmed decision of their name, and neither an unreviewed
+machine decision nor another human's; a screening set aside by a reset
+is not the reviewer's verdict any more; and a paper drawn in the second
+band of a banded draw names that band.
+
+<<test functions>>=
+class TestBlindReviewHelpers:
+  @staticmethod
+  def llm_call(doi="10.5555/blind-helpers"):
+    return ReviewDecision(
+      paper=Paper(title="H", authors=["Ada Lovelace"], doi=doi),
+      provider="openalex", status=DecisionStatus.DISCARDED,
+      tags=["off-topic"], source=ReviewSource.LLM_UNREVIEWED,
+      llm_model="m-1", llm_confidence=0.9,
+    )
+
+  def test_made_by_reviewer(self):
+    from scholar.review import record_human_decision
+    decision = self.llm_call()
+    assert not made_by_reviewer(decision, "alice")
+    decision.source = ReviewSource.LLM_REVIEWED
+    record_human_decision(decision, "tui", by="alice")
+    assert made_by_reviewer(decision, "alice")
+    assert not made_by_reviewer(decision, "bob")
+
+  def test_a_reset_sets_the_reviewers_screening_aside(self):
+    from scholar.review import reset_decision
+    decision = self.llm_call()
+    record_screening(decision, new_screening(
+      kind="human", name="alice", status="kept", tags=[],
+      recorded_at="2026-11-20T09:00:00+00:00"))
+    assert reviewer_screening(decision, "alice")["status"] == "kept"
+    assert reviewer_screening(decision, "bob") is None
+    reset_decision(decision, "2026-11-20T10:00:00+00:00")
+    assert reviewer_screening(decision, "alice") is None
+
+  def test_the_band_that_drew_the_paper(self):
+    from scholar.review import LLMSample
+    decision = self.llm_call()
+    session = ReviewSession(
+      query="q", providers=["openalex"], timestamp=datetime(2026, 11, 20),
+      decisions=[decision],
+    )
+    session.llm_samples = [
+      LLMSample(
+        sample_id=f"g/band={band}", seed=1,
+        drawn_at="2026-11-19T00:00:00+00:00",
+        criteria={"stratum": {"group": "g", "band": band}},
+        sessions=["q"], population=1, population_digest="d", size=1,
+        papers=[{"paper_id": paper_id, "status": "discarded",
+                 "source": "llm", "confidence": 0.9}],
+      )
+      for band, paper_id in ((0, "doi:10.5555/other"),
+                             (1, "doi:10.5555/blind-helpers"))
+    ]
+    assert sample_holding(session, decision) == "g/band=1"
+
+  def test_revealed_verdict(self):
+    assert revealed_verdict(self.llm_call()) \
+      == "discarded by LLM m-1 (90%): off-topic"
+@
+
+\subsection{Blind mode in the application}
+
+The application keeps two things for blind mode: [[blind]], whether it
+is on, and [[reviewer]], the name.  [[blind_state]] tells what blind
+mode does with a decision: nothing ([[None]], blind mode off or a paper
+the sample filter does not list), hide it, show it revealed (the
+reviewer has screened it), or refuse it ([[own]], the reviewer made
+it).  The list asks for every row, so it computes the sample's queue
+once and passes it in; the detail screen asks for one paper.
+
+<<app methods for blind review>>=
+def blind_queue(self) -> set[int]:
+    """The decisions blind mode concerns: those the sample filter lists."""
+    if not self.blind:
+        return set()
+    from scholar.llm_review import sampled_for_review
+    return {id(d) for d in sampled_for_review(self.session)}
+
+def blind_state(self, decision: ReviewDecision,
+                queue: set[int] | None = None) -> str | None:
+    """None, "hidden", "revealed" or "own": what blind mode does with
+    `decision` (`queue` from `blind_queue`, computed if not given)."""
+    if not self.blind:
+        return None
+    if id(decision) not in (self.blind_queue() if queue is None else queue):
+        return None
+    if made_by_reviewer(decision, self.reviewer):
+        return "own"
+    if reviewer_screening(decision, self.reviewer) is not None:
+        return "revealed"
+    return "hidden"
+@
+
+[[b]] switches blind mode.  On, it needs review mode (notes mode
+decides nothing), a sample and a name, asked for when [[--by]] gave
+none; off, it only stops hiding.  The notice says what blind mode
+hides and what it cannot.
+
+<<app methods for blind review>>=
+def action_toggle_blind(self) -> None:
+    """Switch blind review of the sample on or off."""
+    if not self.review_mode:
+        self.notify("Blind review is for review mode", severity="warning")
+        return
+    if self.blind:
+        self.blind = False
+        self.notify("Blind mode off")
+        self._refresh_list()
+        self._update_status()
+        return
+    if not self.session.llm_samples:
+        self.notify("No review sample in this session; draw one with "
+                    "`scholar llm sample`", severity="warning",
+                    markup=False)
+        return
+    if self.reviewer is None:
+        self.push_screen(ReviewerNameModal(), self._on_reviewer_named)
+        return
+    self._start_blind()
+
+def _on_reviewer_named(self, name: str | None) -> None:
+    """Start blind mode under the name given, if one was."""
+    if name:
+        self.reviewer = name
+        self._start_blind()
+    else:
+        self.notify("Blind mode needs your name; it stays off",
+                    severity="warning")
+
+def _start_blind(self) -> None:
+    """Hide the sample's verdicts and list the sample."""
+    self.blind = True
+    self.current_filter = "llm_sample"
+    self.current_index = 0
+    self._refresh_list()
+    self._update_status()
+    self.notify(BLIND_MODE_NOTICE, markup=False, timeout=10)
+
+def blind_status_text(self) -> str:
+    """The status bar's blind mode indicator, "" when off."""
+    if not self.blind:
+        return ""
+    return f" | [bold blue]Blind: {escape(self.reviewer or '')}[/bold blue]"
+<<tui blind review helpers>>=
+BLIND_MODE_NOTICE = (
+    "Blind mode: the sample's verdicts are hidden on these screens until "
+    "you give your own (K, T, d); then the verdict is shown and you "
+    "confirm (C) or change it. Scholar cannot hide what the session file, "
+    "other commands or the sample's criteria show."
+)
+@
+
+[[blind_verdict]] is the branch every keep and discard takes first, in
+the list and on the detail screen alike.  It returns [[False]] when
+blind mode does not concern the paper, and the action goes on as
+without blind mode.  Otherwise it takes the key: for a paper the
+reviewer decided it says so, and for a hidden paper it records the
+verdict, asking for the tags first for [[T]] and [[d]], with nothing
+preselected, since the decision's tags are part of what is hidden, and
+without the counts of each tag, which in a small session could tell
+which tags this paper holds.  A discard needs a motivation here as
+everywhere.  [[done]] is what the
+calling screen does next: the list redraws itself, the detail screen
+shows the paper again, now revealed.
+
+<<app methods for blind review>>=
+def blind_verdict(self, decision: ReviewDecision, status: DecisionStatus,
+                  *, ask_tags: bool, done) -> bool:
+    """Take a keep or discard of `decision` as a blind verdict, if blind
+    mode hides it; True when taken (then `done()` follows a recorded
+    verdict)."""
+    state = self.blind_state(decision)
+    if state == "own":
+        self.notify(
+            f"{self.reviewer} made this decision: blind mode records no "
+            "second verdict of it", severity="warning", markup=False,
+        )
+        return True
+    if state != "hidden":
+        return False
+
+    def record(tags: list[str] | None) -> None:
+        if tags is not None:
+            self.record_blind_verdict(decision, status, tags)
+            done()
+
+    if not ask_tags:
+        record([])
+        return True
+    keep = status is DecisionStatus.KEPT
+    self.push_screen(
+        TagSelectionModal(
+            title=("Themes: " if keep else "Motivations: ")
+            + f"{decision.paper.title[:50]}...",
+            available_tags=list(self.session.all_themes() if keep
+                                else self.session.all_motivations()),
+            selected_tags=[],
+            require_at_least_one=not keep,
+        ),
+        record,
+    )
+    return True
+@
+
+[[record_blind_verdict]] stores the screening and reveals the decision.
+It never touches the decision's status, tags or source: those change
+only through the confirm and decide paths that follow.  The reason is
+left out of the notification, which is short, and shown on the detail
+screen.
+
+<<app methods for blind review>>=
+def record_blind_verdict(self, decision: ReviewDecision,
+                         status: DecisionStatus, tags: list[str]) -> None:
+    """Store the reviewer's blind verdict of `decision` and reveal it."""
+    from scholar.utils import utc_now_iso
+
+    record_screening(decision, new_screening(
+        kind="human", name=self.reviewer, status=status.value,
+        tags=list(tags), recorded_at=utc_now_iso(), blind=True,
+        blind_basis="tui", sample_id=sample_holding(self.session, decision),
+        via="tui",
+    ))
+    self.notify(
+        f"Your verdict: {status.value}. The decision was "
+        f"{revealed_verdict(decision)}. Confirm it (C) or change it "
+        "(K, T, d).", markup=False, timeout=10,
+    )
+
+def blind_refuses_confirm(self, decision: ReviewDecision) -> bool:
+    """Refuse to confirm a decision blind mode still hides."""
+    if self.blind_state(decision) != "hidden":
+        return False
+    self.notify("Give your own verdict first (K, T or d): blind mode "
+                "hides this decision", severity="warning")
+    return True
+
+def _after_blind(self) -> None:
+    """Redraw the list after a blind verdict."""
+    self._refresh_list()
+    self._update_status()
+@
+
+The list row and the detail screen apply the state.  The row replaces
+the status mark by the blind mark and drops the machine mark, which
+carries the confidence.
+
+<<hide the verdict of a row in blind mode>>=
+if self.hidden:
+    status_indicator, llm_indicator = BLIND_MARK, ""
+<<tui blind review helpers>>=
+BLIND_MARK = "[bold blue]B[/bold blue]"
+@
+
+The detail screen leaves out the tags of a hidden paper (where they
+are shown, in \cref{sec:abstract-screen}) and, for a revealed one, adds
+the two verdicts: the reviewer's, and the decision's with the machine's
+reason, which the TUI shows nowhere else, so that the reviewer can
+weigh it before confirming or changing the decision.
+
+<<show the blind review of the paper>>=
+if blind == "revealed":
+    mine = reviewer_screening(self.decision, self.app.reviewer)
+    yield Static("")
+    yield Static("[bold blue]─── Blind review ───[/bold blue]")
+    yield Static(
+        f"Your verdict: {mine['status']}"
+        + (f": {', '.join(mine['tags'])}" if mine["tags"] else ""),
+        markup=False,
+    )
+    yield Static(f"The decision: {revealed_verdict(self.decision)}",
+                 markup=False)
+    reason = self.decision.llm_reason or self.decision.agent_reason
+    if reason:
+        yield Static(f"Reason: {reason}", markup=False)
+    yield Static("[dim]Press [bold yellow]C[/bold yellow] to confirm the "
+                 "decision, or K, T or d to change it.[/dim]")
+@
+
+The reviewer's name is asked for in a small dialog with one input.
+Enter gives the name, stripped; Escape, or an empty name, gives
+[[None]], which leaves blind mode off.
+
+<<tui reviewer name modal>>=
+class ReviewerNameModal(ModalScreen[str | None]):
+    """Ask the reviewer's name before blind mode starts."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    DEFAULT_CSS = """
+    ReviewerNameModal {
+        align: center middle;
+    }
+    #reviewer-dialog {
+        width: 60;
+        height: auto;
+        border: thick $primary;
+        background: $surface;
+        padding: 1 2;
+    }
+    """
+
+    def compose(self) -> ComposeResult:
+        with Container(id="reviewer-dialog"):
+            yield Static("[bold]Blind review[/bold]")
+            yield Static("Your name, recorded with your blind verdicts "
+                         "and decisions:")
+            yield Input(placeholder="Your name", id="reviewer-name")
+
+    def on_mount(self) -> None:
+        self.query_one("#reviewer-name", Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self.dismiss(event.value.strip() or None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+@
+
+\subsection{Testing blind mode}
+
+The tests drive the real application headless, as those of the sample
+filter do (\cref{FilterModal}).  The session has one sampled paper, an
+LLM's discard with confidence, tags and a reason; one unsampled LLM
+keep; and a human's keep.  [[run]] presses the keys and calls
+[[inspect]] on the running application; [[text]] collects what the
+current screen shows, so that a test can check what is and is not
+there.
+
+<<test functions>>=
+class TestBlindReview:
+  """Blind review of a sample in the TUI (#253, #254)."""
+
+  <<blind review test methods>>
+<<blind review test methods>>=
+@staticmethod
+def session():
+  from scholar.review import LLMSample
+
+  def decision(i, status, tags, source, confidence=None):
+    return ReviewDecision(
+      paper=Paper(title=f"Paper {i}", authors=["Ada Lovelace"],
+                  doi=f"10.5555/blind-{i}", abstract=f"Abstract {i}."),
+      provider="openalex", status=status, tags=tags, source=source,
+      llm_confidence=confidence,
+      llm_model="m-1" if source.is_machine else None,
+      llm_reason="Unrelated to recursion." if source.is_machine else None,
+    )
+
+  sampled = decision(0, DecisionStatus.DISCARDED, ["off-topic"],
+                     ReviewSource.LLM_UNREVIEWED, 0.9)
+  unsampled = decision(1, DecisionStatus.KEPT, ["recursion"],
+                       ReviewSource.LLM_UNREVIEWED, 0.7)
+  human = decision(2, DecisionStatus.KEPT, [], ReviewSource.HUMAN)
+  session = ReviewSession(
+    query="q", providers=["openalex"], timestamp=datetime(2026, 11, 20),
+    decisions=[sampled, unsampled, human],
+  )
+  session.llm_samples = [LLMSample(
+    sample_id="s-1", seed=1, drawn_at="2026-11-19T00:00:00+00:00",
+    criteria={}, sessions=["q"], population=2, population_digest="d",
+    size=1,
+    papers=[{"paper_id": "doi:10.5555/blind-0", "status": "discarded",
+             "source": "llm", "confidence": 0.9}],
+  )]
+  return session
+
+@staticmethod
+def text(app):
+  from textual.widgets import Static
+  return "\n".join(str(w.render()) for w in app.screen.query(Static))
+
+@classmethod
+def run(cls, keys, reviewer="alice", inspect=None, session=None):
+  import asyncio
+
+  session = session or cls.session()
+  app = PaperReviewApp(session, reviewer=reviewer)
+
+  async def drive():
+    async with app.run_test() as pilot:
+      await pilot.pause()
+      for key in keys:
+        await pilot.press(key)
+        await pilot.pause()
+      if inspect is not None:
+        inspect(app)
+
+  asyncio.run(drive())
+  return app, session.decisions[0]
+@
+
+Switching blind mode on lists the sample, says so in the status bar,
+and hides the sampled paper's status, machine mark and confidence in its
+row; the unsampled paper, listed under \enquote{All papers}, shows its
+marks as before.
+
+<<blind review test methods>>=
+def test_the_row_hides_the_verdict(self):
+  seen = {}
+
+  def inspect(app):
+    seen["filter"] = app.current_filter
+    seen["text"] = self.text(app)
+
+  self.run(["b"], inspect=inspect)
+  assert seen["filter"] == "llm_sample"
+  assert "Blind: alice" in seen["text"]
+  row = next(line for line in seen["text"].splitlines()
+             if "Paper 0" in line)
+  assert row.startswith("B ")
+  for mark in ("✗", "🤖", "90%"):
+    assert mark not in row
+
+def test_other_papers_show_their_marks(self):
+  seen = []
+  self.run(["b", "f", "a"], inspect=lambda app: seen.append(self.text(app)))
+  rows = seen[0].splitlines()
+  assert any("Paper 1" in r and "🤖70%" in r for r in rows)
+  assert not any("Paper 0" in r and "90%" in r for r in rows)
+@
+
+The detail screen of a hidden paper shows the abstract but neither the
+tags nor the heading that would give the status away.
+
+<<blind review test methods>>=
+def test_the_detail_screen_hides_the_tags(self):
+  seen = []
+  self.run(["b", "enter"], inspect=lambda app: seen.append(self.text(app)))
+  assert "Abstract 0." in seen[0]
+  for hidden in ("off-topic", "Motivations", "Unrelated"):
+    assert hidden not in seen[0]
+@
+
+The path of one paper: a blind keep on the detail screen stores the
+reviewer's screening after a snapshot of the LLM's discard, leaves the
+decision as it was and reveals it on the screen; [[C]] then confirms
+the LLM's decision, recorded as the reviewer's, on the detail screen
+and in the list alike.
+
+<<blind review test methods>>=
+def test_a_blind_verdict_is_a_screening_then_revealed(self):
+  seen = []
+  _, decision = self.run(["b", "enter", "K"],
+                         inspect=lambda app: seen.append(self.text(app)))
+  assert decision.status == DecisionStatus.DISCARDED
+  assert decision.source == ReviewSource.LLM_UNREVIEWED
+  assert decision.tags == ["off-topic"]
+  assert decision.human_decided_at is None
+  snapshot, screening = decision.screenings
+  assert (snapshot["origin"], snapshot["kind"], snapshot["name"],
+          snapshot["status"]) == ("decision", "llm", "m-1", "discarded")
+  assert {k: screening[k] for k in (
+    "origin", "kind", "name", "status", "tags", "blind", "blind_basis",
+    "via", "sample_id", "confidence", "reason")} == {
+    "origin": "screen", "kind": "human", "name": "alice",
+    "status": "kept", "tags": [], "blind": True, "blind_basis": "tui",
+    "via": "tui", "sample_id": "s-1", "confidence": None,
+    "reason": None,
+  }
+  assert "Your verdict: kept" in seen[0]
+  assert "discarded by LLM m-1 (90%): off-topic" in seen[0]
+  assert "Reason: Unrelated to recursion." in seen[0]
+
+def test_the_confirmation_follows_the_screening(self):
+  for keys in (["b", "enter", "K", "C"], ["b", "K", "C"]):
+    _, decision = self.run(keys)
+    assert [r["origin"] for r in decision.screenings] \
+      == ["decision", "screen"], keys
+    assert decision.status == DecisionStatus.DISCARDED, keys
+    assert decision.source == ReviewSource.LLM_REVIEWED, keys
+    assert decision.human_decided_via == "tui", keys
+    assert decision.human_by == "alice", keys
+@
+
+A discard needs a motivation, chosen in the dialog, which starts empty:
+had it preselected the LLM's [[off-topic]], the screening would carry
+it too.  The new tag is typed after Tab moves to the input.
+
+<<blind review test methods>>=
+def test_a_blind_discard_from_the_list(self):
+  _, decision = self.run(["b", "d", "tab", "m", "i", "n", "e", "enter",
+                          "enter"])
+  screening = decision.screenings[-1]
+  assert (screening["status"], screening["tags"]) \
+    == ("discarded", ["mine"])
+  assert decision.tags == ["off-topic"]
+@
+
+Leaving the paper between the two steps keeps the screening; the
+decision stays unreviewed and the sample filter lists the paper again,
+now with its marks.  [[C]] on a hidden paper changes nothing.
+
+<<blind review test methods>>=
+def test_leaving_between_the_steps(self):
+  seen = {}
+
+  def inspect(app):
+    seen["listed"] = [d.paper.title for d in app.get_filtered_decisions()]
+    seen["text"] = self.text(app)
+
+  _, decision = self.run(["b", "enter", "K", "escape"], inspect=inspect)
+  assert [r["origin"] for r in decision.screenings] \
+    == ["decision", "screen"]
+  assert decision.source == ReviewSource.LLM_UNREVIEWED
+  assert decision.human_decided_at is None
+  assert seen["listed"] == ["Paper 0"]
+  row = next(line for line in seen["text"].splitlines()
+             if "Paper 0" in line)
+  assert "✗" in row and "90%" in row
+
+def test_a_hidden_decision_cannot_be_confirmed(self):
+  _, decision = self.run(["b", "C"])
+  assert decision.source == ReviewSource.LLM_UNREVIEWED
+  assert decision.screenings == []
+@
+
+Without [[--by]], switching blind mode on asks for the name; an empty
+answer leaves blind mode off, and so does Escape, and so does a session
+without a sample.  Switching it off again shows the marks.
+
+<<blind review test methods>>=
+def test_the_name_is_asked_for(self):
+  app, _ = self.run(["b", "b", "o", "enter"], reviewer=None)
+  assert (app.blind, app.reviewer) == (True, "bo")
+  app, _ = self.run(["b", "enter"], reviewer=None)
+  assert (app.blind, app.reviewer) == (False, None)
+  app, _ = self.run(["b", "escape"], reviewer=None)
+  assert app.blind is False
+
+def test_no_sample_no_blind_mode(self):
+  session = self.session()
+  session.llm_samples = []
+  app, _ = self.run(["b"], session=session)
+  assert app.blind is False and app.current_filter == "all"
+
+def test_switching_off_shows_the_marks(self):
+  seen = []
+  app, _ = self.run(["b", "b"], inspect=lambda app: seen.append(
+    self.text(app)))
+  assert app.blind is False
+  row = next(line for line in seen[0].splitlines() if "Paper 0" in line)
+  assert "90%" in row
+@
+
+The race: [[sessions resume]] opens the session with a reviewer's name;
+while the TUI is open, the reviewer screens the sampled paper blind, and
+another process, a real one, resets the decision and saves.  The TUI
+then exits and [[sessions resume]] saves.  Both records, the snapshot
+and the reviewer's screening, are set aside with the reset's time, and
+the reset stands.  The application's [[run]] is replaced by a headless
+run of the same application, since a terminal is what a test cannot
+have; everything else, the loading, the keys and the save, is the
+command's own.
+
+<<blind review test methods>>=
+def test_a_screening_during_a_concurrent_reset_is_set_aside(
+    self, monkeypatch):
+  import asyncio
+  import json
+  import subprocess
+  import sys
+  from typer.testing import CliRunner
+  from scholar.cli import app as cli_app
+  from scholar.review import _get_sessions_dir, save_session
+  from scholar.scholar import isolated_registry
+
+  with isolated_registry():
+    session = self.session()
+    session.name = "blind-race"
+    save_session(session)
+  reset = (
+    "from scholar.review import load_session, reset_decision, "
+    "save_session\n"
+    "s = load_session('blind-race')\n"
+    "reset_decision(s.decisions[0], '2026-11-20T10:00:00+00:00')\n"
+    "save_session(s)\n"
+  )
+
+  def run_headless(self_app):
+    async def drive():
+      async with self_app.run_test() as pilot:
+        await pilot.pause()
+        for key in ("b", "K"):
+          await pilot.press(key)
+          await pilot.pause()
+        subprocess.run([sys.executable, "-c", reset], check=True,
+                       timeout=120)
+
+    asyncio.run(drive())
+
+  monkeypatch.setattr(PaperReviewApp, "run", run_headless)
+  with isolated_registry():
+    result = CliRunner().invoke(
+      cli_app, ["sessions", "resume", "blind-race", "--by", "alice"])
+  assert result.exit_code == 0, result.output
+  saved = json.loads(
+    (_get_sessions_dir() / "blind-race.json").read_text()
+  )["decisions"][0]
+  assert saved["status"] == "pending"
+  assert [(r["origin"], r["kind"], r["name"])
+          for r in saved["screenings"]] \
+    == [("decision", "llm", "m-1"), ("screen", "human", "alice")]
+  assert all(r["set_aside_at"] == "2026-11-20T10:00:00+00:00"
+             for r in saved["screenings"])
+@
+
+[[--by]] of [[sessions resume]] names the reviewer outside blind mode
+too: a keep in the paper list carries the name in the human's record.
+An empty name is refused before the session is opened.
+
+<<blind review test methods>>=
+def test_resume_by_names_the_reviewers_decisions(self, monkeypatch):
+  import asyncio
+  from typer.testing import CliRunner
+  from scholar.cli import app as cli_app
+  from scholar.review import load_session, save_session
+  from scholar.scholar import isolated_registry
+
+  with isolated_registry():
+    session = self.session()
+    session.name = "blind-by"
+    save_session(session)
+
+  def run_headless(self_app):
+    async def drive():
+      async with self_app.run_test() as pilot:
+        await pilot.pause()
+        await pilot.press("K")
+        await pilot.pause()
+
+    asyncio.run(drive())
+
+  monkeypatch.setattr(PaperReviewApp, "run", run_headless)
+  result = CliRunner().invoke(
+    cli_app, ["sessions", "resume", "blind-by", "--by", " "])
+  assert result.exit_code == 2
+  with isolated_registry():
+    result = CliRunner().invoke(
+      cli_app, ["sessions", "resume", "blind-by", "--by", "alice"])
+    assert result.exit_code == 0, result.output
+    decision = load_session("blind-by").decisions[0]
+  assert decision.status == DecisionStatus.KEPT
+  assert decision.human_by == "alice"
+  assert decision.screenings == []
 @
 
 \section{Report Generation}
