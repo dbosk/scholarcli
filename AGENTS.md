@@ -1473,38 +1473,59 @@ never changed (tested on the saved JSON). Not yet built (later #253
 PRs): agreement numbers, conflicts, `llm classify --second-screen`,
 report surfaces, the screen sheet.
 **TUI blind review (#253 part D, closes #254's last point; tui.nw
-`sec:tui-blind-review`).** Key `b` in the paper list (free in list and
-detail screen) toggles `PaperReviewApp.blind`; on needs review mode,
-`session.llm_samples` non-empty and `app.reviewer` (from `scholar
-sessions resume S --by NAME`, else `ReviewerNameModal` asks; empty or
-Escape leaves it off; empty `--by` exits 2 before loading). On selects
-the `llm_sample` filter, status bar adds "Blind: NAME". `blind_state(d,
+`sec:tui-blind-review`).** `scholar sessions resume S --blind [--by
+NAME]` (`PaperReviewApp(..., blind=True)`) starts blind mode in
+`on_mount` (`_start_blind_at_mount`) before the list is drawn:
+`blind_unbroken` True; needs review mode and `session.llm_samples`
+(else notice, off) and `app.reviewer` (`--by`, else
+`ReviewerNameModal`; empty/Escape → off; empty `--by` exits 2 before
+loading). Key `b` toggles during a run, only from the paper list
+(`len(screen_stack) > 1` → refused); switching on mid-run (or off and
+on) sets `blind_unbroken` False for the run: screenings then get
+`blind: False, blind_basis: None` (still `via: "tui"`), status bar
+"Blind (verdicts were shown earlier in this run): NAME" instead of
+"Blind: NAME". On selects the `llm_sample` filter. `blind_state(d,
 queue)`: None unless blind and `id(d)` in `blind_queue()` (= what
 `sampled_for_review` lists: every sample, band, census; not reset since
 draw); "own" if `made_by_reviewer` (`verdict_screener` kind human,
 name = reviewer; unreachable via the queue today, which holds only
 unreviewed machine decisions); "revealed" if `reviewer_screening` (a
 counted `origin: screen` human screening of that name, also one from
-`sessions screen`); else "hidden", in any filter view. Hidden: row
-shows `BLIND_MARK` ("B") instead of status mark, no machine
-mark/confidence; detail screen omits tags + Themes/Motivations heading;
-the T/d dialogs start empty. `blind_verdict(d, status, ask_tags, done)`
-runs first in K/T/d of both screens: hidden → `record_blind_verdict`
-(`new_screening(kind="human", name=reviewer, blind=True,
-blind_basis="tui", via="tui", sample_id=sample_holding(session, d))`
-via `record_screening`, decision untouched, notification with
+`sessions screen`); else "hidden". Hidden: row shows `BLIND_MARK`
+("B"), no status/machine mark/confidence; detail screen omits tags +
+Themes/Motivations heading; `f` refused in blind mode
+(`<<refuse the decision filters in blind mode>>`: every status/source/
+example filter selects by decision), `F` (year, venue, citations, OA,
+pub type: `SearchFilters.matches` on the paper only) allowed; status
+bar counts via `status_counts()` leave hidden papers out and add
+"Hidden: N"; every tag dialog (normal and blind, both screens) takes
+`tag_choices(keep)`: outside blind mode the session's
+`all_themes/theme_counts` or `all_motivations/motivation_counts` as
+before, in blind mode only non-hidden papers' tags of that status;
+the blind dialog preselects nothing. `blind_verdict(d, status,
+ask_tags, done)` runs first in K/T/d of both screens: hidden →
+`record_blind_verdict` (`new_screening(kind="human", name=reviewer,
+blind=blind_unbroken, blind_basis="tui" if blind_unbroken else None,
+via="tui", sample_id=sample_holding(session, d))` via
+`record_screening`, decision untouched, notification with
 `revealed_verdict(d)`), the detail screen stays and shows a "Blind
 review" block (both verdicts, the machine's reason); "own" → warning,
 nothing recorded. `blind_refuses_confirm`: C on a hidden paper refused.
 After the reveal K/T/d/C are the normal paths (`mark_as_reviewed` +
 `record_human_decision(..., by=reviewer)`): the adjudication. Leaving
 between keeps the screening; the decision stays unreviewed and listed,
-revealed. Saved by `sessions resume`'s `save_session`; PR A's merge
-sets aside a blind screening made while another process reset the paper
-(`TestBlindReview`, real subprocess, through `sessions resume`). Only
-Scholar's own screens are hidden; a `--discarded`-only sample tells its
-status, a banded draw its confidence band (prose, `sessions resume`
-help, `BLIND_MODE_NOTICE`).
+revealed. The start notice (`BLIND_MODE_NOTICE`) adds
+`sample_giveaway(session, queued)`: all queued samples of one status →
+"This sample holds <describe_sample_criteria of statuses+sources> only:
+their status is known." (different single statuses: "Each sample holds
+one status only ..."); any banded (`stratum`) or bounded draw → "It was
+drawn by confidence: each paper's range of confidence is known."
+Saved by `sessions resume`'s `save_session`; PR A's merge sets aside a
+screening made while another process reset the paper
+(`TestBlindReview`, real subprocess, through `sessions resume
+--blind`). Not hidden: the session file, other commands, what the
+sample's criteria tell, and that queued papers are unreviewed machine
+decisions (prose, `sessions resume` help, notice).
 
 ### Session Arguments
 
@@ -2168,7 +2189,7 @@ A human review leaves them untouched (they are the model's record).
   which ends in uuid4 digits so two draws in one second never collide).
   `test_golden_draw` pins the drawn papers for seed 42.
   The TUI filter `s` (`sampled_for_review`) queues the unreviewed ones
-  (blind mode `b` hides their verdicts until the reviewer's own is
+  (blind mode, `sessions resume --blind` or `b`, hides their verdicts until the reviewer's own is
   recorded as a screening, see Screenings);
   `sessions decide` reviews them. `--report [-f json]`
   (`sample_reports`): a sampled decision counts as reviewed when decided
