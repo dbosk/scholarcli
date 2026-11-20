@@ -5,6 +5,7 @@ TESTS+=		test_ratelimit.py
 TESTS+=		test_network.py
 TESTS+=		test_crossref.py
 TESTS+=		test_unpaywall.py
+TESTS+=		test_europepmc.py
 TESTS+=		test_preprint.py
 TESTS+=		test_enrich.py
 TESTS+=		test_cli.py
@@ -41,6 +42,9 @@ test_crossref.py: ../src/scholar/crossref.nw
 
 test_unpaywall.py: ../src/scholar/unpaywall.nw
 	notangle -R"test [[unpaywall.py]]" $< | cpif $@
+
+test_europepmc.py: ../src/scholar/europepmc.nw
+	notangle -R"test [[europepmc.py]]" $< | cpif $@
 
 test_preprint.py: ../src/scholar/preprint.nw
 	notangle -R"test [[preprint.py]]" $< | cpif $@
