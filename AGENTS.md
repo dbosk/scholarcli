@@ -1139,15 +1139,17 @@ confirmation goes to stderr so `-f json`/`-f bibtex` stdout stays pure.
 Each paper line is a `rich.text.Text` (`session_paper_line`; own
 pieces styled, stored strings appended as plain text: no markup, no
 emoji codes, no highlighter), printed `PAPER_LINES_PER_PRINT` (200)
-papers per call (`print_paper_lines`, #273; 10,000 decisions: ~3x
-faster piped); the console has `emoji=False`. Piped text is pinned by
+papers per call (`print_paper_lines`, #273; 10,000 decisions: ~24 s
+→ ~7 s piped). Piped text is pinned by
 `TestShowPinnedOutput` (80 and 200 columns) and equals the old
 per-line output except where that was wrong: stored brackets
 (`open[alex]` printed `(open)`; tags `x[bold`, `a]b[c` formed Rich
 tags), emoji codes (`a:b:c`) and trailing backslashes (doubled). On a
 terminal numbers and URLs in titles and ids are no longer coloured.
-Other `show` lines (queries, themes, copies) still use markup with
-`escape`, so a trailing backslash there still prints doubled.
+Every other line of `print_session_details` is a `Text` too
+(`print_show_line(con, *parts)`, parts as for `Text.assemble`, with
+the highlighter applied as `Console.print` applies it to a string, so
+terminal colours stay); no stored string goes through markup.
 `--source human|agent|llm` says who decided (#162). It defaults to
 `human` only when stdin is a terminal; otherwise (scripts, agents) a
 missing `--source` exits 2 before loading the session. `agent` (an AI
