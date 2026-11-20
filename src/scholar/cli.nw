@@ -2173,12 +2173,26 @@ if any([
 effective_limit = UNLIMITED_PROVIDER_LIMIT if limit == 0 else limit
 @
 
+The model is first asked for the provider queries, before anything is
+searched.  A model the [[llm]] package does not know, or a missing
+[[llm]] package, ends [[rq]] there with one line and status~1, as the
+labelling step below ends: [[resolve_llm_model]]
+(\cref{sec:resolve-llm-model} in the utilities) turns the unknown name
+into a [[ValueError]] that names it and says how to list the available
+models (\url{https://github.com/dbosk/scholar/issues/284}).  The line
+is printed without Rich's wrapping, so that a long model name does not
+break it in two.
+
 <<generate rq provider queries>>=
-provider_queries = generate_provider_queries(
-    rq_text,
-    provider_names,
-    select_model_id(model_selection, "analytic"),
-)
+try:
+    provider_queries = generate_provider_queries(
+        rq_text,
+        provider_names,
+        select_model_id(model_selection, "analytic"),
+    )
+except (ValueError, ImportError) as e:
+    console.print(f"[red]Error: {escape(str(e))}[/red]", soft_wrap=True)
+    raise typer.Exit(1)
 @
 
 [[rq]] runs each provider's own query through [[search_provider]], the
@@ -2301,7 +2315,9 @@ def generate_provider_queries(
             "Install it with: pip install llm"
         )
 
-    model_obj = llm.get_model(model_id) if model_id else llm.get_model()
+    from scholar.utils import resolve_llm_model
+
+    model_obj = resolve_llm_model(llm, model_id)
 
     rules = {
         "s2": (
@@ -2486,7 +2502,7 @@ class TestRQCommand:
 
         llm_mod = types.ModuleType("llm")
         llm_mod.get_model = lambda model_id=None: DummyModel()  # noqa: E731
-        sys.modules["llm"] = llm_mod
+        monkeypatch.setitem(sys.modules, "llm", llm_mod)
 
         rq_text = "How do we test rq?"
         result = runner.invoke(
@@ -2645,6 +2661,28 @@ class TestRQListsWithheldPapers:
         assert "Left pending, no usable answer (1)" in result.output
         assert "Unanswered Paper" in result.output
         assert "invalid decision 'maybe'" in result.output
+@
+
+A model the [[llm]] package does not know ends [[rq]] with one line
+before anything is searched; the helpers of the test are those of the
+LLM commands' test (\cref{sec:cli-unknown-model}).
+
+<<test functions>>=
+class TestRQUnknownModel:
+  def test_ends_before_the_search(self, tmp_path, monkeypatch):
+    from scholar import providers
+
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+    empty_llm_registries(monkeypatch, tmp_path)
+    provider = Mock()
+    provider.name = "mock"
+    monkeypatch.setattr(providers, "PROVIDERS", {"mock": provider})
+    result = runner.invoke(app, [
+      "rq", "Do novices misread recursion?", "--provider", "mock",
+      "-m", UNKNOWN_MODEL, "--no-enrich",
+    ])
+    assert_unknown_model_line(result)
+    provider.search.assert_not_called()
 @
 
 \section{Reporting currency issues}
@@ -6250,6 +6288,10 @@ json_output: Annotated[
 We validate the same way the [[open]] action does---a missing URL or claim is a
 usage error---and additionally reject disabling both ranking stages, since then
 there is nothing to rank.
+A model named with [[--model]] that the [[llm]] package does not know ends
+the action with one line too: the re-ranker passes it on as a [[ValueError]]
+rather than falling back (\cref{sec:resolve-llm-model}).  An unknown default
+model only makes the re-ranker warn and keep the prior order.
 
 <<pdf quote action>>=
 if not url:
@@ -6280,6 +6322,9 @@ try:
     )
 except PDFDownloadError as e:
     console.print(f"[red]Download failed: {escape(str(e))}[/red]")
+    raise typer.Exit(1)
+except ValueError as e:
+    console.print(f"[red]Error: {escape(str(e))}[/red]", soft_wrap=True)
     raise typer.Exit(1)
 
 <<output quote candidates>>
@@ -6401,6 +6446,50 @@ class TestPdfQuoteCommand:
         assert "authenticated encryption" in payload[0]["text"]
         assert "score" in payload[0]
         assert payload[0]["relevance"] is None
+@
+
+A model named with [[--model]] that the [[llm]] package does not know
+ends the action with the one line of the LLM commands
+(\cref{sec:cli-unknown-model}, whose helpers the test uses) instead of
+a lexical ranking presented as the result.  An unknown \emph{default}
+model, named in [[llm]]'s [[default_model.txt]] (the file
+[[get_default_model]] of [[llm]]~0.38 reads from the directory
+[[LLM_USER_PATH]] names), is not the user's typo in this command: the
+action warns with the same message and gives the lexical ranking, as
+it did before the model was resolved in one place.
+
+<<test functions>>=
+class TestPdfQuoteUnknownModel:
+  def _quote(self, tmp_path, monkeypatch, *options):
+    pdf_path = tmp_path / "p.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4")
+    monkeypatch.setattr("scholar.pdf.get_pdf", lambda *a, **k: pdf_path)
+    monkeypatch.setattr(
+      "scholar.pdf.extract_pdf_pages",
+      lambda path: ["Students traced recursive calls as loops."],
+    )
+    empty_llm_registries(monkeypatch, tmp_path)
+    return runner.invoke(app, [
+      "pdf", "quote", "https://x/p.pdf", "--claim", "recursion as loops",
+      *options,
+    ])
+
+  def test_a_named_model_is_one_line(self, tmp_path, monkeypatch):
+    result = self._quote(tmp_path, monkeypatch, "-m", UNKNOWN_MODEL)
+    assert_unknown_model_line(result)
+    assert "Students traced" not in result.output
+
+  def test_an_unknown_default_warns_and_keeps_the_order(
+    self, tmp_path, monkeypatch
+  ):
+    (tmp_path / "llm").mkdir()
+    (tmp_path / "llm" / "default_model.txt").write_text(UNKNOWN_MODEL)
+    result = self._quote(tmp_path, monkeypatch)
+    assert result.exit_code == 0, result.output
+    assert f"WARNING: {UNKNOWN_MODEL_LINE.removeprefix('Error: ')}" \
+      in result.output
+    assert 'p.1  "Students traced recursive calls as loops."' \
+      in result.output
 @
 
 
@@ -20090,7 +20179,12 @@ def llm_classify(
         bool,
         typer.Option(
             "--dry-run",
-            help="Show the prompt without calling LLM.",
+            help=(
+                "Show the prompt without calling the LLM. The model is "
+                "not looked up, so an unknown --model is noticed only by "
+                "a real run; with --second-screen it is looked up, since "
+                "its id chooses the papers."
+            ),
         ),
     ] = False,
     no_enrich: Annotated[
@@ -20261,7 +20355,9 @@ def llm_classify(
         <<report reasons quoting words not in the record>>
 
     except ValueError as e:
-        console.print(f"[red]Error: {escape(str(e))}[/red]")
+        console.print(
+            f"[red]Error: {escape(str(e))}[/red]", soft_wrap=True
+        )
         raise typer.Exit(1)
     except ImportError as e:
         console.print(f"[red]{escape(str(e))}[/red]")
@@ -20437,6 +20533,18 @@ mapping of any accepted groupings.
 This mapping is then passed to [[generate_literature_synthesis]], which uses it
 to combine papers from all constituent themes under the merged name.
 
+The grouping is a suggestion, so a missing [[llm]] package only skips it
+with a warning.  A model the package does not know is different: it is
+a mistyped [[--model]] (or [[--model-analytic]]) or a default model
+that is no longer installed, and skipping the grouping with a warning
+would let the synthesis run without the grouping the user asked for.
+So [[_apply_theme_groupings]] ends the command with the one line of
+[[resolve_llm_model]] (\cref{sec:resolve-llm-model}) and status~1,
+as [[_resolve_themes]] ends it for themes that do not exist.  Before
+(\url{https://github.com/dbosk/scholar/issues/284}), the unknown model
+ended in a traceback: only [[ImportError]] was caught here, and
+[[_resolve_themes]] runs before the [[try]] of [[llm synthesize]].
+
 <<llm command helpers>>=
 def _select_themes_interactively(
     theme_counts: dict[str, int],
@@ -20609,6 +20717,9 @@ def _apply_theme_groupings(
     except ImportError as e:
         console.print(f"[yellow]Warning: {escape(str(e))}[/yellow]")
         return theme_counts, {}
+    except ValueError as e:
+        console.print(f"[red]Error: {escape(str(e))}[/red]", soft_wrap=True)
+        raise typer.Exit(1)
 
     if not result.groups:
         console.print("[dim]No theme groupings suggested.[/dim]")
@@ -20717,7 +20828,11 @@ def llm_synthesize(
         bool,
         typer.Option(
             "--dry-run",
-            help="Show the prompt without calling LLM.",
+            help=(
+                "Show the prompts without calling the LLM. The writing "
+                "model is not looked up, so an unknown one is noticed "
+                "only by a real run."
+            ),
         ),
     ] = False,
     no_enrich: Annotated[
@@ -20891,11 +21006,128 @@ def llm_synthesize(
             sys.stdout.write(synthesis_text)
 
     except ValueError as e:
-        console.print(f"[red]Error: {escape(str(e))}[/red]")
+        console.print(
+            f"[red]Error: {escape(str(e))}[/red]", soft_wrap=True
+        )
         raise typer.Exit(1)
     except ImportError as e:
         console.print(f"[red]{escape(str(e))}[/red]")
         raise typer.Exit(1)
+@
+
+
+\subsection{A model the [[llm]] package does not know}
+\label{sec:cli-unknown-model}
+
+A mistyped [[--model]] is a common mistake, and every LLM command ends
+it with the same line and status~1: the model's name as the [[llm]]
+package reports it and how to list the models it knows
+([[resolve_llm_model]], \cref{sec:resolve-llm-model}).  Before, the
+package's [[UnknownModelError]], a [[KeyError]], went past the
+commands' [[ValueError]] clauses and ended [[llm classify]] and
+[[llm synthesize]] in a traceback
+(\url{https://github.com/dbosk/scholar/issues/284}).
+
+The tests run the commands with the real [[llm]] package whose model
+registries are emptied, as in the utilities' tests, so the error is the
+package's own, class and message.  A command that ends in an uncaught
+exception leaves it in [[result.exception]] (the runner catches it and
+prints no traceback), so the tests check that the command ended by
+[[typer.Exit]], which the runner records as a [[SystemExit]], and that the
+output ends with the one line.  The model's name is long enough for
+the line to pass the runner's 80 columns, so that Rich would break it
+in two unless the commands print it without wrapping.
+
+<<test functions>>=
+UNKNOWN_MODEL = "a-model-name-long-enough-to-wrap-a-line"
+UNKNOWN_MODEL_LINE = (
+  f"Error: Unknown model: {UNKNOWN_MODEL}; "
+  "`llm models` lists the available models"
+)
+
+
+def empty_llm_registries(monkeypatch, tmp_path):
+  """Make the real `llm` package know no model, without its plugins."""
+  import llm
+
+  monkeypatch.setenv("LLM_USER_PATH", str(tmp_path / "llm"))
+  monkeypatch.setattr(llm, "get_model_aliases", lambda: {})
+  monkeypatch.setattr(llm, "get_async_model_aliases", lambda: {})
+  return llm
+
+
+def assert_unknown_model_line(result):
+  """The command ended with the one line of an unknown model."""
+  assert result.exit_code == 1, result.output
+  assert isinstance(result.exception, SystemExit), result.exception
+  assert "Traceback" not in result.output
+  assert result.output.strip().splitlines()[-1] == UNKNOWN_MODEL_LINE
+
+
+class TestLLMCommandsUnknownModel:
+  """`llm classify` and `llm synthesize` with an unknown model (#284)."""
+
+  <<unknown model test methods>>
+
+<<unknown model test methods>>=
+def _session(self, tmp_path, monkeypatch):
+  from scholar.review import (
+    DecisionStatus, ReviewDecision, ReviewSession, save_session,
+  )
+
+  monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+  empty_llm_registries(monkeypatch, tmp_path)
+  kept = [
+    ReviewDecision(
+      paper=Paper(title=f"Tracing Study {n}", authors=["A"],
+                  doi=f"10.5555/unknown-model-{n}", year=2024,
+                  abstract="Students traced recursive calls."),
+      provider="openalex", status=DecisionStatus.KEPT, tags=[tag],
+    )
+    for n, tag in enumerate(["tracing", "misconceptions"])
+  ]
+  pending = ReviewDecision(
+    paper=Paper(title="Loops in Practice", authors=["C"],
+                doi="10.5555/unknown-model-pending",
+                abstract="A study of loops."),
+    provider="openalex",
+  )
+  save_session(ReviewSession(
+    query="q", providers=["openalex"], timestamp=datetime(2026, 11, 20),
+    name="unknown-model", research_context="Do novices misread recursion?",
+    decisions=[*kept, pending],
+  ))
+
+def test_classify(self, tmp_path, monkeypatch):
+  self._session(tmp_path, monkeypatch)
+  result = runner.invoke(app, [
+    "llm", "classify", "unknown-model", "-m", UNKNOWN_MODEL,
+    "--no-examples", "--no-enrich",
+  ])
+  assert_unknown_model_line(result)
+
+def test_synthesize(self, tmp_path, monkeypatch):
+  self._session(tmp_path, monkeypatch)
+  result = runner.invoke(app, [
+    "llm", "synthesize", "unknown-model", "-m", UNKNOWN_MODEL,
+    "--no-enrich",
+  ])
+  assert_unknown_model_line(result)
+@
+
+The theme grouping of an interactive synthesis asks the analytic model
+before any checklist is shown, so the run ends there, before a prompt
+waits for an answer.
+
+<<unknown model test methods>>=
+def test_theme_grouping(self, tmp_path, monkeypatch):
+  self._session(tmp_path, monkeypatch)
+  result = runner.invoke(app, [
+    "llm", "synthesize", "unknown-model",
+    "--model-analytic", UNKNOWN_MODEL, "-i", "--suggest-groups",
+    "--no-enrich",
+  ])
+  assert_unknown_model_line(result)
 @
 
 
@@ -21290,8 +21522,8 @@ after a copy of the file as [[sessions screen]] keeps one
 merges what other processes saved meanwhile.  A run with nothing left
 to screen, a selection that fails or a model the [[llm]] package does
 not know ends with status~1 and its reason on one line, as the ordinary
-run ends when no paper is pending.  (The ordinary run itself still
-ends with a traceback for an unknown model.)
+run ends when no paper is pending or the model is unknown
+(\cref{sec:cli-unknown-model}).
 
 <<run the second screen>>=
 from scholar.llm_review import second_screen_with_llm
@@ -21574,28 +21806,18 @@ def test_nothing_recorded_saves_nothing(self, tmp_path, monkeypatch):
 @
 
 A model the [[llm]] package does not know ends the run with one line
-and status~1.
+and status~1, a dry run too, since the second screen needs the model's
+id to choose its papers.  The package is the real one with its
+registries emptied (\cref{sec:cli-unknown-model}).
 
 <<classify second screen test methods>>=
 def test_an_unknown_model_is_one_line(self, tmp_path, monkeypatch):
-  from types import SimpleNamespace
-  import scholar.llm_review as llm_review
-
-  class UnknownModelError(KeyError):
-    """As the llm package's own, a KeyError (another test may have put
-    a fake `llm` module without it in `sys.modules`)."""
-
   self._make_session(tmp_path, monkeypatch)
-
-  def unknown(*_):
-    raise UnknownModelError("Unknown model: nope")
-
-  monkeypatch.setattr(llm_review, "llm", SimpleNamespace(get_model=unknown),
-                      raising=False)
+  empty_llm_registries(monkeypatch, tmp_path)
   result = self._classify("--second-screen", "--over", "all", "--dry-run",
-                          "-m", "nope")
-  assert result.exit_code == 1
-  assert result.output.strip() == "Error: Unknown model: nope"
+                          "-m", UNKNOWN_MODEL)
+  assert_unknown_model_line(result)
+  assert result.output.strip() == UNKNOWN_MODEL_LINE
 @
 
 \subsection{Examples left out for their category}
