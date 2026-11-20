@@ -1626,9 +1626,8 @@ never changed (tested on the saved JSON). **Screener identity**
 the identity of the snapshot of a decision the same model made, else
 the latest-record rule hides the first verdict. Only `llm classify
 --second-screen` writes `via: "classify"`; snapshots are `"snapshot"`,
-`sessions screen` `"screen"`. Not yet built (later #253 PR E):
-report surfaces (LaTeX report, `llm synthesize`, audit caption), the
-screen sheet.
+`sessions screen` `"screen"`. Report surfaces: see "Double screen in
+the documents" below; the screen sheet is not yet built (#253 PR E).
 **TUI blind review (#253 part D, closes #254's last point; tui.nw
 `sec:tui-blind-review`).** `scholar sessions resume S --blind [--by
 NAME]` (`PaperReviewApp(..., blind=True)`) starts blind mode in
@@ -1778,6 +1777,69 @@ TUI filter `x` (`conflicts`): decisions with an unresolved conflict;
 a TUI confirm resolves (tested with a pilot). A blind TUI screening
 that differs from the machine's is a status conflict, unresolved until
 the step-two confirm (`test_a_blind_verdict_is_a_conflict_until_confirmed`).
+
+#### Double screen in the documents (#253, part E)
+
+agreement.nw `sec:agreement-reports`; every number comes from
+`ScreeningOverview` / `screening_agreement` (no second computation),
+and every surface starts from `ScreeningOverview.of`, None without
+screenings, so documents of sessions without screenings are byte for
+byte as before (`TestDocumentsWithoutScreenings`: sha256 of report,
+CSV, synthesis summary md+latex, audit table en+sv of `_surface_session(False)`,
+pinned from b05c49e). Shared pieces: `kappa_clause(table)` (kappa
+always with PI/BI, else "kappa undefined (reason)"),
+`ScreeningOverview.pair_summary(a, b)` → (names, numbers) (the `show`
+line is `Double screening: names: numbers`), `resolved_outcomes`,
+`sorted_outcomes`, `outcome_line` (moved from `sessions conflicts`,
+which calls them; same text), `blind_basis(record)` → `prompt`/`tui`/
+`declared` (blind True with that ground), `unstated` (blind True,
+unknown ground), `not blind`, `unknown` (None); `ScreenerProfile`
+counts `snapshots` and `bases` (latest verdict per record);
+`ScreeningOverview.screened_again` (records with a counted non-snapshot
+screening), `second_screen_groups()` → {(kind, ground): (records,
+screeners)}.
+- **Report** (`double_screening_sentences(decisions)`, English, called
+  by `llm_review.build_llm_screening_latex`, escaped there): after the
+  LLM sentence and the samples, `\paragraph{Double screening}`; with no
+  LLM step and no sample `<heading_command>{Double screening}` instead.
+  Sentences: "k of the N records were/was screened a second time.";
+  per screener (`screener_sentence`, `REPORT_BLINDNESS`): "label: n
+  records, all <phrase>." or "(c1 phrase1; c2 phrase2)" (snapshots:
+  "copied from the decision when a screening was recorded"); per pair
+  (`pair_sentences`) "Kept/discarded, A = …, B = …[ (same model)]: n
+  records screened by both; both kept x11, A kept and B discarded x12,
+  A discarded and B kept x21, both discarded x22; observed agreement,
+  positive/negative agreement, Cohen's kappa (PI, BI)." plus PR B's
+  bound sentence; PR B's kappa sentence once after all pairs; conflict
+  counts ("… resolved by a human who decided after the latest
+  screening; … had conflicts on the category only.") and one
+  `outcome_line` per pair and kind; unknown-origin count. No interval
+  (not a sample).
+- **`llm synthesize`** summary (`summary_rows`): after the "Decided"
+  rows, md `- Double screening (names): numbers`, LaTeX
+  `\item[{Double screening: names}] numbers` (braced: names are user
+  text).
+- **Audit caption** (`audit_screening_sentence(decisions, strings)`,
+  called first in `build_audit_table_latex`'s `databases` join, i.e.
+  after the reason/confidence sentence, before `cited_rule` and
+  "Databases searched"): "Screened a second time: k of N records (c by
+  <kind>, <ground>; …)." (groups by kind and ground, "2 agents" when a
+  kind has several screeners), per pair "Agreement on kept/discarded
+  between <model m-1> and <agent a-2>, over n records screened by both:
+  P\,\% (Cohen's kappa K, prevalence index PI, bias index BI)." (or
+  "undefined: reason"), "Status conflicts: s, of which r resolved by a
+  human; category-only conflicts: c."; numbers via `audit_number`,
+  negatives `$-$`; screener all human-confirmed snapshots → "the
+  human-confirmed decisions"; strings in `AUDIT_STRINGS` (review.nw
+  `sec:audit-double-screen`: `screened_again`, `screened_group`,
+  `screener_kinds(_many)`, `blind_bases`, `screening_agreement`,
+  `screening_kappa(_undefined)`, `kappa_reasons`, `screener_nouns`,
+  `screener_unnamed`, `screener_second`, `screener_confirmed`,
+  `screening_conflicts`, `record_one`, `records`; sv too). Rows, order
+  and reasons unchanged (tested with/without screenings).
+  `TestDoubleScreeningCompiles` (marker `latex`) compiles report
+  fragment + sv table in the pdfLaTeX T1 host with a name full of
+  specials.
 
 ### Session Arguments
 
@@ -2374,6 +2436,11 @@ fixture has a quoted query, a `[`-row, `ĸ`, `CO₂`, a ligature. About
   adjacent hits, the B false hits, 2 unclassified and 1 ..."); the
   `extra_*` strings have no leading comma (the full caption adds ", ").
   `all` stays csv + latex.
+- Double screen (#253 E): the report's screening section ends with a
+  "Double screening" paragraph, the `llm synthesize` summary gets a row
+  per screener pair, and the audit caption a few sentences (en/sv) before
+  "Databases searched", all only when the session has screenings; see
+  "Double screen in the documents".
 - The TUI's `prompt_for_report` keeps the standalone default.
 
 ### Provider Text Cleaning
