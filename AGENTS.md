@@ -29,6 +29,8 @@ Providers self-register via `register_provider()` at module load time.
 | `src/scholar/crossref.nw` | Literate source for currency checks |
 | `src/scholar/unpaywall.py` | Unpaywall open-access lookup (per DOI) |
 | `src/scholar/unpaywall.nw` | Literate source for open-access lookup |
+| `src/scholar/europepmc.py` | Europe PMC abstract lookup (per DOI) |
+| `src/scholar/europepmc.nw` | Literate source for the Europe PMC lookup |
 | `src/scholar/preprint.py` | Preprint fallback (adopt a preprint when no PDF found) |
 | `src/scholar/preprint.nw` | Literate source for the preprint fallback |
 | `src/scholar/ratelimit.py` | Persistent cross-session rate-limit/quota tracking |
@@ -634,7 +636,8 @@ direct) is deliberately not part of the key: what changes the data is
 the view the route entitles, and that is already keyed.
 
 `ScopusProvider.get_paper_by_doi()` (a one-result `DOI("...")` search)
-makes Scopus the *last* entry of `ENRICHMENT_PROVIDERS`. It returns
+makes Scopus the last *search provider* in `ENRICHMENT_PROVIDERS`
+(only `crossref`, `europepmc` follow, #260). It returns
 `None` unless the COMPLETE view is served (the default view has no
 abstract to add), and after one refusal it declines without a request,
 so an off-campus enrichment run costs Scopus a single request.
@@ -768,6 +771,54 @@ provider order, for the DOIs (or derived arXiv DOIs) of papers that
 `needs_enrichment`. S2 comes first in `ENRICHMENT_PROVIDERS` and is
 paced at 1 request / 3 s without a key, so
 `--enrich-providers openalex,s2,...` is the fast path.
+
+### Abstracts from Crossref and Europe PMC (#260)
+
+`ENRICHMENT_PROVIDERS` ends with `crossref`, `europepmc`: per-DOI
+abstract services, not registered providers. `enrich.enrichment_source
+(name)` resolves a name to `abstract_source(name)` (the module's shared
+client, `<module>.enrichment_source()`) for the names in
+`ABSTRACT_SOURCE_FIELDS`, else `get_provider`. Both clients have
+`get_paper_by_doi` (a `Paper` with only DOI, abstract and
+`sources=[name]`) and `last_lookup_error` (Europe PMC also
+`last_lookup_declined`, for a DOI holding `"`), so the loop, the merge,
+`Paper.sources` and the #259 tally treat them like any database. The
+loop asks them only while the abstract is requested and still missing
+(`<<skip an abstract service with nothing to fill>>`): a present
+(hand-given, #258) abstract is never asked about; `--fields` without
+`abstract` asks neither. `--enrich-providers` is now validated
+(`cli.parse_enrich_providers`, exit 2, before loading/searching)
+against `enrich.enrichment_source_names()` = registered providers with
+`get_paper_by_doi` + the two services. Test files with enrichment
+switch them off with `scholar.enrich.abstract_source` → None
+(test_enrich autouse fixture, `TestEnrichLookupTally._invoke`).
+- **Crossref** (`crossref.nw` `sec:crossref-abstract`): no request of
+  its own. `_fetch_work` (shared by `fetch_currency` and
+  `fetch_abstract`) caches both the currency result and the raw JATS
+  abstract, a side entry `abstract_cache_key(doi)` = `("abstract",
+  doi)` (str or None; a 404 caches None in both). Chosen over bumping
+  `CURRENCY_CACHE_VERSION`, which would re-fetch every DOI's currency on
+  the next enrich; an old currency entry without the side entry costs
+  one request only when its abstract is asked for. `jats_to_text`
+  (Crossref code, not `clean_metadata_text`): drops a leading
+  `<title>Abstract</title>`, block elements → space, inline removed,
+  entities decoded after, white space collapsed. Docs (read
+  2026-11-20): the REST API page (abstracts exposed; "Some abstracts
+  ... may be subject to copyright by publishers or authors"), the
+  abstracts best-practice page (JATS), swagger `abstract: string`.
+- **Europe PMC** (`europepmc.nw`, `EuropePMCClient`, cache
+  `europepmc.pkl`, limiter `europepmc`): `GET
+  https://www.ebi.ac.uk/europepmc/webservices/rest/search?query=DOI:"<doi>"
+  &resultType=core&format=json&pageSize=5`; `abstract_for_doi` takes the
+  first result whose `doi` matches (case-folded) with an
+  `abstractText`; no result list → failure (not cached). The optional
+  `email` parameter (registers the address for news) is never sent.
+  Source: the API's OpenAPI document `.../rest/v3/api-docs`; the
+  europepmc.org pages were behind a bot challenge (2026-11-20, not
+  read). Rate 5/s is scholar's choice (a forum reply says 10/s or
+  500/min). PubMed E-utilities deliberately not added.
+- `cache clear --provider europepmc`, `providers limits` (imports
+  europepmc), conftest `fresh_rate_limiters` imports it too (#131).
 
 ### Currency / Retraction Checks
 
@@ -2344,7 +2395,7 @@ requests/day and each `scholar` run is a fresh process.
   `RATE_LIMIT` (those names are gone). Health probes pass `acquire()` too
   and record their responses, so a probed 429 starts a cooldown.
   The Crossref and Unpaywall clients declare `LIMITS` too (10/s;
-  Unpaywall also its 100000/day) and go through `acquire()` /
+  Unpaywall also its 100000/day; Europe PMC 5/s) and go through `acquire()` /
   `record_response()`; `all_status()` lists every in-process limiter, so
   `providers limits` shows them alongside the providers.
   Every WoS request (searches, probe, and the extended methods: related,

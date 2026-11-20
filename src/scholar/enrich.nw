@@ -28,6 +28,8 @@ fields on a paper, making it useful for multiple scenarios:
 
 We prioritize Semantic Scholar (good coverage, fast API) with OpenAlex as
 fallback (broader coverage, always free).
+For abstracts that no search provider holds, Crossref and Europe PMC are
+asked last.
 
 \section{Module structure}
 
@@ -71,6 +73,11 @@ By default, therefore, no provider is configured (the same answer
 [[get_provider]] gives for an unknown name), and a test that wants
 enrichment to find something says so with its own patch, which takes
 precedence over the fixture.
+The abstract services, Crossref and Europe PMC, are not providers and
+are not reached through [[get_provider]] (\cref{sec:enrichment-providers}),
+so the fixture switches off [[abstract_source]] as well; otherwise
+every test that patches [[get_provider]] and enriches a paper without
+an abstract in the default order would ask them.
 The suite-wide network guard [[block_network]]
 (\cref{sec:test-configuration}) would catch such a leak too, by failing
 the test; this fixture is what keeps the leak from happening.
@@ -104,6 +111,7 @@ def _offline_preprint_fallback(monkeypatch):
 def _offline_enrichment_providers(monkeypatch):
     """Configure no enrichment provider unless a test patches one in."""
     monkeypatch.setattr("scholar.enrich.get_provider", lambda name: None)
+    monkeypatch.setattr("scholar.enrich.abstract_source", lambda name: None)
 
 
 <<test functions>>
@@ -140,19 +148,92 @@ provider.
   subscribing institution's network or with its token
   (\cref{sec:scopus-doi-lookup}); elsewhere it declines after a single
   request.
-  It comes last because its quota is weekly and metered: we spend it
-  only on what the free providers could not supply.
+  It comes last of the search providers because its quota is weekly
+  and metered: we spend it only on what the free providers could not
+  supply.
+\item[Crossref] The abstract the publisher deposited, if any, read
+  from the work record the currency check fetches anyway
+  (\cref{sec:crossref-abstract}).
+\item[Europe PMC] Abstracts of the life-science literature PubMed
+  indexes (\cref{europepmc-module}).
 \end{description}
+
+The last two are not search providers but per-DOI lookups, and they
+fill the abstract only.
+They come after the search providers, so that a search provider's
+abstract wins whenever there is one, and Crossref before Europe PMC:
+[[scholar enrich]] checks every paper's currency against Crossref
+anyway, and the abstract comes with the same cached response, so asking
+Crossref adds no request to the run (apart from one, once, for a record
+cached before abstracts were kept), while Europe PMC is a request of
+its own.
 
 <<constants>>=
 # Providers to try for DOI-based metadata enrichment (in priority order)
 ENRICHMENT_PROVIDERS = [
     "s2", "arxiv", "openalex", "ieee", "wos", "scopus",
+    "crossref", "europepmc",
 ]
 
 # Global cache for enriched paper data (refs/cites)
 # Stored in data dir (not cache dir) since fetching refs/cites is expensive
 ENRICHMENT_CACHE_DIR = "enrichment_cache"
+@
+
+The loop below asks every name in the list the same question,
+[[get_paper_by_doi]], and merges the answer.
+Crossref's and Europe PMC's clients answer it too
+(\cref{sec:crossref-abstract,europepmc-module}), but they are not in
+the provider registry: they are not search providers, and registering
+them would put them in [[scholar providers list]], [[providers check]]
+and every default search.
+So [[enrichment_source]] resolves a name: the shared client of an
+abstract service, else the registered provider.
+The services' modules are imported here; [[scholar.crossref]] is
+loaded by the preprint fallback already.
+
+<<constants>>=
+# Per-DOI services that fill fields the search providers left empty,
+# with the fields they fill. Not search providers: not registered.
+ABSTRACT_SOURCE_FIELDS = {
+    "crossref": ("abstract",),
+    "europepmc": ("abstract",),
+}
+<<enrichment functions>>=
+def abstract_source(name: str):
+    """Return the shared client of the abstract service `name`."""
+    module = {"crossref": crossref, "europepmc": europepmc}[name]
+    return module.enrichment_source()
+
+
+def enrichment_source(name: str):
+    """Return what to ask for DOI lookups under `name`, or None.
+
+    An abstract service's client (`ABSTRACT_SOURCE_FIELDS`), else the
+    registered provider of that name.
+    """
+    if name in ABSTRACT_SOURCE_FIELDS:
+        return abstract_source(name)
+    return get_provider(name)
+@
+
+A user naming the sources ([[--enrich-providers]]) should hear about
+a misspelt name rather than get a run that silently asked nothing under
+it.
+The names that can answer are the registered providers that have a DOI
+lookup, which includes the preprint servers' OpenAlex lookups, and the
+two abstract services.
+
+<<enrichment functions>>=
+def enrichment_source_names() -> list[str]:
+    """Return the names `enrich_paper` can ask, sorted."""
+    from scholar.providers import PROVIDERS
+
+    names = {
+        name for name, provider in PROVIDERS.items()
+        if hasattr(provider, "get_paper_by_doi")
+    }
+    return sorted(names | set(ABSTRACT_SOURCE_FIELDS))
 @
 
 
@@ -280,8 +361,9 @@ def enrich_paper(
             for provider_name in providers_to_try:
                 if not needs_enrichment(result, fields):
                     break
+                <<skip an abstract service with nothing to fill>>
 
-                provider = get_provider(provider_name)
+                provider = enrichment_source(provider_name)
                 if provider is None:
                     continue
 
@@ -355,6 +437,239 @@ def enrich_paper(
     return clean_paper_text(result)
 
 
+@
+
+The loop goes on while any requested field is missing, so a paper that
+has its abstract but lacks keywords or a PDF link would reach Crossref
+and Europe PMC too.
+They fill only the abstract, so asking them then would cost a request
+(Europe PMC's is never free) and count a lookup in the tally for
+nothing.
+A service is therefore asked only for the fields it fills that are
+both requested and still missing: never when the paper has an
+abstract---a hand-entered one included, which no lookup replaces---and
+never when the caller did not ask for the abstract ([[--fields]]
+without it).
+
+<<skip an abstract service with nothing to fill>>=
+fills = ABSTRACT_SOURCE_FIELDS.get(provider_name)
+if fills is not None and not needs_enrichment(
+    result, [name for name in fields if name in fills]
+):
+    continue
+@
+
+[[needs_enrichment]] of no fields is false, so a run without
+[[abstract]] among its fields skips both services.
+
+Let's verify the order and the skipping with the real clients of both
+services, their caches emptied and their sessions answering with the
+responses recorded for their chapters (trimmed further here: one
+sentence of the abstract).
+Only the services' HTTP requests are replaced; resolving the names,
+the loop, the merge and the outcome run as they do in a real run.
+The module's autouse fixture switches the services off, so these tests
+switch them on again with the module's own [[abstract_source]], which
+the star import bound here before any fixture patched it.
+
+<<test functions>>=
+# Recorded 2026-11-20 (see the Crossref and Europe PMC chapters), trimmed.
+CROSSREF_WITH_ABSTRACT = {
+    "DOI": "10.7717/peerj.4375",
+    "abstract": (
+        "<jats:p>Despite growing interest in Open Access (OA) to "
+        "scholarly literature, there is an unmet need for large-scale, "
+        "up-to-date, and reproducible studies assessing the prevalence "
+        "and characteristics of OA.</jats:p>"
+    ),
+}
+CROSSREF_WITHOUT_ABSTRACT = {"DOI": "10.7717/peerj.4375"}
+EUROPEPMC_HIT = {"hitCount": 1, "resultList": {"result": [{
+    "doi": "10.7717/peerj.4375",
+    "abstractText": (
+        "Despite growing interest in Open Access (OA) to scholarly "
+        "literature, there is an unmet need for large-scale, up-to-date, "
+        "and reproducible studies assessing the prevalence and "
+        "characteristics of OA."
+    ),
+}]}}
+EUROPEPMC_NO_HIT = {"hitCount": 0, "resultList": {"result": []}}
+
+
+def _json_response(data):
+    """A replayed HTTP 200 answer with the JSON body `data`."""
+    response = MagicMock()
+    response.status_code = 200
+    response.headers = {}
+    response.json.return_value = data
+    return response
+
+
+class TestAbstractServices:
+    """Crossref and Europe PMC fill abstracts the providers lack (#260)."""
+
+    DOI = "10.7717/peerj.4375"
+
+    @pytest.fixture(autouse=True)
+    def _services(self, monkeypatch):
+        """The real service clients, with caches of their own."""
+        from scholar import crossref, europepmc
+
+        monkeypatch.setattr(
+            "scholar.enrich.abstract_source", abstract_source
+        )
+        monkeypatch.setattr(crossref._client, "_cache", {})
+        monkeypatch.setattr(europepmc._client, "_cache", {})
+        self.crossref = crossref._client
+        self.europepmc = europepmc._client
+
+    def _replay(self, crossref=None, europepmc=None):
+        """Patch both sessions to answer `body`, or raise it if an error."""
+        from contextlib import ExitStack
+
+        stack = ExitStack()
+        gets = []
+        for client, body in (
+            (self.crossref, crossref), (self.europepmc, europepmc),
+        ):
+            if isinstance(body, Exception):
+                get = stack.enter_context(
+                    patch.object(client._session, "get", side_effect=body)
+                )
+            else:
+                get = stack.enter_context(patch.object(
+                    client._session, "get",
+                    return_value=_json_response(
+                        {"message": body} if client is self.crossref
+                        else body
+                    ),
+                ))
+            gets.append(get)
+        return stack, gets
+
+    def _paper(self, **fields):
+        return Paper(
+            title="The state of OA", authors=["Heather Piwowar"],
+            doi=self.DOI, **fields,
+        )
+
+    def test_crossref_fills_a_missing_abstract(self):
+        outcome = LookupOutcome()
+        stack, (crossref_get, europepmc_get) = self._replay(
+            crossref=CROSSREF_WITH_ABSTRACT, europepmc=EUROPEPMC_HIT,
+        )
+        with stack:
+            paper = enrich_paper(
+                self._paper(), fields=["abstract"], outcome=outcome,
+            )
+        assert paper.abstract.startswith("Despite growing interest")
+        assert "<" not in paper.abstract
+        assert "crossref" in paper.sources
+        assert outcome.asked == ["crossref"]
+        europepmc_get.assert_not_called()
+
+    def test_europepmc_is_asked_when_crossref_has_none(self):
+        outcome = LookupOutcome()
+        stack, gets = self._replay(
+            crossref=CROSSREF_WITHOUT_ABSTRACT, europepmc=EUROPEPMC_HIT,
+        )
+        with stack:
+            paper = enrich_paper(
+                self._paper(), fields=["abstract"], outcome=outcome,
+            )
+        assert paper.abstract.startswith("Despite growing interest")
+        assert "europepmc" in paper.sources
+        assert "crossref" not in paper.sources
+        assert outcome.asked == ["crossref", "europepmc"]
+        assert outcome.failed == {}
+
+    def test_a_providers_abstract_wins(self):
+        provider = MagicMock()
+        provider.get_paper_by_doi.return_value = Paper(
+            title="The state of OA", authors=["Heather Piwowar"],
+            doi=self.DOI, abstract="From Semantic Scholar.",
+        )
+        stack, (crossref_get, europepmc_get) = self._replay(
+            crossref=CROSSREF_WITH_ABSTRACT, europepmc=EUROPEPMC_HIT,
+        )
+        with stack, patch(
+            "scholar.enrich.get_provider",
+            side_effect=lambda name: provider if name == "s2" else None,
+        ):
+            paper = enrich_paper(self._paper(), fields=["abstract"])
+        assert paper.abstract == "From Semantic Scholar."
+        crossref_get.assert_not_called()
+        europepmc_get.assert_not_called()
+
+    def test_a_present_abstract_is_never_replaced(self):
+        """A hand-given abstract (#258) is not asked about, even while
+        other fields are still missing."""
+        stack, (crossref_get, europepmc_get) = self._replay(
+            crossref=CROSSREF_WITH_ABSTRACT, europepmc=EUROPEPMC_HIT,
+        )
+        with stack:
+            paper = enrich_paper(
+                self._paper(abstract="Typed in by hand."),
+                fields=["abstract", "keywords"],
+            )
+        assert paper.abstract == "Typed in by hand."
+        crossref_get.assert_not_called()
+        europepmc_get.assert_not_called()
+
+    def test_not_asked_when_the_abstract_is_not_requested(self):
+        outcome = LookupOutcome()
+        stack, (crossref_get, europepmc_get) = self._replay(
+            crossref=CROSSREF_WITH_ABSTRACT, europepmc=EUROPEPMC_HIT,
+        )
+        with stack:
+            paper = enrich_paper(
+                self._paper(), fields=["keywords"], outcome=outcome,
+            )
+        assert paper.abstract is None
+        assert outcome.asked == []
+        crossref_get.assert_not_called()
+        europepmc_get.assert_not_called()
+
+    def test_a_failure_is_tallied_and_no_record_is_an_answer(self):
+        import requests
+
+        failed, answered = LookupOutcome(), LookupOutcome()
+        stack, _ = self._replay(
+            crossref=requests.exceptions.ConnectionError("down"),
+            europepmc=EUROPEPMC_NO_HIT,
+        )
+        with stack:
+            first = enrich_paper(
+                self._paper(), fields=["abstract"], outcome=failed,
+            )
+        stack, _ = self._replay(
+            crossref=CROSSREF_WITHOUT_ABSTRACT, europepmc=EUROPEPMC_NO_HIT,
+        )
+        other = Paper(title="Other", authors=["A B"], doi="10.1/other")
+        with stack:
+            second = enrich_paper(
+                other, fields=["abstract"], outcome=answered,
+            )
+        assert failed.failed == {
+            "crossref": "connection failed (ConnectionError)",
+        }
+        assert answered.asked == ["crossref", "europepmc"]
+        assert answered.failed == {}
+        tally = tally_lookups([first, second], [failed, answered])
+        assert (tally.with_failure, tally.all_answered) == (1, 1)
+        lines = abstract_tally_lines(tally, "papers")
+        assert "    crossref: connection failed (ConnectionError) (1)" \
+            in lines
+        assert any("1 answered by every database asked" in line
+                   for line in lines)
+
+    def test_default_order_ends_with_the_services(self):
+        assert ENRICHMENT_PROVIDERS[-2:] == ["crossref", "europepmc"]
+
+    def test_source_names_are_those_that_can_answer(self):
+        names = enrichment_source_names()
+        assert {"crossref", "europepmc", "s2", "openalex"} <= set(names)
+        assert "dblp" not in names  # no DOI lookup
 @
 
 Any [[Paper]] attribute could be passed in [[fields]], but only some
@@ -2056,7 +2371,7 @@ class TestLookupTally:
 import logging
 from typing import Any, Callable, cast
 
-from scholar import Paper, preprint, unpaywall
+from scholar import Paper, crossref, europepmc, preprint, unpaywall
 from scholar.providers import get_provider
 from scholar.utils import clean_paper_text, derive_arxiv_doi
 <<enrichment cache imports>>
