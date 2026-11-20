@@ -1260,25 +1260,30 @@ plain definition; a review measured 30,000 decisions with two reasons
 each at 3.0-4.4 s CPU under heavy load; the 10,000-decision test's 8 s
 CPU limit guards against the ~10x slower `str.translate` folding, it
 is no performance promise).
-**Batch check (#291, review.nw `sec:batch-check`, cli.nw
-`sec:decide-batch-check`, `sec:sessions-check-batches`).**
-`batch_findings(rows, one_reason=False, ordered=True)` over
-`BatchRow(paper, title, reason, confidence, status, tags)` (the
-confidence is the row's own column, never `-c`) returns `BatchFinding`s
-(`kind`, `count`, `rows`, `papers`, `detail`, `information`):
-`shared-reasons` (rows whose reason, white space collapsed + casefold,
-punctuation kept, is shared with a row of a *different* title, folded
-to letters/digits; >= `SHARED_REASON_MIN_ROWS` = 10 rows AND >=
-`SHARED_REASON_MIN_SHARE` = 0.25 of the rows with a reason),
-`flat-confidence` (every row with a confidence has the same one, >=
-`FLAT_CONFIDENCE_MIN_ROWS` = 20 rows), `identical-run` (consecutive
-rows with equal (status, tags, reason), counted in distinct titles, >=
-`IDENTICAL_RUN_MIN_ROWS` = 10; skipped with `ordered=False`);
-`one_reason=True` (one `--reason` for many records: a rule on purpose)
-gives only `one-reason`, `information=True`, never refused. All
-thresholds are scholar's choice, reasoned in the prose from the one
-report in the issue (no frequency figure exists). Runs in `sessions
-decide` (`--reasons-file`/`--reason`, agent only) and `sessions screen`
+**Batch check (#291, review.nw `sec:batch-check`, `sec:stored-batches`,
+`sec:batch-calibration`; cli.nw `sec:decide-batch-check`,
+`sec:sessions-check-batches`).** `batch_findings(rows, one_reason=False,
+confidence=True)` over `BatchRow(paper, title, reason, confidence,
+status, tags)` (the confidence is the row's own column, never `-c`)
+returns `BatchFinding`s (`kind`, `count`, `rows`, `papers`, `detail`,
+`information`): one `shared-reason` per reason (white space collapsed +
+casefold, punctuation kept) given to >= `SHARED_REASON_MIN_RECORDS` =
+10 records with different titles (titles folded to letters/digits, so
+copies count once), whatever the batch size, most records first,
+detail "shared by N records with different titles (M rows): \"…\""
+(`shared_reason_findings`); then `flat-confidence` (every row with a
+confidence has the same one, >= `FLAT_CONFIDENCE_MIN_ROWS` = 20; no
+exception for high values, unlike the external ~100-row validator's
+>= 0.9: a range is not flat, a default "off topic" at 0.95 would pass).
+`one_reason=True` (one `--reason` for many records) gives only
+`one-reason`, `information=True`, never refused. No share-of-batch
+condition and no run check any more (2026-11-20 calibration on copies
+of nine sessions of one project, in the prose as a table, anonymised
+A–I: honest reasons shared by <= 7 records, defaulted >= 13; stored
+runs merge many screeners' batches, 275 rows were 9 % of a 3,007-row
+run; a run of 10 identical rows is a shared reason of 10, so the run
+check only duplicated it). Runs in `sessions decide`
+(`--reasons-file`/`--reason`, agent only) and `sessions screen`
 (`--verdicts-file`/`--reason`) after the quote check, before saving
 (`<<check the batch as a whole>>`, reads `trace_of`, `reason`,
 `selected`, `by_id`, `by_doi`, `quote_misses`, `strict`, `saving`):
@@ -1293,15 +1298,20 @@ and refusal with the real exit codes, records in memory only, prints
 "Would mark N paper(s) kept|discarded by SRC in session 'x'; nothing
 written." (`<<report or save the decisions>>`), never saves (decide
 keeps no pre-run copy anyway). **`scholar sessions check-batches S
-[-f table|json]`**: read-only, exit 0; `review.stored_batch_runs`
-groups decisions with an `agent_reason` by (`agent_by`,
-`agent_decided_at`) and screenings with `origin` "screen" (snapshots
-left out) by (kind, name, `recorded_at`); `ordered=False` (no line
-order stored); a run whose rows all share one reason is checked as
-`one_reason` (detail says "one --reason, or the same reason on every
-line"); text lists runs with findings (count excludes noted-only
-runs), JSON lists every run. The help states the thresholds (a test
-ties them to the constants).
+[-f table|json]`**: read-only, exit 0; `review.stored_batch_check` →
+`StoredBatchCheck(shared, runs)`: runs group decisions with an
+`agent_reason` by (`agent_by`, `agent_decided_at`) and screenings with
+`origin` "screen" (snapshots left out) by (kind, name, `recorded_at`);
+a run whose rows all share one reason gets only a `one-reason` note and
+its rows stay out of the pool; shared reasons are looked for
+session-wide over the pooled rows, agent reasons and screening reasons
+apart (`shared["agent decisions"]`, `shared["screenings"]`), since a
+stored run is neither a screener's batch nor a superset of one; flat
+confidence is not judged there (needs a stored batch id, #292). Text:
+counts line, session-wide shared reasons, runs with one reason, then
+what a stored run is and that flat confidence is not judged. JSON:
+`shared_reasons`, `runs`, `flat_confidence`. The help states the
+thresholds (a test ties them to the constants).
 **Records decided without an abstract (#293, review.nw
 `sec:abstract-lookup`, enrich.nw `sec:enrich-lookup-record`, cli.nw
 `sec:decided-without-abstract`).** `ReviewDecision.abstract_lookup`
