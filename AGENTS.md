@@ -2126,7 +2126,9 @@ A human review leaves them untouched (they are the model's record).
   report) see only title and abstract (see Headless Review Sessions).
   Answers without a valid `paper_index` are skipped (never index 0).
 - **Second screen (#253 C).** `scholar llm classify S --second-screen
-  [--over all|machine | --sample ID] [-n N] [--rescreen]`
+  (--over all|machine | --sample ID) [-n N] [--rescreen]` (exactly one
+  selection, no default: exit 2 before loading; `second_screen_candidates`
+  raises `ValueError` for neither or both)
   (`llm_review.second_screen_with_llm`, llm_review.nw
   `sec:second-screen`; cli.nw `sec:llm-classify-second-screen`)
   classifies *decided* papers (never pending) and stores each usable
@@ -2136,8 +2138,11 @@ A human review leaves them untouched (they are the model's record).
   one), `abstract_truncated`, `blind` True, `blind_basis` "prompt",
   `sample_id`, `via` "classify") via `record_screening` (snapshot
   first); never `apply_llm_decisions`, decisions untouched (tested on
-  `decision_state`/`human_record_of` and the saved JSON). Selection
-  (`second_screen_candidates`): `all` (default) every decided paper,
+  `decision_state`/`human_record_of` and the saved JSON); with
+  enrichment on (as in an ordinary run) a missing abstract may be filled
+  and saved, and every copy under the paper's id gets the filled
+  `Paper`. Selection (`second_screen_candidates`): `all` every decided
+  paper,
   `machine` = `is_unreviewed_machine`, `--sample` = a band's
   `sample_id` (that band) or a banded draw's group id (`sample_group`,
   all bands; each screening stores its band's id); sampled papers
@@ -2147,9 +2152,18 @@ A human review leaves them untouched (they are the model's record).
   (`has_second_screen_by`) are skipped unless `--rescreen`; copies under
   one id are shown once and all screened. `classify_papers_with_llm(...,
   papers=)` classifies given decisions and takes examples and
-  themes/motivations from `visible` (shallow session copy without those
-  paper ids); whether categories are offered is read from the whole
-  session. Tested: the prompt is byte-identical when the screened
+  themes/motivations from `visible` (shallow session copy without every
+  decision sharing a `same_work_keys` key with a screened paper: paper
+  id, `version_link_dois`, `work:<audit_work_key>` when the title part
+  is non-empty; no namesake guard, a hidden namesake costs an example;
+  copies the keys miss are not hidden); whether categories are offered
+  is read from the whole session. An unknown model (`UnknownModelError`,
+  a `KeyError`) becomes a `ValueError`: one line, exit 1 (the ordinary
+  run still prints a traceback). Prose cites Vembye 2025 Table 5 steps
+  1-5 (test with recall >= .75, specificity >= .8, which Scholar does
+  not run) and 9, Page 2021 E&E Box 3 (partial checks); a `machine` or
+  single-status sample selection makes agreement conditional on the
+  first screen. Tested: the prompt is byte-identical when the screened
   papers' verdicts are flipped. Refused (exit 2, before loading, no
   model call): `--include-llm-examples` with it, `--sample/--over/
   --rescreen` without it, `--sample` with `--over`, bad `--over`;
