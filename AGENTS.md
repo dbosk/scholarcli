@@ -916,52 +916,73 @@ line, a table fragment, ... Flag, never drop.
   None` (enrich.nw `sec:doubtful-abstracts`; its own module, tangled
   from enrich.nw, stdlib + `scholar.utils` only, so `sessions show` and
   the report do not import providers or the Crossref cache). Order:
-  (1) `is_table_of_contents` (front-matter heading at the start and
-  "Chapter 1"/"Part I"/"1. X" within `FRONT_MATTER_CHARS` = 300) →
-  "table of contents"; (2) `DOUBTFUL_OPENINGS`: per kind (the reason
+  (1) `is_table_of_contents` (front-matter heading at the start, not
+  followed by a lower-case word, and "Chapter 1"/"Part I"/"1. X" within
+  `FRONT_MATTER_CHARS` = 300) → "table of contents"; (2) `DOUBTFUL_OPENINGS`: per kind (the reason
   string) a few regexes matched only at the START of the text, after
   `TEXT_START` (white space, inline tags, footnote marks/quotes, a
   leading "Abstract"; `[` kept); (3) `first_sentence_statement`: the
   first sentence (≤ 300 chars) whose first "is/are (word) available"
-  is within `AVAILABLE_WITHIN` = 120 chars, no `;` before it, and that
-  names supplementary material → supplementary-material note, or says
-  "available (up)on (word) request" → data-availability statement
-  (a repository alone is not a sign); (4) a statement from (2)/(3) is
+  is within `AVAILABLE_WITHIN` = 120 chars, no `;` before it, and whose
+  part before "available" names `SUPPLEMENTARY_MATERIAL`
+  (supplementary/supplemental material(s)/information/data/file(s)/
+  table(s)/figure(s)/appendix/appendices/text(s), or supporting
+  information) → supplementary-material note, or names
+  `AVAILABLE_THINGS` (data, dataset(s), code, material(s),
+  transcript(s), script(s), software, questionnaire(s), protocol(s))
+  with "available (up)on (word) request" → data-availability statement
+  (the word "supplementary" alone, or a repository alone, is not a
+  sign); (4) a statement from (2)/(3) is
   NOT doubtful when `abstract_follows`: later an `ABSTRACT_HEADING`
   (Abstract, Background, Objective(s), Purpose, Introduction, Aim(s),
   Methods; capitalised or caps, after space/punctuation, then `:`/`.`)
   with ≥ 100 chars after it (not for table/reference fragments,
   `NOT_RESCUED`; the TOC returns before); (5) `TOO_SHORT` = "fewer than
-  100 characters" (`MIN_ABSTRACT_CHARS`, after collapsing white space).
+  100 characters" (`MIN_ABSTRACT_CHARS`, after collapsing white space;
+  `weighed_length`: East Asian wide/fullwidth characters, W or F, count
+  `WIDE_CHAR_WEIGHT` = 2, so short complete CJK abstracts pass).
   Kinds of (2): conflict-of-interest statement (incl. disclosure prose:
   Dr/Prof/Professor + 1-3 capitalised names, or "the author(s)", +
   has received honoraria/consulting|speaker|personal fees/grants/
   research support, serves as … editor, is an employee of, reports
-  grants/fees), data-availability statement, funding statement,
+  grants/fees), data-availability statement, funding statement ("This
+  work was supported/funded by" unless the sentence goes on with "and"
+  + one of `STUDY_VERBS` within 200 chars),
   acknowledgements (heading), opens with thanks ("We (would like to)
   thank", "The authors are grateful"), keywords line, author address or
-  correspondence, supplementary-material note, table fragment,
+  correspondence ("Correspondence to" needs `:` or a capitalised name;
+  a bare "Corresponding author(s)" needs a delimiter),
+  supplementary-material note, table fragment ("Table N" not followed
+  by shows/lists/presents/summarises/reports/compares/gives/contains),
   reference-list fragment ("References"/"Bibliography" heading, or
   "[1] " with "[2]" within `REFERENCE_ENTRY_CHARS` = 200, so numbered
   paragraphs are not lists). A word that can be a topic ("Disclosure of
   HIV status", "Funding agencies", "Correspondence analysis",
   "Email-based", "Table tennis") is a heading only with `heading()`
-  evidence: a delimiter (`: .` en/em dash, ` - `), the end of the text,
-  or a capitalised run-in word from a short case-sensitive list. A list
+  evidence: a delimiter (`: .` en/em dash, ` - `) not followed by a
+  lower-case "a"/"an" ("Funding: a key determinant ..." is a topic),
+  the end of the text, or a capitalised run-in word from a short
+  case-sensitive list. A list
   or tuple is judged joined (`join_paragraphs`); other non-text values
   are not judged. All patterns and thresholds are scholar's own choice.
   `python -m scholar.abstract_check FILE.json ...` (reads the JSON
   only, never the data dir; dedups by paper id; skips hand-given
   abstracts; prints counts by reason, "Stored values that are not text:
   FIELD N" over `TEXT_FIELDS`, and each flagged text's first 80
-  characters). Calibration 2026-11-20 (developer's sessions, scholar's
-  own measurement): 147,108 abstracts, 667 flagged (0.45 %), 649 by the
-  floor; false positives (a disclosure line or a keywords line before a
-  real abstract, numbered-paragraph articles) led to (4) and the "[2]"
-  rule; enrich.nw `sec:abstract-check-calibration` describes the shapes
-  (no real texts in the repo). Not covered: free-form statements, an
+  characters). Calibration (developer's sessions, scholar's own
+  measurements, enrich.nw `sec:abstract-check-calibration`, shapes only,
+  no real texts in the repo): first run 2026-11-20, 147,108 abstracts,
+  667 flagged (0.45 %), 649 by the floor; its false positives (a
+  disclosure or keywords line before a real abstract, numbered-paragraph
+  articles) led to (4) and the "[2]" rule. Second run 2026-11-20:
+  145,772 judged (36,981 papers without an abstract), 729 doubtful
+  (0.50 %): 648 floor, 68 TOC, 6 thanks, 2 COI, 2 supplementary, 1
+  keywords, 1 funding, 1 acknowledgements heading; 22 list abstracts.
+  The review of PR #294 then narrowed (3), the heading delimiter, the
+  table/front-matter/funding/correspondence openings and the floor (CJK)
+  for real topics it found; a third run is pending. Not covered: free-form statements, an
   article's opening paragraph, non-English boilerplate. 10,000
-  abstracts of ~1,000 characters take about 0.3 s (test allows 1 s).
+  abstracts of ~1,000 characters take about 0.2 s (test allows 1 s).
 - **enrich** (`sec:replace-doubtful-abstract`): `needs_enrichment(p,
   fields, judge_abstract=False)`, `enrich_paper(..., judge_abstract=
   False)`, `enrich_papers(..., judge_abstracts=[bool per paper])`.
@@ -976,13 +997,22 @@ line, a table fragment, ... Flag, never drop.
   never replaced. `LookupOutcome` gained `abstract_from` (source whose
   abstract the call stored; dropped when a preprint adoption replaced
   the abstract), `doubtful`, `doubtful_text`, `doubtful_from` (None =
-  held before the call) and property `doubtful_replaced`.
-  `LookupTally.doubtful` counts `(reason, replaced)`;
+  held before the call), `abstract_adopted` (a preprint adoption
+  replaced the abstract) and properties `doubtful_replaced`,
+  `doubtful_ending` ("replaced" / "adopted" / "kept").
+  `LookupTally.doubtful` counts `(reason, ending)`;
   `doubtful_tally_lines` prints after the abstract tally (also on the
   interrupt path): "Doubtful abstracts (...): N papers." then per
-  reason "k replaced by a later source's abstract, m kept, no better
-  one found", and `DOUBTFUL_KEPT_HINT` (sessions show,
-  `sessions set-abstract --replace`) when any was kept.
+  reason "k replaced by a later source's abstract, j replaced by an
+  adopted preprint's abstract, m kept, no better one found"
+  (`DOUBTFUL_ENDINGS`), and `DOUBTFUL_KEPT_HINT` (sessions show,
+  `sessions set-abstract --replace`) when any was kept. Known costs
+  (prose and `enrich` help): a kept doubtful abstract is looked up
+  again by every source on every run (WoS/Scopus DOI lookups are not
+  cached), as a paper without an abstract is; no cache added. A DOI
+  lookup returning another work can replace a doubtful abstract with
+  that work's text; `replaced.text` keeps the old text and the source
+  is named.
 - **Origin** (review.nw `sec:fetched-abstract`):
   `ReviewDecision.abstract_fetched` = `[{"at", "from", "chars",
   "digest", "replaced"}]` (`replaced` = `{"text", "reason", "from"}`
@@ -991,9 +1021,12 @@ line, a table fragment, ... Flag, never drop.
   On the decision like `abstract_set` (no paper-merge rule): saved only
   when non-empty, old files `[]`, append copy, united by
   `merge_concurrent_changes` and by both folds, not in
-  `decision_state`. No abstract text in it (would double the file):
-  `abstract_digest` (sha256[:16]) lets `fetched_abstract_source(d)`
-  name the source only while the paper still holds that text; old data
+  `decision_state`. The stored abstract itself is not copied into the
+  record (would double the file), only `chars` and `digest`; the
+  replaced doubtful text, when there is one, is kept in full in
+  `replaced.text`. `abstract_digest` (sha256[:16]) lets
+  `fetched_abstract_source(d)` name the source only while the paper
+  still holds that text; old data
   and changed abstracts show nothing. Search ingest records no source
   (the merged paper's abstract provider is unknown there).
 - **Display**: `review.abstract_doubt(d)` (None for a hand-given
@@ -1001,8 +1034,11 @@ line, a table fragment, ... Flag, never drop.
   "(doubtful abstract: REASON[, from SOURCE])" after the title
   (`cli.doubtful_mark`), a "Doubtful abstracts: N papers have ...;
   replace one with `scholar sessions set-abstract --replace`." line
-  after the summary, JSON `abstract_doubtful` and `abstract_from`
-  (each only when set); help text names `set-abstract --replace`.
+  after the summary (both built as `Text` through `paper_line_notes` /
+  `print_show_line`, stored strings plain, #286), JSON
+  `abstract_doubtful` and `abstract_fetched_from` (each only when set;
+  not `abstract_from`, the CSV's column for where a hand-given abstract
+  was found); help text names `set-abstract --replace`.
   Report: `doubtful_abstracts_sentence` after the hand-abstract
   sentence (papers counted). Audit table and decisions unchanged (the
   review's `no-abstract` criterion is the reviewer's).
