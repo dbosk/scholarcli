@@ -218,12 +218,48 @@ Providers self-register via `register_provider()` at module load time.
   keep loading and read as "fetch date unknown"; no CACHE_VERSION bump.
   `search_dates_label` ("searched 2026-11-18, cached answer fetched
   2026-10-02") in `sessions show`; `search_source_date` feeds the audit
-  caption's "Searched A to B." (+ "Search date unknown for k of n
-  searches."); `bibtex+prov`'s `DATE` is the fetch date of the parts
+  caption's "Searched A to B." (+ "Search date not recorded for k of n
+  searches.", en wording since #275; sv "Sökdatum saknas för ..."); `bibtex+prov`'s `DATE` is the fetch date of the parts
   that returned the paper, "unknown (cached answer, fetch date not
   recorded)" when the cache does not know, the timestamp's date only
   for results without any dates. The session's `timestamp` is
   unchanged.
+- Retired searches (#275, review.nw `sec:retired-searches`).
+  `SearchRecord.retired` = `{"at", "by", "note"}` or None (saved only
+  when set, old files load None; `retire_record`, `retired_label` /
+  `retirement_label` "retired 2026-11-20 by X: note",
+  `current_records` / `retired_records`; the note's white space is
+  collapsed, blank -> None). Not in `key`, not in `record_rank`.
+  `SearchRecord.record_id`: first 7 hex digits (`RECORD_ID_LENGTH`) of
+  SHA-256 of the key joined by `\x1f`; same across re-runs of the
+  key, unlike the list position (each run's records go first);
+  `records_with_id_prefix` (case-insensitive prefix). A re-run of the key (`create_review_session`) whose
+  record wins replaces it unmarked (WARNING line "... running it again
+  makes it current"); a kept retired record (failed/narrower re-run)
+  keeps the mark (WARNING "... which stays retired"). A retired record
+  never covers a current merged record (`merged_record_cover`); a
+  current one covers a retired merged record. Concurrent merge
+  (`sec:retired-in-merge`): `SessionBaseline.retired` (key -> mark
+  copy); when both
+  records of a key are the same run (`same_run`: searched_at,
+  fetched_at, limit, hits, error), `merged_retirement` three-way (one
+  side changed -> that side; both or no base -> ours), applied to the
+  kept record via `replace`; different runs: the kept record's own
+  mark. Reports count current records only: `searched_providers`,
+  `unsearched_providers`, `unrecorded_providers`,
+  `searched_providers_text`, `searched_queries`, `search_period`; the
+  report adds a "Retired" item and the abstract the caption sentence
+  (`audit_retired_count`); when every record is retired
+  (`all_searches_retired`) the parameters are one item "Searches: all
+  N searches of the session have been retired; see the table of
+  searches" and the abstract "The N papers (...) were found through
+  searches that have since been retired, in <full names>"
+  (`retired_databases_text`, semantic left out); the provider table keeps every record,
+  query cell "q (retired ...)" (`search_retirements`, `query_cell`),
+  and is shown whenever any record is retired. Checked: the pipx 1.29
+  build loads such a file and drops the mark on save; the searches
+  then count as current again in every report. Both sides retiring one
+  run with different notes: ours (the last save) wins.
 
 ### Search Flow
 
@@ -1467,6 +1503,28 @@ report (`hand_abstracts_sentence`, one English sentence counting
 papers, nothing when zero) and the CSV column `abstract_from` (`from
 time [by NAME]; ...`, no text, `review.abstract_from_cell`, after
 `reset_from`, before `paper_id`). The audit table is unchanged.
+**`scholar sessions retire-search S (--query Q [-p P] [--filters-like
+T] | --record ID ... | --all-failed-outright) [--undo] [--dry-run]
+[--note T] [--by N]`** (#275, cli.nw `sec:sessions-retire-search`)
+marks search records retired (record and links stay). `--record`
+takes the ids `sessions show` prints ("  [3fa9c1e] s2: q", escaped
+for Rich; JSON `id`), each a unique prefix of at least 4 characters
+(`RECORD_ID_MIN_PREFIX`; shorter exit 2, ambiguous exit 2 naming the
+records, unknown exit 1, all checked before exiting); `--query` is
+exact and never matches a merged record (`q | q`), a match with
+different filters keys exits 2 naming them unless `--filters-like`
+(substring of the flags as `show` prints them, limit included) or
+`--record`; same filters on several providers are retired together;
+`--provider`/`--filters-like` need `--query` (exit 2); unmatched
+`--query` exits 1 unsaved; a blank `--note` exits 2;
+`--all-failed-outright` (`failed_outright`) matching nothing is not
+an error. Already retired (or, with `--undo`, current) records are
+named and left alone. `--undo` refuses `--note`/`--by` (exit 2).
+Otherwise like reset: `open_session_argument`, `--dry-run` writes
+nothing, `keep_copy_before_run(session, "pre-retire-search")`, one
+`_utcnow()` per run. `sessions show` heading "Queries by provider: N
+current, M retired" (only when any is retired), line suffix
+"(retired <date>: note)", JSON `retired` when set.
 Together these let scripted/agent-driven systematic reviews produce the same
 session record and `sessions export` audit trail as TUI reviews.
 #### Screenings: a second screener's verdicts (#253, part A)
@@ -1945,6 +2003,12 @@ with the records of its query and provider as candidates). Old sessions get link
 searches are re-run with `-n` (cache hits cost nothing). Never fall back
 to `search_record_for(provider)`: with several queries on a provider it
 returns the latest search, which is how #128 named wrong queries.
+A retired search's command gets a shell comment on the same line
+(`FOUND-VIA: scholar search ... # retired 2026-11-20: note`,
+`_retired_comment`, whitespace collapsed), so it stays inside a
+`prov import` block and is ignored when pasted to a shell; JSON adds
+`retired` (absent for current searches). `bibtex+prov` only writes the
+search just run, which is current, so it never carries the mark (#275).
 `review.sessions_mentioning(fragment)` finds the sessions by a
 case-insensitive byte search for the id in each file (every decision
 stores `paper_id`; an arXiv DOI also matches its bare arXiv id) and
@@ -2227,7 +2291,21 @@ fixture has a quoted query, a `[`-row, `ĸ`, `CO₂`, a ligature. About
   whose `SearchRecord`s carry errors is marked
   "failed for k of n queries" / "incomplete for k of n queries"
   (localised), and one that failed every query outright is not
-  named. `--bearing-only` lists only orders 0-2 and states the other
+  named. Retired search records (#275, review.nw `sec:audit-retired`)
+  are left out of the databases and dates sentences and the shortfall
+  notes (`build_audit_table_latex` passes `current_records`);
+  `audit_retired_sentence` then adds "{n} earlier searches that have
+  since been retired are not counted here." / sv "{n} tidigare
+  sökningar som sedan har strukits räknas inte här." (singular
+  `retired_one`; `audit_number`), and a row code known only from
+  retired records (`retired_only_codes`) is not named among the
+  databases but in that sentence, code first (`audit_coded_names`):
+  "; rows coded WoS (Web of Science) were found only through them"
+  (sv "; rader märkta ... hittades bara genom dem"; singular "it" /
+  "den"). Semantic (ranked) codes are never named there; the semantic
+  sentence appears for a current semantic record or an OA-sem row and
+  counts from all semantic records, retired too. Rows are untouched. Without
+  retired records the caption is byte-identical. `--bearing-only` lists only orders 0-2 and states the other
   counts in the caption: without extras "the A adjacent and B false
   hits" (`unlisted_pair`), with extras each group with its noun and
   `audit_joined_list` putting "and"/"och" before the last ("the A
