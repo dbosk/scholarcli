@@ -13,6 +13,7 @@ TESTS+=		test_tui.py
 TESTS+=		test_review.py
 TESTS+=		test_notes.py
 TESTS+=		test_llm_review.py
+TESTS+=		test_agreement.py
 TESTS+=		test_pdf.py
 TESTS+=		test_utils.py
 
@@ -66,6 +67,9 @@ test_notes.py: ../src/scholar/notes.nw
 
 test_llm_review.py: ../src/scholar/llm_review.nw
 	notangle -R"test [[llm_review.py]]" $< | cpif $@
+
+test_agreement.py: ../src/scholar/agreement.nw
+	notangle -R"test [[agreement.py]]" $< | cpif $@
 
 test_pdf.py: ../src/scholar/pdf.nw
 	notangle -R"test [[pdf.py]]" $< | cpif $@

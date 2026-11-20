@@ -37,6 +37,8 @@ Providers self-register via `register_provider()` at module load time.
 | `src/scholar/ratelimit.nw` | Literate source for rate-limit tracking |
 | `src/scholar/network.py` | Proxy route and User-Agent for every request |
 | `src/scholar/network.nw` | Literate source for the network settings |
+| `src/scholar/agreement.py` | Agreement and conflicts between screeners (#253) |
+| `src/scholar/agreement.nw` | Literate source for agreement and conflicts |
 | `src/scholar/cli.py` | CLI commands and output formatters |
 | `src/scholar/cli.nw` | Literate programming source for CLI |
 | `src/scholar/tutorials/*.nw` | Literate sources of the interactive tutorials (tangle to `*.md`, weave to chapters) |
@@ -1557,9 +1559,106 @@ only when `saving` (set before the chunk: decide True, screen
 `recorded_at` = `at`; `keep_copy_before_run(session, "pre-screen")`;
 `--dry-run` writes nothing. `--blind`/`--not-blind` → `blind`
 True/False, `blind_basis: "declared"`; neither → None. The decision is
-never changed (tested on the saved JSON). Not yet built (later #253
-PRs): agreement numbers, conflicts, `llm classify --second-screen`, the
-TUI's blind mode, report surfaces, the screen sheet.
+never changed (tested on the saved JSON). **Screener identity**
+(#253 C): `review.screener_identity(record)` = `(kind, name, via ==
+"classify")`; comparisons (agreement, conflicts) pair by it, not by
+`(kind, name)`: a classifier second screen keeps `name` = the model id
+(so "same model" = both kind llm with equal names) but must not share
+the identity of the snapshot of a decision the same model made, else
+the latest-record rule hides the first verdict. Only `llm classify
+--second-screen` writes `via: "classify"`; snapshots are `"snapshot"`,
+`sessions screen` `"screen"`. Not yet built (later #253 PRs): the
+TUI's blind mode, report surfaces (LaTeX report, `llm synthesize`,
+audit caption), the screen sheet.
+
+#### Agreement and conflicts (#253, part B)
+
+`agreement.nw` (new module, chapter after llm_review; reads, never
+writes). **Screener** = `review.screener_identity(record)` =
+`(kind, name, via == "classify")` (defined in `sec:screenings`,
+shared with PR C #277 so a model's second screen is apart from the
+snapshot of its own decision; `screener_of` returns None for a kind
+not in `SCREENING_KINDS`, counted by `unknown_origin_count`, never
+paired); unnamed = `(kind, None, ...)`, one screener per kind,
+labelled "unnamed agent"; second screen labelled "llm (m), second
+screen". `--pair` form `kind[+second]:name` or bare `kind[+second]`
+(`screener_spec`/`parse_screener_spec`, first colon splits;
+`parse_screener_pair` splits `A,B` at the one comma followed by a kind
+[+second] and `:` or the end, so names may hold commas; none or
+several such commas, or one screener twice → ValueError, exit 2).
+`pair_header` prints `Pair --pair <shlex-quoted A,B>`, copyable. `same_model(a, b)` (kind llm, one
+name): header line "same model: m" plus both sides' prompt versions
+("none recorded"), show line "(same model)". `screener_verdicts(decision)`: latest counted
+record per screener by `at` else `recorded_at` (ties: later in list);
+the live decision is never a verdict, its snapshot is.
+`ScreenerProfile.label`: a screener all of whose records are snapshots
+with `confirmed_from` is "the human-confirmed decision (by NAME;
+proposed by llm MODEL)" (parts only when known/unique); partly →
+"human (X) (k of n records the human-confirmed decision)"; profiles
+also list prompt versions. **`AgreementTable`** (frozen; `cells[i][j]`
+= A's label i, B's label j, positive first; everything computed from
+cells): `n`, `agreeing`, `observed`, `positive_agreement` =
+2x11/(2x11+x12+x21), `negative_agreement`, `prevalence_index` =
+(x11-x22)/N, `bias_index` = (x12-x21)/N (signed), `chance_agreement`,
+`kappa` None with `kappa_undefined_reason` when either screener used
+one verdict ("one screener gave only one verdict" / "both ...", never
+0), "no records screened by both", "not computed for more than two
+categories". Sources in the prose: ShankarBangdiwala2014 (Po, kappa,
+PI/BI, scenarios 1-3 as test vectors; Byrt and Cicchetti-Feinstein
+cited through it), Tan2024 (Ppos/Pneg; lepidic/acinar vectors),
+VachGerke2023, Wongpakaran2013 (zero marginal; Table 7 scales differ),
+Vembye2025 p. 9, Reichenheim2004 (why no kappa interval). Not
+computed: AC1, PABAK, B, kappa interval, multi-category kappa, verbal
+labels. **Questions** (`QUESTIONS`, `verdict_value`): `status`,
+`bearing` (category `<= AUDIT_ORDER_BEARING` of `audit_category(tags)`),
+`category` (4x4, observed only); a verdict without category →
+`without_category`. `screening_agreement(records, a, b, question)`
+takes `screener_verdicts` maps (computed once); a record = a decision
+(copies counted each). `screener_pairs` (fixed order by
+`SCREENING_KINDS` then name). **Samples**: `sample_bands(sessions, id)`
+(id or stratified group id; one `SampleBand` per stored band, papers
+by id as `sample_reports`: `reset_since_draw` left out and counted,
+missing papers and sessions not given → `not_found`); `band_agreement`
+adds `modified_wilson_interval(agreeing, n)` unless
+`interval_withheld`: census, or any counted sampled paper lacks a
+verdict/category of either screener (reset/not found do not withhold).
+No interval over all records. **Conflicts**: `conflicts(decision,
+verdicts=None)` per screener pair: `status` if statuses differ, else
+`category` if both categories present and different. `conflict_resolved`:
+decided, source not `is_unreviewed`, `human_decided_at` not older
+than the latest counted screening's `recorded_at`.
+`conflict_outcome` → `a`/`b`/`neither` (status: decision status;
+category: `audit_category(decision.tags)`). **Text**:
+`agreement_block` (table, measures, then two sentences, always: "X of
+N records were discarded by both, so observed agreement is at least
+X/N (P %) whatever the screeners did with the rest; positive agreement
+counts only records at least one screener kept." and "For the same
+observed agreement, kappa is lower the more one verdict dominates. No
+verbal label is given for kappa."; bearing worded "judged (not)
+bearing"), `agreement_data`
+(JSON, `interval` only for samples, category without kappa keys),
+`pair_header`, `ScreeningOverview.of(decisions)` (None without any
+decision with screenings; `lines()`, `data()`, `conflict_counts()`).
+`conflict_counts(entries)`/`conflict_counts_line`: one definition for
+show and `sessions conflicts` (a paper with any status conflict counts
+as status, else "category only").
+**CLI** (cli.nw `sec:sessions-agreement`, `sec:sessions-conflicts`):
+`scholar sessions agreement S [S...] [--sample ID] [--pair A,B] [-f
+table|json]` (sessions deduped by file; `--sample` reads
+`pooled_sample_sessions`; one block per band; bad `--pair` or unknown
+sample exit 2, missing session exit 1); `scholar sessions conflicts S
+[--pair A,B] [--status-only|--category-only] [--unresolved] [-f
+table|json]` (both kind flags exit 2; outcome counts per pair and kind
+over resolved conflicts; one print). `sessions show` adds the
+overview's lines after the "Screenings:" line (one per pair: records,
+kept/discarded agreement, kappa with "(prevalence index …, bias index
+…)" or undefined with its reason, status conflicts (resolved); then
+"Screening conflicts: N status (R resolved by a human), C category
+only"; unknown-origin count) in one print, and JSON
+`double_screening` (`pairs`, `conflicts`, `unknown_origin`); neither
+without screenings (`TestSessionsConflicts.test_show_unchanged_without_screenings`).
+TUI filter `x` (`conflicts`): decisions with an unresolved conflict;
+a TUI confirm resolves (tested with a pilot).
 
 ### Session Arguments
 
@@ -2270,6 +2369,59 @@ moved five places, `paper_id` stays last): empty when unset,
   Nothing is withheld or retried for it. Later checks (`sessions show`,
   report) see only title and abstract (see Headless Review Sessions).
   Answers without a valid `paper_index` are skipped (never index 0).
+- **Second screen (#253 C).** `scholar llm classify S --second-screen
+  (--over all|machine | --sample ID) [-n N] [--rescreen]` (exactly one
+  selection, no default: exit 2 before loading; `second_screen_candidates`
+  raises `ValueError` for neither or both)
+  (`llm_review.second_screen_with_llm`, llm_review.nw
+  `sec:second-screen`; cli.nw `sec:llm-classify-second-screen`)
+  classifies *decided* papers (never pending) and stores each usable
+  answer as a screening (`kind` llm, `name` = the model's reported
+  `model_id`, status, tags, confidence, `reason` cut by
+  `truncate_reason`, `at` = batch time, `prompt_version` (the ordinary
+  one), `abstract_truncated`, `blind` True, `blind_basis` "prompt",
+  `sample_id`, `via` "classify") via `record_screening` (snapshot
+  first); never `apply_llm_decisions`, decisions untouched (tested on
+  `decision_state`/`human_record_of` and the saved JSON); with
+  enrichment on (as in an ordinary run) a missing abstract may be filled
+  and saved, and every copy under the paper's id gets the filled
+  `Paper`. Selection (`second_screen_candidates`): `all` every decided
+  paper,
+  `machine` = `is_unreviewed_machine`, `--sample` = a band's
+  `sample_id` (that band) or a banded draw's group id (`sample_group`,
+  all bands; each screening stores its band's id); sampled papers
+  `reset_since_draw` are skipped and counted. Session order, `-n` per
+  run (one request + the one retry, as classify); decisions with a
+  counted screening of identity `("llm", model, True)`
+  (`has_second_screen_by`) are skipped unless `--rescreen`; copies under
+  one id are shown once and all screened. `classify_papers_with_llm(...,
+  papers=)` classifies given decisions and takes examples and
+  themes/motivations from `visible` (shallow session copy without every
+  decision sharing a `same_work_keys` key with a screened paper: paper
+  id, `version_link_dois`, `work:<audit_work_key>` when the title part
+  is non-empty; no namesake guard, a hidden namesake costs an example;
+  copies the keys miss are not hidden); whether categories are offered
+  is read from the whole session. An unknown model (`UnknownModelError`,
+  a `KeyError`) becomes a `ValueError`: one line, exit 1 (the ordinary
+  run still prints a traceback). Prose cites Vembye 2025 Table 5 steps
+  1-5 (test with recall >= .75, specificity >= .8, which Scholar does
+  not run) and 9, Page 2021 E&E Box 3 (partial checks); a `machine` or
+  single-status sample selection makes agreement conditional on the
+  first screen. Tested: the prompt is byte-identical when the screened
+  papers' verdicts are flipped. Refused (exit 2, before loading, no
+  model call): `--include-llm-examples` with it, `--sample/--over/
+  --rescreen` without it, `--sample` with `--over`, bad `--over`;
+  unknown sample exit 2 (screen's chunk). Nothing left → exit 1. A
+  decision the same model made (unreviewed `llm`, `llm_model` = model)
+  is screened, never refused, and announced ("Same model as the first
+  screen for N paper(s)"; `SecondScreen.same_model`). Withheld answers
+  store nothing (no snapshot) and are listed under "No screening
+  stored, ..." (`print_withheld_papers(lead=)`); the quote line checks
+  the screenings' reasons (`print_reason_quote_misses(reason_of=)`).
+  Saved only when something was recorded, after
+  `keep_copy_before_run(session, "pre-screen")`. Dry run prints the
+  prompt, stores nothing (resolves the model, to skip what it
+  screened). Prints "Left to screen: N".
 - **Abstracts.** `MAX_ABSTRACT_CHARS` = 4000 for papers to classify
   (marked `[abstract truncated]` in the prompt), `EXAMPLE_ABSTRACT_CHARS`
   = 1000 for examples.
