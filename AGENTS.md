@@ -1436,7 +1436,8 @@ confidence=True)` over `BatchRow(paper, title, reason, confidence,
 status, tags)` (the confidence is the row's own column, never `-c`)
 returns `BatchFinding`s (`kind`, `count`, `rows`, `papers`, `detail`,
 `information`): one `shared-reason` per reason (white space collapsed +
-casefold, punctuation kept) given to >= `SHARED_REASON_MIN_RECORDS` =
+casefold only, punctuation and templated ids kept: a known limit,
+stated in the prose) given to >= `SHARED_REASON_MIN_RECORDS` =
 10 records with different titles (titles folded to letters/digits, so
 copies count once), whatever the batch size, most records first,
 detail "shared by N records with different titles (M rows): \"…\""
@@ -1471,8 +1472,14 @@ keeps no pre-run copy anyway). **`scholar sessions check-batches S
 `StoredBatchCheck(shared, runs)`: runs group decisions with an
 `agent_reason` by (`agent_by`, `agent_decided_at`) and screenings with
 `origin` "screen" (snapshots left out) by (kind, name, `recorded_at`);
-a run whose rows all share one reason gets only a `one-reason` note and
-its rows stay out of the pool; shared reasons are looked for
+a run of two or more works (title keys) whose rows all share one
+reason gets a `one-reason` note and counts as ONE pooled record (a row
+keyed by the run, "run of N (agent NAME, TIME)"), so a rule applied to
+50 records counts once while the same reason across runs adds up; a
+one-row run is an ordinary row (a per-record `decide --paper-id X
+--reason R` loop adds up); the text adds `ONE_REASON_RUN_NOTE` (a file
+with one reason on every line is a shared reason at decide/screen time
+and `--strict` refuses it); shared reasons are looked for
 session-wide over the pooled rows, agent reasons and screening reasons
 apart (`shared["agent decisions"]`, `shared["screenings"]`), since a
 stored run is neither a screener's batch nor a superset of one; flat
@@ -1516,7 +1523,10 @@ a source replaced it, else the sources' outcome. One stderr line
 dry run, "selected"), `llm classify` and `--second-screen`: "k of the n
 records decided have no abstract (parts); run `scholar enrich S
 --pending-only --fields abstract` first if that has not been tried."
-(hint only with failed or no-record parts; S via `session_argument`,
+(hint only with failed, no-record or doubtful parts; `--pending-only`
+only where the records stay pending: dry run and `sessions screen`,
+not after a real decide, classify or second screen; has/have and
+record/records agree with the counts; S via `session_argument`,
 shell-quoted). `sessions show`: `decided_without_abstract_sentence`
 line (also the report's sentence, after the hand-abstract count), JSON
 `abstract_lookup` per decision and top-level
