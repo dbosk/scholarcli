@@ -2348,10 +2348,18 @@ model_id)` (utils.nw `sec:resolve-llm-model`): the `llm` package's
 passed in, `KeyError` for a stand-in without it) becomes `ValueError("Unknown
 model: X; `llm models` lists the available models")`. `llm classify`
 (both runs), `llm synthesize` (also its `-i --suggest-groups` grouping,
-which exits instead of warning), `rq` (before any search) and `pdf quote`
-(no fallback to the prior order for this one failure) print it as one
-unwrapped line and exit 1. A dry run of the ordinary classify or of the
-synthesis resolves no model, so it does not notice. Tests use the real
+which before ended in a traceback, named model or default: only
+`ImportError` was caught there and `_resolve_themes` runs before the
+command's `try`), `rq` (before any search) and `pdf quote` with `-m`
+print it as one unwrapped line and exit 1. `pdf quote` without `-m`
+and an unknown *default* model (llm's `default_model.txt`) keeps the
+old fallback: `rerank_passages_llm` logs the message as a WARNING and
+returns None (lexical order, exit 0). Dry runs of the ordinary classify
+and of the synthesis resolve no model (a dry run works offline; resolving
+asks every plugin), so they do not notice a typo; `--dry-run`'s help
+says so. The second screen's dry run does resolve it: it needs the
+model's own id (what decisions store as `llm_model`, whatever alias
+was typed) to choose the papers the model has not screened. Tests use the real
 package with `get_model_aliases`/`get_async_model_aliases` patched to
 `{}` (resolving a model asks every plugin; llm-gpt4all fetches its list
 over the network) and a long model name, so a wrapped line would fail.
