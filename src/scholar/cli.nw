@@ -7985,6 +7985,7 @@ def sessions_show(
     from scholar.review import (
         quote_check_tally, reason_quote_checks, unmatched_quotes_of,
     )
+    from scholar.review import screenings_summary
 
     console = Console()
     session = open_session_argument(name)
@@ -8055,6 +8056,10 @@ def sessions_show(
                     **(
                         {"abstract_set": d.abstract_set}
                         if d.abstract_set else {}
+                    ),
+                    **(
+                        {"screenings": d.screenings}
+                        if d.screenings else {}
                     ),
                     **(
                         {"llm_trace": EARLIER_TRACE_LABEL}
@@ -8143,6 +8148,12 @@ def sessions_show(
             quotes_line = reason_quotes_line(quote_tally)
             if quotes_line:
                 con.print(f"[cyan]{escape(quotes_line)}[/cyan]")
+                con.print()
+
+            # Count the screenings beside the decisions
+            screenings_line = screenings_summary(session.decisions)
+            if screenings_line:
+                con.print(f"[cyan]{escape(screenings_line)}[/cyan]")
                 con.print()
 
             # Show themes overview
@@ -10563,14 +10574,76 @@ def parse_reasons_file(text: str) -> tuple[list[ReasonLine], list[str]]:
     Returns the valid lines and a problem per invalid line, naming its
     number. Blank lines and lines starting with `#` are skipped.
     """
-    entries: list[ReasonLine] = []
+    entries, problems = parse_tab_file(text, REASONS_LAYOUT)
+    return [
+        ReasonLine(number, paper, reason, confidence)
+        for number, paper, (reason, confidence) in entries
+    ], problems
+@
+
+The rules of the lines are not the reasons file's own: [[sessions
+screen]] reads a file of verdicts with the same conventions
+(\cref{sec:sessions-screen}), and two parsers would drift apart in
+what they accept.  So the line rules live in [[parse_tab_file]], and a
+file's columns are given to it as a layout ([[TabFileLayout]]): after
+the id, which every file has first, one [[TabFileColumn]] per column,
+each with a function that reads its text into a value and says what is
+wrong with it, and whether it may be left out.  A layout also names
+what a line holds, for the messages, and may add a check of the whole
+line once every column has been read.  The reasons file is the first
+layout: a reason and an optional confidence.
+
+<<sessions command>>=
+@dataclass(frozen=True)
+class TabFileColumn:
+    """A column after the id of a tab-separated batch file.
+
+    `read` turns the column's text into its value and the problem with
+    it (None if there is none). An `optional` column may be absent or
+    empty, and then reads as None.
+    """
+
+    read: Callable[[str], tuple[Any, str | None]]
+    optional: bool = False
+
+
+@dataclass(frozen=True)
+class TabFileLayout:
+    """The columns of a batch file after its id, and how lines are named.
+
+    `too_few` is the problem of a line with fewer columns than the
+    required ones; `holds` says what a line holds and `last` names the
+    last column, for a line with too many; `check`, if given, returns
+    the problems of a line whose columns all read well.
+    """
+
+    columns: tuple[TabFileColumn, ...]
+    too_few: str
+    holds: str
+    last: str
+    check: Callable[[tuple], list[str]] | None = None
+
+
+def parse_tab_file(
+    text: str, layout: TabFileLayout
+) -> tuple[list[tuple[int, str, tuple]], list[str]]:
+    """Parse the lines of a tab-separated batch file by `layout`.
+
+    Returns `(line number, id, column values)` for each valid line and
+    a problem per invalid line, naming its number. Blank lines and lines
+    starting with `#` are skipped.
+    """
+    entries: list[tuple[int, str, tuple]] = []
     problems: list[str] = []
     for number, raw in enumerate(text.split("\n"), start=1):
         raw = raw.removesuffix("\r")
         if not raw.strip() or raw.lstrip().startswith("#"):
             continue
-        <<parse one line of a reasons file>>
+        <<parse one line of a batch file>>
     return entries, problems
+<<cli imports>>=
+from collections.abc import Callable
+from typing import Any
 @
 
 Only a newline ends a line, and a carriage return before it is dropped
@@ -10583,53 +10656,87 @@ error after it would name a line number one higher than the editor
 shows.  Splitting at newlines alone keeps such characters inside the
 reason, where they are stored as they were written.
 
-A line has two or three columns.  The third is optional, and an empty
-one (a spreadsheet's export of an empty cell) counts as absent rather
-than as a bad number.  A fourth column comes from a tab inside the
-reason or from tabs after the confidence; the message names each extra
-column and what it holds, since an empty one (two trailing tabs) is
-otherwise invisible.  The file is not quoted, as a CSV file would be:
-quote marks are part of the reason and stored as written.
+A line holds the id, the required columns and, after them, the
+optional ones.  An empty optional column (a spreadsheet's export of an
+empty cell) counts as absent rather than as a bad value.  A column more
+than the layout has comes from a tab inside the reason or from tabs
+after the last column; the message names each extra column and what it
+holds, since an empty one (two trailing tabs) is otherwise invisible.
+The file is not quoted, as a CSV file would be: quote marks are part
+of the reason and stored as written.  The problems of one line are
+joined in the order of its columns, the empty id first.
 
-<<parse one line of a reasons file>>=
+<<parse one line of a batch file>>=
 columns = raw.split("\t")
-if len(columns) < 2:
-    problems.append(f"line {number}: no tab between the id and the reason")
+required = 1 + sum(not column.optional for column in layout.columns)
+if len(columns) < required:
+    problems.append(f"line {number}: {layout.too_few}")
     continue
-if len(columns) > 3:
+if len(columns) > 1 + len(layout.columns):
+    first_extra = 2 + len(layout.columns)
     extra = ", ".join(
         f"{index} ({column!r})"
-        for index, column in enumerate(columns[3:], start=4)
+        for index, column in enumerate(
+            columns[first_extra - 1:], start=first_extra
+        )
     )
     problems.append(
-        f"line {number}: extra column {extra} after the confidence "
-        "(a line holds an id, a reason and an optional confidence; a "
-        "tab inside a reason starts a new column)"
+        f"line {number}: extra column {extra} after {layout.last} "
+        f"({layout.holds}; a tab inside a reason starts a new column)"
     )
     continue
 paper = columns[0].strip()
-reason_text, problem = checked_agent_reason(columns[1])
-problem = problem or reason_column_shift(reason_text)
-line_problems = [problem] if problem else []
-if not paper:
-    line_problems.insert(0, "empty id")
-confidence = None
-if len(columns) == 3 and columns[2].strip():
-    try:
-        confidence = float(columns[2])
-    except ValueError:
-        line_problems.append(
-            f"confidence {columns[2].strip()!r} is not a number"
-        )
-    else:
-        if not 0.0 <= confidence <= 1.0:
-            line_problems.append(
-                f"confidence {confidence} is not between 0 and 1"
-            )
+line_problems = [] if paper else ["empty id"]
+values = []
+for index, column in enumerate(layout.columns, start=1):
+    text_value = columns[index] if index < len(columns) else None
+    if text_value is None or (column.optional and not text_value.strip()):
+        values.append(None)
+        continue
+    value, problem = column.read(text_value)
+    if problem:
+        line_problems.append(problem)
+    values.append(value)
+if not line_problems and layout.check is not None:
+    line_problems.extend(layout.check(tuple(values)))
 if line_problems:
     problems.append(f"line {number}: {'; '.join(line_problems)}")
     continue
-entries.append(ReasonLine(number, paper, reason_text, confidence))
+entries.append((number, paper, tuple(values)))
+@
+
+The reason column is checked as [[--reason]] is
+([[checked_agent_reason]]), and as a column it can also be shifted
+([[reason_column_shift]], \cref{sec:decide-quote-check}).  The
+confidence is a number between 0 and~1, the range of [[-c]].
+
+<<sessions command>>=
+def read_reason_column(text: str) -> tuple[str, str | None]:
+    """Read a reason column: stripped, checked, not a shifted column."""
+    reason, problem = checked_agent_reason(text)
+    return reason, problem or reason_column_shift(reason)
+
+
+def read_confidence_column(text: str) -> tuple[float | None, str | None]:
+    """Read a confidence column: a number between 0 and 1."""
+    try:
+        confidence = float(text)
+    except ValueError:
+        return None, f"confidence {text.strip()!r} is not a number"
+    if not 0.0 <= confidence <= 1.0:
+        return None, f"confidence {confidence} is not between 0 and 1"
+    return confidence, None
+
+
+REASONS_LAYOUT = TabFileLayout(
+    columns=(
+        TabFileColumn(read_reason_column),
+        TabFileColumn(read_confidence_column, optional=True),
+    ),
+    too_few="no tab between the id and the reason",
+    holds="a line holds an id, a reason and an optional confidence",
+    last="the confidence",
+)
 @
 
 Once the session is loaded, each line's id is looked up as
@@ -14545,6 +14652,1061 @@ def test_show_marks_the_paper(self, tmp_path, monkeypatch):
   shown = runner.invoke(app, ["sessions", "show", "hand"])
   assert "from Crossref, 2026-11-20, since replaced)" \
     in " ".join(shown.output.split())
+@
+
+\subsection{Recording a second screener's verdicts}
+\label{sec:sessions-screen}
+
+[[sessions screen]] records another screener's verdicts of papers in a
+session as screenings (\cref{sec:screenings} in the review module),
+beside the decisions, which it leaves as they are
+(\url{https://github.com/dbosk/scholarcli/issues/253}).  It is a
+command of its own rather than an option of [[sessions decide]],
+because [[decide]] means \enquote{set the outcome}, and every guard it
+has ([[--force]], [[--keep-trace]], the refusal to replace a human's
+decision) is about that.  A screening sets no outcome, so none of
+those guards applies, and none of their options belongs here.
+
+Who screened is given with [[--as]]: [[agent]] for an AI agent's
+verdicts; [[human]] for a second human screener who records without
+the TUI; and [[llm]] for a classifier's verdicts relayed from outside
+Scholar, which must name the model with [[--by]], since a classifier
+verdict without its model says nothing about which classifier it was.
+For the others [[--by]] is optional and never guessed, as for an
+agent's reason; two unnamed screeners of one kind are one screener to
+whatever compares them.  Like [[--source]] of [[sessions decide]],
+[[--as]] defaults to [[human]] at a terminal and is required
+otherwise (status~2), so that an agent that leaves it out is not
+recorded as a human.
+
+The papers and verdicts are given in one of two ways.  On the command
+line, papers are selected with [[--doi]] and [[--paper-id]], and all
+get one verdict ([[--keep]] or [[--discard]]), its [[--tag]]s, an
+optional [[--reason]] and [[-c]].  A screen of many papers gives each
+its own verdict in [[--verdicts-file]], one line per paper:
+\begin{verbatim}
+doi:10.1145/3568813<TAB>kept<TAB>supports-claim,recursion<TAB>Reports ...
+10.1145/3568814<TAB>discarded<TAB>off-topic-false-hit<TAB>A compiler ...<TAB>0.9
+\end{verbatim}
+that is, the id, [[kept]] or [[discarded]], the tags separated by
+commas (the column may be empty for a keep), the reason and an
+optional confidence.  The file follows every convention of
+[[--reasons-file]] (\cref{sec:sessions-decide}): read as
+[[utf-8-sig]], lines ended by a newline only, blank and [[#]] lines
+skipped, the id a paper id or a DOI with or without [[doi:]], no
+quoting, every bad line named and refused before the session is
+loaded (status~2), placeholders and shifted columns refused, and the
+quotes of each reason checked against its own record once the session
+is loaded, listed on standard error or, with [[--strict-quotes]],
+refusing the batch.  It does so by sharing the code:
+[[parse_verdicts_file]] is [[parse_tab_file]] with a layout of its
+own, and the quote check is the one [[sessions decide]] runs.
+
+A discard needs a tag, as in [[sessions decide]] and the TUI, and a
+verdict holds at most one category tag.  When the session uses
+categories at all (any decision has one of [[AUDIT_CATEGORIES]]), a
+machine's screening, an agent's or a relayed classifier's, must carry
+exactly one, fitting its status ([[STATUS_CATEGORIES]], the rule the
+classifier is held to, \cref{sec:category-fits-status} in the LLM
+review module).  This is stricter than [[sessions decide]], which lets
+an agent record a supporting paper as excluded: a decision may
+deliberately exclude a relevant hit under a rule of the review, but a
+screening is there to be compared with another screener's, by status
+and by category, and a category that contradicts its own status would
+make one verdict disagree with itself.  A human's screening is free in
+this, as a human's decision is, and one without a category is stored
+as it is.  A human screening carries no confidence either: [[-c]] is
+the machine's confidence wherever Scholar stores one, so with
+[[--as human]] it is refused rather than dropped.
+
+[[--blind]] records that the screener did not see the other verdicts,
+[[--not-blind]] that it did, both as declared by the caller; without
+either nothing is claimed.  Scholar cannot know whether an agent
+looked: an agent that can run Scholar can read the session file.
+[[--sample ID]] records which review sample
+(\cref{sec:llm-sample-record} in the review module) the screen was
+made for; it must name a sample of the session, by its id or, for a
+sample drawn in confidence bands, by the id the bands share.  Whether
+every screened paper was drawn in it is a question for the reports
+that read the samples, not for this command.  Copies of one work
+decided apart under one id ([[same_id_pairs]]) need [[--all-copies]],
+for the reason given with [[sessions decide]]: a caller who named the
+id need not know there were two.
+
+The command records nothing else: the decision, its source, its trace
+and the human's record are not touched, which is what the tests below
+check on the saved file.  With [[--dry-run]] it prints what it would
+record and writes nothing.  Otherwise it copies the session file with
+[[keep_copy_before_run]] under the label [[pre-screen]] and saves with
+[[save_session]], which merges what other processes saved meanwhile.
+All screenings of one run share one time, [[recorded_at]], as the
+decisions of one [[sessions decide]] run share theirs.
+
+<<sessions command>>=
+@sessions_app.command("screen")
+def sessions_screen(
+    name: Annotated[
+        str,
+        typer.Argument(
+            help="Session name or query whose papers were screened.",
+            autocompletion=complete_session_name,
+        ),
+    ],
+    as_kind: Annotated[
+        Optional[str],
+        typer.Option(
+            "--as",
+            help="Who screened: agent (an AI agent), human (a second "
+                 "human screener) or llm (a classifier's verdicts "
+                 "relayed from outside Scholar; needs --by MODEL). "
+                 "Defaults to human at a terminal; required otherwise.",
+        ),
+    ] = None,
+    by: Annotated[
+        Optional[str],
+        typer.Option(
+            "--by",
+            help="The screener's name (the model for --as llm), kept "
+                 "with each screening as given. Not guessed.",
+        ),
+    ] = None,
+    verdicts_file: Annotated[
+        Optional[Path],
+        typer.Option(
+            "--verdicts-file",
+            help="One verdict per line: ID<TAB>kept|discarded<TAB>TAGS"
+                 "<TAB>REASON, optionally <TAB>CONFIDENCE. ID is "
+                 "doi:..., a bare DOI or a session paper id; TAGS are "
+                 "comma-separated. Not quoted (not CSV), no tab in a "
+                 "reason; blank and # lines are skipped. Replaces "
+                 "--doi/--paper-id/--keep/--discard/--tag/--reason.",
+            exists=True, dir_okay=False, readable=True,
+        ),
+    ] = None,
+    doi: Annotated[
+        Optional[list[str]],
+        typer.Option(
+            "--doi",
+            help="Select a paper by DOI (case-insensitive). Repeatable.",
+        ),
+    ] = None,
+    paper_id: Annotated[
+        Optional[list[str]],
+        typer.Option(
+            "--paper-id",
+            help="Select a paper by its session paper id. Repeatable.",
+            autocompletion=complete_session_paper_id,
+        ),
+    ] = None,
+    keep: Annotated[
+        bool,
+        typer.Option("--keep", help="The screener kept the papers."),
+    ] = False,
+    discard: Annotated[
+        bool,
+        typer.Option(
+            "--discard",
+            help="The screener discarded the papers (requires --tag).",
+        ),
+    ] = False,
+    tag: Annotated[
+        Optional[list[str]],
+        typer.Option(
+            "--tag", "-t",
+            help="Tag of the screener's verdict (at most one category). "
+                 "Repeatable.",
+        ),
+    ] = None,
+    reason: Annotated[
+        Optional[str],
+        typer.Option(
+            "--reason",
+            help="The screener's reason, stored with every selected "
+                 "paper's screening (at most 2000 characters).",
+        ),
+    ] = None,
+    confidence: Annotated[
+        Optional[float],
+        typer.Option(
+            "--confidence", "-c",
+            help="The machine screener's confidence (0-1); in a "
+                 "verdicts file, for lines without their own. Refused "
+                 "with --as human.",
+        ),
+    ] = None,
+    blind: Annotated[
+        Optional[bool],
+        typer.Option(
+            "--blind/--not-blind",
+            help="Declare that the screener did (not) see the other "
+                 "verdicts. Without either, nothing is claimed.",
+        ),
+    ] = None,
+    sample: Annotated[
+        Optional[str],
+        typer.Option(
+            "--sample",
+            help="The review sample of the session (`scholar llm "
+                 "sample`) the screen was made for, by its id.",
+        ),
+    ] = None,
+    all_copies: Annotated[
+        bool,
+        typer.Option(
+            "--all-copies",
+            help="Screen every copy of a work the session holds twice "
+                 "under one id, decided apart (refused otherwise).",
+        ),
+    ] = False,
+    dry_run: Annotated[
+        bool,
+        typer.Option(
+            "--dry-run",
+            help="Print what would be recorded; write nothing.",
+        ),
+    ] = False,
+    strict_quotes: Annotated[
+        bool,
+        typer.Option(
+            "--strict-quotes",
+            help="Refuse the batch (exit 2, nothing saved) when a "
+                 "reason quotes, between double quote marks, three or "
+                 "more words that its record's title and abstract do "
+                 "not hold. Without it such quotes are listed on "
+                 "stderr.",
+        ),
+    ] = False,
+) -> None:
+    """
+    Record another screener's verdicts beside the decisions.
+
+    Each verdict is stored as a screening of the paper (kind, name,
+    status, tags, confidence, reason, time); the decision itself is not
+    changed. The first screening of a decided paper also stores the
+    decision's current verdict, so that a later change of the decision
+    does not change what the first screener said. `sessions show`
+    counts the screenings and lists them in its JSON.
+
+    --as agent|human|llm says who screened (llm: a classifier's
+    verdicts relayed from outside Scholar, --by naming the model). It
+    defaults to human at a terminal and is required otherwise.
+
+    Give one verdict for papers selected with --doi/--paper-id
+    (--keep or --discard, --tag, --reason, -c), or a verdict per paper
+    in --verdicts-file. A discard needs a tag. When the session uses
+    category tags (supports-claim, ...), an agent's or classifier's
+    verdict must carry exactly one that fits its status. Any bad line,
+    any id not in the session or one paper given two verdicts aborts
+    the batch unsaved.
+
+    Examples:
+        scholar sessions screen my-review --as agent --by second-agent \\
+            --verdicts-file verdicts.tsv --blind
+        scholar sessions screen my-review --as human --by "a colleague" \\
+            --discard --tag off-topic-false-hit --doi 10.1145/3568813
+    """
+    from scholar.review import (
+        AUDIT_CATEGORIES, CopyConflict, SessionFileError,
+        copy_conflict_line, keep_copy_before_run, new_screening,
+        record_screening, same_id_pairs, save_session,
+    )
+    from scholar.utils import utc_now_iso
+
+    console = Console()
+    <<validate screen options>>
+    try:
+        session = open_session_argument(name, strict=True)
+    except SessionFileError as error:
+        exit_on_unreadable_session(error)
+    if session is None:
+        console.print(f"[red]Session not found: {escape(name)}[/red]")
+        raise typer.Exit(1)
+    <<refuse a sample the session does not hold>>
+    <<select the papers screened>>
+    <<refuse machine verdicts without a fitting category>>
+    <<refuse to screen copies decided apart>>
+    <<check the quotes of the agent's reasons>>
+    <<record the screenings>>
+@
+
+The options are checked before the session is loaded, every problem
+of the reason, the name and the file in one run, as in [[sessions
+decide]].  The tags given on the command line are stripped and taken
+once each, in order.
+
+<<validate screen options>>=
+if as_kind is None:
+    if sys.stdin is None or not sys.stdin.isatty():
+        console.print(
+            "[red]Not run at a terminal: pass --as agent|human|llm to "
+            "say who screened.[/red]"
+        )
+        raise typer.Exit(2)
+    as_kind = "human"
+if as_kind not in ("agent", "human", "llm"):
+    console.print(
+        f"[red]Invalid --as: {escape(as_kind)}. Use agent, human or "
+        "llm.[/red]"
+    )
+    raise typer.Exit(2)
+tags = list(dict.fromkeys(t.strip() for t in tag or [] if t.strip()))
+usage: list[str] = []
+if verdicts_file is not None:
+    if doi or paper_id or keep or discard or tags or reason is not None:
+        usage.append(
+            "--verdicts-file gives each paper its verdict, tags and "
+            "reason; drop --doi, --paper-id, --keep, --discard, --tag "
+            "and --reason."
+        )
+else:
+    if keep == discard:
+        usage.append("Specify exactly one of --keep or --discard, or "
+                     "give a --verdicts-file.")
+    if not doi and not paper_id:
+        usage.append("Select at least one paper with --doi or "
+                     "--paper-id, or give a --verdicts-file.")
+    if discard and not tags:
+        usage.append("--discard requires at least one --tag "
+                     "(motivation).")
+    categories_given = [t for t in tags if t in AUDIT_CATEGORIES]
+    if len(categories_given) > 1:
+        usage.append("A verdict holds one category, but --tag names "
+                     f"{', '.join(categories_given)}.")
+if confidence is not None and as_kind == "human":
+    usage.append("-c is a machine's confidence; a human screening "
+                 "carries none.")
+if confidence is not None and not 0.0 <= confidence <= 1.0:
+    usage.append(f"-c {confidence} is not between 0 and 1.")
+if strict_quotes and reason is None and verdicts_file is None:
+    usage.append("--strict-quotes checks the quotes of a reason; give "
+                 "--reason or --verdicts-file too.")
+if sample is not None:
+    sample = sample.strip()
+    if not sample:
+        usage.append("--sample: empty sample id.")
+for problem in usage:
+    console.print(f"[red]{escape(problem)}[/red]", soft_wrap=True)
+if usage:
+    raise typer.Exit(2)
+<<check the screener's name, reason and verdicts file>>
+@
+
+A relayed classifier verdict names its model; [[--by]] is otherwise
+optional, but a name given empty is a mistake, as in [[sessions
+decide]].  A verdicts file's confidences are refused for a human
+screener as [[-c]] is.
+
+<<check the screener's name, reason and verdicts file>>=
+problems: list[str] = []
+verdict_lines: list[VerdictLine] = []
+if by is not None:
+    by = by.strip()
+    if not by:
+        problems.append("--by: empty name")
+if as_kind == "llm" and not by:
+    problems.append("--as llm relays a classifier's verdicts; name the "
+                    "model with --by.")
+if reason is not None:
+    reason, problem = checked_agent_reason(reason)
+    if problem:
+        problems.append(f"--reason: {problem}")
+if verdicts_file is not None:
+    try:
+        text = verdicts_file.read_bytes().decode("utf-8-sig")
+    except (OSError, UnicodeDecodeError) as error:
+        problems.append(f"{verdicts_file}: cannot be read ({error})")
+    else:
+        verdict_lines, file_problems = parse_verdicts_file(text)
+        problems.extend(f"{verdicts_file}: {p}" for p in file_problems)
+        if not verdict_lines and not file_problems:
+            problems.append(f"{verdicts_file}: names no paper")
+        if as_kind == "human":
+            problems.extend(
+                f"{verdicts_file}: line {entry.line}: a human screening "
+                "carries no confidence"
+                for entry in verdict_lines if entry.confidence is not None
+            )
+for problem in problems:
+    console.print(f"[red]{escape(problem)}[/red]", soft_wrap=True)
+if problems:
+    console.print("[yellow]No changes saved.[/yellow]")
+    raise typer.Exit(2)
+@
+
+The verdicts file is the reasons file's layout with two columns more
+before the reason, the verdict and the tags, and a check of the whole
+line that a discard has a tag.  The verdict is spelt as the session
+stores it, [[kept]] or [[discarded]], in any case; the tags are split
+at commas, stripped and taken once each, and more than one category is
+refused there, before any session is read.
+
+<<sessions command>>=
+@dataclass(frozen=True)
+class VerdictLine:
+    """One line of a `--verdicts-file`: which paper and its verdict."""
+
+    line: int
+    paper: str
+    status: str
+    tags: tuple[str, ...]
+    reason: str
+    confidence: float | None
+
+
+def read_verdict_column(text: str) -> tuple[str | None, str | None]:
+    """Read a verdict column: kept or discarded."""
+    verdict = text.strip().lower()
+    if verdict in ("kept", "discarded"):
+        return verdict, None
+    return None, f"verdict {text.strip()!r} is neither kept nor discarded"
+
+
+def read_tags_column(text: str) -> tuple[tuple[str, ...], str | None]:
+    """Read a tags column: comma-separated, at most one category."""
+    from scholar.review import AUDIT_CATEGORIES
+
+    tags = tuple(dict.fromkeys(
+        t.strip() for t in text.split(",") if t.strip()
+    ))
+    categories = [t for t in tags if t in AUDIT_CATEGORIES]
+    if len(categories) > 1:
+        return tags, ("a verdict holds one category, not "
+                      f"{', '.join(categories)}")
+    return tags, None
+
+
+def _discard_has_a_tag(values: tuple) -> list[str]:
+    status, tags = values[0], values[1]
+    if status == "discarded" and not tags:
+        return ["a discard needs a tag (motivation)"]
+    return []
+
+
+VERDICTS_LAYOUT = TabFileLayout(
+    columns=(
+        TabFileColumn(read_verdict_column),
+        TabFileColumn(read_tags_column),
+        TabFileColumn(read_reason_column),
+        TabFileColumn(read_confidence_column, optional=True),
+    ),
+    too_few="too few columns (a line holds an id, kept or discarded, "
+            "the tags and a reason, separated by tabs)",
+    holds="a line holds an id, a verdict, the tags, a reason and an "
+          "optional confidence",
+    last="the confidence",
+    check=_discard_has_a_tag,
+)
+
+
+def parse_verdicts_file(text: str) -> tuple[list[VerdictLine], list[str]]:
+    """Parse a `--verdicts-file`: `ID<TAB>STATUS<TAB>TAGS<TAB>REASON` lines.
+
+    An optional fifth column gives the confidence. Returns the valid
+    lines and a problem per invalid line, naming its number. Blank lines
+    and lines starting with `#` are skipped.
+    """
+    entries, problems = parse_tab_file(text, VERDICTS_LAYOUT)
+    return [
+        VerdictLine(number, paper, *values)
+        for number, paper, values in entries
+    ], problems
+@
+
+A sample is named by the id [[llm sample]] gave it.  A sample drawn in
+confidence bands is stored as one sample per band, tied by the group id
+in the [[stratum]] entry of each band's criteria (\cref{sec:llm-sample} in the
+LLM review module), and a screen made for the whole sample names that
+group id, which is accepted too.  The refusal lists the ids the session
+holds, so the caller need not look them up.
+
+<<refuse a sample the session does not hold>>=
+if sample is not None:
+    known = set()
+    for held in session.llm_samples:
+        known.add(held.sample_id)
+        stratum = held.criteria.get("stratum")
+        if isinstance(stratum, dict) and stratum.get("group"):
+            known.add(stratum["group"])
+    if sample not in known:
+        console.print(
+            f"[red]--sample {escape(sample)} names no review sample of "
+            "this session"
+            + (f" (it holds {escape(', '.join(sorted(known)))})"
+               if known else " (it holds none)")
+            + ".[/red]",
+            soft_wrap=True,
+        )
+        raise typer.Exit(2)
+@
+
+Papers are looked up as [[sessions decide]] looks them up
+([[<<select decisions by doi and paper id>>]] there): a DOI or an id
+selects every decision under it, every unmatched selector or line is
+named before the batch aborts unsaved (status~1), and one paper given
+two different verdicts by two lines (by id and by DOI, say) is refused
+(status~2).  [[trace_of]] maps each decision named in the file to its
+line, under the name the quote check reads
+([[<<check the quotes of the agent's reasons>>]]), and [[verdict_of]]
+gives any selected decision its verdict, from its line or from the
+command line.
+
+<<select the papers screened>>=
+by_doi: dict[str, list] = {}
+by_id: dict[str, list] = {}
+for d in session.decisions:
+    if d.paper.doi:
+        by_doi.setdefault(d.paper.doi.strip().lower(), []).append(d)
+    by_id.setdefault(d.paper.id, []).append(d)
+selected: dict[int, Any] = {}
+missing: list[str] = []
+for value in doi or []:
+    matches = by_doi.get(value.strip().lower())
+    if not matches:
+        missing.append(f"DOI {value}")
+    for decision in matches or []:
+        selected[id(decision)] = decision
+for value in paper_id or []:
+    matches = by_id.get(value)
+    if not matches:
+        missing.append(f"paper id {value}")
+    for decision in matches or []:
+        selected[id(decision)] = decision
+trace_of: dict[int, VerdictLine] = {}
+clashes: list[str] = []
+for entry in verdict_lines:
+    matches = decisions_named_by(entry.paper, by_id, by_doi)
+    if not matches:
+        missing.append(f"verdicts-file line {entry.line}: {entry.paper}")
+    for decision in matches:
+        earlier = trace_of.setdefault(id(decision), entry)
+        if earlier.line != entry.line and (
+            earlier.status, earlier.tags, earlier.reason, earlier.confidence
+        ) != (entry.status, entry.tags, entry.reason, entry.confidence):
+            clashes.append(
+                f"verdicts-file lines {earlier.line} and {entry.line} give "
+                f"{decision.paper.id} different verdicts"
+            )
+        selected[id(decision)] = decision
+if missing:
+    for entry in missing:
+        console.print(f"[red]Not in session: {escape(entry)}[/red]")
+    console.print("[yellow]No changes saved.[/yellow]")
+    raise typer.Exit(1)
+for clash in clashes:
+    console.print(f"[red]{escape(clash)}[/red]", soft_wrap=True)
+if clashes:
+    console.print("[yellow]No changes saved.[/yellow]")
+    raise typer.Exit(2)
+
+
+def verdict_of(decision) -> tuple[str, list[str], str | None, float | None]:
+    """The verdict given for `decision`: status, tags, reason, confidence."""
+    entry = trace_of.get(id(decision))
+    if entry is None:
+        return ("kept" if keep else "discarded", tags, reason, confidence)
+    return (entry.status, list(entry.tags), entry.reason,
+            entry.confidence if entry.confidence is not None
+            else confidence)
+@
+
+The category rule is checked on the verdicts, not on the decisions: a
+line names its own verdict, and the command line gives one for every
+paper.  Each refused line is named with what is wrong with it.
+
+<<refuse machine verdicts without a fitting category>>=
+if as_kind != "human" and any(
+    t in AUDIT_CATEGORIES for d in session.decisions for t in d.tags
+):
+    from scholar.llm_review import STATUS_CATEGORIES
+
+    given = (
+        [(f"verdicts-file line {e.line}", e.status, e.tags)
+         for e in verdict_lines]
+        or [("the verdict", "kept" if keep else "discarded", tags)]
+    )
+    unfit: list[str] = []
+    for where, status, verdict_tags in given:
+        categories = [t for t in verdict_tags if t in AUDIT_CATEGORIES]
+        if not categories:
+            unfit.append(f"{where}: no category")
+        elif categories[0] not in STATUS_CATEGORIES[status]:
+            unfit.append(
+                f"{where}: category {categories[0]} does not fit a "
+                f"{status} verdict"
+            )
+    for problem in unfit:
+        console.print(f"[red]{escape(problem)}[/red]", soft_wrap=True)
+    if unfit:
+        def fitting(status: str) -> str:
+            return ", ".join(sorted(
+                STATUS_CATEGORIES[status], key=AUDIT_CATEGORIES.get
+            ))
+
+        console.print(
+            f"[red]The session uses categories, so an {as_kind}'s "
+            "screening carries exactly one that fits its verdict: kept "
+            f"takes {fitting('kept')}; discarded takes "
+            f"{fitting('discarded')}.[/red]\n"
+            "[yellow]No changes saved.[/yellow]",
+            soft_wrap=True,
+        )
+        raise typer.Exit(2)
+@
+
+<<refuse to screen copies decided apart>>=
+if not all_copies:
+    apart = [
+        pair for pair in same_id_pairs(session)
+        if any(id(d) in selected for d in pair)
+    ]
+    for pair in apart:
+        console.print(
+            f"[red]{escape(copy_conflict_line(CopyConflict(list(pair))))}"
+            "[/red]",
+            soft_wrap=True,
+        )
+    if apart:
+        console.print(
+            "[red]These copies of one work are decided apart; pass "
+            "--all-copies to record the screening on every copy.[/red]\n"
+            "[yellow]No changes saved.[/yellow]"
+        )
+        raise typer.Exit(2)
+@
+
+The quote check is [[sessions decide]]'s
+([[<<check the quotes of the agent's reasons>>]]): it reads
+[[selected]], [[trace_of]], [[reason]] and [[strict_quotes]], which the
+chunks above define under the same names.  Then the screenings are
+recorded, after the snapshot of each decided paper's verdict
+([[record_screening]]).  The summary counts the papers, like
+[[sessions decide]]'s, and the snapshots it took.
+
+<<record the screenings>>=
+who = f"{as_kind} {by}" if by else f"unnamed {as_kind}"
+papers = len({d.paper.id for d in selected.values()})
+if dry_run:
+    console.print(
+        f"Would record {len(selected)} screening(s) by {escape(who)} on "
+        f"{papers} paper(s) in session '{escape(name)}'; nothing written."
+    )
+    return
+copy = keep_copy_before_run(session, "pre-screen")
+recorded_at = utc_now_iso()
+snapshots = 0
+for decision in selected.values():
+    status, verdict_tags, verdict_reason, verdict_confidence = (
+        verdict_of(decision)
+    )
+    screening = new_screening(
+        kind=as_kind, name=by, status=status, tags=verdict_tags,
+        recorded_at=recorded_at, confidence=verdict_confidence,
+        reason=verdict_reason, blind=blind,
+        blind_basis="declared" if blind is not None else None,
+        sample_id=sample, via="screen",
+    )
+    if record_screening(decision, screening) is not None:
+        snapshots += 1
+save_session(session)
+console.print(
+    f"[green]Recorded {len(selected)} screening(s) by {escape(who)} on "
+    f"{papers} paper(s)[/green] in session '{escape(name)}' "
+    f"({snapshots} snapshot(s) of the decision taken)."
+)
+if copy is not None:
+    console.print(f"[dim]Copy of the session before: {copy}[/dim]")
+@
+
+Let's check the command on a session of invented records: a discard by
+a classifier with its trace, a keep a human confirmed, and a pending
+paper, each with an abstract.  The saved file is compared before and
+after, so \enquote{the decision is untouched} means every saved field
+of it but the screenings.
+
+<<test functions>>=
+class TestSessionsScreen:
+  """`sessions screen` records verdicts beside the decisions (#253)."""
+
+  <<sessions screen test methods>>
+
+<<sessions screen test methods>>=
+AT = "2026-11-20T10:00:00+00:00"
+
+def _make_session(self, tmp_path, monkeypatch, categories=False,
+                  samples=()):
+  monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+  from scholar.review import (
+    DecisionStatus, ReviewDecision, ReviewSession, ReviewSource,
+    record_human_decision, save_session,
+  )
+
+  off_topic = "off-topic-false-hit" if categories else "off-topic"
+  llm = ReviewDecision(
+    paper=Paper(title="Compilers for Beginners", authors=["A"],
+                doi="10.1/llm",
+                abstract="We describe a compiler course for beginners."),
+    provider="openalex", status=DecisionStatus.DISCARDED,
+    tags=[off_topic], source=ReviewSource.LLM_UNREVIEWED,
+    llm_confidence=0.7, llm_model="m-1", llm_reason="About compilers.",
+    llm_decided_at=self.AT,
+  )
+  human = ReviewDecision(
+    paper=Paper(title="Recursion Misconceptions", authors=["B"],
+                doi="10.1/human",
+                abstract="Most students treated recursion as a loop."),
+    provider="openalex", status=DecisionStatus.KEPT,
+    tags=["supports-claim"] if categories else ["recursion"],
+    source=ReviewSource.LLM_REVIEWED, llm_model="m-1",
+  )
+  record_human_decision(human, "tui", by="the author", at=self.AT)
+  pending = ReviewDecision(
+    paper=Paper(title="Loops in Practice", authors=["C"],
+                doi="10.1/pending", abstract="A study of loops."),
+    provider="openalex",
+  )
+  session = ReviewSession(
+    query="q", providers=["openalex"], timestamp=datetime(2026, 11, 20),
+    name="screens", decisions=[llm, human, pending],
+  )
+  session.llm_samples = list(samples)
+  return save_session(session)
+
+def _screen(self, *args, name="screens"):
+  return runner.invoke(app, ["sessions", "screen", name, *args])
+
+def _saved(self, path):
+  import json
+
+  return {d["paper"]["doi"]: d
+          for d in json.loads(path.read_text())["decisions"]}
+
+def _file(self, tmp_path, text):
+  path = tmp_path / "verdicts.tsv"
+  path.write_text(text)
+  return str(path)
+
+def test_an_agent_screening_leaves_the_decision(self, tmp_path,
+                                                 monkeypatch):
+  import scholar.utils
+
+  path = self._make_session(tmp_path, monkeypatch)
+  before = self._saved(path)
+  monkeypatch.setattr(scholar.utils, "utc_now_iso", lambda: self.AT)
+  result = self._screen("--as", "agent", "--by", "agent-2", "--keep",
+                        "--tag", "compilers", "--reason", "Teaching.",
+                        "-c", "0.6", "--doi", "10.1/llm",
+                        "--doi", "10.1/pending", "--blind")
+  assert result.exit_code == 0, result.output
+  flat = " ".join(result.output.split())
+  assert "Recorded 2 screening(s) by agent agent-2 on 2 paper(s)" in flat
+  assert "(1 snapshot(s) of the decision taken)" in flat
+  after = self._saved(path)
+  for doi in before:
+    rest = {k: v for k, v in after[doi].items() if k != "screenings"}
+    assert rest == before[doi], doi
+  snapshot, screening = after["10.1/llm"]["screenings"]
+  assert (snapshot["origin"], snapshot["kind"], snapshot["name"],
+          snapshot["status"]) == ("decision", "llm", "m-1", "discarded")
+  assert {k: screening[k] for k in (
+    "origin", "kind", "name", "status", "tags", "reason", "confidence",
+    "blind", "blind_basis", "recorded_at", "via", "sample_id")} == {
+    "origin": "screen", "kind": "agent", "name": "agent-2",
+    "status": "kept", "tags": ["compilers"], "reason": "Teaching.",
+    "confidence": 0.6, "blind": True, "blind_basis": "declared",
+    "recorded_at": self.AT, "via": "screen", "sample_id": None,
+  }
+  [pending] = after["10.1/pending"]["screenings"]
+  assert pending["origin"] == "screen"
+  assert "screenings" not in after["10.1/human"]
+
+def test_a_confirmed_call_is_snapshot_as_the_humans(self, tmp_path,
+                                                     monkeypatch):
+  path = self._make_session(tmp_path, monkeypatch)
+  result = self._screen("--as", "agent", "--discard", "--tag",
+                        "off-topic", "--doi", "10.1/human")
+  assert result.exit_code == 0, result.output
+  snapshot, screening = self._saved(path)["10.1/human"]["screenings"]
+  assert (snapshot["kind"], snapshot["name"], snapshot["confirmed_from"],
+          snapshot["confirmed_name"]) == ("human", "the author", "llm",
+                                          "m-1")
+  assert (screening["kind"], screening["name"], screening["blind"]) \
+    == ("agent", None, None)
+
+def test_who_screened_is_required_off_a_terminal(self, tmp_path,
+                                                 monkeypatch):
+  path = self._make_session(tmp_path, monkeypatch)
+  for args, message in (
+    ([], "pass --as agent|human|llm"),
+    (["--as", "robot"], "Invalid --as"),
+    (["--as", "llm"], "name the model with --by"),
+    (["--as", "human", "-c", "0.5"], "a human screening carries none"),
+    (["--as", "agent", "--by", " "], "--by: empty name"),
+  ):
+    result = self._screen(*args, "--keep", "--doi", "10.1/llm")
+    assert result.exit_code == 2, (args, result.output)
+    assert message in result.output, args
+  for args, message in (
+    (["--doi", "10.1/llm"], "exactly one of --keep or --discard"),
+    (["--keep"], "Select at least one paper"),
+    (["--discard", "--doi", "10.1/llm"], "requires at least one --tag"),
+    (["--keep", "-t", "supports-claim", "-t", "adjacent-subtopic",
+      "--doi", "10.1/llm"], "holds one category"),
+    (["--keep", "--doi", "10.1/llm", "--strict-quotes"],
+     "--strict-quotes checks"),
+    (["--keep", "--doi", "10.1/llm", "--reason", "TODO"],
+     "is a placeholder"),
+  ):
+    result = self._screen("--as", "agent", *args)
+    assert result.exit_code == 2, (args, result.output)
+    assert message in result.output, args
+  result = self._screen("--as", "agent", "--keep", "--doi", "10.1/llm",
+                        name="no-such-session", )
+  assert result.exit_code == 1
+  assert all("screenings" not in d for d in self._saved(path).values())
+
+def test_a_relayed_classifier_verdict_names_its_model(self, tmp_path,
+                                                      monkeypatch):
+  path = self._make_session(tmp_path, monkeypatch)
+  result = self._screen("--as", "llm", "--by", "m-2", "--keep",
+                        "--doi", "10.1/pending", "-c", "0.9")
+  assert result.exit_code == 0, result.output
+  [screening] = self._saved(path)["10.1/pending"]["screenings"]
+  assert (screening["kind"], screening["name"], screening["confidence"]) \
+    == ("llm", "m-2", 0.9)
+@
+
+The verdicts file: every bad line is named in one run and nothing is
+saved; a good file gives each paper its own verdict, tags, reason and
+confidence ([[-c]] for the lines without one), and a paper named by two
+lines with different verdicts, or an id the session lacks, aborts the
+batch.
+
+<<sessions screen test methods>>=
+def test_bad_verdict_lines_are_all_named(self, tmp_path, monkeypatch):
+  path = self._make_session(tmp_path, monkeypatch)
+  verdicts = self._file(tmp_path, "\n".join([
+    "# a comment",
+    "10.1/llm\tkept\tcompilers",
+    "10.1/llm\tmaybe\tx\tA reason.",
+    "\tkept\tx\tA reason.",
+    "10.1/llm\tdiscarded\t\tNo tag.",
+    "10.1/llm\tkept\tsupports-claim,adjacent-subtopic\tTwo.",
+    "10.1/llm\tkept\tx\t0.9",
+    "10.1/llm\tkept\tx\tPLACEHOLDER",
+    "10.1/llm\tkept\tx\tA reason.\t1.5",
+    "10.1/llm\tkept\tx\tA reason.\t0.5\t",
+    "",
+  ]))
+  result = self._screen("--as", "agent", "--verdicts-file", verdicts)
+  assert result.exit_code == 2, result.output
+  flat = " ".join(result.output.split())
+  for expected in (
+    "line 2: too few columns",
+    "line 3: verdict 'maybe' is neither kept nor discarded",
+    "line 4: empty id",
+    "line 5: a discard needs a tag",
+    "line 6: a verdict holds one category",
+    "line 7: reason '0.9' is only a number",
+    "line 8: reason 'PLACEHOLDER' is a placeholder",
+    "line 9: confidence 1.5 is not between 0 and 1",
+    "line 10: extra column 6 ('')",
+  ):
+    assert expected in flat, expected
+  assert "line 1:" not in flat
+  assert all("screenings" not in d for d in self._saved(path).values())
+
+def test_a_verdicts_file_gives_each_paper_its_verdict(self, tmp_path,
+                                                      monkeypatch):
+  path = self._make_session(tmp_path, monkeypatch)
+  verdicts = self._file(tmp_path, (
+    "﻿doi:10.1/LLM\tKept\tcompilers, teaching\tA course.\t0.8\r\n"
+    "10.1/pending\tdiscarded\toff-topic\tAbout loops only.\n"
+  ))
+  result = self._screen("--as", "agent", "--by", "agent-2", "-c", "0.4",
+                        "--verdicts-file", verdicts)
+  assert result.exit_code == 0, result.output
+  saved = self._saved(path)
+  screening = saved["10.1/llm"]["screenings"][1]
+  assert (screening["status"], screening["tags"], screening["reason"],
+          screening["confidence"]) \
+    == ("kept", ["compilers", "teaching"], "A course.", 0.8)
+  [pending] = saved["10.1/pending"]["screenings"]
+  assert (pending["status"], pending["confidence"]) == ("discarded", 0.4)
+
+def test_unknown_ids_and_clashing_lines_abort(self, tmp_path, monkeypatch):
+  path = self._make_session(tmp_path, monkeypatch)
+  result = self._screen("--as", "agent", "--verdicts-file", self._file(
+    tmp_path, "10.1/llm\tkept\tx\tFine.\n10.1/none\tkept\tx\tFine.\n"))
+  assert result.exit_code == 1
+  assert "verdicts-file line 2: 10.1/none" in result.output
+  result = self._screen("--as", "agent", "--verdicts-file", self._file(
+    tmp_path,
+    "10.1/llm\tkept\tx\tFine.\ndoi:10.1/llm\tdiscarded\tx\tNot fine.\n"))
+  assert result.exit_code == 2
+  assert "lines 1 and 2 give doi:10.1/llm different verdicts" \
+    in result.output
+  assert all("screenings" not in d for d in self._saved(path).values())
+
+def test_a_human_verdicts_file_has_no_confidence(self, tmp_path,
+                                                 monkeypatch):
+  self._make_session(tmp_path, monkeypatch)
+  result = self._screen("--as", "human", "--verdicts-file", self._file(
+    tmp_path, "10.1/llm\tkept\tx\tFine.\t0.5\n"))
+  assert result.exit_code == 2
+  assert "line 1: a human screening carries no confidence" in result.output
+@
+
+The quote check of [[sessions decide]] applies to each line's reason:
+a quote the record does not hold is listed and the screenings are
+saved, unless [[--strict-quotes]] refuses the batch.
+
+<<sessions screen test methods>>=
+def test_the_quotes_of_the_reasons_are_checked(self, tmp_path,
+                                               monkeypatch):
+  path = self._make_session(tmp_path, monkeypatch)
+  verdicts = self._file(tmp_path, (
+    '10.1/llm\tkept\tx\tSays "most students treated recursion".\n'
+    '10.1/human\tkept\tx\tSays "most students treated recursion".\n'
+  ))
+  result = self._screen("--as", "agent", "--verdicts-file", verdicts,
+                        "--strict-quotes")
+  assert result.exit_code == 2
+  assert 'line 1, 10.1/llm: "most students treated recursion"' \
+    in result.stderr
+  assert "line 2," not in result.stderr
+  assert all("screenings" not in d for d in self._saved(path).values())
+  result = self._screen("--as", "agent", "--verdicts-file", verdicts)
+  assert result.exit_code == 0, result.output
+  assert "screenings" in self._saved(path)["10.1/llm"]
+@
+
+The category rule applies to a machine's screenings once the session
+uses categories, and not to a human's; a session without categories
+takes any tags.
+
+<<sessions screen test methods>>=
+def test_machine_screenings_carry_a_fitting_category(self, tmp_path,
+                                                     monkeypatch):
+  path = self._make_session(tmp_path, monkeypatch, categories=True)
+  verdicts = self._file(tmp_path, (
+    "10.1/llm\tkept\tcompilers\tNo category.\n"
+    "10.1/human\tdiscarded\tsupports-claim\tExcluded.\n"
+    "10.1/pending\tdiscarded\toff-topic-false-hit\tFits.\n"
+  ))
+  result = self._screen("--as", "agent", "--verdicts-file", verdicts)
+  assert result.exit_code == 2
+  flat = " ".join(result.output.split())
+  assert "verdicts-file line 1: no category" in flat
+  assert ("verdicts-file line 2: category supports-claim does not fit a "
+          "discarded verdict") in flat
+  assert "line 3" not in flat
+  result = self._screen("--as", "llm", "--by", "m-2", "--keep",
+                        "-t", "off-topic-false-hit", "--doi", "10.1/llm")
+  assert result.exit_code == 2
+  assert "the verdict: category off-topic-false-hit does not fit" \
+    in " ".join(result.output.split())
+  assert all("screenings" not in d for d in self._saved(path).values())
+  result = self._screen("--as", "human", "--verdicts-file", verdicts)
+  assert result.exit_code == 0, result.output
+  assert self._saved(path)["10.1/llm"]["screenings"][1]["tags"] \
+    == ["compilers"]
+@
+
+A sample must be the session's, named by its id or by the group id of
+a sample drawn in bands; copies of one work decided apart need
+[[--all-copies]]; and a dry run writes nothing, not even the copy of
+the session.
+
+<<sessions screen test methods>>=
+def _sample(self, sample_id, group=None):
+  from scholar.review import LLMSample
+
+  criteria = {"statuses": ["discarded"]}
+  if group:
+    criteria["stratum"] = {"group": group, "band": 0, "bands": 2,
+                           "cuts": [0.5]}
+  return LLMSample(sample_id=sample_id, seed=1, drawn_at=self.AT,
+                   criteria=criteria, sessions=["screens"], population=1,
+                   population_digest="0", size=1,
+                   papers=[{"paper_id": "doi:10.1/llm"}])
+
+def test_the_sample_must_be_the_sessions(self, tmp_path, monkeypatch):
+  path = self._make_session(tmp_path, monkeypatch, samples=[
+    self._sample("s-1"), self._sample("s-2-band", group="s-2"),
+  ])
+  result = self._screen("--as", "agent", "--keep", "--doi", "10.1/llm",
+                        "--sample", "s-9")
+  assert result.exit_code == 2
+  assert "it holds s-1, s-2, s-2-band" in result.output
+  for sample in ("s-1", "s-2"):
+    result = self._screen("--as", "agent", "--keep", "--doi", "10.1/llm",
+                          "--sample", sample)
+    assert result.exit_code == 0, result.output
+  assert [r["sample_id"] for r in self._saved(path)["10.1/llm"][
+    "screenings"]] == [None, "s-1", "s-2"]
+
+def test_copies_decided_apart_need_all_copies(self, tmp_path, monkeypatch):
+  monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+  from scholar.review import (
+    DecisionStatus, ReviewDecision, ReviewSession, ReviewSource,
+    load_session, save_session,
+  )
+
+  paper = Paper(title="Twice", authors=["A"], doi="10.1/twice")
+  save_session(ReviewSession(
+    query="q", providers=["openalex"], timestamp=datetime(2026, 11, 20),
+    name="screens", decisions=[
+      ReviewDecision(paper=paper, provider="openalex",
+                     status=DecisionStatus.KEPT, tags=["ml"],
+                     source=ReviewSource.AGENT_UNREVIEWED),
+      ReviewDecision(paper=paper, provider="dblp",
+                     status=DecisionStatus.DISCARDED, tags=["off-topic"],
+                     source=ReviewSource.AGENT_UNREVIEWED),
+    ],
+  ))
+  result = self._screen("--as", "agent", "--keep", "--doi", "10.1/twice")
+  assert result.exit_code == 2
+  assert "pass --all-copies" in result.output
+  result = self._screen("--as", "agent", "--keep", "--doi", "10.1/twice",
+                        "--all-copies")
+  assert result.exit_code == 0, result.output
+  assert [len(d.screenings) for d in load_session("screens").decisions] \
+    == [2, 2]
+
+def test_a_dry_run_writes_nothing(self, tmp_path, monkeypatch):
+  path = self._make_session(tmp_path, monkeypatch)
+  text = path.read_text()
+  result = self._screen("--as", "agent", "--keep", "--doi", "10.1/llm",
+                        "--dry-run")
+  assert result.exit_code == 0, result.output
+  assert "Would record 1 screening(s) by unnamed agent" in result.output
+  assert path.read_text() == text
+  assert list(path.parent.glob("*.pre-screen-*")) == []
+@
+
+[[sessions show]] counts the screenings and lists them in its JSON, and
+says nothing about them for a session without any.
+
+<<sessions screen test methods>>=
+def test_show_counts_and_lists_them(self, tmp_path, monkeypatch):
+  import json
+
+  self._make_session(tmp_path, monkeypatch)
+  result = runner.invoke(app, ["sessions", "show", "screens"])
+  assert "Screenings" not in result.output
+  data = json.loads(runner.invoke(
+    app, ["sessions", "show", "screens", "-f", "json"]).output)
+  assert all("screenings" not in d for d in data["decisions"])
+  self._screen("--as", "agent", "--keep", "--doi", "10.1/llm",
+               "--doi", "10.1/pending")
+  result = runner.invoke(app, ["sessions", "show", "screens"])
+  assert ("Screenings: 3 on 2 paper(s), 1 of them snapshots of the "
+          "decision.") in result.output
+  data = json.loads(runner.invoke(
+    app, ["sessions", "show", "screens", "-f", "json"]).output)
+  lists = {d["doi"]: d.get("screenings") for d in data["decisions"]}
+  assert [r["origin"] for r in lists["10.1/llm"]] == ["decision", "screen"]
+  assert lists["10.1/human"] is None
 @
 
 \subsection{Reconciling copies of one work}
