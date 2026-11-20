@@ -680,6 +680,11 @@ class ReviewDecision:
             (`{"at", "from", "by", "chars", "text", "previous"}`,
             `previous` only when an abstract was replaced), oldest
             first; see `set_abstract`.
+        screenings: Verdicts of other screeners beside the decision, and
+            snapshots of the decision's own verdict taken when the first
+            of them was recorded (dicts keyed by `SCREENING_KEYS`), in
+            the order recorded; see `record_screening`. They never
+            change the decision.
         baseline_key: The decision's key in its session's baseline,
             given when the session was loaded or saved (not saved
             itself); `None` for a decision made since. See
@@ -700,6 +705,7 @@ class ReviewDecision:
     relabelled: list[dict] = field(default_factory=list)
     resets: list[dict] = field(default_factory=list)
     abstract_set: list[dict] = field(default_factory=list)
+    screenings: list[dict] = field(default_factory=list)
     baseline_key: str | None = field(default=None, compare=False, repr=False)
 
     def __post_init__(self):
@@ -716,6 +722,8 @@ class ReviewDecision:
             self.resets = []
         if self.abstract_set is None:
             self.abstract_set = []
+        if self.screenings is None:
+            self.screenings = []
 
     def add_relabel(self, record: dict) -> None:
         """Note a correction of the source (`relabel_source`), once.
@@ -746,6 +754,25 @@ class ReviewDecision:
         if record not in self.abstract_set:
             self.abstract_set.append(record)
             self.abstract_set.sort(key=lambda r: str(r.get("at") or ""))
+
+    def add_screening(self, record: dict) -> None:
+        """Note a screening (`record_screening`), once by its `id`.
+
+        Two versions of one `id` become one (`merged_screening`: the
+        later relabel's correction, a set-aside mark from either); an
+        entry without an id is compared whole. Kept in the order of the
+        `recorded_at` times, as `add_relabel` keeps its records.
+        """
+        key = record.get("id") if isinstance(record, dict) else None
+        for index, held in enumerate(self.screenings):
+            held_key = held.get("id") if isinstance(held, dict) else None
+            if key is None and held == record:
+                return
+            if key is not None and held_key == key:
+                self.screenings[index] = merged_screening(held, record)
+                return
+        self.screenings.append(record)
+        self.screenings.sort(key=_screening_order)
 
     def add_same_id_copy(self, copy: dict) -> None:
         """Note another work returned under this paper's id, once."""
@@ -1929,11 +1956,13 @@ def relabel_source(
         "at": at, "note": note, "by": by,
         "is_example": decision.is_example,
     }
+    old_verdict = _snapshot_key(decision_snapshot(decision, at))
     human = clear_human_record(decision)
     if human:
         record["human"] = human
     decision.source = target
     decision.is_example = False
+    <<correct the snapshots of the relabelled verdict>>
     decision.add_relabel(record)
     return record
 @
@@ -2205,7 +2234,8 @@ be marked \enquote{LLM, unreviewed} in [[sessions show]] and the
 report, because [[unreviewed_mark]] does not look at the status.
 Everything else is a fact about the paper or the searches, not about
 the decision, and stays: the paper and its metadata, the provider,
-[[found_by]], [[same_id_copies]], [[relabelled]], and of course the
+[[found_by]], [[same_id_copies]], [[relabelled]], the screenings (set
+aside, and counted in the reset record, \cref{sec:screenings}), and of course the
 session's search records, snowball rounds, LLM samples and research
 context.
 
@@ -2268,6 +2298,7 @@ def reset_decision(
         "note": note,
         "by": by,
     }
+    <<count the screenings a reset sets aside>>
     decision.status = DecisionStatus.PENDING
     decision.tags = []
     decision.llm_confidence = None
@@ -3248,6 +3279,1312 @@ def test_a_stale_set_abstract_saved_last(self):
   assert saved["paper"]["abstract"] == "Found by hand."
   [record] = saved["abstract_set"]
   assert record["previous"] == "A provider's abstract."
+@
+
+\subsection{Screenings: verdicts beside the decision}
+\label{sec:screenings}
+
+A session holds one decision per paper, and a review that screens its
+records twice, a classifier's screen checked by an agent or by a second
+human, say, has nowhere to put the second verdict
+(\url{https://github.com/dbosk/scholarcli/issues/253}).  A machine
+[[sessions decide]] replaces the first decision and clears its trace,
+and a human's turns it into a reviewed one ([[mark_as_reviewed]]), so
+after either the first verdict is gone.  Without both verdicts nothing
+can list where two screeners disagree or say how often they agree.
+
+So a decision keeps a list of \emph{screenings} beside it,
+[[screenings]]: each is one screener's verdict of the paper (kept or
+discarded, with tags, confidence and reason), recorded by a screening
+command and never by deciding.  The decision's status, tags and source
+stay the outcome that counts: nothing reads the list to decide what is
+kept, cited or counted as decided.  This section holds the record and
+its rules; [[sessions screen]] (in the CLI module) records agents',
+humans' and relayed classifiers' verdicts.  How agreement is computed
+from the list, how conflicts are listed and how the report states them
+are later parts of the issue.
+
+\paragraph{One record.}
+Every record has the same keys, all present when saved and [[None]]
+when unknown, so a reader never has to guess what a missing key meant:
+\begin{description}
+\item[ [[id]] ] a random hex string ([[uuid4]]); the record's identity
+  when two processes' lists are united (below).
+\item[ [[origin]] ] [[screen]] for a verdict a screening command
+  recorded, [[decision]] for a snapshot of the decision's own verdict
+  (below).
+\item[ [[kind]], [[name]] ] the screener: [[llm]], [[agent]] or
+  [[human]], and its name as given (the model for a classifier), or
+  [[None]]; Scholar does not guess a name, as for an agent's reason
+  (\cref{sec:agent-audit-fields}).
+\item[ [[confirmed_from]], [[confirmed_name]] ] for a snapshot of a
+  human's confirmation of a machine's call, which kind of machine
+  ([[llm]], [[agent]]) proposed it and its name; [[None]] otherwise.
+\item[ [[status]], [[tags]] ] the verdict, [[kept]] or [[discarded]]
+  (pending is no verdict), and its tags as given.  The category is not
+  stored apart: it is [[audit_category]] of the tags when read, as
+  everywhere else, so one rule decides it.
+\item[ [[confidence]], [[reason]] ] as the screener gave them.  A
+  reason is stored whole, under the agent's limit
+  ([[MAX_AGENT_REASON_CHARS]]).
+\item[ [[at]], [[recorded_at]] ] when the verdict was made, when known,
+  and when Scholar stored it (both UTC, ISO 8601).
+\item[ [[prompt_version]], [[abstract_truncated]] ] a classifier's
+  record (\cref{sec:llm-audit-fields}), for classifier verdicts only.
+\item[ [[blind]], [[blind_basis]] ] whether the screener worked without
+  seeing the other verdicts ([[True]], [[False]], or [[None]] for
+  unknown), and on what ground Scholar says so: [[prompt]] (Scholar
+  built the classifier's prompt), [[tui]] (a blind review screen) or
+  [[declared]] (the caller said so).  For an agent, which can read the
+  session file, it can only be declared.
+\item[ [[sample_id]] ] the review sample (\cref{sec:llm-sample-record})
+  the screen was made for, or [[None]].
+\item[ [[via]] ] where it was recorded: [[screen]], [[classify]],
+  [[tui]], or [[snapshot]] for a snapshot.
+\end{description}
+[[_screening_record]] builds a record in that key order and refuses a
+key that is not one of them, so a writer added later cannot slip a
+field past the list.
+
+<<review imports>>=
+import uuid
+<<review data structures>>=
+SCREENING_KEYS: tuple[str, ...] = (
+    "id", "origin", "kind", "name", "confirmed_from", "confirmed_name",
+    "status", "tags", "confidence", "reason", "at", "recorded_at",
+    "prompt_version", "abstract_truncated", "blind", "blind_basis",
+    "sample_id", "via",
+)
+SCREENING_KINDS: tuple[str, ...] = ("llm", "agent", "human")
+SCREENING_STATUSES: tuple[str, ...] = ("kept", "discarded")
+SCREENING_BLIND_BASES: tuple[str, ...] = ("prompt", "tui", "declared")
+SCREENING_VIAS: tuple[str, ...] = ("screen", "classify", "tui", "snapshot")
+
+
+def _screening_record(**values) -> dict:
+    """A screening with every key of `SCREENING_KEYS`, in that order."""
+    unknown = set(values) - set(SCREENING_KEYS)
+    if unknown:
+        raise ValueError(f"not a screening key: {', '.join(sorted(unknown))}")
+    return {key: values.get(key) for key in SCREENING_KEYS}
+@
+
+A screening command builds its verdicts with [[new_screening]].  It
+checks what a caller could get wrong and a reader would trust: the
+kind, the status, the channel and the ground of blindness are each one
+of a few values, a confidence lies between 0 and~1 like [[-c]] of
+[[sessions decide]], and a reason is not longer than an agent's.  A
+verdict made through a command has no time of its own but the run's,
+so [[at]] defaults to [[recorded_at]], as an agent's reason takes the
+time of its [[sessions decide]] run.
+
+<<review data structures>>=
+def new_screening(
+    *,
+    kind: str,
+    status: str,
+    tags: list[str],
+    recorded_at: str,
+    name: str | None = None,
+    confidence: float | None = None,
+    reason: str | None = None,
+    at: str | None = None,
+    prompt_version: str | None = None,
+    abstract_truncated: bool | None = None,
+    blind: bool | None = None,
+    blind_basis: str | None = None,
+    sample_id: str | None = None,
+    via: str = "screen",
+) -> dict:
+    """A screener's verdict, as a screening command records it.
+
+    `at` (when the verdict was made) defaults to `recorded_at`.
+
+    Raises:
+        ValueError: For a kind, status, channel or ground of blindness
+            that is not one of `SCREENING_KINDS`, `SCREENING_STATUSES`,
+            `SCREENING_VIAS` (`snapshot` excepted) and
+            `SCREENING_BLIND_BASES`, a confidence outside [0, 1] or a
+            reason longer than `MAX_AGENT_REASON_CHARS`.
+    """
+    if kind not in SCREENING_KINDS:
+        raise ValueError(f"unknown screener kind {kind!r}")
+    if status not in SCREENING_STATUSES:
+        raise ValueError(f"a screening is kept or discarded, not {status!r}")
+    if via not in SCREENING_VIAS or via == "snapshot":
+        raise ValueError(f"unknown channel {via!r}")
+    if blind_basis is not None and blind_basis not in SCREENING_BLIND_BASES:
+        raise ValueError(f"unknown ground of blindness {blind_basis!r}")
+    if confidence is not None and not 0.0 <= confidence <= 1.0:
+        raise ValueError(f"confidence {confidence} is not between 0 and 1")
+    if reason is not None and len(reason) > MAX_AGENT_REASON_CHARS:
+        raise ValueError(
+            f"reason of {len(reason)} characters, over the limit of "
+            f"{MAX_AGENT_REASON_CHARS}"
+        )
+    return _screening_record(
+        id=uuid.uuid4().hex, origin="screen", kind=kind, name=name,
+        status=status, tags=list(tags), confidence=confidence,
+        reason=reason, at=at if at is not None else recorded_at,
+        recorded_at=recorded_at, prompt_version=prompt_version,
+        abstract_truncated=abstract_truncated, blind=blind,
+        blind_basis=blind_basis, sample_id=sample_id, via=via,
+    )
+@
+
+\paragraph{The decision's verdict as the first screen.}
+A second verdict is compared with the first, and the first is the
+decision's.  But the decision does not stay what the first screener
+said: a human's review overwrites the machine's status when it
+disagrees ([[mark_as_reviewed]]), so comparing a second screen with
+the live decision after an adjudication would compare the second
+screener with an outcome that screener helped bring about, and the
+two would look more in agreement than they were.  So when a screening
+is recorded for a decided paper, Scholar first copies the decision's
+current verdict into the list as a screening of its own,
+[[origin: "decision"]], [[via: "snapshot"]].  A later change of the
+decision leaves the record of what the first screener said.
+
+Who that verdict is from follows the source.  An unreviewed classifier
+or agent decision is that machine's verdict: kind [[llm]] or
+[[agent]], named by [[llm_model]] or [[agent_by]], with its
+confidence, its reason and its time, and for a classifier its prompt
+version and truncation flag.  A decision a human made, confirmed or
+changed ([[human]], [[llm_reviewed]], [[agent_reviewed]]: the
+sources of [[REVIEWED_BY_A_HUMAN]]) is the human's verdict: when the
+human changed the machine's call, the status is the human's, and when
+they confirmed it, they made it theirs.  So its kind is [[human]],
+named by [[human_by]] and timed by [[human_decided_at]] of the human's
+record (\cref{sec:human-review-record}), while [[confirmed_from]] and
+[[confirmed_name]] say which machine proposed it, so that a report can
+call it the human-confirmed decision.  The machine's confidence and
+reason are not copied into it: they describe the machine's call, not
+the human's, and they are still on the decision.  A decision whose
+stored source Scholar does not know (\cref{sec:review-source}) gives a
+snapshot of kind [[None]], which no comparison will pair.
+
+<<review data structures>>=
+SNAPSHOT_FIELDS: tuple[str, ...] = (
+    "kind", "name", "confirmed_from", "confirmed_name", "confidence",
+    "reason", "at", "prompt_version", "abstract_truncated",
+)
+
+
+def verdict_screener(decision: ReviewDecision) -> dict:
+    """Who made the decision's verdict, as a snapshot records it.
+
+    The keys of `SNAPSHOT_FIELDS`, `None` where unknown or not the
+    screener's own (a human's confirmation carries no machine
+    confidence or reason).
+    """
+    fields = dict.fromkeys(SNAPSHOT_FIELDS)
+    source = decision.source
+    if source in REVIEWED_BY_A_HUMAN:
+        confirmed = {ReviewSource.LLM_REVIEWED: "llm",
+                     ReviewSource.AGENT_REVIEWED: "agent"}.get(source)
+        fields.update(
+            kind="human", name=decision.human_by,
+            confirmed_from=confirmed,
+            confirmed_name={"llm": decision.llm_model,
+                            "agent": decision.agent_by}.get(confirmed),
+            at=decision.human_decided_at,
+        )
+    elif source is ReviewSource.LLM_UNREVIEWED:
+        fields.update(
+            kind="llm", name=decision.llm_model,
+            confidence=decision.llm_confidence,
+            reason=decision.llm_reason, at=decision.llm_decided_at,
+            prompt_version=decision.llm_prompt_version,
+            abstract_truncated=decision.llm_abstract_truncated,
+        )
+    elif source is ReviewSource.AGENT_UNREVIEWED:
+        fields.update(
+            kind="agent", name=decision.agent_by,
+            confidence=decision.llm_confidence,
+            reason=decision.agent_reason, at=decision.agent_decided_at,
+        )
+    return fields
+
+
+def decision_snapshot(decision: ReviewDecision, recorded_at: str) -> dict:
+    """The decision's current verdict as a screening (`origin: decision`)."""
+    return _screening_record(
+        id=uuid.uuid4().hex, origin="decision",
+        status=decision.status.value, tags=list(decision.tags),
+        recorded_at=recorded_at, via="snapshot",
+        **verdict_screener(decision),
+    )
+@
+
+One snapshot serves every screening of the same verdict.  Before
+taking one, [[record_screening]] looks for a snapshot already counted
+(below) with the same status, tags, screener and time, and takes none
+if there is one: a third screener compared with the decision meets the
+same first verdict as the second did.  A changed decision (a machine
+[[sessions decide]], a human's adjudication) differs in one of these,
+so the next screening snapshots the new verdict, and the old snapshot
+stays as the record of what was there before.  Nothing snapshots a
+decision when it changes: most sessions never record a screening, and
+copying every machine decision into the list from now on would about
+double the size of every session for a feature it may never use, while
+old decisions would still need the snapshot.  A pending paper has no
+verdict, so its screening is recorded without a snapshot.
+
+<<review data structures>>=
+def _snapshot_key(record: dict) -> tuple:
+    """What makes two snapshots one verdict: status, tags, screener, time."""
+    return (
+        record.get("status"), tuple(record.get("tags") or ()),
+        record.get("kind"), record.get("name"),
+        record.get("confirmed_from"), record.get("confirmed_name"),
+        record.get("at"),
+    )
+
+
+def record_screening(decision: ReviewDecision, record: dict) -> dict | None:
+    """Add the screening `record` to `decision`, after its verdict.
+
+    A decided paper's current verdict is added first as a snapshot
+    (`decision_snapshot`), unless an equal one is already counted
+    (`counted_screenings`). The decision itself is not changed.
+    Returns the snapshot taken, or None.
+    """
+    snapshot = None
+    if decision.is_decided:
+        candidate = decision_snapshot(decision, record["recorded_at"])
+        if not any(
+            held.get("origin") == "decision"
+            and _snapshot_key(held) == _snapshot_key(candidate)
+            for held in counted_screenings(decision)
+        ):
+            decision.add_screening(candidate)
+            snapshot = candidate
+    decision.add_screening(record)
+    return snapshot
+@
+
+\paragraph{Which records count.}
+Three kinds of entries are kept but not counted.  An entry without an
+[[id]], or without a status that is [[kept]] or [[discarded]], comes
+from a hand edit or a writer that broke the format; it is kept as it
+is, so that a save never loses what was there, skipped by every reader,
+and warned about once per file and process
+([[warn_about_malformed_screenings]], as for unknown sources).  And a
+reset (\cref{sec:reset-decision}) sets aside every screening recorded
+before it: the reset says the decision was flawed and will be made
+again, and the snapshot of that decision, and the verdicts compared
+with it, describe a screen that no longer stands.  They stay in the
+list as history; [[counted_screenings]] keeps only those recorded after
+the last reset, comparing the times as times, as [[reset_since_draw]]
+does for samples (\cref{sec:llm-sample} in the LLM review module).  A
+screening recorded in the very second of the reset counts as set
+aside: the stored times have no finer grain to tell the order.  The
+third kind is a screening made at the same time as a reset by another
+process, which the time cannot tell from one made after it; the merge
+marks it with [[set_aside_at]] (below), and a marked record is not
+counted either.
+
+<<review data structures>>=
+def is_valid_screening(record) -> bool:
+    """Whether `record` is a screening a reader can count."""
+    return (
+        isinstance(record, dict) and bool(record.get("id"))
+        and record.get("status") in SCREENING_STATUSES
+    )
+
+
+def _iso_after(at: str, since: str) -> bool:
+    """Whether the time `at` is later than `since` (both ISO 8601)."""
+    try:
+        return datetime.fromisoformat(at) > datetime.fromisoformat(since)
+    except (TypeError, ValueError):
+        return at > since
+
+
+def counted_screenings(decision: ReviewDecision) -> list[dict]:
+    """The valid screenings of `decision` recorded since its last reset."""
+    valid = [
+        r for r in decision.screenings
+        if is_valid_screening(r) and not r.get("set_aside_at")
+    ]
+    if not decision.resets:
+        return valid
+    last = str(decision.resets[-1].get("at") or "")
+    return [
+        r for r in valid
+        if _iso_after(str(r.get("recorded_at") or ""), last)
+    ]
+
+
+def _screening_order(record) -> str:
+    """Sort key of the list: the time the screening was recorded."""
+    if not isinstance(record, dict):
+        return ""
+    return str(record.get("recorded_at") or "")
+<<review data structures>>=
+_WARNED_MALFORMED_SCREENINGS: set[str] = set()
+
+
+def warn_about_malformed_screenings(session_path: Path, session) -> None:
+    """Warn once that `session` holds screenings no reader can count."""
+    count = sum(
+        1 for d in session.decisions for r in d.screenings
+        if not is_valid_screening(r)
+    )
+    if not count or str(session_path) in _WARNED_MALFORMED_SCREENINGS:
+        return
+    _WARNED_MALFORMED_SCREENINGS.add(str(session_path))
+    logger.warning(
+        "%s: %d screening(s) without an id or a kept/discarded status; "
+        "they are kept as they are and skipped",
+        session_path.name, count,
+    )
+@
+
+\paragraph{How the list travels.}
+Like the reset history (\cref{sec:reset-decision}), the list is saved
+only when non-empty, so the file of a session nobody screened twice is
+unchanged; loaded as empty from a file without the key; copied with the
+decision when search results are appended
+(\cref{sec:review-create-strict}); and united with the file's, by
+[[id]], by a save that merges another process's changes
+(\cref{sec:session-integrity}).  A fold of two copies of one work
+(\cref{sec:session-copies}) gives the survivor the other copy's
+screenings, so a fold never loses one.  Both go through
+[[unite_screenings]], which applies the snapshot rule once more: two
+processes that screened the same paper at once each took a snapshot of
+the same verdict, under two ids, and of two snapshots of one verdict
+only one is kept.  Every other record is kept whatever it holds.
+
+<<review data structures>>=
+def unite_screenings(decision: ReviewDecision, records: list) -> None:
+    """Add the screenings `records` to `decision`'s, each once.
+
+    A snapshot of a verdict that `decision` already holds a counted
+    snapshot of, under another id, is left out.
+    """
+    for record in records:
+        if is_valid_screening(record) and record.get("origin") == "decision":
+            held = counted_screenings(decision)
+            if (record["id"] not in {r["id"] for r in held}
+                    and any(r.get("origin") == "decision"
+                            and _snapshot_key(r) == _snapshot_key(record)
+                            for r in held)):
+                continue
+        decision.add_screening(record)
+@
+
+Unlike the reset history, the list is part of neither
+[[decision_state]] nor [[decision_verdict]], although the issue
+sketched it as part of the state.  Both reasons come from the reviews
+of the two records added to the decision just before it.
+\begin{description}
+\item[Not in the merge's state] The merge takes the whole decision from
+  the file when this process's state is still the baseline's, and keeps
+  this process's when it differs.  A screening does not change the
+  decision, but in the state it would look as if it did: a [[sessions
+  screen]] run that loaded the session before another process saved a
+  human's adjudication would hold a changed state, and its save would
+  put the old decision back over the human's.  That is what the review
+  of the hand-given abstracts found for their records
+  (\cref{sec:set-abstract}).  Out of the state, the screenings are
+  united on their own and the decision follows the usual rule.  The
+  snapshot such a run took stays, beside the human's later decision,
+  as the verdict that run compared with.
+\item[Not in the copy comparison] Copies of one work are compared by
+  [[decision_verdict]] ([[_fold_direction]], [[same_id_pairs]]), and
+  anything in it that differs between two copies keeps them apart: the
+  review of the human's record found that copies decided alike at two
+  moments no longer folded (\cref{sec:human-review-record}).  A
+  screening recorded on one copy would do the same, and more: the
+  copies would be listed as decided apart, and [[sessions decide]]
+  would refuse to decide them without [[--all-copies]], though nobody
+  decided anything.  Left out, the fold unites the lists instead
+  (above).
+\end{description}
+A pending copy with screenings is not \emph{unscreened}
+([[is_unscreened]]), so neither [[sessions reconcile]] nor a save that
+settles a folded copy ([[apply_tombstones]]) drops it: a second
+screener's verdict of a paper is a judgement, whatever the decision
+says.  Nothing registers the list in [[MACHINE_AUDIT_FIELDS]] either,
+so a machine [[sessions decide]], with or without [[--force]], leaves
+the screenings alone; the next screening snapshots the new decision.
+
+A record's identity is its [[id]], and two things change a stored
+record: a relabel's correction of a snapshot (below), which stamps it
+with [[relabelled_at]], and the merge's mark [[set_aside_at]] on a
+screening made at the same time as a reset (next).  So when two lists
+hold one [[id]] with different contents, [[add_screening]] makes one
+record of the two ([[merged_screening]]): the version with the later
+relabel stamp, carrying a set-aside mark if either version has one.
+A process that loaded the session before the correction or the mark
+then cannot put the old version back, whichever saves last.
+
+<<review data structures>>=
+def merged_screening(held: dict, record: dict) -> dict:
+    """One record of two versions of a screening with the same `id`.
+
+    The version with the later `relabelled_at` (`held` on a tie), with
+    the earliest `set_aside_at` either version has.
+    """
+    newer = held
+    if (str(record.get("relabelled_at") or "")
+            > str(held.get("relabelled_at") or "")):
+        newer = record
+    asides = [r["set_aside_at"] for r in (held, record)
+              if r.get("set_aside_at")]
+    if not asides or newer.get("set_aside_at") == min(asides):
+        return newer
+    return {**newer, "set_aside_at": min(asides)}
+@
+
+\paragraph{Races with a reset or a relabel.}
+A screening is made against the decision the screener saw, and the
+snapshot records it.  When another process resets or relabels that
+decision between the screener's load and its save, the two saves are
+merged and each change stands, but the screening and the snapshot then
+describe a decision that is no longer there.  The window is short for
+[[sessions screen]], which holds the session for milliseconds, but a
+review that holds it for minutes (a blind review in the TUI, say) makes
+it the normal case.  The time rule of [[counted_screenings]] cannot
+settle it: the screener's [[recorded_at]] may well be later than the
+reset's [[at]], since both ran at once.
+
+The merge can, because it sees what each side added since both loaded
+the session ([[ConcurrentHistory]]): the screenings, resets and
+relabels in one side's list and not in the other's.  Anything this
+process loaded is in the file too (every save unites the lists), so
+what only one side holds is what that side added meanwhile.  A
+screening one side added while the other side added a reset was made
+against the decision before the reset, so it is marked
+[[set_aside_at]], with the reset's time, and no longer counted.  A
+snapshot one side added while the other side relabelled the decision
+claims the old source, so it is corrected as the relabel corrects its
+own snapshots ([[correct_relabelled_snapshots]]), from the verdict the
+decision had before each relabel ([[relabelled_verdict_keys]]).  This
+runs after the decision itself is merged, in whichever process saves
+second, so it does not matter which of the two that is.  When both
+processes changed the decision itself, ours is kept with a warning
+(below), and a relabel only the file holds may then match no snapshot;
+that is left with the warning.
+
+<<review data structures>>=
+@dataclass
+class ConcurrentHistory:
+    """What each of two versions of a decision added since both loaded it.
+
+    `mine_*` are in this process's version only, `their_*` in the
+    file's only: screening ids, reset records and relabel records.
+    """
+
+    mine_screenings: set[str]
+    their_screenings: set[str]
+    mine_resets: list[dict]
+    their_resets: list[dict]
+    mine_relabels: list[dict]
+    their_relabels: list[dict]
+
+    @classmethod
+    def of(cls, ours: ReviewDecision,
+           theirs: ReviewDecision) -> "ConcurrentHistory":
+        """Compare two versions of one decision, before they are united."""
+        def ids(decision):
+            return {r["id"] for r in decision.screenings
+                    if is_valid_screening(r)}
+
+        return cls(
+            mine_screenings=ids(ours) - ids(theirs),
+            their_screenings=ids(theirs) - ids(ours),
+            mine_resets=[r for r in ours.resets if r not in theirs.resets],
+            their_resets=[r for r in theirs.resets if r not in ours.resets],
+            mine_relabels=[r for r in ours.relabelled
+                           if r not in theirs.relabelled],
+            their_relabels=[r for r in theirs.relabelled
+                            if r not in ours.relabelled],
+        )
+
+
+def relabelled_verdict_keys(
+    decision: ReviewDecision, relabels: list[dict]
+) -> list[tuple]:
+    """The snapshot keys `decision`'s verdict had before each relabel.
+
+    Undoes `relabels`, newest first: each gives back its old source and
+    the human's record it cleared.
+    """
+    keys = []
+    state = decision
+    for record in sorted(relabels, key=lambda r: str(r.get("at") or ""),
+                         reverse=True):
+        human = record.get("human") or {}
+        state = replace(
+            state, source=ReviewSource(str(record.get("from"))),
+            **{name: human.get(name) for name in HUMAN_AUDIT_FIELDS},
+        )
+        keys.append(_snapshot_key(decision_snapshot(state, "")))
+    return keys
+
+
+def settle_concurrent_screenings(
+    decision: ReviewDecision, history: ConcurrentHistory
+) -> None:
+    """Settle one side's screenings against the other side's resets and
+    relabels, made at the same time (`ConcurrentHistory`)."""
+    for screenings, resets, relabels in (
+        (history.their_screenings, history.mine_resets,
+         history.mine_relabels),
+        (history.mine_screenings, history.their_resets,
+         history.their_relabels),
+    ):
+        if not screenings:
+            continue
+        if relabels:
+            correct_relabelled_snapshots(
+                decision, screenings,
+                relabelled_verdict_keys(decision, relabels),
+                max(str(r.get("at") or "") for r in relabels),
+            )
+        if resets:
+            at = max(str(r.get("at") or "") for r in resets)
+            for index, held in enumerate(decision.screenings):
+                if (is_valid_screening(held) and held["id"] in screenings
+                        and not held.get("set_aside_at")):
+                    decision.screenings[index] = {
+                        **held, "set_aside_at": at,
+                    }
+@
+
+An older Scholar reads a decision by the keys it knows, so it loads a
+file with screenings and drops the list when it next saves the
+session, as with [[relabelled]] (\cref{sec:relabel-source}).
+This was checked on November 20, 2026, with the installed pipx build
+(version 1.29, built from the main checkout before the human's record
+of \cref{sec:human-review-record} existed): it showed a session with
+screenings and, after a [[sessions decide]] on another paper, saved it
+without the list, the decisions themselves intact.  Every installation
+that saves a session must be updated before the screenings are relied
+on.
+
+The list costs space.  In the indented JSON of a session file a
+screening without a reason takes about 670 bytes and a snapshot about
+690 (measured on invented records on November 20, 2026); a reason
+comes on top, stored whole, and a classifier's snapshot copies the
+classifier's reason too.  A second screen of 30\,000 decided records
+with 300-character reasons, one snapshot and one screening each, thus
+adds about 50~MB to the file, more when the snapshots copy classifiers'
+reasons.  Reasons are not cut to save it: a reason
+cut short is no longer the screener's.
+
+\paragraph{The relabel and the reset.}
+A relabel (\cref{sec:relabel-source}) corrects who made the decision
+and leaves the verdict as it is.  The screenings recorded by a command
+stand as they were: they are other screeners' verdicts.  But a snapshot
+of this decision taken under the old source claims the same wrong
+origin as the source did, so it is corrected with it: every counted
+snapshot whose verdict and screener are those the decision had before
+the relabel takes the screener the relabelled decision gives
+([[verdict_screener]]), stamped with the relabel's time.  The values
+it replaces are kept in the snapshot, under [[before_relabel]]: the
+label was wrong, but what the snapshot claimed (a classifier's model,
+reason and prompt version, say, when an LLM call is relabelled as an
+agent's) is part of the record, as the relabel record keeps the old
+source.  A snapshot relabelled twice keeps what it claimed first.  The
+old kind is also noted in the relabel record as [[screenings_kind]].
+Leaving the snapshot would keep, as a human's verdict, one the relabel
+has just declared an agent's.  A relabel of a decision without a
+snapshot writes the record it wrote before.
+
+<<correct the snapshots of the relabelled verdict>>=
+counted = {r["id"] for r in counted_screenings(decision)}
+if correct_relabelled_snapshots(decision, counted, [old_verdict], at):
+    record["screenings_kind"] = old_verdict[2]
+<<review data structures>>=
+def correct_relabelled_snapshots(
+    decision: ReviewDecision, ids: set[str], old_keys: list[tuple], at: str
+) -> int:
+    """Give the snapshots of a relabelled verdict the decision's screener.
+
+    The snapshots among `ids` whose `_snapshot_key` is one of
+    `old_keys` take `verdict_screener(decision)`, stamped with
+    `relabelled_at`; the values they claimed before are kept under
+    `before_relabel` (the first relabel's). Returns how many changed.
+    """
+    new_screener = verdict_screener(decision)
+    corrected = 0
+    for index, held in enumerate(decision.screenings):
+        if (is_valid_screening(held) and held["id"] in ids
+                and held.get("origin") == "decision"
+                and _snapshot_key(held) in old_keys):
+            decision.screenings[index] = {
+                **held, **new_screener, "relabelled_at": at,
+                "before_relabel": held.get("before_relabel") or {
+                    name: held.get(name) for name in SNAPSHOT_FIELDS
+                },
+            }
+            corrected += 1
+    return corrected
+@
+
+A reset keeps the screenings, as history; [[counted_screenings]] sets
+aside those recorded before it (above).  So that the history says so
+too, the reset record notes how many screenings it set aside, under
+[[screenings]], when there were any; a reset of a decision without
+screenings writes the record it wrote before.  The count is of the
+screenings the reset saw.  Those another process recorded at the same
+time are marked by the merge (above), but the reset record is not
+changed afterwards: it is part of the decision's state, and two
+versions of one record would be united as two resets.
+
+<<count the screenings a reset sets aside>>=
+set_aside = len(counted_screenings(decision))
+if set_aside:
+    record["screenings"] = set_aside
+@
+
+\paragraph{What [[sessions show]] says.}
+[[screenings_summary]] counts the screenings in one line, empty for a
+session without any, so that the display of every other session stays
+as it was: the counted screenings, on how many papers, how many of
+them are snapshots of the decision, and, when there are any, how many
+a reset set aside and how many entries are malformed.  Papers are
+counted by id, since copies of one work under one id are one paper.
+
+<<review data structures>>=
+def screenings_summary(decisions) -> str:
+    """One line counting the screenings of `decisions`; "" if none."""
+    entries = [r for d in decisions for r in d.screenings]
+    if not entries:
+        return ""
+    counted = [(d, r) for d in decisions for r in counted_screenings(d)]
+    valid = sum(1 for r in entries if is_valid_screening(r))
+    papers = len({get_paper_id(d.paper) for d, _ in counted})
+    snapshots = sum(1 for _, r in counted if r.get("origin") == "decision")
+    parts = [
+        f"Screenings: {len(counted)} on {papers} paper(s), {snapshots} of "
+        "them snapshots of the decision"
+    ]
+    if valid > len(counted):
+        parts.append(f"{valid - len(counted)} set aside by a reset")
+    if len(entries) > valid:
+        parts.append(f"{len(entries) - valid} malformed, skipped")
+    return "; ".join(parts) + "."
+@
+
+Let's check the record itself: a screening of a decided paper brings a
+snapshot of the decision's verdict, once per verdict, and leaves the
+decision as it was; a pending paper's has none; each source gives the
+snapshot its screener, the human-confirmed classifier call as a human's
+verdict with the model it confirmed; a bad value is refused.
+
+<<test functions>>=
+class TestScreeningRecord:
+  """Verdicts beside the decision and the snapshot of its own (#253)."""
+
+  <<screening record test methods>>
+
+<<screening record test methods>>=
+AT = "2026-11-20T10:00:00+00:00"
+LATER = "2026-11-20T11:00:00+00:00"
+
+def _llm_call(self, doi="10.5555/screen", **kwargs):
+  values = dict(
+    status=DecisionStatus.DISCARDED, tags=["off-topic-false-hit"],
+    source=ReviewSource.LLM_UNREVIEWED, llm_confidence=0.8,
+    llm_model="m-1", llm_decided_at="2026-11-01T09:00:00+00:00",
+    llm_prompt_version="0123456789abcdef", llm_reason="Off topic.",
+    llm_abstract_truncated=False,
+  )
+  values.update(kwargs)
+  return ReviewDecision(
+    paper=Paper(title="Screened", authors=["Ada Lovelace"], year=2021,
+                doi=doi),
+    provider="openalex", **values,
+  )
+
+def _agent_verdict(self, status="kept", recorded_at=AT, **kwargs):
+  return new_screening(kind="agent", name="agent-2", status=status,
+                       tags=["adjacent-subtopic"], recorded_at=recorded_at,
+                       reason="Background only.", **kwargs)
+
+def test_a_screening_brings_a_snapshot_once(self):
+  decision = self._llm_call()
+  state, verdict = decision_state(decision), decision_verdict(decision)
+  first = self._agent_verdict()
+  snapshot = record_screening(decision, first)
+  assert decision.screenings == [snapshot, first]
+  assert snapshot == {
+    "id": snapshot["id"], "origin": "decision", "kind": "llm",
+    "name": "m-1", "confirmed_from": None, "confirmed_name": None,
+    "status": "discarded", "tags": ["off-topic-false-hit"],
+    "confidence": 0.8, "reason": "Off topic.",
+    "at": "2026-11-01T09:00:00+00:00", "recorded_at": self.AT,
+    "prompt_version": "0123456789abcdef", "abstract_truncated": False,
+    "blind": None, "blind_basis": None, "sample_id": None,
+    "via": "snapshot",
+  }
+  assert list(first) == list(SCREENING_KEYS)
+  assert (first["origin"], first["at"], first["via"]) \
+    == ("screen", self.AT, "screen")
+  second = new_screening(kind="human", status="discarded",
+                         tags=["off-topic-false-hit"],
+                         recorded_at=self.LATER)
+  assert record_screening(decision, second) is None
+  assert decision.screenings == [snapshot, first, second]
+  assert decision_state(decision) == state
+  assert decision_verdict(decision) == verdict
+  assert decision.status is DecisionStatus.DISCARDED
+  assert decision.tags == ["off-topic-false-hit"]
+
+def test_a_changed_decision_gets_a_new_snapshot(self):
+  decision = self._llm_call()
+  record_screening(decision, self._agent_verdict())
+  decision.status, decision.tags = DecisionStatus.KEPT, ["adjacent-subtopic"]
+  decision.llm_decided_at = "2026-11-02T09:00:00+00:00"
+  snapshot = record_screening(decision, self._agent_verdict(
+    recorded_at=self.LATER))
+  assert snapshot["status"] == "kept"
+  assert [r["origin"] for r in decision.screenings] \
+    == ["decision", "screen", "decision", "screen"]
+
+def test_a_pending_paper_has_no_snapshot(self):
+  decision = ReviewDecision(paper=Paper(title="Open", authors=["A"]),
+                            provider="p")
+  verdict = self._agent_verdict()
+  assert record_screening(decision, verdict) is None
+  assert decision.screenings == [verdict]
+  assert decision.status is DecisionStatus.PENDING
+
+def test_each_source_gives_its_screener(self):
+  human = self._llm_call(source=ReviewSource.HUMAN)
+  record_human_decision(human, "decide", by="the author", at=self.AT)
+  agent = self._llm_call(source=ReviewSource.AGENT_UNREVIEWED,
+                         agent_reason="Not about it.", agent_by="agent-1",
+                         agent_decided_at=self.AT)
+  unknown = self._llm_call(source=ReviewSource("manual"))
+  screeners = {
+    name: verdict_screener(d)
+    for name, d in (("human", human), ("agent", agent),
+                    ("unknown", unknown))
+  }
+  assert screeners["human"] == {
+    **dict.fromkeys(SNAPSHOT_FIELDS),
+    "kind": "human", "name": "the author", "at": self.AT,
+  }
+  assert screeners["agent"] == {
+    **dict.fromkeys(SNAPSHOT_FIELDS),
+    "kind": "agent", "name": "agent-1", "confidence": 0.8,
+    "reason": "Not about it.", "at": self.AT,
+  }
+  assert screeners["unknown"] == dict.fromkeys(SNAPSHOT_FIELDS)
+
+def test_a_confirmed_classifier_call_is_the_humans_verdict(self):
+  decision = self._llm_call(source=ReviewSource.LLM_REVIEWED)
+  record_human_decision(decision, "tui", by="the author", at=self.AT)
+  snapshot = record_screening(decision, self._agent_verdict(
+    recorded_at=self.LATER))
+  assert (snapshot["kind"], snapshot["name"], snapshot["at"]) \
+    == ("human", "the author", self.AT)
+  assert (snapshot["confirmed_from"], snapshot["confirmed_name"]) \
+    == ("llm", "m-1")
+  assert (snapshot["confidence"], snapshot["reason"],
+          snapshot["prompt_version"]) == (None, None, None)
+  agent = self._llm_call(source=ReviewSource.AGENT_REVIEWED,
+                         agent_by="agent-1")
+  assert verdict_screener(agent)["confirmed_from"] == "agent"
+  assert verdict_screener(agent)["confirmed_name"] == "agent-1"
+
+def test_bad_values_are_refused(self):
+  from scholar.review import _screening_record
+
+  for kwargs, message in (
+    ({"kind": "robot"}, "kind"),
+    ({"status": "pending"}, "kept or discarded"),
+    ({"via": "snapshot"}, "channel"),
+    ({"blind_basis": "hope"}, "blindness"),
+    ({"confidence": 1.5}, "between 0 and 1"),
+    ({"reason": "x" * (MAX_AGENT_REASON_CHARS + 1)}, "over the limit"),
+  ):
+    values = dict(kind="agent", status="kept", tags=[],
+                  recorded_at=self.AT)
+    values.update(kwargs)
+    with pytest.raises(ValueError, match=message):
+      new_screening(**values)
+  with pytest.raises(ValueError, match="not a screening key"):
+    _screening_record(score=1)
+@
+
+A screening does not make a copy screened in the copy comparison, but a
+pending copy that carries one is no longer unscreened, so nothing folds
+it away; two copies decided alike still fold, the survivor taking both
+lists.
+
+<<screening record test methods>>=
+def _copies(self):
+  bare = ReviewDecision(
+    paper=Paper(title="A Work", authors=["Ada Lovelace"], year=2021),
+    provider="dblp", status=DecisionStatus.KEPT, tags=["ml"],
+  )
+  with_doi = ReviewDecision(
+    paper=Paper(title="A Work", authors=["Ada Lovelace"], year=2021,
+                doi="10.5555/screen-copies"),
+    provider="openalex", status=DecisionStatus.KEPT, tags=["ml"],
+  )
+  return ReviewSession(query="q", providers=["p"],
+                       timestamp=datetime(2026, 11, 20),
+                       decisions=[bare, with_doi])
+
+def test_copies_decided_alike_fold_with_their_screenings(self):
+  session = self._copies()
+  bare, with_doi = session.decisions
+  verdict = self._agent_verdict()
+  record_screening(bare, verdict)
+  assert same_id_pairs(session) == []
+  assert alike_copies(session) == []
+  assert len(foldable_copies(session)) == 1
+  assert len(reconcile_copies(session)) == 1
+  assert session.decisions == [with_doi]
+  assert verdict in with_doi.screenings
+  assert len(with_doi.screenings) == 2
+
+def test_a_screened_pending_copy_is_not_folded_away(self):
+  session = self._copies()
+  bare, with_doi = session.decisions
+  bare.status, bare.tags = DecisionStatus.PENDING, []
+  with_doi.status = DecisionStatus.DISCARDED
+  assert is_unscreened(bare)
+  record_screening(bare, self._agent_verdict())
+  assert not is_unscreened(bare)
+  assert foldable_copies(session) == []
+  assert reconcile_copies(session) == []
+  assert len(session.decisions) == 2
+@
+
+The relabel and the reset.  A relabel corrects the snapshot of the
+relabelled verdict, and only that one: a verdict a command recorded
+stays as it was, and so does a snapshot of an earlier verdict.  A reset
+keeps the list, sets its records aside and says how many in its own
+record; after it, the paper decided anew gets a new snapshot.
+
+<<screening record test methods>>=
+def test_a_relabel_corrects_the_snapshot(self):
+  decision = self._llm_call(source=ReviewSource.HUMAN)
+  record_human_decision(decision, "decide", by="the author", at=self.AT)
+  verdict = new_screening(kind="human", name="the author",
+                          status="discarded", tags=["off-topic-false-hit"],
+                          recorded_at=self.AT)
+  snapshot = record_screening(decision, verdict)
+  record = relabel_source(decision, ReviewSource.AGENT_UNREVIEWED,
+                          self.LATER)
+  corrected = decision.screenings[0]
+  assert corrected["id"] == snapshot["id"]
+  assert (corrected["kind"], corrected["name"], corrected["at"]) \
+    == ("agent", None, None)
+  assert corrected["relabelled_at"] == self.LATER
+  assert record["screenings_kind"] == "human"
+  assert record["human"]["human_by"] == "the author"
+  assert decision.screenings[1] == verdict
+  assert record_screening(decision, self._agent_verdict(
+    recorded_at=self.LATER)) is None
+
+def test_a_relabel_keeps_what_the_snapshot_claimed(self):
+  decision = self._llm_call()
+  snapshot = record_screening(decision, self._agent_verdict())
+  relabel_source(decision, ReviewSource.AGENT_UNREVIEWED, self.LATER)
+  relabel_source(decision, ReviewSource.LLM_UNREVIEWED,
+                 "2026-11-20T12:00:00+00:00")
+  corrected = decision.screenings[0]
+  assert corrected["before_relabel"] == {
+    name: snapshot[name] for name in SNAPSHOT_FIELDS
+  }
+  assert corrected["before_relabel"]["reason"] == "Off topic."
+  assert corrected["before_relabel"]["prompt_version"] \
+    == "0123456789abcdef"
+  assert corrected["kind"] == "llm"
+  assert corrected["relabelled_at"] == "2026-11-20T12:00:00+00:00"
+
+def test_two_versions_of_a_record_keep_both_corrections(self):
+  decision = self._llm_call()
+  snapshot = record_screening(decision, self._agent_verdict())
+  marked = {**snapshot, "set_aside_at": self.LATER}
+  relabelled = {**snapshot, "kind": "agent",
+                "relabelled_at": "2026-11-20T12:00:00+00:00"}
+  decision.add_screening(marked)
+  decision.add_screening(snapshot)
+  assert decision.screenings[0] == marked
+  decision.add_screening(relabelled)
+  assert decision.screenings[0] == {**relabelled,
+                                    "set_aside_at": self.LATER}
+  assert counted_screenings(decision) == [decision.screenings[1]]
+
+def test_a_relabel_without_a_snapshot_writes_the_old_record(self):
+  decision = self._llm_call(source=ReviewSource.HUMAN)
+  record = relabel_source(decision, ReviewSource.AGENT_UNREVIEWED, self.AT)
+  assert "screenings_kind" not in record
+
+def test_a_reset_sets_the_screenings_aside(self):
+  decision = self._llm_call()
+  record_screening(decision, self._agent_verdict())
+  before = list(decision.screenings)
+  assert len(counted_screenings(decision)) == 2
+  record = reset_decision(decision, self.LATER)
+  assert record["screenings"] == 2
+  assert decision.screenings == before
+  assert counted_screenings(decision) == []
+  decision.status, decision.tags = DecisionStatus.DISCARDED, ["off-topic"]
+  decision.source = ReviewSource.LLM_UNREVIEWED
+  decision.llm_model = "m-1"
+  snapshot = record_screening(decision, self._agent_verdict(
+    recorded_at="2026-11-20T12:00:00+00:00"))
+  assert snapshot is not None
+  assert len(counted_screenings(decision)) == 2
+  assert "screenings" not in reset_decision(self._llm_call(), self.AT)
+
+def test_malformed_entries_are_kept_and_skipped(self):
+  decision = self._llm_call()
+  verdict = self._agent_verdict()
+  decision.screenings = [{"status": "kept"}, "a note", verdict]
+  assert counted_screenings(decision) == [verdict]
+  decision.add_screening({"status": "kept"})
+  assert len(decision.screenings) == 3
+@
+
+The list survives a save, a load and an append, and is written only
+when there is one; malformed entries are written back as they were,
+with one warning per file.  A save by a process that loaded the session
+before a screening was recorded keeps it, and a screening run's save
+keeps a decision another process saved meanwhile, in both orders.
+Each process loads the session in a registry of its own, as in the
+abstract tests above.
+
+<<test functions>>=
+class TestScreeningPersistence:
+  """Screenings are saved, loaded, appended and merged (#253)."""
+
+  <<screening persistence test methods>>
+
+<<screening persistence test methods>>=
+AT = "2026-11-20T10:00:00+00:00"
+
+def _session(self, name):
+  return ReviewSession(
+    query="q", providers=["openalex"], timestamp=datetime(2026, 11, 20),
+    name=name, decisions=[
+      TestScreeningRecord()._llm_call(doi=f"10.5555/screen-{name}"),
+    ],
+  )
+
+def _verdict(self, name="agent-2", status="kept", at=AT):
+  return new_screening(kind="agent", name=name, status=status,
+                       tags=["adjacent-subtopic"], recorded_at=at)
+
+def _load_apart(self, name):
+  from scholar.scholar import isolated_registry
+
+  with isolated_registry():
+    return load_session(name)
+
+def test_saved_only_when_non_empty(self, tmp_path, monkeypatch):
+  import json
+
+  monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+  path = save_session(self._session("screen-file"))
+  assert "screenings" not in json.loads(path.read_text())["decisions"][0]
+  session = self._load_apart("screen-file")
+  assert session.decisions[0].screenings == []
+  record_screening(session.decisions[0], self._verdict())
+  save_session(session)
+  stored = json.loads(path.read_text())["decisions"][0]["screenings"]
+  assert stored == session.decisions[0].screenings
+  assert self._load_apart("screen-file").decisions[0].screenings == stored
+
+def test_malformed_entries_survive_with_one_warning(
+  self, tmp_path, monkeypatch, caplog,
+):
+  import json
+  import logging
+
+  monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+  path = save_session(self._session("screen-bad"))
+  data = json.loads(path.read_text())
+  data["decisions"][0]["screenings"] = [{"status": "kept"}, "a note"]
+  path.write_text(json.dumps(data))
+  with caplog.at_level(logging.WARNING, logger="scholar.review"):
+    session = self._load_apart("screen-bad")
+    save_session(session)
+    self._load_apart("screen-bad")
+  warnings = [r for r in caplog.records if "without an id" in r.message]
+  assert len(warnings) == 1
+  assert json.loads(path.read_text())["decisions"][0]["screenings"] \
+    == [{"status": "kept"}, "a note"]
+
+def test_append_keeps_them(self, tmp_path, monkeypatch):
+  from scholar.scholar import SearchResult
+
+  monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+  session = self._session("screen-append")
+  record_screening(session.decisions[0], self._verdict())
+  save_session(session)
+  stored = load_session("screen-append").decisions[0]
+  paper = Paper(title="Screened", authors=["Ada Lovelace"], year=2021,
+                doi="10.5555/screen-screen-append", sources=["openalex"])
+  appended = create_review_session([SearchResult(
+    query="q", provider="openalex", timestamp="t", papers=[paper],
+  )], "q", session_name="screen-append")
+  assert appended.decisions[0].screenings == stored.screenings
+  assert len(stored.screenings) == 2
+
+def test_append_copies_the_list(self, tmp_path, monkeypatch):
+  import scholar.review
+  from scholar.scholar import SearchResult
+
+  monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+  session = self._session("screen-copy")
+  record_screening(session.decisions[0], self._verdict())
+  save_session(session)
+  loaded = []
+  own = scholar.review.load_own_session
+
+  def keep_loaded(*args, **kwargs):
+    loaded.append(own(*args, **kwargs))
+    return loaded[-1]
+
+  monkeypatch.setattr(scholar.review, "load_own_session", keep_loaded)
+  paper = Paper(title="Screened", authors=["Ada Lovelace"], year=2021,
+                doi="10.5555/screen-screen-copy", sources=["openalex"])
+  appended = create_review_session([SearchResult(
+    query="q", provider="openalex", timestamp="t", papers=[paper],
+  )], "q", session_name="screen-copy")
+  [previous] = loaded
+  copied = appended.decisions[0].screenings
+  assert copied == previous.decisions[0].screenings
+  assert copied is not previous.decisions[0].screenings
+
+def test_two_screening_runs_are_united(self, tmp_path, monkeypatch):
+  monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+  save_session(self._session("screen-two"))
+  first = self._load_apart("screen-two")
+  second = self._load_apart("screen-two")
+  one = self._verdict("agent-2")
+  two = self._verdict("agent-3", at="2026-11-20T10:00:01+00:00")
+  record_screening(first.decisions[0], one)
+  save_session(first)
+  record_screening(second.decisions[0], two)
+  save_session(second)
+  saved = self._load_apart("screen-two").decisions[0].screenings
+  assert one in saved and two in saved
+  assert [r["origin"] for r in saved].count("decision") == 1
+
+def _decide_and_screen(self, name, screen_first):
+  save_session(self._session(name))
+  screener = self._load_apart(name)
+  decider = self._load_apart(name)
+  verdict = self._verdict()
+  record_screening(screener.decisions[0], verdict)
+  decision = decider.decisions[0]
+  decision.status, decision.tags = DecisionStatus.KEPT, ["supports-claim"]
+  decision.source = ReviewSource.LLM_REVIEWED
+  record_human_decision(decision, "decide", at=self.AT)
+  for session in ((screener, decider) if screen_first
+                  else (decider, screener)):
+    save_session(session)
+  return self._load_apart(name).decisions[0], verdict
+
+def test_a_screening_and_a_human_decision_saved_first(
+  self, tmp_path, monkeypatch,
+):
+  monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+  saved, verdict = self._decide_and_screen("screen-late", False)
+  assert saved.status is DecisionStatus.KEPT
+  assert saved.source is ReviewSource.LLM_REVIEWED
+  assert saved.human_decided_at == self.AT
+  assert verdict in saved.screenings
+  assert saved.screenings[0]["status"] == "discarded"
+
+def test_a_human_decision_and_a_screening_saved_first(
+  self, tmp_path, monkeypatch,
+):
+  monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+  saved, verdict = self._decide_and_screen("screen-early", True)
+  assert saved.status is DecisionStatus.KEPT
+  assert saved.source is ReviewSource.LLM_REVIEWED
+  assert verdict in saved.screenings
+
+def test_a_stale_save_keeps_the_corrected_snapshot(
+  self, tmp_path, monkeypatch,
+):
+  monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+  session = self._session("screen-relabel")
+  session.decisions[0].source = ReviewSource.HUMAN
+  record_screening(session.decisions[0], self._verdict())
+  save_session(session)
+  stale = self._load_apart("screen-relabel")
+  relabeller = self._load_apart("screen-relabel")
+  relabel_source(relabeller.decisions[0], ReviewSource.AGENT_UNREVIEWED,
+                 "2026-11-20T11:00:00+00:00")
+  save_session(relabeller)
+  record_screening(stale.decisions[0], self._verdict(
+    "agent-3", at="2026-11-20T12:00:00+00:00"))
+  save_session(stale)
+  saved = self._load_apart("screen-relabel").decisions[0]
+  assert saved.source is ReviewSource.AGENT_UNREVIEWED
+  kinds = [(r["origin"], r["kind"]) for r in saved.screenings]
+  assert kinds == [("decision", "agent"), ("screen", "agent"),
+                   ("screen", "agent")]
+@
+
+The races are played in real processes, in both save orders, since
+that is how they happen: a [[sessions screen]] and a reset, or a
+relabel, that both loaded the session before either saved.  The
+screening is recorded an hour after the reset's time, so that only the
+mark, not the time rule, can set it aside.  Each process prints a line
+once it has loaded the session and waits for one before it changes
+anything; the test reads the saved file itself.
+
+<<test functions>>=
+class TestScreeningRaces:
+  """A screening and a reset or a relabel, saved in either order (#253)."""
+
+  <<screening race test methods>>
+
+<<screening race test methods>>=
+NAME = "screen-race"
+SCREEN = """
+  from scholar.review import (
+    load_session, new_screening, record_screening, save_session,
+  )
+  session = load_session("screen-race")
+  WAIT
+  record_screening(session.decisions[0], new_screening(
+    kind="agent", name="agent-2", status="kept", tags=["t"],
+    recorded_at="2026-11-20T11:00:00+00:00"))
+  save_session(session)
+"""
+RESET = """
+  from scholar.review import load_session, reset_decision, save_session
+  session = load_session("screen-race")
+  WAIT
+  reset_decision(session.decisions[0], "2026-11-20T10:00:00+00:00")
+  save_session(session)
+"""
+RELABEL = """
+  from scholar.review import (
+    ReviewSource, load_session, relabel_source, save_session,
+  )
+  session = load_session("screen-race")
+  WAIT
+  relabel_source(session.decisions[0], ReviewSource.AGENT_UNREVIEWED,
+                 "2026-11-20T10:00:00+00:00")
+  save_session(session)
+"""
+WAIT = 'import sys; print("loaded", flush=True); sys.stdin.readline()'
+
+def _first_save(self, source):
+  from scholar.scholar import isolated_registry
+
+  with isolated_registry():
+    decision = ReviewDecision(
+      paper=Paper(title="A Race", authors=["Ada Lovelace"], year=2021,
+                  doi="10.5555/screen-race"),
+      provider="openalex", status=DecisionStatus.DISCARDED,
+      tags=["off-topic"], source=source, llm_model="m-1",
+      llm_reason="Off topic.", llm_decided_at="2026-11-01T09:00:00+00:00",
+    )
+    if source is ReviewSource.HUMAN:
+      record_human_decision(decision, "decide", by="the author",
+                            at="2026-11-01T09:00:00+00:00")
+    save_session(ReviewSession(
+      query="q", providers=["openalex"], timestamp=datetime(2026, 11, 20),
+      name=self.NAME, decisions=[decision],
+    ))
+
+def _code(self, template, wait):
+  import textwrap
+
+  return textwrap.dedent(template).replace(
+    "WAIT", self.WAIT if wait else "")
+
+def _race(self, source, stale, other):
+  """`stale` loads and waits; `other` runs whole; then `stale` saves."""
+  import json
+  import subprocess
+  import sys
+  from scholar.review import _get_sessions_dir
+  from scholar.scholar import isolated_registry
+
+  self._first_save(source)
+  first = subprocess.Popen(
+    [sys.executable, "-c", self._code(stale, wait=True)],
+    stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+  )
+  try:
+    assert first.stdout.readline().strip() == "loaded"
+    subprocess.run([sys.executable, "-c", self._code(other, wait=False)],
+                   check=True, timeout=120)
+    first.communicate("go\n", timeout=120)
+  finally:
+    if first.poll() is None:
+      first.kill()
+  assert first.returncode == 0
+  path = _get_sessions_dir() / f"{self.NAME}.json"
+  saved = json.loads(path.read_text())["decisions"][0]
+  with isolated_registry():
+    return saved, load_session(self.NAME).decisions[0]
+
+def _assert_set_aside(self, saved, decision):
+  assert saved["status"] == "pending"
+  assert [r["origin"] for r in saved["screenings"]] \
+    == ["decision", "screen"]
+  assert all(r["set_aside_at"] == "2026-11-20T10:00:00+00:00"
+             for r in saved["screenings"])
+  assert counted_screenings(decision) == []
+
+def test_a_screening_saved_before_a_concurrent_reset(self):
+  saved, decision = self._race(ReviewSource.LLM_UNREVIEWED,
+                               self.RESET, self.SCREEN)
+  self._assert_set_aside(saved, decision)
+
+def test_a_screening_saved_after_a_concurrent_reset(self):
+  saved, decision = self._race(ReviewSource.LLM_UNREVIEWED,
+                               self.SCREEN, self.RESET)
+  self._assert_set_aside(saved, decision)
+
+def _assert_corrected(self, saved):
+  assert saved["source"] == "agent"
+  snapshot, screening = saved["screenings"]
+  assert (snapshot["origin"], snapshot["kind"], snapshot["name"]) \
+    == ("decision", "agent", None)
+  assert snapshot["relabelled_at"] == "2026-11-20T10:00:00+00:00"
+  assert snapshot["before_relabel"]["kind"] == "human"
+  assert snapshot["before_relabel"]["name"] == "the author"
+  assert (screening["kind"], screening["name"]) == ("agent", "agent-2")
+  assert "set_aside_at" not in snapshot
+
+def test_a_screening_saved_before_a_concurrent_relabel(self):
+  saved, _ = self._race(ReviewSource.HUMAN, self.RELABEL, self.SCREEN)
+  self._assert_corrected(saved)
+
+def test_a_screening_saved_after_a_concurrent_relabel(self):
+  saved, _ = self._race(ReviewSource.HUMAN, self.SCREEN, self.RELABEL)
+  self._assert_corrected(saved)
+@
+
+[[screenings_summary]] counts what [[sessions show]] prints, and says
+nothing for a session without screenings.
+
+<<test functions>>=
+def test_screenings_summary_counts_papers_and_set_asides():
+  record = TestScreeningRecord()
+  first, second = record._llm_call(doi="10.5555/s1"), \
+    record._llm_call(doi="10.5555/s2")
+  assert screenings_summary([first, second]) == ""
+  record_screening(first, record._agent_verdict())
+  record_screening(second, record._agent_verdict())
+  reset_decision(second, "2026-11-20T11:00:00+00:00")
+  second.screenings.append({"status": "kept"})
+  assert screenings_summary([first, second]) == (
+    "Screenings: 2 on 1 paper(s), 1 of them snapshots of the decision; "
+    "2 set aside by a reset; 1 malformed, skipped."
+  )
 @
 
 \subsection{Samples of machine decisions drawn for review}
@@ -6966,6 +8303,7 @@ for result in results:
                 relabelled=list(prev_dec.relabelled),
                 resets=list(prev_dec.resets),
                 abstract_set=list(prev_dec.abstract_set),
+                screenings=list(prev_dec.screenings),
             )
         elif prev_record:
             <<rebuild the decision from the old decision store>>
@@ -7900,7 +9238,9 @@ records a paper several providers returned, \cref{sec:review-found-by}), so prov
 returned either copy.  The records of abstracts given by hand, which
 hold their texts, are united too; a record whose text lost to the
 other copy's abstract then reads as replaced, and a warning says so
-([[abstract_records_after_fold]], \cref{sec:set-abstract}).  A pair
+([[abstract_records_after_fold]], \cref{sec:set-abstract}).  So are
+the screenings, except a second snapshot of a verdict the survivor
+already holds one of ([[unite_screenings]], \cref{sec:screenings}).  A pair
 whose copies both carry a note is not
 folded, because [[migrate_paper_id]] keeps the target's note and drops
 the moved one when both ids have a note.  If the notes file cannot be
@@ -7941,6 +9281,7 @@ def is_unscreened(decision: ReviewDecision) -> bool:
         and not any(agent_audit_of(decision).values())
         and not any(human_record_of(decision).values())
         and not decision.resets
+        and not decision.screenings
     )
 
 
@@ -8021,6 +9362,7 @@ for link in absorbed.found_by:
     survivor.record_search(*link)
 for copy in absorbed.same_id_copies:
     survivor.add_same_id_copy(copy)
+unite_screenings(survivor, absorbed.screenings)
 survivor.provider = united_providers(survivor.provider, absorbed.provider)
 for name, value in human_record_of(
     newer_human_record(survivor, absorbed)
@@ -10127,6 +11469,7 @@ def read_session_file(
                     relabelled=list(dec_data.get("relabelled") or []),
                     resets=list(dec_data.get("resets") or []),
                     abstract_set=list(dec_data.get("abstract_set") or []),
+                    screenings=list(dec_data.get("screenings") or []),
                 )
             )
         
@@ -10135,6 +11478,7 @@ def read_session_file(
             TypeError) as e:
         raise SessionFileError(session_path, e) from e
     warn_about_unknown_sources(session_path, session)
+    warn_about_malformed_screenings(session_path, session)
     warn_about_foreign_name(session_path, session)
     if record_baseline:
         session._baseline = SessionBaseline.of(
@@ -10264,6 +11608,7 @@ data = {
                 {"abstract_set": d.abstract_set}
                 if d.abstract_set else {}
             ),
+            **({"screenings": d.screenings} if d.screenings else {}),
             "paper": d.paper.to_dict(include_refs_cites=True),
         }
         for d in session.decisions
@@ -10491,14 +11836,18 @@ links this process holds, whatever the decision rules decide.  The
 same goes for the other works a search returned under a paper's id
 ([[same_id_copies]], \cref{sec:session-copies}), for the
 corrections of its source ([[relabelled]], \cref{sec:relabel-source}),
-for its resets to pending ([[resets]], \cref{sec:reset-decision})
-and for the records of abstracts given by hand ([[abstract_set]],
-\cref{sec:set-abstract}).
-All but the last are also part of the decision's state, so this process's state
+for its resets to pending ([[resets]], \cref{sec:reset-decision}),
+for the records of abstracts given by hand ([[abstract_set]],
+\cref{sec:set-abstract}) and for other screeners' verdicts
+([[screenings]], \cref{sec:screenings}).
+All but the last two are also part of the decision's state, so this process's state
 is taken before the file's are added: otherwise the union itself would
 look like a change made here, and a process that changed nothing would
 keep its stale source over the file's corrected one.  Why the records
-of abstracts are not part of it is said with them.  After the
+of abstracts and the screenings are not part of it is said with them,
+and so is why, once the decision is merged, the screenings one side
+added are settled against a reset or a relabel the other side made
+meanwhile ([[settle_concurrent_screenings]]).  After the
 decisions are merged, the tombstones of folded copies are united with
 the file's and applied ([[apply_tombstones]], \cref{sec:session-copies}),
 so that a copy that [[sessions reconcile]] folded after this process
@@ -10911,7 +12260,9 @@ def merge_concurrent_changes(
         paper_id = get_paper_id(decision.paper)
         theirs = paired.get(id(decision))
         mine = decision_state(decision)
+        history = None
         if theirs is not None:
+            history = ConcurrentHistory.of(decision, theirs)
             mine_new = [r for r in decision.abstract_set
                         if r not in theirs.abstract_set]
             their_new = [r for r in theirs.abstract_set
@@ -10930,25 +12281,26 @@ def merge_concurrent_changes(
                 decision.add_reset(record)
             for record in theirs.abstract_set:
                 decision.add_abstract_record(record)
+            unite_screenings(decision, theirs.screenings)
         base_state = base_states.get(base_key_of(decision, base))
-        if theirs is None or base_state is None:
-            continue
-        if decision_state(theirs) in (base_state, mine):
-            continue
-        if mine == base_state:
-            decision.status = theirs.status
-            decision.tags = list(theirs.tags)
-            decision.source = theirs.source
-            decision.is_example = theirs.is_example
-            decision.llm_confidence = theirs.llm_confidence
-            for name, value in llm_audit_of(theirs).items():
-                setattr(decision, name, value)
-            for name, value in agent_audit_of(theirs).items():
-                setattr(decision, name, value)
-            for name, value in human_record_of(theirs).items():
-                setattr(decision, name, value)
-        else:
-            <<warn that both processes decided the paper>>
+        if (theirs is not None and base_state is not None
+                and decision_state(theirs) not in (base_state, mine)):
+            if mine == base_state:
+                decision.status = theirs.status
+                decision.tags = list(theirs.tags)
+                decision.source = theirs.source
+                decision.is_example = theirs.is_example
+                decision.llm_confidence = theirs.llm_confidence
+                for name, value in llm_audit_of(theirs).items():
+                    setattr(decision, name, value)
+                for name, value in agent_audit_of(theirs).items():
+                    setattr(decision, name, value)
+                for name, value in human_record_of(theirs).items():
+                    setattr(decision, name, value)
+            else:
+                <<warn that both processes decided the paper>>
+        if history is not None:
+            settle_concurrent_screenings(decision, history)
 
     for theirs in additions:
         held = get_registry().register(theirs.paper)
