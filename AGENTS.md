@@ -2462,6 +2462,14 @@ subprocess with a fake `XDG_CACHE_HOME`.
 1. Add `@app.command()` decorated function in `cli.py`
 2. Add tests in `test_cli.py`
 
+A chunk tangled into a command function must not use one of that
+function's parameters as a `for`, `with ... as` or `except ... as`
+name: Python has no block scope, so it overwrites the option for the
+rest of the command (#280: `sessions decide --keep-trace` printed a
+field name as the session's name). `TestNoLoopRebindsAParameter` in
+`cli.nw` parses `cli.py` and fails on any such binding; plain
+assignments (`by = by.strip()`) are allowed.
+
 ## Literate Programming
 
 This project uses noweb-style literate programming. The `.nw` files are the source of truth:
