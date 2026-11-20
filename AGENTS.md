@@ -1100,6 +1100,11 @@ confirmation goes to stderr so `-f json`/`-f bibtex` stdout stays pure.
 `sessions show` prints each paper's id (`doi:…`/`hash:…`, the value
 `--paper-id` takes) under its title, and `show -f json` carries `doi` and
 `paper_id`, so a decision never needs a CSV detour.
+Each paper list prints in one Rich call without the highlighter
+(`print_paper_lines`, #273; 10,000 decisions: ~26 s → ~10 s piped):
+the piped text is byte-identical (pinned by `TestShowPinnedOutput` at
+80 and 200 columns), on a terminal numbers and URLs in titles and ids
+are no longer coloured.
 `--source human|agent|llm` says who decided (#162). It defaults to
 `human` only when stdin is a terminal; otherwise (scripts, agents) a
 missing `--source` exits 2 before loading the session. `agent` (an AI
