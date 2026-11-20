@@ -37,6 +37,8 @@ Providers self-register via `register_provider()` at module load time.
 | `src/scholar/ratelimit.nw` | Literate source for rate-limit tracking |
 | `src/scholar/network.py` | Proxy route and User-Agent for every request |
 | `src/scholar/network.nw` | Literate source for the network settings |
+| `src/scholar/agreement.py` | Agreement and conflicts between screeners (#253) |
+| `src/scholar/agreement.nw` | Literate source for agreement and conflicts |
 | `src/scholar/cli.py` | CLI commands and output formatters |
 | `src/scholar/cli.nw` | Literate programming source for CLI |
 | `src/scholar/tutorials/*.nw` | Literate sources of the interactive tutorials (tangle to `*.md`, weave to chapters) |
@@ -1558,15 +1560,104 @@ only when `saving` (set before the chunk: decide True, screen
 True/False, `blind_basis: "declared"`; neither → None. The decision is
 never changed (tested on the saved JSON). **Screener identity**
 (#253 C): `review.screener_identity(record)` = `(kind, name, via ==
-"classify")`; comparisons (agreement, conflicts) must pair by it, not by
+"classify")`; comparisons (agreement, conflicts) pair by it, not by
 `(kind, name)`: a classifier second screen keeps `name` = the model id
 (so "same model" = both kind llm with equal names) but must not share
 the identity of the snapshot of a decision the same model made, else
 the latest-record rule hides the first verdict. Only `llm classify
 --second-screen` writes `via: "classify"`; snapshots are `"snapshot"`,
-`sessions screen` `"screen"`. Not yet built (later #253 PRs): agreement
-numbers, conflicts, the TUI's blind mode, report surfaces, the screen
-sheet.
+`sessions screen` `"screen"`. Not yet built (later #253 PRs): the
+TUI's blind mode, report surfaces (LaTeX report, `llm synthesize`,
+audit caption), the screen sheet.
+
+#### Agreement and conflicts (#253, part B)
+
+`agreement.nw` (new module, chapter after llm_review; reads, never
+writes). **Screener** = `review.screener_identity(record)` =
+`(kind, name, via == "classify")` (defined in `sec:screenings`,
+shared with PR C #277 so a model's second screen is apart from the
+snapshot of its own decision; `screener_of` returns None for a kind
+not in `SCREENING_KINDS`, counted by `unknown_origin_count`, never
+paired); unnamed = `(kind, None, ...)`, one screener per kind,
+labelled "unnamed agent"; second screen labelled "llm (m), second
+screen". `--pair` form `kind[+second]:name` or bare `kind[+second]`
+(`screener_spec`/`parse_screener_spec`, first colon splits;
+`parse_screener_pair` splits `A,B` at the one comma followed by a kind
+[+second] and `:` or the end, so names may hold commas; none or
+several such commas, or one screener twice → ValueError, exit 2).
+`pair_header` prints `Pair --pair <shlex-quoted A,B>`, copyable. `same_model(a, b)` (kind llm, one
+name): header line "same model: m" plus both sides' prompt versions
+("none recorded"), show line "(same model)". `screener_verdicts(decision)`: latest counted
+record per screener by `at` else `recorded_at` (ties: later in list);
+the live decision is never a verdict, its snapshot is.
+`ScreenerProfile.label`: a screener all of whose records are snapshots
+with `confirmed_from` is "the human-confirmed decision (by NAME;
+proposed by llm MODEL)" (parts only when known/unique); partly →
+"human (X) (k of n records the human-confirmed decision)"; profiles
+also list prompt versions. **`AgreementTable`** (frozen; `cells[i][j]`
+= A's label i, B's label j, positive first; everything computed from
+cells): `n`, `agreeing`, `observed`, `positive_agreement` =
+2x11/(2x11+x12+x21), `negative_agreement`, `prevalence_index` =
+(x11-x22)/N, `bias_index` = (x12-x21)/N (signed), `chance_agreement`,
+`kappa` None with `kappa_undefined_reason` when either screener used
+one verdict ("one screener gave only one verdict" / "both ...", never
+0), "no records screened by both", "not computed for more than two
+categories". Sources in the prose: ShankarBangdiwala2014 (Po, kappa,
+PI/BI, scenarios 1-3 as test vectors; Byrt and Cicchetti-Feinstein
+cited through it), Tan2024 (Ppos/Pneg; lepidic/acinar vectors),
+VachGerke2023, Wongpakaran2013 (zero marginal; Table 7 scales differ),
+Vembye2025 p. 9, Reichenheim2004 (why no kappa interval). Not
+computed: AC1, PABAK, B, kappa interval, multi-category kappa, verbal
+labels. **Questions** (`QUESTIONS`, `verdict_value`): `status`,
+`bearing` (category `<= AUDIT_ORDER_BEARING` of `audit_category(tags)`),
+`category` (4x4, observed only); a verdict without category →
+`without_category`. `screening_agreement(records, a, b, question)`
+takes `screener_verdicts` maps (computed once); a record = a decision
+(copies counted each). `screener_pairs` (fixed order by
+`SCREENING_KINDS` then name). **Samples**: `sample_bands(sessions, id)`
+(id or stratified group id; one `SampleBand` per stored band, papers
+by id as `sample_reports`: `reset_since_draw` left out and counted,
+missing papers and sessions not given → `not_found`); `band_agreement`
+adds `modified_wilson_interval(agreeing, n)` unless
+`interval_withheld`: census, or any counted sampled paper lacks a
+verdict/category of either screener (reset/not found do not withhold).
+No interval over all records. **Conflicts**: `conflicts(decision,
+verdicts=None)` per screener pair: `status` if statuses differ, else
+`category` if both categories present and different. `conflict_resolved`:
+decided, source not `is_unreviewed`, `human_decided_at` not older
+than the latest counted screening's `recorded_at`.
+`conflict_outcome` → `a`/`b`/`neither` (status: decision status;
+category: `audit_category(decision.tags)`). **Text**:
+`agreement_block` (table, measures, then two sentences, always: "X of
+N records were discarded by both, so observed agreement is at least
+X/N (P %) whatever the screeners did with the rest; positive agreement
+counts only records at least one screener kept." and "For the same
+observed agreement, kappa is lower the more one verdict dominates. No
+verbal label is given for kappa."; bearing worded "judged (not)
+bearing"), `agreement_data`
+(JSON, `interval` only for samples, category without kappa keys),
+`pair_header`, `ScreeningOverview.of(decisions)` (None without any
+decision with screenings; `lines()`, `data()`, `conflict_counts()`).
+`conflict_counts(entries)`/`conflict_counts_line`: one definition for
+show and `sessions conflicts` (a paper with any status conflict counts
+as status, else "category only").
+**CLI** (cli.nw `sec:sessions-agreement`, `sec:sessions-conflicts`):
+`scholar sessions agreement S [S...] [--sample ID] [--pair A,B] [-f
+table|json]` (sessions deduped by file; `--sample` reads
+`pooled_sample_sessions`; one block per band; bad `--pair` or unknown
+sample exit 2, missing session exit 1); `scholar sessions conflicts S
+[--pair A,B] [--status-only|--category-only] [--unresolved] [-f
+table|json]` (both kind flags exit 2; outcome counts per pair and kind
+over resolved conflicts; one print). `sessions show` adds the
+overview's lines after the "Screenings:" line (one per pair: records,
+kept/discarded agreement, kappa with "(prevalence index …, bias index
+…)" or undefined with its reason, status conflicts (resolved); then
+"Screening conflicts: N status (R resolved by a human), C category
+only"; unknown-origin count) in one print, and JSON
+`double_screening` (`pairs`, `conflicts`, `unknown_origin`); neither
+without screenings (`TestSessionsConflicts.test_show_unchanged_without_screenings`).
+TUI filter `x` (`conflicts`): decisions with an unresolved conflict;
+a TUI confirm resolves (tested with a pilot).
 
 ### Session Arguments
 

@@ -15,6 +15,7 @@ SRC_TEX+=	../src/scholar/pdf.tex
 SRC_TEX+=	../src/scholar/notes.tex
 SRC_TEX+=	../src/scholar/review.tex
 SRC_TEX+=	../src/scholar/llm_review.tex
+SRC_TEX+=	../src/scholar/agreement.tex
 SRC_TEX+=	../src/scholar/cli.tex
 SRC_TEX+=	../src/scholar/tui.tex
 SRC_TEX+=	../src/scholar/tutorials/first-search.tex
