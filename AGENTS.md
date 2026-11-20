@@ -1259,7 +1259,81 @@ single-space shortcuts in `normalized_for_quotes`, tested against the
 plain definition; a review measured 30,000 decisions with two reasons
 each at 3.0-4.4 s CPU under heavy load; the 10,000-decision test's 8 s
 CPU limit guards against the ~10x slower `str.translate` folding, it
-is no performance promise). A machine
+is no performance promise).
+**Batch check (#291, review.nw `sec:batch-check`, cli.nw
+`sec:decide-batch-check`, `sec:sessions-check-batches`).**
+`batch_findings(rows, one_reason=False, ordered=True)` over
+`BatchRow(paper, title, reason, confidence, status, tags)` (the
+confidence is the row's own column, never `-c`) returns `BatchFinding`s
+(`kind`, `count`, `rows`, `papers`, `detail`, `information`):
+`shared-reasons` (rows whose reason, white space collapsed + casefold,
+punctuation kept, is shared with a row of a *different* title, folded
+to letters/digits; >= `SHARED_REASON_MIN_ROWS` = 10 rows AND >=
+`SHARED_REASON_MIN_SHARE` = 0.25 of the rows with a reason),
+`flat-confidence` (every row with a confidence has the same one, >=
+`FLAT_CONFIDENCE_MIN_ROWS` = 20 rows), `identical-run` (consecutive
+rows with equal (status, tags, reason), counted in distinct titles, >=
+`IDENTICAL_RUN_MIN_ROWS` = 10; skipped with `ordered=False`);
+`one_reason=True` (one `--reason` for many records: a rule on purpose)
+gives only `one-reason`, `information=True`, never refused. All
+thresholds are scholar's choice, reasoned in the prose from the one
+report in the issue (no frequency figure exists). Runs in `sessions
+decide` (`--reasons-file`/`--reason`, agent only) and `sessions screen`
+(`--verdicts-file`/`--reason`) after the quote check, before saving
+(`<<check the batch as a whole>>`, reads `trace_of`, `reason`,
+`selected`, `by_id`, `by_doi`, `quote_misses`, `strict`, `saving`):
+stderr lines with the first `BATCH_PAPERS_SHOWN` = 5 ids and "…and k
+more", saved anyway. `--strict` (both commands; needs a reason/file,
+exit 2 before loading) refuses unsaved, exit 2, on any non-information
+finding OR any quote miss; `--strict-quotes` unchanged (refuses on
+quotes before the batch check prints). The quote check's "Saved all
+the same; --strict-quotes or --strict refuses" line prints only when
+`saving and not strict`. **`sessions decide --dry-run`**: every check
+and refusal with the real exit codes, records in memory only, prints
+"Would mark N paper(s) kept|discarded by SRC in session 'x'; nothing
+written." (`<<report or save the decisions>>`), never saves (decide
+keeps no pre-run copy anyway). **`scholar sessions check-batches S
+[-f table|json]`**: read-only, exit 0; `review.stored_batch_runs`
+groups decisions with an `agent_reason` by (`agent_by`,
+`agent_decided_at`) and screenings with `origin` "screen" (snapshots
+left out) by (kind, name, `recorded_at`); `ordered=False` (no line
+order stored); a run whose rows all share one reason is checked as
+`one_reason` (detail says "one --reason, or the same reason on every
+line"); text lists runs with findings (count excludes noted-only
+runs), JSON lists every run. The help states the thresholds (a test
+ties them to the constants).
+**Records decided without an abstract (#293, review.nw
+`sec:abstract-lookup`, enrich.nw `sec:enrich-lookup-record`, cli.nw
+`sec:decided-without-abstract`).** `ReviewDecision.abstract_lookup`
+(dict or None): what `scholar enrich` found the last time it asked for
+the paper's abstract, `{"at", "outcome", "asked", "failed"}` (last two
+only when non-empty; outcome in `ABSTRACT_LOOKUP_OUTCOMES` = found,
+none-found, failed, no-doi, none-asked, from
+`enrich.abstract_lookup_outcome`, which `tally_lookups` now uses too).
+Set only by `scholar enrich` per chunk, when `abstract` is in
+`--fields`, for papers that lacked an abstract before the chunk and
+have an outcome (`abstract_lookup_record`); one time per chunk; latest
+attempt only. Saved only when set, loaded None from old files (non-dict
+→ None), copied on append, concurrent merge keeps the later `at`
+(`later_abstract_lookup`), a fold keeps the DOI copy's; NOT in
+`decision_state` or `is_unscreened` (as `abstract_set`). `abstract_gap(
+decisions)` → `AbstractGap(papers, without, none_found, failed,
+not_asked, no_record, doubtful)`, one per paper id; a `found` record on
+a paper without an abstract, an unknown outcome, or no record →
+`no_record` ("no record of a lookup", never "never looked up").
+`abstract_is_doubtful(paper)` is the hook for #287 (always False; the
+`doubtful` count stays 0 and unprinted). One stderr line
+(`cli.print_abstract_gap`/`abstract_gap_line`) after `sessions decide
+--source agent|llm`, `sessions screen --as agent|llm` (both also on a
+dry run, "selected"), `llm classify` and `--second-screen`: "k of the n
+records decided have no abstract (parts); run `scholar enrich S
+--pending-only --fields abstract` first if that has not been tried."
+(hint only with failed or no-record parts; S via `session_argument`,
+shell-quoted). `sessions show`: `decided_without_abstract_sentence`
+line (also the report's sentence, after the hand-abstract count), JSON
+`abstract_lookup` per decision and top-level
+`decided_without_abstract` (both only when present).
+A machine
 `decide` never replaces a decided
 paper whose source is `human`, `llm_reviewed` or `agent_reviewed`:
 the batch is refused unsaved (exit 2, each conflict named) unless
@@ -1590,7 +1664,7 @@ screening, ~690 per snapshot, plus reasons.
 **`scholar sessions screen S --as agent|human|llm --by NAME
 (--verdicts-file F | (--doi D|--paper-id ID)... --keep|--discard
 [--tag T]... [--reason TEXT]) [-c C] [--blind|--not-blind] [--sample
-ID] [--all-copies] [--dry-run] [--strict-quotes]`** (cli.nw
+ID] [--all-copies] [--dry-run] [--strict-quotes] [--strict]`** (cli.nw
 `sec:sessions-screen`): `--as` defaults to human at a terminal, else
 exit 2; `--by` required for every kind (exit 2 before loading; the
 model for llm); a screener whose `(kind, name)` is that of a selected

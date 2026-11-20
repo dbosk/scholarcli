@@ -3188,6 +3188,7 @@ from scholar.crossref import annotate_papers, noting_failures
 from scholar.review import save_session
 
 before = [decision.paper for decision in chunk]
+lacked_abstract = [needs_enrichment(p, ["abstract"]) for p in before]
 chunk_outcomes: list = []
 after = enrich_papers(
     before,
@@ -3204,11 +3205,82 @@ after = annotate_papers(
 )
 for decision, paper in zip(chunk, after):
     decision.paper = paper
+<<keep the abstract lookup on each decision>>
 <<record preprint adoptions during enrich>>
 save_session(session_data)
 originals.extend(before)
 processed.extend(after)
 lookup_outcomes.extend(chunk_outcomes)
+@
+
+Each decision whose paper lacked an abstract before the chunk, when
+the abstract is among [[--fields]], keeps what the run found
+([[abstract_lookup_record]], \cref{sec:enrich-lookup-record} in the
+enrichment module), so that a screener can later tell a record no
+source has an abstract for from one nobody asked about
+(\url{https://github.com/dbosk/scholarcli/issues/293}).  Whether the
+paper lacked one is taken before the enrichment, which may fill the
+field of the very object it was given.  A paper that already had an
+abstract was not asked about, and its record, if any, stays.  The
+outcomes are matched by position, as [[enrich_papers]] appends them;
+a paper without one (a caller that collected none) gets no record,
+since nothing is known about its lookup.  One time serves the chunk,
+which is when its lookups were made.
+
+<<keep the abstract lookup on each decision>>=
+if "abstract" in enrich_fields:
+    from scholar.enrich import abstract_lookup_record
+    from scholar.utils import utc_now_iso
+
+    looked_up_at = utc_now_iso()
+    for index, decision in enumerate(chunk):
+        if lacked_abstract[index] and index < len(chunk_outcomes):
+            decision.abstract_lookup = abstract_lookup_record(
+                decision.paper, chunk_outcomes[index], looked_up_at
+            )
+@
+
+Let's check it through the real command and the real enrichment, with
+the stand-ins of the tally tests above: a lookup refused by the
+limiter, one answered by the cache, a paper that already had an
+abstract and is not asked about, and a run without the abstract among
+[[--fields]], which records nothing.
+
+<<test functions>>=
+class TestEnrichKeepsTheLookup:
+  """`scholar enrich` keeps each abstract lookup on the decision (#293)."""
+
+  def test_the_outcome_is_kept(self, tmp_path, monkeypatch):
+    from scholar.review import load_session, save_session
+
+    name = TestEnrichSelectionAndSaving._session(tmp_path, monkeypatch, 3)
+    session = load_session(name)
+    session.decisions[2].paper.abstract = "Already here."
+    save_session(session)
+    s2 = TestEnrichLookupTally._throttled_s2(monkeypatch, "10.1/c137-1")
+    result = TestEnrichLookupTally._invoke(
+      [name, "--fields", "abstract"], s2
+    )
+    assert result.exit_code == 0, result.stdout
+    saved = TestEnrichSelectionAndSaving._saved(name)
+    refused = saved["10.1/c137-0"].abstract_lookup
+    assert refused["outcome"] == "failed"
+    assert refused["asked"] == ["s2"]
+    assert TestEnrichLookupTally.REASON in refused["failed"]["s2"]
+    answered = saved["10.1/c137-1"].abstract_lookup
+    assert answered == {"at": refused["at"], "outcome": "none-found",
+                        "asked": ["s2"]}
+    assert saved["10.1/c137-2"].abstract_lookup is None
+
+  def test_nothing_is_kept_without_the_abstract(self, tmp_path, monkeypatch):
+    name = TestEnrichSelectionAndSaving._session(tmp_path, monkeypatch, 1)
+    s2 = TestEnrichLookupTally._throttled_s2(monkeypatch, "10.1/c137-0")
+    result = TestEnrichLookupTally._invoke(
+      [name, "--fields", "keywords"], s2
+    )
+    assert result.exit_code == 0, result.stdout
+    saved = TestEnrichSelectionAndSaving._saved(name)
+    assert saved["10.1/c137-0"].abstract_lookup is None
 @
 
 [[signal.signal]] may only be called from the main thread, and the
@@ -7967,6 +8039,89 @@ class TestShowTheAgentsReason:
     assert flat.count("reason(") + flat.count("reason:") == 2
 @
 
+\paragraph{Decisions on records without an abstract.}
+How many decisions rest on a title alone, and whether anyone looked for
+the abstract, is a question about the whole session
+(\url{https://github.com/dbosk/scholarcli/issues/293}), so
+[[sessions show]] answers it in one line after the quote check, not per
+paper: the report's sentence ([[decided_without_abstract_sentence]],
+\cref{sec:abstract-lookup} in the review module), printed when some
+decided paper has no abstract.  The JSON form gives each decision its
+[[abstract_lookup]] record when it has one, and the counts at the top
+level under [[decided_without_abstract]], also only when there is such
+a paper, so the JSON of a session without one is as it was.
+
+<<sessions command>>=
+def decided_without_abstract_data(gap) -> dict:
+    """The `sessions show` JSON counts of decided papers without one."""
+    if not gap.without:
+        return {}
+    return {"decided_without_abstract": {
+        "decided": gap.papers,
+        "without_abstract": gap.without,
+        "every_source_had_none": gap.none_found,
+        "not_asked": gap.not_asked,
+        "lookup_failed": gap.failed,
+        "no_record": gap.no_record,
+    }}
+@
+
+Let's check both forms on a session with a decided paper whose lookup
+failed, one without a record, one with an abstract and a pending paper
+without one, which is not counted.
+
+<<test functions>>=
+class TestShowDecidedWithoutAbstract:
+  """`sessions show` counts decisions on records without one (#293)."""
+
+  def _make_session(self, tmp_path, monkeypatch):
+    from scholar.review import (
+      DecisionStatus, ReviewDecision, ReviewSession, save_session,
+    )
+
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+    failed = {"at": "2026-11-20T10:00:00+00:00", "outcome": "failed",
+              "asked": ["s2"], "failed": {"s2": "HTTP 429"}}
+
+    def decision(n, abstract=None, lookup=None, decided=True):
+      return ReviewDecision(
+        paper=Paper(title=f"Show Gap {n}", authors=["A"],
+                    doi=f"10.5555/show-gap-{n}", abstract=abstract),
+        provider="openalex",
+        status=DecisionStatus.DISCARDED if decided
+        else DecisionStatus.PENDING,
+        tags=["t"] if decided else [], abstract_lookup=lookup,
+      )
+
+    save_session(ReviewSession(
+      query="q", providers=["openalex"], timestamp=datetime(2026, 11, 20),
+      name="show-gap", decisions=[
+        decision(1, lookup=failed), decision(2),
+        decision(3, abstract="Text."), decision(4, decided=False),
+      ],
+    ))
+    return failed
+
+  def test_text_and_json(self, tmp_path, monkeypatch):
+    failed = self._make_session(tmp_path, monkeypatch)
+    text = runner.invoke(app, ["sessions", "show", "show-gap"])
+    assert text.exit_code == 0, text.output
+    assert ("2 of the 3 decided papers were decided without an abstract "
+            "(1 a lookup failed; 1 no record of a lookup).") \
+      in " ".join(text.output.split())
+    as_json = runner.invoke(app, ["sessions", "show", "show-gap", "-f",
+                                  "json"])
+    data = json.loads(as_json.output)
+    assert data["decided_without_abstract"] == {
+      "decided": 3, "without_abstract": 2, "every_source_had_none": 0,
+      "not_asked": 0, "lookup_failed": 1, "no_record": 1,
+    }
+    lookups = {d["doi"]: d.get("abstract_lookup")
+               for d in data["decisions"]}
+    assert lookups["10.5555/show-gap-1"] == failed
+    assert lookups["10.5555/show-gap-2"] is None
+@
+
 \paragraph{Quotes in the machine reasons.}
 A reason that quotes words its record does not hold
 (\cref{sec:reason-quotes} in the review module) reads as evidence it
@@ -8297,6 +8452,9 @@ def sessions_show(
         quote_check_tally, reason_quote_checks, unmatched_quotes_of,
     )
     from scholar.review import screenings_summary
+    from scholar.review import (
+        abstract_gap, decided_without_abstract_sentence,
+    )
 
     console = Console()
     session = open_session_argument(name)
@@ -8375,6 +8533,10 @@ def sessions_show(
                         if d.abstract_set else {}
                     ),
                     **(
+                        {"abstract_lookup": d.abstract_lookup}
+                        if d.abstract_lookup else {}
+                    ),
+                    **(
                         {"screenings": d.screenings}
                         if d.screenings else {}
                     ),
@@ -8394,6 +8556,9 @@ def sessions_show(
             **(
                 {"reason_quotes": quote_tally}
                 if reason_quotes_line(quote_tally) else {}
+            ),
+            **decided_without_abstract_data(
+                abstract_gap(d for d in session.decisions if d.is_decided)
             ),
             **{
                 key: [
@@ -8474,6 +8639,14 @@ def sessions_show(
             quotes_line = reason_quotes_line(quote_tally)
             if quotes_line:
                 con.print(f"[cyan]{escape(quotes_line)}[/cyan]")
+                con.print()
+
+            # Count the decisions made on records without an abstract
+            without_abstract = decided_without_abstract_sentence(
+                session.decisions
+            )
+            if without_abstract:
+                con.print(f"[cyan]{escape(without_abstract)}[/cyan]")
                 con.print()
 
             # Count the screenings beside the decisions
@@ -10116,6 +10289,29 @@ def sessions_decide(
                  "saved.",
         ),
     ] = False,
+    strict: Annotated[
+        bool,
+        typer.Option(
+            "--strict",
+            help="With --reason or --reasons-file: refuse the batch (exit 2, "
+                 "nothing saved) on any finding of the batch check (one "
+                 "reason shared by rows about different records, one "
+                 "confidence on every row, a long run of identical "
+                 "rows) and on any quote not found, which "
+                 "--strict-quotes refuses alone. A single --reason "
+                 "for many records is noted, never refused. Without "
+                 "it the findings are listed on stderr and the batch "
+                 "is saved.",
+        ),
+    ] = False,
+    dry_run: Annotated[
+        bool,
+        typer.Option(
+            "--dry-run",
+            help="Run every check and print what would be recorded; "
+                 "write nothing. Exits as the real run would.",
+        ),
+    ] = False,
 ) -> None:
     """
     Record keep/discard decisions in a saved session, without the TUI.
@@ -10183,6 +10379,17 @@ def sessions_decide(
     it is a paraphrase or belongs to another record. The batch is saved
     all the same, unless --strict-quotes refuses it (exit 2).
 
+    The batch is also checked as a whole: reasons shared by rows about
+    different records, one confidence on every row, long runs of
+    identical rows (thresholds: `scholar sessions check-batches
+    --help`). The findings are listed on stderr and the batch is saved;
+    --strict refuses it (exit 2) on any finding or any quote not found.
+    One --reason for many records is a rule applied on purpose and only
+    noted. --dry-run runs every check and writes nothing.
+
+    An agent or LLM decision on records without an abstract prints one
+    line counting them, with what the last `scholar enrich` found.
+
     A human decision (--source human, also the default at a terminal)
     keeps a record of the review: the time, the channel (`decide`) and
     the name given with --by (not guessed). `sessions show` and the
@@ -10226,8 +10433,10 @@ def sessions_decide(
     <<select decisions by doi and paper id>>
     <<refuse to decide copies decided apart>>
     <<refuse to let a machine replace a human decision>>
-    saving = True
+    saving = not dry_run
     <<check the quotes of the agent's reasons>>
+    <<check the batch as a whole>>
+    <<warn about decided records without an abstract>>
 
     status = DecisionStatus.KEPT if keep else DecisionStatus.DISCARDED
     untag_seen: set[str] = set()
@@ -10236,15 +10445,7 @@ def sessions_decide(
         <<record one decision with its source>>
 
     <<note the tags no paper had>>
-    save_session(session)
-    word = "kept" if keep else "discarded"
-    papers = len({d.paper.id for d in selected.values()})
-    copies = (f" ({len(selected)} decisions)"
-              if len(selected) != papers else "")
-    console.print(
-        f"[green]{papers} paper(s) marked {word}{copies}[/green] "
-        f"in session '{escape(name)}'"
-    )
+    <<report or save the decisions>>
 @
 
 The summary counts papers, not decisions: a work held twice under one
@@ -10980,7 +11181,8 @@ trace.  For a human, [[--by]] is accepted alone and names who decided
 in the human's review record (below); with [[--source llm]] it is
 refused like the reasons.  [[--strict-quotes]] without a reason is
 refused too, since it would have no quote to check
-(\cref{sec:decide-quote-check}).
+(\cref{sec:decide-quote-check}), and so is [[--strict]], which would
+have no reason to check (\cref{sec:decide-batch-check}).
 
 Most screens decide many records with one verdict but a reason of
 their own each.  One command per record would work, but each command
@@ -11066,6 +11268,12 @@ if strict_quotes and reason is None and reasons_file is None:
     console.print(
         "[red]--strict-quotes checks the quotes of a reason; give "
         "--reason or --reasons-file too.[/red]"
+    )
+    raise typer.Exit(2)
+if strict and reason is None and reasons_file is None:
+    console.print(
+        "[red]--strict checks the reasons of a batch; give --reason or "
+        "--reasons-file too.[/red]"
     )
     raise typer.Exit(2)
 <<check the reason, the name and the reasons file>>
@@ -13127,9 +13335,9 @@ status~2 like the other refusals, for a screener who wants a mix-up to
 stop the run.  A record's id appears once per line, however many copies
 the session holds under it.  The line that says the batch is saved all
 the same is printed only when the command is about to save
-([[saving]], which each command sets before the check): [[sessions
-decide]] always is, [[sessions screen]] (\cref{sec:sessions-screen})
-not on a dry run.
+([[saving]], which each command sets before the check), not on a dry
+run of either command, and not under [[--strict]], which refuses the
+batch after the batch check (\cref{sec:decide-batch-check}).
 
 <<sessions command>>=
 QUOTE_PROBLEMS_SHOWN = 20
@@ -13190,10 +13398,10 @@ if quote_misses:
         )
         console.print("[yellow]No changes saved.[/yellow]")
         raise typer.Exit(2)
-    if saving:
+    if saving and not strict:
         errors.print(
-            "[yellow]Saved all the same; --strict-quotes refuses such a "
-            "batch.[/yellow]"
+            "[yellow]Saved all the same; --strict-quotes or --strict "
+            "refuses such a batch.[/yellow]"
         )
 @
 
@@ -13393,6 +13601,843 @@ def test_a_placeholder_reason_option_is_refused(
                         name="no-such-session")
   assert result.exit_code == 2, result.output
   assert "--reason: reason 'TBD' is a placeholder" in result.output
+@
+
+
+\paragraph{The batch as a whole.}
+\label{sec:decide-batch-check}
+A reasons file can pass every line check and the quote check and still
+not be a screener's work: a screener given several hundred records
+that read some and filled the rest with one reason and one confidence
+writes well-formed lines (\url{https://github.com/dbosk/scholarcli/issues/291}).
+So once the ids are resolved, after the quote check and before
+anything is saved, the batch is checked as a whole with the review
+module's [[batch_findings]] (\cref{sec:batch-check} there, which states
+the thresholds and why they are what they are): reasons shared by rows
+about different records, one confidence on every row, and long runs of
+identical rows.  [[sessions screen --verdicts-file]]
+(\cref{sec:sessions-screen}) runs the same chunk.
+
+The rows are the file's lines in the file's order, one per line, each
+with the title of the record its id names; a line's confidence is its
+own column, never [[-c]], which is the same for every line by
+construction.  A single [[--reason]] for many records shares its
+reason by construction too: it is how a rule is applied on purpose,
+so it is checked as one, and reported as information (\enquote{Noted:
+one reason for 50 records\dots}), which nothing refuses.  A command
+without a reason has nothing to check.
+
+The findings go to standard error, each with its count and the first
+[[BATCH_PAPERS_SHOWN]] ids, the rest counted, so that a screener can
+look at the rows the check means.  By default the batch is then saved,
+as with the quote check: the check is a heuristic, a batch it flags may
+be honest, and scripts written before it must keep working.
+[[--strict]] refuses the batch instead, unsaved and with status~2, on
+any finding that is not information \emph{and} on any quote not found,
+so that one option stops a run on everything the checks of a batch can
+see.  [[--strict-quotes]] stays as it was, the narrower option, and
+refuses on quotes alone, before the batch check is printed.  Under
+[[--strict]] every finding is printed before the refusal, so a
+screener sees all that is wrong in one run.
+
+<<sessions command>>=
+BATCH_PAPERS_SHOWN = 5
+
+
+def batch_rows_of(lines, by_id: dict, by_doi: dict) -> list:
+    """The batch check's rows of a reasons or verdicts file, in its order.
+
+    Each row has the title of the first decision its id names; a
+    verdicts file's lines also give the verdict and tags.
+    """
+    from scholar.review import BatchRow
+
+    rows = []
+    for entry in sorted(lines, key=lambda entry: entry.line):
+        matches = decisions_named_by(entry.paper, by_id, by_doi)
+        rows.append(BatchRow(
+            paper=entry.paper,
+            title=matches[0].paper.title if matches else None,
+            reason=entry.reason,
+            confidence=entry.confidence,
+            status=getattr(entry, "status", None),
+            tags=tuple(getattr(entry, "tags", ())),
+        ))
+    return rows
+
+
+def one_reason_rows(decisions, reason: str) -> list:
+    """The batch check's rows of one `--reason`, one per paper."""
+    from scholar.review import BatchRow
+
+    papers = {d.paper.id: d.paper for d in decisions}
+    return [BatchRow(paper=paper_id, title=paper.title, reason=reason)
+            for paper_id, paper in papers.items()]
+
+
+def batch_finding_lines(findings) -> list[str]:
+    """One line per finding: its detail and the first ids it concerns."""
+    lines = []
+    for finding in findings:
+        shown = ", ".join(finding.papers[:BATCH_PAPERS_SHOWN])
+        more = len(finding.papers) - BATCH_PAPERS_SHOWN
+        line = f"{finding.detail}: {shown}" + (
+            f" \N{HORIZONTAL ELLIPSIS}and {more} more" if more > 0 else ""
+        )
+        lines.append(f"Noted: {line}" if finding.information else line)
+    return lines
+@
+
+The chunk reads [[trace_of]] (each decision named in the file, mapped
+to its line), [[reason]], [[selected]], [[by_id]], [[by_doi]],
+[[quote_misses]] (from the quote check, just before), [[strict]] and
+[[saving]], which both commands define under these names.  The lines of
+the file are taken from [[trace_of]], once each, since a line naming a
+work held twice under one id is mapped from both copies.
+
+<<check the batch as a whole>>=
+from scholar.review import batch_findings
+
+if trace_of:
+    lines_given = {id(entry): entry for entry in trace_of.values()}
+    findings = batch_findings(
+        batch_rows_of(lines_given.values(), by_id, by_doi)
+    )
+elif reason is not None:
+    findings = batch_findings(
+        one_reason_rows(selected.values(), reason), one_reason=True
+    )
+else:
+    findings = []
+refusable = [finding for finding in findings if not finding.information]
+if findings:
+    errors = Console(stderr=True)
+    if refusable:
+        errors.print(
+            "[yellow]The batch as a whole (scholar's own thresholds; "
+            "see `scholar sessions check-batches --help`):[/yellow]",
+            soft_wrap=True,
+        )
+    for line in batch_finding_lines(findings):
+        errors.print(f"  {escape(line)}", soft_wrap=True, highlight=False)
+    if refusable and saving and not strict:
+        errors.print(
+            "[yellow]Saved all the same; --strict refuses such a "
+            "batch.[/yellow]"
+        )
+if strict and (refusable or quote_misses):
+    console.print(
+        "[red]--strict: the batch has "
+        + " and ".join(
+            what for what, present in (
+                (f"{len(refusable)} batch finding(s)", refusable),
+                (f"{len(quote_misses)} quote(s) not found", quote_misses),
+            ) if present
+        )
+        + ".[/red]"
+    )
+    console.print("[yellow]No changes saved.[/yellow]")
+    raise typer.Exit(2)
+@
+
+Let's check it through [[sessions decide]] on invented sessions.  The
+reported shape is a reasons file of 365 lines, of which forty were read
+and 325 carry one reason; it is reported with its counts and first ids
+and saved, and refused unsaved with [[--strict]].  The honest batches
+are the review module's (\cref{sec:batch-check}), here through the
+command: a small file whose lines agree, a large file with round
+confidences, copies of one work sharing a reason, and one [[--reason]]
+for fifty records, which is noted and saved even under [[--strict]].
+[[--strict]] also refuses on a quote not found, and like
+[[--strict-quotes]] it needs a reason to check.
+
+<<test functions>>=
+class TestDecideChecksTheBatch:
+  """`sessions decide` checks a reasons file as a whole (#291)."""
+
+  <<decide batch check test methods>>
+<<decide batch check test methods>>=
+FILLED = "Not relevant to the research question."
+
+def _make_session(self, tmp_path, monkeypatch, count, copies=0,
+                  without_abstract=(), lookups=None):
+  monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+  from scholar.review import (
+    ReviewDecision, ReviewSession, save_session, session_file_path,
+  )
+
+  papers = [
+    Paper(title=f"Batch Work {n}", authors=["A"], doi=f"10.1/batch-{n}",
+          abstract=(None if n in without_abstract
+                    else f"An abstract about work {n}."))
+    for n in range(count)
+  ] + [
+    Paper(title=f"Batch Work {n}", authors=["A"],
+          abstract=f"An abstract about work {n}.")
+    for n in range(copies)
+  ]
+  session = ReviewSession(
+    query="q", providers=["openalex"], timestamp=datetime(2026, 11, 20),
+    name="batch", decisions=[
+      ReviewDecision(paper=paper, provider="openalex",
+                     abstract_lookup=(lookups or {}).get(n))
+      for n, paper in enumerate(papers)
+    ],
+  )
+  save_session(session)
+  return session_file_path(session), session
+
+def _decide(self, *args):
+  return runner.invoke(app, [
+    "sessions", "decide", "batch", "--source", "agent", "--discard",
+    "--tag", "off-topic-false-hit", "--by", "screener-1", *args,
+  ])
+
+def _file(self, tmp_path, lines):
+  path = tmp_path / "reasons.tsv"
+  path.write_text("".join(line + "\n" for line in lines), encoding="utf-8")
+  return str(path)
+
+def _reported_shape(self, tmp_path):
+  read = [f"doi:10.1/batch-{n}\tWork {n} studies something else, "
+          f"namely topic {n}.\t{(0.6, 0.75, 0.9)[n % 3]}"
+          for n in range(40)]
+  filled = [f"doi:10.1/batch-{n}\t{self.FILLED}\t0.85"
+            for n in range(40, 365)]
+  return self._file(tmp_path, read + filled)
+
+def test_the_reported_shape_is_reported_and_saved(
+  self, tmp_path, monkeypatch
+):
+  from scholar.review import load_session
+
+  path, _ = self._make_session(tmp_path, monkeypatch, 365)
+  result = self._decide("--reasons-file", self._reported_shape(tmp_path))
+  assert result.exit_code == 0, result.output
+  stderr = " ".join(result.stderr.split())
+  assert "The batch as a whole (scholar's own thresholds" in stderr
+  assert ("325 of 365 rows share their reason with a row about another "
+          "record (325 rows: \"Not relevant to the research question.\"): "
+          "doi:10.1/batch-40, doi:10.1/batch-41, doi:10.1/batch-42, "
+          "doi:10.1/batch-43, doi:10.1/batch-44 …and 320 more"
+          ) in stderr
+  assert "325 rows in runs of consecutive rows with the same reason" \
+    in stderr
+  assert "Saved all the same; --strict refuses such a batch." in stderr
+  stored = {d.paper.doi: d for d in load_session("batch").decisions}
+  assert stored["10.1/batch-364"].agent_reason == self.FILLED
+
+def test_strict_refuses_the_reported_shape_unsaved(
+  self, tmp_path, monkeypatch
+):
+  path, _ = self._make_session(tmp_path, monkeypatch, 365)
+  before = path.read_bytes()
+  result = self._decide("--reasons-file", self._reported_shape(tmp_path),
+                        "--strict")
+  assert result.exit_code == 2, result.output
+  assert "--strict: the batch has 2 batch finding(s)." in result.output
+  assert "No changes saved." in result.output
+  assert "Saved all the same" not in result.stderr
+  assert path.read_bytes() == before
+@
+
+<<decide batch check test methods>>=
+def _assert_saved_without_findings(self, path, before, result):
+  assert result.exit_code == 0, result.output
+  assert "The batch as a whole" not in result.stderr
+  assert path.read_bytes() != before
+
+def test_a_small_file_whose_lines_agree_is_saved(
+  self, tmp_path, monkeypatch
+):
+  path, _ = self._make_session(tmp_path, monkeypatch, 6)
+  before = path.read_bytes()
+  reasons = self._file(tmp_path, [
+    f"doi:10.1/batch-{n}\tA compiler course, no learners.\t0.9"
+    for n in range(6)
+  ])
+  result = self._decide("--reasons-file", reasons, "--strict")
+  self._assert_saved_without_findings(path, before, result)
+
+def test_round_confidences_are_saved(self, tmp_path, monkeypatch):
+  path, _ = self._make_session(tmp_path, monkeypatch, 120)
+  before = path.read_bytes()
+  reasons = self._file(tmp_path, [
+    f"doi:10.1/batch-{n}\tWork {n} is about topic {n}, not ours."
+    f"\t{0.9 if n % 4 else 0.8}"
+    for n in range(120)
+  ])
+  result = self._decide("--reasons-file", reasons, "--strict")
+  self._assert_saved_without_findings(path, before, result)
+
+def test_copies_sharing_a_reason_are_saved(self, tmp_path, monkeypatch):
+  path, session = self._make_session(tmp_path, monkeypatch, 15, copies=15)
+  before = path.read_bytes()
+  lines = []
+  for n in range(15):
+    bare = session.decisions[15 + n].paper.id
+    reason = f"Work {n}: a survey of tools, no learners."
+    lines += [f"doi:10.1/batch-{n}\t{reason}", f"{bare}\t{reason}"]
+  result = self._decide("--reasons-file", self._file(tmp_path, lines),
+                        "--strict")
+  self._assert_saved_without_findings(path, before, result)
+
+def test_one_reason_for_many_records_is_noted_and_saved(
+  self, tmp_path, monkeypatch
+):
+  path, _ = self._make_session(tmp_path, monkeypatch, 50)
+  before = path.read_bytes()
+  selectors = [arg for n in range(50) for arg in ("--doi", f"10.1/batch-{n}")]
+  result = self._decide(*selectors, "--reason",
+                        "No evaluation with learners; criterion 3.",
+                        "-c", "0.8", "--strict")
+  assert result.exit_code == 0, result.output
+  stderr = " ".join(result.stderr.split())
+  assert ("Noted: one reason for 50 records, a rule applied on purpose: "
+          "\"No evaluation with learners; criterion 3.\": "
+          "doi:10.1/batch-0") in stderr
+  assert "The batch as a whole" not in stderr
+  assert path.read_bytes() != before
+
+def test_strict_refuses_a_quote_not_found(self, tmp_path, monkeypatch):
+  path, _ = self._make_session(tmp_path, monkeypatch, 2)
+  before = path.read_bytes()
+  reasons = self._file(tmp_path, [
+    'doi:10.1/batch-0\tSays "an abstract about work one".',
+    "doi:10.1/batch-1\tAbout something else.",
+  ])
+  result = self._decide("--reasons-file", reasons, "--strict")
+  assert result.exit_code == 2, result.output
+  assert "--strict: the batch has 1 quote(s) not found." in result.output
+  assert "The batch as a whole" not in result.stderr
+  assert path.read_bytes() == before
+
+def test_strict_needs_a_reason(self, tmp_path, monkeypatch):
+  monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+  result = runner.invoke(app, [
+    "sessions", "decide", "no-such-session", "--source", "agent",
+    "--discard", "--tag", "t", "--doi", "10.1/x", "--strict",
+  ])
+  assert result.exit_code == 2, result.output
+  assert "--strict checks the reasons of a batch" in result.output
+
+def test_the_help_says_what_strict_covers(self):
+  import click
+
+  group = typer.main.get_command(app)
+  context = click.Context(group)
+  sessions = group.get_command(context, "sessions")
+  for command in ("decide", "screen"):
+    params = {p.name: p.help for p in
+              sessions.get_command(context, command).params}
+    for words in ("batch check", "quote", "exit 2", "--strict-quotes"):
+      assert words in params["strict"], (command, words)
+@
+
+[[sessions screen]] runs the same chunk on a verdicts file, where a run
+also needs the same verdict and tags: the reported shape as a verdicts
+file is reported and recorded, and refused unsaved with [[--strict]].
+
+<<decide batch check test methods>>=
+def test_screen_checks_a_verdicts_file(self, tmp_path, monkeypatch):
+  path, _ = self._make_session(tmp_path, monkeypatch, 365)
+  verdicts = tmp_path / "verdicts.tsv"
+  verdicts.write_text("".join(
+    f"doi:10.1/batch-{n}\tdiscarded\toff-topic\t"
+    + (f"Work {n} studies topic {n}.\t{(0.6, 0.9)[n % 2]}" if n < 40
+       else f"{self.FILLED}\t0.85")
+    + "\n"
+    for n in range(365)
+  ), encoding="utf-8")
+  args = ["sessions", "screen", "batch", "--as", "agent", "--by",
+          "agent-2", "--verdicts-file", str(verdicts)]
+  before = path.read_bytes()
+  strict = runner.invoke(app, [*args, "--strict"])
+  assert strict.exit_code == 2, strict.output
+  assert "--strict: the batch has 2 batch finding(s)." in strict.output
+  assert path.read_bytes() == before
+  result = runner.invoke(app, args)
+  assert result.exit_code == 0, result.output
+  stderr = " ".join(result.stderr.split())
+  assert ("325 rows in runs of consecutive rows with the same verdict, "
+          "tags and reason") in stderr
+  assert "Saved all the same; --strict refuses such a batch." in stderr
+  assert "Recorded 365 screening(s)" in " ".join(result.output.split())
+@
+
+\paragraph{A dry run of a decision.}
+[[sessions decide --dry-run]] runs everything a real run runs up to the
+save: the line checks, the id resolution, the copy and conflict rules,
+the quote check and the batch check, and their refusals with the same
+exit codes, so that a screener, or a validator outside Scholar, can ask
+Scholar whether a batch would pass instead of reimplementing its
+checks (\url{https://github.com/dbosk/scholarcli/issues/291}).  It then
+records the decisions in memory only, so that what it reports (the
+tags no paper had, the papers counted) is what the real run would
+report, says what it would have recorded, and writes nothing: no save,
+and no line that says the batch was saved.  [[sessions decide]] keeps
+no copy of the session before a run, so there is no copy to skip.
+
+<<report or save the decisions>>=
+word = "kept" if keep else "discarded"
+papers = len({d.paper.id for d in selected.values()})
+copies = (f" ({len(selected)} decisions)"
+          if len(selected) != papers else "")
+if dry_run:
+    console.print(
+        f"Would mark {papers} paper(s) {word}{copies} by {source} in "
+        f"session '{escape(name)}'; nothing written."
+    )
+else:
+    save_session(session)
+    console.print(
+        f"[green]{papers} paper(s) marked {word}{copies}[/green] "
+        f"in session '{escape(name)}'"
+    )
+@
+
+The test runs the reported shape as a dry run: the findings are
+printed, the session file is untouched, and the exit status is the real
+run's, 0 without [[--strict]] and 2 with it; a missing id still exits 1.
+
+<<decide batch check test methods>>=
+def test_a_dry_run_checks_and_writes_nothing(self, tmp_path, monkeypatch):
+  path, _ = self._make_session(tmp_path, monkeypatch, 365)
+  before = path.read_bytes()
+  reasons = self._reported_shape(tmp_path)
+  result = self._decide("--reasons-file", reasons, "--dry-run")
+  assert result.exit_code == 0, result.output
+  assert "Would mark 365 paper(s) discarded by agent in session " \
+    "'batch'; nothing written." in " ".join(result.output.split())
+  assert "325 of 365 rows share their reason" in result.stderr
+  assert "Saved" not in result.stderr
+  assert "marked discarded" not in result.output
+  strict = self._decide("--reasons-file", reasons, "--dry-run", "--strict")
+  assert strict.exit_code == 2, strict.output
+  missing = self._decide("--doi", "10.1/not-there", "--reason", "Off.",
+                         "--dry-run")
+  assert missing.exit_code == 1, missing.output
+  assert path.read_bytes() == before
+  assert list(path.parent.glob("*.bak")) == []
+@
+
+\paragraph{Checking the batches a session stores.}
+\label{sec:sessions-check-batches}
+The batch check runs when a batch is recorded, so batches written
+before it existed went in unchecked.  [[scholar sessions check-batches
+S]] examines them: it groups the session's stored agent reasons and
+screenings by run ([[stored_batch_runs]], \cref{sec:batch-check} in
+the review module) and lists each run with findings, the findings
+printed as [[sessions decide]] prints them; the count in its first line
+leaves out runs that were only noted, one reason on every row.  It is
+a command of its own
+rather than a flag of [[sessions show]], which prints a session, or of
+[[sessions check]], which checks a session against a semantic search:
+this one reads only the stored reasons and confidences, and its output
+is a list of runs.  It is read-only, never saves, and exits~0 whatever
+it finds, since it reports on decisions already made; [[-f json]] gives
+every run checked with its findings, for a script.  The help states the
+thresholds, which are scholar's own choice, explained in the review
+module; [[sessions decide]] and [[sessions screen]] point to it.
+
+<<sessions command>>=
+@sessions_app.command("check-batches")
+def sessions_check_batches(
+    name: Annotated[
+        str,
+        typer.Argument(
+            help="Session name or query whose stored batches to check.",
+            autocompletion=complete_session_name,
+        ),
+    ],
+    output_format: Annotated[
+        str,
+        typer.Option(
+            "--format", "-f",
+            help="Output format: table or json.",
+            autocompletion=complete_display_format,
+        ),
+    ] = "table",
+) -> None:
+    """
+    Check the stored agent reasons and screenings of a session, by run.
+
+    The decisions of one `sessions decide --source agent` run share the
+    agent's name and time, and the screenings of one `sessions screen`
+    or second-screen run their screener and time. Each run is checked
+    as a batch, as `sessions decide --reasons-file` and `sessions
+    screen --verdicts-file` check a file, and the runs with findings
+    are listed. Read-only; exits 0.
+
+    The thresholds are scholar's own choice, made so that an honest
+    batch (a handful of rows, round confidences, copies of one work
+    sharing a reason, two or three records excluded for one reason) is
+    not flagged: rows sharing their reason with rows about other
+    records are a finding when they are at least 10 and a quarter of
+    the rows; one confidence on every row when there are at least 20;
+    a run of identical consecutive rows (checked when a file is given,
+    not here: storage keeps no line order) from 10 works. One reason on
+    every row of a run is noted, never flagged: it may be one --reason,
+    a rule applied on purpose. A flat confidence in a stored run may
+    come from one -c for the whole run.
+    """
+    from scholar.review import stored_batch_runs
+
+    if output_format not in ("table", "json"):
+        Console().print(
+            f"[red]Unknown format: {escape(output_format)}; use table or "
+            "json.[/red]"
+        )
+        raise typer.Exit(2)
+    session = open_session_argument(name)
+    if session is None:
+        Console().print(f"[red]Session not found: {escape(name)}[/red]")
+        raise typer.Exit(1)
+    runs = stored_batch_runs(session)
+    if output_format == "json":
+        print(json.dumps(check_batches_data(runs), indent=2))
+        return
+    for line in check_batches_lines(runs, name):
+        Console().print(escape(line), soft_wrap=True, highlight=False)
+@
+
+The run is named by what it stored, who and when, and an unnamed agent
+as such, since a name is never guessed.
+
+<<sessions command>>=
+def stored_run_label(run) -> str:
+    """`agent screener-1, <time> (365 agent decisions)` for a stored run."""
+    who = f"{run.kind} {run.name}" if run.name else f"{run.kind} (no name)"
+    return (f"{who}, {run.at or 'time not recorded'} "
+            f"({len(run.rows)} {run.what})")
+
+
+def check_batches_lines(runs, name: str) -> list[str]:
+    """The text of `sessions check-batches`: runs with findings."""
+    flagged = [run for run in runs if run.findings]
+    with_findings = sum(
+        any(not finding.information for finding in run.findings)
+        for run in flagged
+    )
+    lines = [
+        f"Checked {len(runs)} stored run(s) in session '{name}': "
+        f"{with_findings} with findings."
+    ]
+    for run in flagged:
+        lines.append(stored_run_label(run) + ":")
+        lines.extend(f"  {line}" for line in batch_finding_lines(run.findings))
+    if runs:
+        lines.append(
+            "Stored runs keep no line order, so runs of identical rows "
+            "are not looked for; a confidence given with -c to a whole "
+            "run reads as one confidence on every row."
+        )
+    return lines
+
+
+def check_batches_data(runs) -> dict:
+    """The JSON of `sessions check-batches`: every run and its findings."""
+    return {"runs": [
+        {
+            "what": run.what, "kind": run.kind, "name": run.name,
+            "at": run.at, "rows": len(run.rows),
+            "findings": [
+                {"kind": f.kind, "count": f.count, "rows": f.rows,
+                 "papers": list(f.papers), "detail": f.detail,
+                 "information": f.information}
+                for f in run.findings
+            ],
+        }
+        for run in runs
+    ]}
+@
+
+Let's run it on a saved session with a defaulted agent run and an honest
+one: the defaulted run is listed with its finding, the honest run is
+not, the file is left as it was, and the JSON lists both runs.  The
+help's numbers are the review module's constants, so a change of a
+threshold that forgets the help fails here.
+
+<<test functions>>=
+class TestSessionsCheckBatches:
+  """`sessions check-batches` checks stored runs (#291)."""
+
+  def _make_session(self, tmp_path, monkeypatch):
+    from scholar.review import (
+      DecisionStatus, ReviewDecision, ReviewSession, ReviewSource,
+      save_session, session_file_path,
+    )
+
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+
+    def decision(n, reason, at, confidence):
+      return ReviewDecision(
+        paper=Paper(title=f"Checked Work {n}", authors=["A"],
+                    doi=f"10.5555/checked-{n}"),
+        provider="openalex", status=DecisionStatus.DISCARDED, tags=["t"],
+        source=ReviewSource.AGENT_UNREVIEWED, agent_reason=reason,
+        agent_by="screener-1", agent_decided_at=at,
+        llm_confidence=confidence,
+      )
+
+    filled_at = "2026-11-20T10:00:00+00:00"
+    honest_at = "2026-11-21T10:00:00+00:00"
+    session = ReviewSession(
+      query="q", providers=["openalex"], timestamp=datetime(2026, 11, 20),
+      name="checked", decisions=(
+        [decision(n, f"Work {n} is about topic {n}.", filled_at, 0.7)
+         for n in range(10)]
+        + [decision(10 + n, "Not relevant.", filled_at, 0.85)
+           for n in range(30)]
+        + [decision(100 + n, f"Work {n} studies topic {n}.", honest_at,
+                    (0.8, 0.9)[n % 2]) for n in range(30)]
+      ),
+    )
+    save_session(session)
+    return session_file_path(session)
+
+  def test_the_defaulted_run_is_listed(self, tmp_path, monkeypatch):
+    path = self._make_session(tmp_path, monkeypatch)
+    before = path.read_bytes()
+    result = runner.invoke(app, ["sessions", "check-batches", "checked"])
+    assert result.exit_code == 0, result.output
+    flat = " ".join(result.output.split())
+    assert "Checked 2 stored run(s) in session 'checked': 1 with " \
+      "findings." in flat
+    assert ("agent screener-1, 2026-11-20T10:00:00+00:00 (40 agent "
+            "decisions): 30 of 40 rows share their reason") in flat
+    assert "2026-11-21" not in flat
+    assert path.read_bytes() == before
+    data = json.loads(runner.invoke(
+      app, ["sessions", "check-batches", "checked", "-f", "json"]).output)
+    assert [(r["at"][:10], [f["kind"] for f in r["findings"]])
+            for r in data["runs"]] == [
+      ("2026-11-20", ["shared-reasons"]), ("2026-11-21", []),
+    ]
+
+  def test_the_help_states_the_thresholds(self):
+    from scholar.review import (
+      FLAT_CONFIDENCE_MIN_ROWS, IDENTICAL_RUN_MIN_ROWS,
+      SHARED_REASON_MIN_ROWS, SHARED_REASON_MIN_SHARE,
+    )
+
+    assert SHARED_REASON_MIN_SHARE == 0.25
+    help_text = " ".join(sessions_check_batches.__doc__.split())
+    assert (f"at least {SHARED_REASON_MIN_ROWS} and a quarter of the rows"
+            in help_text)
+    assert f"when there are at least {FLAT_CONFIDENCE_MIN_ROWS}" in help_text
+    assert f"from {IDENTICAL_RUN_MIN_ROWS} works" in help_text
+@
+
+\paragraph{Records decided without an abstract.}
+\label{sec:decided-without-abstract}
+Records were screened before [[scholar enrich]] had been run, so that
+their verdicts rest on titles alone, and nothing said so
+(\url{https://github.com/dbosk/scholarcli/issues/293}).  So whenever a
+machine or an agent records verdicts ([[sessions decide --source]]
+[[agent]] or [[llm]], [[sessions screen --as]] [[agent]] or [[llm]],
+[[llm classify]] with or without [[--second-screen]]), the command
+prints one line on standard error when some of the records it decided
+or screened have no abstract: how many of how many, split by what the
+last enrichment found for them ([[abstract_gap]],
+\cref{sec:abstract-lookup} in the review module), and the hint to run
+[[scholar enrich]] first.  The hint is given only when it can help,
+that is when a lookup failed or there is no record of one; a record
+every source answered without an abstract, or one without a DOI, would
+get the same answer again.  It is a warning and nothing more: a review
+may have a rule for records without an abstract, and the screener may
+be applying it.  A human's decisions get no such line, since a human at
+the TUI or the terminal sees the record in front of them.  A dry run
+says \enquote{selected} instead of \enquote{decided}, since nothing is.
+The session is named as the user types it ([[session_argument]]),
+quoted for the shell.
+
+<<sessions command>>=
+def abstract_gap_line(gap, argument: str, verb: str) -> str | None:
+    """The line on records `verb` (decided, screened) without an abstract.
+
+    None when every record has an abstract (and none is doubtful).
+    """
+    import shlex
+
+    from scholar.review import abstract_gap_parts
+
+    if not gap.without and not gap.doubtful:
+        return None
+    parts = abstract_gap_parts(gap)
+    line = f"{gap.without} of the {gap.papers} records {verb} have no abstract"
+    if parts:
+        line += f" ({'; '.join(parts)})"
+    if gap.doubtful:
+        line += f", and {gap.doubtful} have a doubtful one"
+    if gap.failed or gap.no_record:
+        line += (
+            f"; run `scholar enrich {shlex.quote(argument)} --pending-only "
+            "--fields abstract` first if that has not been tried"
+        )
+    return line + "."
+
+
+def print_abstract_gap(decisions, session, verb: str) -> None:
+    """Print `abstract_gap_line` for `decisions` on stderr, if any."""
+    from scholar.review import abstract_gap, session_argument
+
+    line = abstract_gap_line(
+        abstract_gap(decisions), session_argument(session), verb
+    )
+    if line:
+        Console(stderr=True).print(
+            f"[yellow]{escape(line)}[/yellow]", soft_wrap=True,
+            highlight=False,
+        )
+<<warn about decided records without an abstract>>=
+if source in MACHINE_DECISION_SOURCES:
+    print_abstract_gap(
+        selected.values(), session, "selected" if dry_run else "decided"
+    )
+@
+
+The line itself is a pure function of the counts and is checked
+directly: every part, the hint only when it can help, and a session
+name with a space quoted for the shell.
+
+<<test functions>>=
+class TestAbstractGapLine:
+  """The line on records decided without an abstract (#293)."""
+
+  def test_parts_and_hint(self):
+    from scholar.review import AbstractGap
+
+    gap = AbstractGap(papers=10, without=4, none_found=1, failed=1,
+                      not_asked=1, no_record=1)
+    assert abstract_gap_line(gap, "my review", "decided") == (
+      "4 of the 10 records decided have no abstract (1 every source "
+      "asked had none; 1 not asked (no DOI, or no source available); "
+      "1 a lookup failed; 1 no record of a lookup); run `scholar enrich "
+      "'my review' --pending-only --fields abstract` first if that has "
+      "not been tried."
+    )
+
+  def test_no_hint_when_running_again_cannot_help(self):
+    from scholar.review import AbstractGap
+
+    gap = AbstractGap(papers=3, without=2, none_found=1, not_asked=1)
+    assert abstract_gap_line(gap, "r", "screened") == (
+      "2 of the 3 records screened have no abstract (1 every source "
+      "asked had none; 1 not asked (no DOI, or no source available))."
+    )
+    assert abstract_gap_line(AbstractGap(papers=3), "r", "decided") is None
+    assert abstract_gap_line(
+      AbstractGap(papers=3, doubtful=1), "r", "decided"
+    ) == ("0 of the 3 records decided have no abstract, and 1 have a "
+          "doubtful one.")
+@
+
+Each command prints it.  [[sessions decide]] with an agent's verdicts on
+three records, one with an abstract, one whose lookup failed and one
+without a record, prints it with the hint; the same decision by a
+human prints nothing.  [[sessions screen --as agent]] prints it for the
+screened records, also on a dry run, which says \enquote{selected}.
+
+<<decide batch check test methods>>=
+def _gap_session(self, tmp_path, monkeypatch):
+  path, _ = self._make_session(
+    tmp_path, monkeypatch, 3, without_abstract=(1, 2),
+    lookups={1: {"at": "2026-11-20T10:00:00+00:00", "outcome": "failed",
+                 "asked": ["s2"], "failed": {"s2": "HTTP 429"}}},
+  )
+  return path
+
+def test_records_without_an_abstract_are_counted(
+  self, tmp_path, monkeypatch
+):
+  self._gap_session(tmp_path, monkeypatch)
+  selectors = [arg for n in range(3) for arg in ("--doi", f"10.1/batch-{n}")]
+  result = self._decide(*selectors, "--reason", "Not about learners.")
+  assert result.exit_code == 0, result.output
+  assert ("2 of the 3 records decided have no abstract (1 a lookup "
+          "failed; 1 no record of a lookup); run `scholar enrich batch "
+          "--pending-only --fields abstract` first if that has not been "
+          "tried.") in " ".join(result.stderr.split())
+  human = runner.invoke(app, [
+    "sessions", "decide", "batch", "--source", "human", "--keep",
+    *selectors,
+  ])
+  assert human.exit_code == 0, human.output
+  assert "have no abstract" not in human.stderr
+
+def test_screen_counts_them_too(self, tmp_path, monkeypatch):
+  self._gap_session(tmp_path, monkeypatch)
+  args = ["sessions", "screen", "batch", "--as", "agent", "--by", "agent-2",
+          "--keep", "--doi", "10.1/batch-2"]
+  dry = runner.invoke(app, [*args, "--dry-run"])
+  assert dry.exit_code == 0, dry.output
+  assert "1 of the 1 records selected have no abstract" in dry.stderr
+  result = runner.invoke(app, args)
+  assert result.exit_code == 0, result.output
+  assert ("1 of the 1 records screened have no abstract (1 no record of "
+          "a lookup)") in " ".join(result.stderr.split())
+@
+
+[[llm classify]] prints it after its summary, for the papers it decided,
+and with [[--second-screen]] for the papers it screened.  The model is
+the fake of the second-screen tests (\cref{sec:llm-classify-second-screen}),
+which keeps every paper; of the two pending papers one has no abstract,
+and so has the machine's decision among the two decided ones.
+
+<<test functions>>=
+class TestLLMClassifyCountsMissingAbstracts:
+  """`llm classify` says how many records it decided lacked one (#293)."""
+
+  def _make_session(self, tmp_path, monkeypatch):
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+    from scholar.review import (
+      DecisionStatus, ReviewDecision, ReviewSession, ReviewSource,
+      save_session,
+    )
+
+    def paper(n, abstract):
+      return Paper(title=f"Recursion Study {n}", authors=["A"],
+                   doi=f"10.5555/gap-{n}", abstract=abstract)
+
+    save_session(ReviewSession(
+      query="q", providers=["openalex"], timestamp=datetime(2026, 11, 20),
+      name="second", research_context="Do novices misread recursion?",
+      decisions=[
+        ReviewDecision(paper=paper(0, None), provider="openalex",
+                       status=DecisionStatus.DISCARDED, tags=["off-topic"],
+                       source=ReviewSource.LLM_UNREVIEWED,
+                       llm_model="model-a"),
+        ReviewDecision(paper=paper(1, "Students traced calls."),
+                       provider="openalex", status=DecisionStatus.KEPT,
+                       tags=["recursion"]),
+        ReviewDecision(paper=paper(2, None), provider="openalex"),
+        ReviewDecision(paper=paper(3, "Students misread base cases."),
+                       provider="openalex"),
+      ],
+    ))
+
+  def test_a_classification(self, tmp_path, monkeypatch):
+    self._make_session(tmp_path, monkeypatch)
+    TestLLMClassifySecondScreen._fake(self, monkeypatch)
+    result = runner.invoke(app, [
+      "llm", "classify", "second", "-m", "model-a", "--no-enrich",
+      "--no-examples",
+    ])
+    assert result.exit_code == 0, result.output
+    assert ("1 of the 2 records decided have no abstract (1 no record of "
+            "a lookup)") in " ".join(result.stderr.split())
+
+  def test_a_second_screen(self, tmp_path, monkeypatch):
+    self._make_session(tmp_path, monkeypatch)
+    TestLLMClassifySecondScreen._fake(self, monkeypatch)
+    result = runner.invoke(app, [
+      "llm", "classify", "second", "--second-screen", "--over", "all",
+      "-m", "model-b", "--no-enrich",
+    ])
+    assert result.exit_code == 0, result.output
+    assert ("1 of the 2 records screened have no abstract (1 no record of "
+            "a lookup)") in " ".join(result.stderr.split())
 @
 
 \subsection{Correcting who decided}
@@ -16198,6 +17243,21 @@ def sessions_screen(
                  "stderr.",
         ),
     ] = False,
+    strict: Annotated[
+        bool,
+        typer.Option(
+            "--strict",
+            help="With --reason or --verdicts-file: refuse the batch (exit 2, "
+                 "nothing saved) on any finding of the batch check (one "
+                 "reason shared by rows about different records, one "
+                 "confidence on every row, a long run of identical "
+                 "rows) and on any quote not found, which "
+                 "--strict-quotes refuses alone. A single --reason "
+                 "for many records is noted, never refused. Without "
+                 "it the findings are listed on stderr and the batch "
+                 "is saved.",
+        ),
+    ] = False,
 ) -> None:
     """
     Record another screener's verdicts beside the decisions.
@@ -16223,6 +17283,12 @@ def sessions_screen(
     verdict must carry exactly one that fits its status. Any bad line,
     any id not in the session or one paper given two verdicts aborts
     the batch unsaved.
+
+    A verdicts file is also checked as a whole, as `sessions decide`
+    checks a reasons file (shared reasons, one confidence on every row,
+    long runs of identical verdicts, tags and reasons): the findings are
+    listed on stderr and the batch is saved, unless --strict refuses it
+    (exit 2), which it also does for a quote not found.
 
     Examples:
         scholar sessions screen my-review --as agent --by second-agent \\
@@ -16253,6 +17319,8 @@ def sessions_screen(
     <<refuse to screen copies decided apart>>
     saving = not dry_run
     <<check the quotes of the agent's reasons>>
+    <<check the batch as a whole>>
+    <<warn about screened records without an abstract>>
     <<record the screenings>>
 @
 
@@ -16306,6 +17374,9 @@ if confidence is not None and not 0.0 <= confidence <= 1.0:
     usage.append(f"-c {confidence} is not between 0 and 1.")
 if strict_quotes and reason is None and verdicts_file is None:
     usage.append("--strict-quotes checks the quotes of a reason; give "
+                 "--reason or --verdicts-file too.")
+if strict and reason is None and verdicts_file is None:
+    usage.append("--strict checks the reasons of a batch; give "
                  "--reason or --verdicts-file too.")
 if sample is not None:
     sample = sample.strip()
@@ -16640,7 +17711,21 @@ The quote check is [[sessions decide]]'s
 ([[<<check the quotes of the agent's reasons>>]]): it reads
 [[selected]], [[trace_of]], [[reason]], [[strict_quotes]] and
 [[saving]], which the chunks above define under the same names; a dry
-run is not saving, so it does not say the batch was saved.  Then the screenings are
+run is not saving, so it does not say the batch was saved.  The batch
+check follows ([[<<check the batch as a whole>>]],
+\cref{sec:decide-batch-check}), with [[--strict]] as there, and so does
+the line on records without an abstract
+(\cref{sec:decided-without-abstract}) for an agent's or a
+classifier's screen.
+
+<<warn about screened records without an abstract>>=
+if as_kind in ("agent", "llm"):
+    print_abstract_gap(
+        selected.values(), session, "selected" if dry_run else "screened"
+    )
+@
+
+  Then the screenings are
 recorded, after the snapshot of each decided paper's verdict
 ([[record_screening]]).  The summary counts the papers, like
 [[sessions decide]]'s, and the snapshots it took.
@@ -20052,6 +21137,7 @@ def llm_classify(
         console.print(f"  Pending: {stats['pending']}")
         <<report papers left pending by the classifier>>
         <<report reasons quoting words not in the record>>
+        print_abstract_gap(updated, session, "decided")
 
     except ValueError as e:
         console.print(
@@ -21310,6 +22396,7 @@ print_reason_quote_misses(
     console, [d for d, _ in screen.screened], screen.batch.passages,
     reason_of=lambda d: reasons[id(d)],
 )
+print_abstract_gap([d for d, _ in screen.screened], session, "screened")
 if copy_path is not None:
     console.print(f"[dim]Copy of the session before: {copy_path}[/dim]")
 @

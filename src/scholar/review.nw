@@ -65,6 +65,7 @@ session persistence, and report generation.
 <<review session functions>>
 <<review filtering functions>>
 <<review quote check>>
+<<review batch check>>
 <<review report generation>>
 @
 
@@ -680,6 +681,10 @@ class ReviewDecision:
             (`{"at", "from", "by", "chars", "text", "previous"}`,
             `previous` only when an abstract was replaced), oldest
             first; see `set_abstract`.
+        abstract_lookup: What `scholar enrich` found the last time it
+            asked for the paper's abstract (`{"at", "outcome", "asked",
+            "failed"}`, see `ABSTRACT_LOOKUP_OUTCOMES`); `None` when no
+            lookup was recorded.
         screenings: Verdicts of other screeners beside the decision, and
             snapshots of the decision's own verdict taken when the first
             of them was recorded (dicts keyed by `SCREENING_KEYS`), in
@@ -705,6 +710,7 @@ class ReviewDecision:
     relabelled: list[dict] = field(default_factory=list)
     resets: list[dict] = field(default_factory=list)
     abstract_set: list[dict] = field(default_factory=list)
+    abstract_lookup: dict | None = None
     screenings: list[dict] = field(default_factory=list)
     baseline_key: str | None = field(default=None, compare=False, repr=False)
 
@@ -3279,6 +3285,351 @@ def test_a_stale_set_abstract_saved_last(self):
   assert saved["paper"]["abstract"] == "Found by hand."
   [record] = saved["abstract_set"]
   assert record["previous"] == "A provider's abstract."
+@
+
+\subsection{Abstract lookups by enrichment}
+\label{sec:abstract-lookup}
+
+A record without an abstract can mean that no source holds one, or
+that nobody asked.  [[scholar enrich]] tells the two apart for the
+papers of one run ([[LookupOutcome]], \cref{sec:enrich-lookup-outcomes}
+in the enrichment module), but used to keep nothing of it, so a
+screener deciding a record weeks later could not tell either; records
+were screened on titles alone before anyone had run the enrichment
+(\url{https://github.com/dbosk/scholarcli/issues/293}).  The decision
+therefore keeps, in [[abstract_lookup]], what [[scholar enrich]] found
+the last time it asked for the paper's abstract:
+[[{"at", "outcome", "asked", "failed"}]], the UTC time of the run, one
+of [[ABSTRACT_LOOKUP_OUTCOMES]], the sources asked (left out when none
+was) and the failed ones with their reasons (left out when none
+failed).  The outcomes are those of the run's tally
+(\cref{sec:enrich-lookup-outcomes}):
+\begin{description}
+\item[ [[found]] ] the run filled the abstract;
+\item[ [[none-found]] ] every source asked answered, and none had an
+  abstract;
+\item[ [[failed]] ] at least one lookup failed, so the abstract may be
+  there for the asking;
+\item[ [[no-doi]] ] nothing could be asked, the paper has no DOI;
+\item[ [[none-asked]] ] the paper has a DOI, but every source declined
+  or none was available.
+\end{description}
+The enrichment module once said that the outcome belongs to the run,
+since a stored \enquote{failed} goes stale when the next run is
+answered.  The record carries its time for that reason and holds only
+the latest attempt: a later run replaces it, and a reader sees when the
+answer was given.  It is one dictionary, not a history like
+[[abstract_set]], because only the latest attempt says anything about
+the record as it stands.
+
+It is set by [[scholar enrich]] only, for the papers it asked an
+abstract for.  Like [[abstract_set]] (\cref{sec:set-abstract}) it lives
+on the decision, not on the [[Paper]], so that the three-way merge of
+paper metadata needs no rule for it, and for the same reason it is not
+part of [[decision_state]] or of [[is_unscreened]]: an enrichment run
+that loaded the session before a human decided a paper must not, by
+holding a changed record, put the old pending decision back over the
+human's in its save.  It is saved only when set, loaded as [[None]] from
+a file without it, copied with the decision on an append, and in a
+concurrent save the newer of the two records wins
+([[later_abstract_lookup]]), since both describe the same paper and
+the later attempt replaces the earlier.  Sessions written before it
+existed have no record: that says nothing about whether a lookup was
+made, and the counts below call it \enquote{no record of a lookup},
+never \enquote{never looked up}.
+
+<<review data structures>>=
+ABSTRACT_LOOKUP_OUTCOMES: tuple[str, ...] = (
+    "found", "none-found", "failed", "no-doi", "none-asked",
+)
+
+
+def later_abstract_lookup(
+    ours: dict | None, theirs: dict | None
+) -> dict | None:
+    """The later of two abstract lookup records; `ours` on a tie."""
+    if not isinstance(theirs, dict):
+        return ours
+    if not isinstance(ours, dict):
+        return theirs
+    if str(theirs.get("at") or "") > str(ours.get("at") or ""):
+        return theirs
+    return ours
+@
+
+A fold of two copies (\cref{sec:session-copies}) keeps the DOI copy's
+record: the survivor takes the DOI copy's paper, and the DOI-less
+copy's record can only say [[no-doi]], which is no longer true of it.
+
+\paragraph{Counting decisions made without an abstract.}
+The counts are made over a set of decisions, one per paper: the
+records a command has just decided or screened, or every decided paper
+of a session.  A paper without an abstract (none, or only white space)
+is sorted by its record: [[none-found]], [[failed]], not asked
+([[no-doi]] and [[none-asked]]) or no record.  A record of a
+[[found]] abstract on a paper that has none (the abstract was replaced
+since, by a preprint's adoption, say) does not describe the paper as it
+stands, so it counts as no record, as does an outcome this version
+does not know.
+
+A stored abstract may also not be one: a cookie notice or a
+publisher's boilerplate kept as the abstract
+(\url{https://github.com/dbosk/scholarcli/issues/287}).  That check is
+not in this version, so [[abstract_is_doubtful]] is the place where it
+will be asked; it answers [[False]] until then, and the count of
+doubtful abstracts stays zero and unprinted.
+
+<<review data structures>>=
+def abstract_is_doubtful(paper: Paper) -> bool:
+    """Whether `paper`'s stored abstract is doubtful (hook for #287).
+
+    Always False in this version: the check of doubtful abstracts is
+    issue #287; the counts of `abstract_gap` call it already.
+    """
+    return False
+
+
+@dataclass(frozen=True)
+class AbstractGap:
+    """How many of some decided papers lack an abstract, and why.
+
+    `papers` counts the papers, `without` those without an abstract,
+    split by their lookup record into `none_found`, `failed`,
+    `not_asked` and `no_record`; `doubtful` counts papers whose
+    abstract `abstract_is_doubtful` doubts.
+    """
+
+    papers: int = 0
+    without: int = 0
+    none_found: int = 0
+    failed: int = 0
+    not_asked: int = 0
+    no_record: int = 0
+    doubtful: int = 0
+
+
+def has_abstract(paper: Paper) -> bool:
+    """Whether `paper` holds an abstract that is not only white space."""
+    return bool((paper.abstract or "").strip())
+
+
+def abstract_gap(decisions) -> AbstractGap:
+    """Count the papers of `decisions` without an abstract, by lookup."""
+    counts = dict.fromkeys(
+        ("without", "none_found", "failed", "not_asked", "no_record",
+         "doubtful"), 0,
+    )
+    seen: dict[str, ReviewDecision] = {}
+    for decision in decisions:
+        seen.setdefault(get_paper_id(decision.paper), decision)
+    for decision in seen.values():
+        if has_abstract(decision.paper):
+            counts["doubtful"] += abstract_is_doubtful(decision.paper)
+            continue
+        counts["without"] += 1
+        record = decision.abstract_lookup
+        outcome = record.get("outcome") if isinstance(record, dict) else None
+        if outcome == "none-found":
+            counts["none_found"] += 1
+        elif outcome == "failed":
+            counts["failed"] += 1
+        elif outcome in ("no-doi", "none-asked"):
+            counts["not_asked"] += 1
+        else:
+            counts["no_record"] += 1
+    return AbstractGap(papers=len(seen), **counts)
+@
+
+The parts are named in the order a user acts on them, as the
+enrichment's own tally names them: what is settled, what could not be
+asked, what failed and what nobody knows.  A part of zero is left out.
+
+<<review data structures>>=
+def abstract_gap_parts(gap: AbstractGap) -> list[str]:
+    """The parts of `gap.without`, e.g. `3 every source asked had none`."""
+    return [
+        f"{count} {what}"
+        for count, what in (
+            (gap.none_found, "every source asked had none"),
+            (gap.not_asked, "not asked (no DOI, or no source available)"),
+            (gap.failed, "a lookup failed"),
+            (gap.no_record, "no record of a lookup"),
+        )
+        if count
+    ]
+@
+
+<<test functions>>=
+class TestAbstractLookupRecord:
+  """What enrichment found when it asked for the abstract (#293)."""
+
+  def _decision(self, n, abstract=None, outcome=None, doi=True):
+    paper = Paper(title=f"Lookup Work {n}", authors=["A"],
+                  doi=f"10.5555/lookup-{n}" if doi else None,
+                  abstract=abstract)
+    record = ({"at": "2026-11-20T10:00:00+00:00", "outcome": outcome}
+              if outcome else None)
+    return ReviewDecision(paper=paper, provider="openalex",
+                          status=DecisionStatus.DISCARDED, tags=["t"],
+                          abstract_lookup=record)
+
+  def test_the_gap_is_split_by_record(self):
+    decisions = [
+      self._decision(1, abstract="An abstract."),
+      self._decision(2, outcome="none-found"),
+      self._decision(3, outcome="failed"),
+      self._decision(4, outcome="no-doi", doi=False),
+      self._decision(5, outcome="none-asked"),
+      self._decision(6),
+      self._decision(7, abstract="   ", outcome="found"),
+      self._decision(8, outcome="from a later version"),
+    ]
+    decisions.append(decisions[2])
+    gap = abstract_gap(decisions)
+    assert gap == AbstractGap(papers=8, without=7, none_found=1, failed=1,
+                              not_asked=2, no_record=3)
+    assert abstract_gap_parts(gap) == [
+      "1 every source asked had none",
+      "2 not asked (no DOI, or no source available)",
+      "1 a lookup failed", "3 no record of a lookup",
+    ]
+
+  def test_the_later_record_wins(self):
+    early = {"at": "2026-11-19T10:00:00+00:00", "outcome": "failed"}
+    late = {"at": "2026-11-20T10:00:00+00:00", "outcome": "none-found"}
+    assert later_abstract_lookup(early, late) is late
+    assert later_abstract_lookup(late, early) is late
+    assert later_abstract_lookup(None, early) is early
+    assert later_abstract_lookup(early, None) is early
+    assert later_abstract_lookup(late, dict(late)) is late
+
+  def test_it_is_not_part_of_the_decision_state(self):
+    decision = self._decision(9)
+    before = decision_state(decision)
+    decision.abstract_lookup = {"at": "2026-11-20", "outcome": "failed"}
+    assert decision_state(decision) == before
+    pending = ReviewDecision(paper=decision.paper, provider="openalex",
+                             abstract_lookup={"at": "x", "outcome": "failed"})
+    assert is_unscreened(pending)
+@
+
+The record travels as [[abstract_set]] does: saved only when set,
+absent from a file without one, kept by an append, and in a save that
+merges another process's changes the later record wins, whichever
+process wrote it: a human's decision saved after an enrichment keeps
+the enrichment's record, a process holding an older record does not
+put it back, and neither undoes the human's decision.
+
+<<test functions>>=
+class TestAbstractLookupPersistence:
+  """The lookup record is saved, appended and merged (#293)."""
+
+  AT1 = "2026-11-19T10:00:00+00:00"
+  AT2 = "2026-11-20T10:00:00+00:00"
+
+  def _session(self, name):
+    return ReviewSession(
+      query="q", providers=["openalex"], timestamp=datetime(2026, 11, 20),
+      name=name, decisions=[ReviewDecision(
+        paper=Paper(title="Persisted Lookup", authors=["Ada Lovelace"],
+                    year=2021, doi=f"10.5555/lookup-{name}"),
+        provider="openalex",
+      )],
+    )
+
+  def _load_apart(self, name):
+    from scholar.scholar import isolated_registry
+
+    with isolated_registry():
+      return load_session(name)
+
+  def test_saved_only_when_set(self, tmp_path, monkeypatch):
+    import json
+
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+    path = save_session(self._session("lookup-file"))
+    assert "abstract_lookup" not in json.loads(
+      path.read_text())["decisions"][0]
+    session = load_session("lookup-file")
+    assert session.decisions[0].abstract_lookup is None
+    record = {"at": self.AT1, "outcome": "none-found", "asked": ["s2"]}
+    session.decisions[0].abstract_lookup = record
+    save_session(session)
+    assert json.loads(path.read_text())["decisions"][0][
+      "abstract_lookup"] == record
+    assert self._load_apart("lookup-file").decisions[0].abstract_lookup \
+      == record
+
+  def test_append_keeps_it(self, tmp_path, monkeypatch):
+    from scholar.scholar import SearchResult
+
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+    session = self._session("lookup-append")
+    record = {"at": self.AT1, "outcome": "failed", "asked": ["s2"],
+              "failed": {"s2": "HTTP 429"}}
+    session.decisions[0].abstract_lookup = record
+    save_session(session)
+    paper = Paper(title="Persisted Lookup", authors=["Ada Lovelace"],
+                  year=2021, doi="10.5555/lookup-lookup-append",
+                  sources=["openalex"])
+    appended = create_review_session([SearchResult(
+      query="q", provider="openalex", timestamp="t", papers=[paper],
+    )], "q", session_name="lookup-append")
+    assert appended.decisions[0].abstract_lookup == record
+
+  def test_a_concurrent_save_keeps_the_later_record(
+    self, tmp_path, monkeypatch
+  ):
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+    save_session(self._session("lookup-merge"))
+    enricher = self._load_apart("lookup-merge")
+    human = self._load_apart("lookup-merge")
+    stale = self._load_apart("lookup-merge")
+    later = {"at": self.AT2, "outcome": "none-found"}
+    enricher.decisions[0].abstract_lookup = later
+    save_session(enricher)
+    human.decisions[0].status = DecisionStatus.KEPT
+    human.decisions[0].tags = ["t"]
+    save_session(human)
+    stored = self._load_apart("lookup-merge").decisions[0]
+    assert stored.status == DecisionStatus.KEPT
+    assert stored.abstract_lookup == later
+    stale.decisions[0].abstract_lookup = {"at": self.AT1,
+                                          "outcome": "failed"}
+    save_session(stale)
+    stored = self._load_apart("lookup-merge").decisions[0]
+    assert stored.status == DecisionStatus.KEPT
+    assert stored.abstract_lookup == later
+@
+
+A fold whose DOI-less copy survives, because it was decided and its DOI
+twin was not, takes the twin's paper and with it the twin's record; the
+DOI-less copy's [[no-doi]] would otherwise stay on a paper with a DOI.
+
+<<test functions>>=
+class TestAbstractLookupFold:
+  def test_the_doi_copy_record_survives(self, tmp_path, monkeypatch):
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+    bare = ReviewDecision(
+      paper=Paper(title="Folded Lookup", authors=["Ada Lovelace"],
+                  year=2021),
+      provider="dblp", status=DecisionStatus.KEPT, tags=["t"],
+      abstract_lookup={"at": "2026-11-20", "outcome": "no-doi"},
+    )
+    twin = ReviewDecision(
+      paper=Paper(title="Folded Lookup", authors=["Ada Lovelace"],
+                  year=2021, doi="10.5555/lookup-fold"),
+      provider="openalex",
+      abstract_lookup={"at": "2026-11-19", "outcome": "none-found"},
+    )
+    session = ReviewSession(query="q", providers=["openalex"],
+                            timestamp=datetime(2026, 11, 20))
+    session.decisions = [bare, twin]
+    assert reconcile_copies(session) != []
+    [survivor] = session.decisions
+    assert survivor.status == DecisionStatus.KEPT
+    assert survivor.paper.doi == "10.5555/lookup-fold"
+    assert survivor.abstract_lookup["outcome"] == "none-found"
 @
 
 \subsection{Screenings: verdicts beside the decision}
@@ -8739,6 +9090,7 @@ for result in results:
                 relabelled=list(prev_dec.relabelled),
                 resets=list(prev_dec.resets),
                 abstract_set=list(prev_dec.abstract_set),
+                abstract_lookup=prev_dec.abstract_lookup,
                 screenings=list(prev_dec.screenings),
             )
         elif prev_record:
@@ -9794,6 +10146,7 @@ before_fold = [
 ]
 survivor.paper = merge_version_of(with_doi.paper, bare.paper)
 survivor.abstract_set = abstract_records_after_fold(survivor.paper, before_fold)
+survivor.abstract_lookup = with_doi.abstract_lookup
 for link in absorbed.found_by:
     survivor.record_search(*link)
 for copy in absorbed.same_id_copies:
@@ -11906,6 +12259,11 @@ def read_session_file(
                     relabelled=list(dec_data.get("relabelled") or []),
                     resets=list(dec_data.get("resets") or []),
                     abstract_set=list(dec_data.get("abstract_set") or []),
+                    abstract_lookup=(
+                        dec_data.get("abstract_lookup")
+                        if isinstance(dec_data.get("abstract_lookup"), dict)
+                        else None
+                    ),
                     screenings=list(dec_data.get("screenings") or []),
                 )
             )
@@ -12045,6 +12403,10 @@ data = {
             **(
                 {"abstract_set": d.abstract_set}
                 if d.abstract_set else {}
+            ),
+            **(
+                {"abstract_lookup": d.abstract_lookup}
+                if d.abstract_lookup else {}
             ),
             **({"screenings": d.screenings} if d.screenings else {}),
             "paper": d.paper.to_dict(include_refs_cites=True),
@@ -12725,6 +13087,9 @@ def merge_concurrent_changes(
                 decision.add_reset(record)
             for record in theirs.abstract_set:
                 decision.add_abstract_record(record)
+            decision.abstract_lookup = later_abstract_lookup(
+                decision.abstract_lookup, theirs.abstract_lookup
+            )
             unite_screenings(decision, theirs.screenings)
         base_state = base_states.get(base_key_of(decision, base))
         if (theirs is not None and base_state is not None
@@ -18393,6 +18758,650 @@ def test_ten_thousand_reasons_are_checked_quickly(self):
 @
 
 
+\section{Checking a batch of reasons as a whole}
+\label{sec:batch-check}
+
+The checks of \cref{sec:reason-quotes} and the line checks of a reasons
+file (\cref{sec:decide-quote-check} in the CLI module) look at one row
+at a time, and a row can pass them all and still not be a screener's
+verdict.  Agent screening through [[sessions decide --reasons-file]]
+and [[sessions screen --verdicts-file]] showed how
+(\url{https://github.com/dbosk/scholarcli/issues/291}): screeners given
+several hundred records each read some of them and filled the rest
+with one verdict, one shared reason and one confidence.  Every such
+line is well formed: an id that exists, a reason with letters, a
+confidence in range, no placeholder, often no quote to check.  What
+gives the batch away is the batch: the same reason on many records
+with different titles, the same confidence on every row, and a long
+run of identical rows.  Scholar used to store every row as a reasoned
+verdict, and nothing in the session tells such a row apart afterwards.
+
+This section holds the check as one pure function over the rows of
+\emph{one} batch: a reasons file, a verdicts file, one [[--reason]]
+given to many records, or a run of verdicts already stored.  It returns
+findings, each with its kind, its count and the records concerned;
+printing them, and refusing a batch under [[--strict]], is the
+commands' business (\cref{sec:decide-batch-check} in the CLI module),
+and so is the read-only report over stored runs
+([[sessions check-batches]]).
+
+The check is a heuristic about what defaulted rows look like, and it
+can err both ways.  A check that warns on honest batches will be
+switched off, and one that only fires on a batch that is all one row
+is useless.  Its thresholds are therefore scholar's own choice, made
+from the one case reported in the issue and from what an honest batch
+looks like, and each is stated with its reason below.  The issue
+describes the case: in one pass, three of four batches of about 365
+rows had been filled so, and batches of 100 had not.  No figure is
+known about how often screeners default rows, and none is assumed.
+
+\subsection{Rows and findings}
+
+A row is what the check needs of one line of a batch.  It names its
+record as the batch named it (a line's id, or the paper id), carries
+the record's title, the reason and, from a verdicts file, the verdict
+and its tags.  The confidence is the row's \emph{own}: the third column
+of a reasons file, the fifth of a verdicts file.  A [[-c]] given for
+the whole batch applies to every row by construction, like one
+[[--reason]], so it says nothing about how the rows were written and
+is not put into the rows.
+
+<<review batch check>>=
+@dataclass(frozen=True)
+class BatchRow:
+    """One row of a screening batch, as `batch_findings` reads it.
+
+    `paper` names the record as the batch named it; `title` is the
+    record's title (copies of one work share it); `confidence` is the
+    row's own, not one given for the whole batch; `status` and `tags`
+    are a verdicts file's verdict (None and empty for a reasons file).
+    """
+
+    paper: str
+    title: str | None
+    reason: str | None
+    confidence: float | None = None
+    status: str | None = None
+    tags: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class BatchFinding:
+    """What the batch check found: kind, rows concerned, their records.
+
+    `count` is the number of rows concerned, `rows` the number of rows
+    checked, `papers` the records concerned in batch order (each once),
+    `detail` one sentence for a reader. An `information` finding is
+    reported but never refuses a batch.
+    """
+
+    kind: str
+    count: int
+    rows: int
+    papers: tuple[str, ...]
+    detail: str
+    information: bool = False
+@
+
+Two rows share a reason when their texts are equal once white space is
+collapsed and case is folded: a screener that pastes one reason does
+not vary its case, but a line break or a doubled space from a script's
+template should not hide the copy.  Punctuation is kept, since
+\enquote{Off topic} and \enquote{Off topic.} are already a near-miss a
+reader would not call one reason, and a looser comparison would start
+to call short honest reasons copies of each other.  A title is reduced
+to its case-folded letters and digits, as the audit table reduces it
+([[audit_work_key]]), so the copies of one work that two providers
+spelt with other punctuation still count as one; a row without a title
+counts as a work of its own.
+
+<<review batch check>>=
+def batch_reason_key(reason: str | None) -> str | None:
+    """A reason with white space collapsed and case folded; None if empty."""
+    if not reason or not reason.strip():
+        return None
+    return " ".join(reason.split()).casefold()
+
+
+def batch_title_key(row: BatchRow) -> str:
+    """The work a row is about: its folded title, else its own id."""
+    folded = unicodedata.normalize(
+        "NFKD", clean_metadata_text(row.title or "")
+    ).casefold()
+    letters = "".join(c for c in folded if c.isalnum())
+    return f"title:{letters}" if letters else f"id:{row.paper}"
+@
+
+\subsection{The three findings}
+
+\paragraph{Shared reasons.}
+A row counts as sharing its reason when another row about a
+\emph{different} work has the same reason.  Copies of one work, which
+a session can hold under two ids (\cref{sec:session-copies}), may
+honestly share a reason, and two rows naming one record do so by
+definition, so a reason given only to rows of one title is not shared.
+The finding is made when the rows sharing a reason are at least
+[[SHARED_REASON_MIN_ROWS]] (ten) and at least
+[[SHARED_REASON_MIN_SHARE]] (a quarter) of the rows with a reason.
+Both are needed.  Ten keeps a small batch out, as the issue asks, and
+leaves room for two or three records excluded for one stated reason
+(\enquote{No empirical evaluation.}), which an honest screener writes
+without being careless.  The quarter keeps a large batch with a few
+small groups of such reasons out: forty-odd rows in groups of three in
+a batch of 365 are a screener's habits, not a default.  The reported
+batches had most of their rows on one reason, far above both.
+
+\paragraph{One confidence on every row.}
+The finding is made when every row with its own confidence has the
+same one, and there are at least [[FLAT_CONFIDENCE_MIN_ROWS]] (twenty)
+of them.  A screener that gives round confidences, 0.8 and 0.9, uses
+more than one value over a batch unless every record looks equally
+clear to it, and below twenty rows a batch of equally clear records
+(ten obvious off-topic hits, each given 0.9) is too likely to be
+honest to warn about.  The reported batches were about 365 rows.  The
+check asks for \emph{every} row, not most of them: a screener that
+read forty records with confidences of their own and gave the other
+three hundred one value does not make this finding, but the other two
+do.
+
+\paragraph{A run of identical rows.}
+The finding is made when at least [[IDENTICAL_RUN_MIN_ROWS]] (ten)
+consecutive rows about different works have the same verdict, tags and
+reason (a verdicts file), or the same reason (a reasons file, whose
+verdict and tags are one for the whole file anyway).  A run is counted
+in works, so copies of one work next to each other add one, and a row
+without a reason ends a run.  It catches what the share misses: a block
+of defaulted rows that is less than a quarter of a long batch.  Ten is
+the same as for shared reasons, and for the same reason; a rule applied
+to many records on purpose belongs in a [[--reason]] of its own run,
+where it is reported as such (below), not in a file of individual
+reasons.
+
+<<review batch check>>=
+SHARED_REASON_MIN_ROWS = 10
+SHARED_REASON_MIN_SHARE = 0.25
+FLAT_CONFIDENCE_MIN_ROWS = 20
+IDENTICAL_RUN_MIN_ROWS = 10
+@
+
+\paragraph{One reason for many records.}
+A single [[--reason]] given to many records shares its reason by
+construction: it is how a rule is applied on purpose (\enquote{No
+abstract; excluded under criterion 3}).  So such a batch gets one
+finding of its own, [[one-reason]], as information, which never
+refuses a batch, and none of the three above.  The same holds for a
+stored run whose rows all carry one reason
+([[sessions check-batches]]), which cannot tell such a [[--reason]]
+from a file with one reason on every line.
+
+<<review batch check>>=
+def batch_findings(
+    rows: Sequence[BatchRow], *, one_reason: bool = False,
+    ordered: bool = True,
+) -> list[BatchFinding]:
+    """Check a batch of screening rows as a whole.
+
+    Returns `shared-reasons`, `flat-confidence` and `identical-run`
+    findings (see `SHARED_REASON_MIN_ROWS` and the other thresholds),
+    or, when `one_reason` says that one reason was given to every row
+    on purpose, one `one-reason` finding as information. `ordered`
+    false skips the run check, for rows whose order is not the
+    batch's.
+    """
+    if one_reason:
+        return _one_reason_findings(rows)
+    findings = [
+        finding for finding in (
+            _shared_reason_finding(rows),
+            _flat_confidence_finding(rows),
+            _identical_run_finding(rows) if ordered else None,
+        )
+        if finding is not None
+    ]
+    return findings
+
+
+def _papers_of(rows) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(row.paper for row in rows))
+@
+
+The shared reasons are found by grouping the rows by reason and keeping
+the groups about two works or more; the detail names the most common
+reason, cut short, since it is the first thing a reader wants to see.
+
+<<review batch check>>=
+BATCH_REASON_SHOWN_CHARS = 60
+
+
+def _shown_reason(reason: str) -> str:
+    reason = " ".join(reason.split())
+    if len(reason) > BATCH_REASON_SHOWN_CHARS:
+        reason = reason[:BATCH_REASON_SHOWN_CHARS - 1].rstrip() + "…"
+    return f'"{reason}"'
+
+
+def _shared_reason_finding(rows) -> BatchFinding | None:
+    groups: dict[str, list[BatchRow]] = {}
+    for row in rows:
+        key = batch_reason_key(row.reason)
+        if key is not None:
+            groups.setdefault(key, []).append(row)
+    with_reason = sum(len(group) for group in groups.values())
+    shared = [
+        group for group in groups.values()
+        if len({batch_title_key(row) for row in group}) > 1
+    ]
+    count = sum(len(group) for group in shared)
+    if (count < SHARED_REASON_MIN_ROWS
+            or count < SHARED_REASON_MIN_SHARE * with_reason):
+        return None
+    largest = max(shared, key=len)
+    in_shared = {id(row) for group in shared for row in group}
+    shared_rows = [row for row in rows if id(row) in in_shared]
+    return BatchFinding(
+        "shared-reasons", count, with_reason, _papers_of(shared_rows),
+        f"{count} of {with_reason} rows share their reason with a row "
+        f"about another record ({len(largest)} rows: "
+        f"{_shown_reason(largest[0].reason)})",
+    )
+
+
+def _flat_confidence_finding(rows) -> BatchFinding | None:
+    rated = [row for row in rows if row.confidence is not None]
+    if (len(rated) < FLAT_CONFIDENCE_MIN_ROWS
+            or len({row.confidence for row in rated}) != 1):
+        return None
+    return BatchFinding(
+        "flat-confidence", len(rated), len(rows), _papers_of(rated),
+        f"all {len(rated)} rows with a confidence have the same one, "
+        f"{rated[0].confidence:g}",
+    )
+@
+
+A run is read in the order of the rows.  Its key is the verdict, the
+tags and the reason; for a reasons file the first two are [[None]] and
+empty on every row, so the key is the reason alone.  Every run long
+enough is part of the finding, and the detail names the longest.
+
+<<review batch check>>=
+def _identical_run_finding(rows) -> BatchFinding | None:
+    runs: list[list[BatchRow]] = []
+    current: list[BatchRow] = []
+    current_key = None
+    for row in rows:
+        reason = batch_reason_key(row.reason)
+        key = (row.status, tuple(row.tags), reason) if reason else None
+        if key is not None and key == current_key:
+            current.append(row)
+            continue
+        runs.append(current)
+        current, current_key = ([row], key) if key is not None else ([], None)
+    runs.append(current)
+    long_runs = [
+        run for run in runs
+        if len({batch_title_key(row) for row in run})
+        >= IDENTICAL_RUN_MIN_ROWS
+    ]
+    if not long_runs:
+        return None
+    run_rows = [row for run in long_runs for row in run]
+    longest = max(long_runs, key=len)
+    what = ("verdict, tags and reason" if longest[0].status is not None
+            else "reason")
+    return BatchFinding(
+        "identical-run", len(run_rows), len(rows), _papers_of(run_rows),
+        f"{len(run_rows)} rows in runs of consecutive rows with the same "
+        f"{what} (longest {len(longest)} rows: "
+        f"{_shown_reason(longest[0].reason)})",
+    )
+
+
+def _one_reason_findings(rows) -> list[BatchFinding]:
+    papers = _papers_of(row for row in rows if row.reason)
+    if len(papers) < 2:
+        return []
+    reason = next(row.reason for row in rows if row.reason)
+    return [BatchFinding(
+        "one-reason", len(papers), len(rows), papers,
+        f"one reason for {len(papers)} records, a rule applied on "
+        f"purpose: {_shown_reason(reason)}",
+        information=True,
+    )]
+@
+
+\subsection{Testing the batch check}
+
+The tests feed the function invented batches.  The reported shape
+comes first: 365 rows, the first forty read, each with a reason and a
+confidence of its own, and the other 325 one verdict, one reason and
+one confidence.  It makes the shared-reason and the run findings, and
+not the flat one, since forty rows have confidences of their own.  A
+batch whose reasons differ but whose every row says 0.9 makes the flat
+finding alone.
+
+The honest batches are written as carefully, since a check that cries
+wolf on them would be switched off: a handful of rows that agree in
+everything; a large batch whose screener gives round confidences;
+copies of one work sharing a reason, next to each other; three records
+excluded for one stated reason in a batch of forty; a large batch of
+discards, grouped by verdict as the help tells screeners to group them,
+each with its own reason; a rule applied with one [[--reason]]; and the
+thresholds themselves, one row below and at each.
+
+<<test functions>>=
+def batch_rows(n, reason=lambda i: f"Reason {i} about record {i}.",
+               confidence=lambda i: None, title=lambda i: f"Work {i}",
+               status=None, tags=()):
+  return [
+    BatchRow(paper=f"doi:10.5555/batch-{i}", title=title(i),
+             reason=reason(i), confidence=confidence(i),
+             status=status, tags=tuple(tags))
+    for i in range(n)
+  ]
+
+
+class TestBatchFindings:
+  """The batch check over invented batches (#291)."""
+
+  <<batch check test methods>>
+<<batch check test methods>>=
+def test_the_reported_shape_is_found(self):
+  read = batch_rows(
+    40, confidence=lambda i: (0.6, 0.75, 0.9)[i % 3],
+    status="discarded", tags=["off-topic-false-hit"],
+  )
+  filled = [
+    BatchRow(paper=f"doi:10.5555/filled-{i}", title=f"Filled {i}",
+             reason="Not relevant to the research question.",
+             confidence=0.85, status="discarded",
+             tags=("off-topic-false-hit",))
+    for i in range(325)
+  ]
+  findings = {f.kind: f for f in batch_findings(read + filled)}
+  assert set(findings) == {"shared-reasons", "identical-run"}
+  shared = findings["shared-reasons"]
+  assert (shared.count, shared.rows) == (325, 365)
+  assert shared.papers[0] == "doi:10.5555/filled-0"
+  assert len(shared.papers) == 325
+  assert "325 of 365 rows share their reason" in shared.detail
+  run = findings["identical-run"]
+  assert run.count == 325
+  assert "same verdict, tags and reason (longest 325 rows" in run.detail
+  assert not any(f.information for f in findings.values())
+
+def test_one_confidence_on_every_row_is_found(self):
+  findings = batch_findings(batch_rows(100, confidence=lambda i: 0.9))
+  assert [f.kind for f in findings] == ["flat-confidence"]
+  assert findings[0].count == 100
+  assert "have the same one, 0.9" in findings[0].detail
+@
+
+<<batch check test methods>>=
+def test_a_handful_of_identical_rows_is_not_flagged(self):
+  rows = batch_rows(6, reason=lambda i: "Off topic.",
+                    confidence=lambda i: 0.9, status="discarded",
+                    tags=["off-topic-false-hit"])
+  assert batch_findings(rows) == []
+
+def test_round_confidences_are_not_flagged(self):
+  rows = batch_rows(365, confidence=lambda i: (0.8, 0.9)[i % 7 == 0])
+  assert batch_findings(rows) == []
+
+def test_copies_of_one_work_may_share_a_reason(self):
+  rows = batch_rows(
+    24, reason=lambda i: f"Copy pair {i // 2}: a survey, no learners.",
+    title=lambda i: f"Survey of Work {i // 2}" + ("." if i % 2 else ""),
+    status="discarded", tags=["off-topic-false-hit"],
+  )
+  assert batch_findings(rows) == []
+
+def test_three_records_excluded_for_one_reason_are_not_flagged(self):
+  rows = batch_rows(
+    40, reason=lambda i: ("No empirical evaluation." if i < 3
+                          else f"Reason {i} about record {i}."),
+    confidence=lambda i: round(0.5 + (i % 5) / 10, 1),
+  )
+  assert batch_findings(rows) == []
+
+def test_a_large_batch_grouped_by_verdict_is_not_flagged(self):
+  rows = batch_rows(
+    365, confidence=lambda i: (0.6, 0.7, 0.8, 0.9, 0.95)[i % 5],
+    status="discarded", tags=["off-topic-false-hit"],
+  )
+  assert batch_findings(rows) == []
+
+def test_a_rule_applied_with_one_reason_is_information(self):
+  rows = batch_rows(50, reason=lambda i: "No abstract; criterion 3.",
+                    confidence=lambda i: 0.8)
+  [finding] = batch_findings(rows, one_reason=True)
+  assert finding.kind == "one-reason"
+  assert finding.information
+  assert finding.count == 50
+  assert batch_findings(rows[:1], one_reason=True) == []
+@
+
+The thresholds are pinned one row below and at each, so that a change
+of a number is a change of a test.  The share is checked on a batch
+where ten rows share one reason: in forty rows that is exactly a
+quarter, in forty-one less.
+
+<<batch check test methods>>=
+def test_the_thresholds(self):
+  def kinds(rows, **options):
+    return [f.kind for f in batch_findings(rows, **options)]
+
+  shared = lambda n: (lambda i: "One reason." if i < n
+                      else f"Reason {i} about record {i}.")
+  assert kinds(batch_rows(36, reason=shared(9))) == []
+  assert kinds(batch_rows(40, reason=shared(10))) == [
+    "shared-reasons", "identical-run",
+  ]
+  scattered = lambda n: (lambda i: "One reason." if i % 4 == 0 and i < 4 * n
+                         else f"Reason {i} about record {i}.")
+  assert kinds(batch_rows(40, reason=scattered(10))) == ["shared-reasons"]
+  assert kinds(batch_rows(41, reason=scattered(10))) == []
+  assert kinds(batch_rows(19, confidence=lambda i: 0.9)) == []
+  assert kinds(batch_rows(20, confidence=lambda i: 0.9)) == [
+    "flat-confidence",
+  ]
+  run = lambda n: (lambda i: "One reason." if 100 <= i < 100 + n
+                   else f"Reason {i} about record {i}.")
+  assert kinds(batch_rows(400, reason=run(9))) == []
+  assert kinds(batch_rows(400, reason=run(10))) == ["identical-run"]
+  assert kinds(batch_rows(400, reason=run(10)), ordered=False) == []
+@
+
+A reason that differs only in white space and case is the same reason,
+one that differs in punctuation is not, and copies spelt with other
+punctuation are one work:
+
+<<batch check test methods>>=
+def test_what_counts_as_the_same_reason_and_work(self):
+  assert batch_reason_key(" Off  topic.\n") == batch_reason_key("off topic.")
+  assert batch_reason_key("Off topic") != batch_reason_key("Off topic.")
+  assert batch_reason_key("  ") is None
+  assert (batch_title_key(BatchRow("a", "Recursion: A Study", None))
+          == batch_title_key(BatchRow("b", "recursion - a study", None)))
+  assert batch_title_key(BatchRow("a", None, None)) == "id:a"
+@
+
+
+\subsection{Batches already stored}
+
+Batches written before the check existed are in the sessions already,
+and the check is how they can be examined.  A batch is not stored as
+such, but its run is: the decisions of one [[sessions decide]] run
+share their agent's name and time ([[agent_by]], [[agent_decided_at]],
+\cref{sec:agent-audit-fields}), and the screenings of one [[sessions
+screen]] or [[llm classify --second-screen]] run share their screener's
+kind, name and [[recorded_at]] (\cref{sec:screenings}).  So
+[[stored_batch_runs]] groups the agent reasons and the screenings by
+run and checks each group as a batch.  Only decisions that still carry
+an agent reason count: a later machine decision clears it, and a reset
+keeps it in its history, so the run's remaining rows are the ones whose
+reasons stand.  The snapshots of a decision's verdict
+([[origin]] [[decision]]) are not a screener's batch and are left out.
+
+Two things are lost in storage and the check says so rather than guess.
+The order of the lines is not kept (the decisions are in the session's
+order), so runs of identical rows are not looked for.  And a run's rows
+cannot tell a [[-c]] given to the whole run from the same confidence on
+every line, nor one [[--reason]] from a file with one reason on every
+line.  A group whose rows all carry one reason is therefore checked as
+one [[--reason]], whose finding is information and says that it may be
+either; any other group gets
+the shared-reason and flat-confidence checks, where a flat confidence
+may come from [[-c]], as the command's output says.
+
+<<review batch check>>=
+@dataclass(frozen=True)
+class StoredRun:
+    """One stored run of agent reasons or screenings, and its findings.
+
+    `what` is `agent decisions` or `screenings`; `kind` and `name` say
+    who (`name` None when not recorded); `at` is the run's time.
+    """
+
+    what: str
+    kind: str
+    name: str | None
+    at: str | None
+    rows: tuple[BatchRow, ...]
+    findings: tuple[BatchFinding, ...]
+
+
+def stored_batch_runs(session: "ReviewSession") -> list[StoredRun]:
+    """Group a session's agent reasons and screenings by run and check each.
+
+    Runs come in the order of their first row in the session.
+    """
+    groups: dict[tuple, list[BatchRow]] = {}
+    for decision in session.decisions:
+        paper = decision.paper
+        if decision.agent_reason:
+            groups.setdefault(
+                ("agent decisions", "agent", decision.agent_by,
+                 decision.agent_decided_at), [],
+            ).append(BatchRow(
+                paper=paper.id, title=paper.title,
+                reason=decision.agent_reason,
+                confidence=decision.llm_confidence,
+                status=decision.status.value, tags=tuple(decision.tags),
+            ))
+        for screening in decision.screenings:
+            if (not isinstance(screening, dict)
+                    or screening.get("origin") != "screen"):
+                continue
+            groups.setdefault(
+                ("screenings", screening.get("kind"), screening.get("name"),
+                 screening.get("recorded_at")), [],
+            ).append(BatchRow(
+                paper=paper.id, title=paper.title,
+                reason=screening.get("reason"),
+                confidence=screening.get("confidence"),
+                status=screening.get("status"),
+                tags=tuple(screening.get("tags") or ()),
+            ))
+    runs = []
+    for (what, kind, name, at), rows in groups.items():
+        reasons = {batch_reason_key(row.reason) for row in rows}
+        one_reason = len(reasons) == 1 and None not in reasons
+        findings = batch_findings(rows, one_reason=one_reason,
+                                  ordered=False)
+        if one_reason:
+            findings = [
+                replace(finding, detail=(
+                    f"one reason for all {finding.count} records of the "
+                    "run (one --reason, or the same reason on every "
+                    f"line): {_shown_reason(rows[0].reason)}"
+                ))
+                for finding in findings
+            ]
+        runs.append(StoredRun(what, kind, name, at, tuple(rows),
+                              tuple(findings)))
+    return runs
+@
+
+Let's check it on a session holding two agent runs, one defaulted and
+one honest, a run with one reason for every decision, and a defaulted
+screening run whose snapshots are left out.
+
+<<test functions>>=
+class TestStoredBatchRuns:
+  """The batch check over the runs a session stores (#291)."""
+
+  AT = "2026-11-20T10:00:00+00:00"
+
+  def _decision(self, n, **fields):
+    return ReviewDecision(
+      paper=Paper(title=f"Stored Work {n}", authors=["A"],
+                  doi=f"10.5555/stored-{n}"),
+      provider="p", status=DecisionStatus.DISCARDED, tags=["t"],
+      source=ReviewSource.AGENT_UNREVIEWED, **fields,
+    )
+
+  def test_runs_are_grouped_and_checked(self):
+    filled = [self._decision(n, agent_reason="Off topic.",
+                             llm_confidence=0.85, agent_by="screener-1",
+                             agent_decided_at=self.AT) for n in range(30)]
+    read = [self._decision(100 + n, agent_reason=f"Work {n} is on topic {n}.",
+                           llm_confidence=(0.7, 0.9)[n % 2],
+                           agent_by="screener-1",
+                           agent_decided_at="2026-11-21T10:00:00+00:00")
+            for n in range(30)]
+    rule = [self._decision(200 + n, agent_reason="No abstract; rule 3.",
+                           llm_confidence=0.8, agent_by="screener-2",
+                           agent_decided_at=self.AT) for n in range(12)]
+    screened = [self._decision(300 + n) for n in range(25)]
+    for decision in screened:
+      record_screening(decision, new_screening(
+        kind="agent", name="second", status="kept", tags=["r"],
+        recorded_at=self.AT, confidence=0.9,
+        reason=f"Kept, record {decision.paper.doi[-3:]} is about it.",
+      ))
+    session = ReviewSession(query="q", providers=["p"],
+                            timestamp=datetime(2026, 11, 20))
+    session.decisions = filled + read + rule + screened
+    runs = stored_batch_runs(session)
+    summary = [(r.what, r.name, r.at, len(r.rows),
+                [f.kind for f in r.findings]) for r in runs]
+    assert summary == [
+      ("agent decisions", "screener-1", self.AT, 30, ["one-reason"]),
+      ("agent decisions", "screener-1", "2026-11-21T10:00:00+00:00", 30,
+       []),
+      ("agent decisions", "screener-2", self.AT, 12, ["one-reason"]),
+      ("screenings", "second", self.AT, 25, ["flat-confidence"]),
+    ]
+    assert all(f.information for r in runs[:3] for f in r.findings)
+@
+
+A run that read some records and filled the others with one reason is
+found by the shared reasons, since its reasons are not all one:
+
+<<test functions>>=
+def test_a_partly_filled_stored_run_shares_its_reasons():
+  def decision(n, reason):
+    return ReviewDecision(
+      paper=Paper(title=f"Partly {n}", authors=["A"],
+                  doi=f"10.5555/partly-{n}"),
+      provider="p", status=DecisionStatus.DISCARDED, tags=["t"],
+      source=ReviewSource.AGENT_UNREVIEWED, agent_reason=reason,
+      agent_by=None, agent_decided_at="2026-11-20T10:00:00+00:00",
+    )
+
+  session = ReviewSession(query="q", providers=["p"],
+                          timestamp=datetime(2026, 11, 20))
+  session.decisions = (
+    [decision(n, f"Work {n} studies topic {n}.") for n in range(10)]
+    + [decision(10 + n, "Not relevant.") for n in range(30)]
+  )
+  [run] = stored_batch_runs(session)
+  assert run.name is None
+  assert [f.kind for f in run.findings] == ["shared-reasons"]
+  assert run.findings[0].count == 30
+@
+
+
 \section{Report Generation}
 
 The module produces three \LaTeX{} artefacts from a review session, plus a
@@ -21470,6 +22479,7 @@ def build_review_provenance_latex(
     <<add the quote check of the machine reasons>>
     <<add the explanation of the review records>>
     <<add the count of abstracts given by hand>>
+    <<add the count of decisions without an abstract>>
     <<add the LLM screening paragraphs>>
     <<add snowballing section>>
     return lines
@@ -21857,6 +22867,70 @@ class TestReportHandAbstracts:
       self._session(self._decision(4)),
     ))
     assert "added by hand" not in text
+@
+
+A decision made on a record without an abstract rests on its title,
+and the reader of the report should know how many did
+(\url{https://github.com/dbosk/scholarcli/issues/293}).  One sentence
+after the summary counts the decided papers without an abstract and
+splits them by what the last [[scholar enrich]] found for them
+([[abstract_gap]], \cref{sec:abstract-lookup}): every source asked had
+none, nothing could be asked, a lookup failed, or there is no record of
+a lookup, which is what every session written before the record existed
+holds.  [[sessions show]] prints the same sentence.  Nothing is said
+when every decided paper has an abstract.  The count is of the papers
+as they stand: an abstract filled in after the decision makes the paper
+count as having one, although the screener did not see it, since the
+session does not record what a screener saw.
+
+<<review report generation>>=
+def decided_without_abstract_sentence(decisions) -> str:
+    """One sentence counting the decided papers without an abstract.
+
+    Empty when there are none.
+    """
+    gap = abstract_gap(d for d in decisions if d.is_decided)
+    if not gap.without:
+        return ""
+    return (
+        f"{gap.without} of the {gap.papers} decided papers "
+        f"{'was' if gap.without == 1 else 'were'} decided without an "
+        f"abstract ({'; '.join(abstract_gap_parts(gap))})."
+    )
+<<add the count of decisions without an abstract>>=
+without_abstract = decided_without_abstract_sentence(session.decisions)
+if without_abstract:
+    lines.extend([without_abstract, ""])
+@
+
+<<test functions>>=
+class TestReportDecidedWithoutAbstract:
+  def test_the_sentence(self):
+    def decision(n, status, abstract=None, outcome=None):
+      return ReviewDecision(
+        paper=Paper(title=f"Gap {n}", authors=["A"],
+                    doi=f"10.5555/gap-report-{n}", abstract=abstract),
+        provider="p", status=status,
+        tags=["t"] if status != DecisionStatus.PENDING else [],
+        abstract_lookup={"at": "2026-11-20", "outcome": outcome}
+        if outcome else None,
+      )
+
+    session = ReviewSession(query="q", providers=["p"],
+                            timestamp=datetime(2026, 11, 20))
+    session.decisions = [
+      decision(1, DecisionStatus.KEPT, abstract="Text."),
+      decision(2, DecisionStatus.DISCARDED, outcome="none-found"),
+      decision(3, DecisionStatus.DISCARDED),
+      decision(4, DecisionStatus.PENDING),
+    ]
+    lines = build_review_provenance_latex(session)
+    assert ("2 of the 3 decided papers were decided without an abstract "
+            "(1 every source asked had none; 1 no record of a lookup)."
+            ) in lines
+    session.decisions = session.decisions[:1]
+    assert "without an abstract" not in " ".join(
+      build_review_provenance_latex(session))
 @
 
 A session's decisions are records, not works: the copies of one work
