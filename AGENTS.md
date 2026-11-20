@@ -2530,6 +2530,34 @@ case-insensitive byte search for the id in each file (every decision
 stores `paper_id`; an arXiv DOI also matches its bare arXiv id) and
 decodes only those; non-ASCII/`"`/`\` fragments decode every file.
 
+### Spreadsheet-safe CSV (`--spreadsheet-safe`, #285)
+
+`sessions export -f csv|all --spreadsheet-safe` and `search -f csv
+--spreadsheet-safe` (review.nw `sec:spreadsheet-safe`) write each text
+cell that begins with a character of `SPREADSHEET_FORMULA_STARTS` (`=
++ - @`, tab, CR, LF, full-width U+FF1D U+FF0B U+FF0D U+FF20: OWASP's
+CSV-injection list, read 2026-11-20 at
+https://owasp.org/www-community/attacks/CSV_Injection, no more and no
+fewer), or with `'` itself, with one `'` in front
+(`spreadsheet_safe_cell`). The page's tab prefix was not taken: the
+same page lists tab as a trigger. Undo: drop the first character of
+every text cell that begins with `'` (exact, because a leading `'` is
+doubled). Numeric columns are untouched (`CSV_NUMERIC_COLUMNS` =
+`year`, `llm_confidence`; `SpreadsheetSafeWriter` finds them by header
+name, so a new column is text); search's year likewise; `#` lines and
+headers are unchanged. Off by default and byte-identical without it
+(checked against e7dc5f5): scripts read the raw file. To make it the
+default, set `cli.SPREADSHEET_SAFE_DEFAULT = True` (the flag has
+`--no-spreadsheet-safe`; `None` = not given). With another format it
+is refused (exit 2; search: not csv/auto, before searching; export:
+not csv/all, before loading). Limits (the page's): Excel may drop the
+prefix on save and reopen; a reader splitting on another separator
+(`;`) can start a cell inside a field; search's TSV quotes nothing, so
+a tab or line break inside a field already breaks it. LibreOffice
+26.2.6.3 (tried 2026-11-20) read `=` cells of the raw export as
+formulas and none of the safe one, showing the `'`; Excel not tried.
+Not covered: `sessions check -f csv`, the screen sheet (TSV).
+
 ### LaTeX Output: Standalone, Fragment, Audit Table
 
 `review.py` owns the shared LaTeX pieces: the escapers (`escape_latex`,
