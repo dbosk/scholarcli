@@ -1854,14 +1854,21 @@ fixture has a quoted query, a `[`-row, `ĸ`, `CO₂`, a ligature. About
   version-link DOIs, else `audit_work_key` under `plausibly_same_work`;
   failing both, a second chance, #272: `match_loose_title` on
   `loose_title` (a trailing edition phrase `, 2nd edition`/`(3rd rev.
-  ed.)`/`second edition`, ordinals 1-10, and a leading chapter number
-  before a title with no lower-case and some upper-case letter, removed
-  from both titles; `matched_by` `CHECK_BY_LOOSE_TITLE`; the bib's
-  `edition` field, the entries' optional third element, read by
-  `edition_number`, else its title's phrase, must equal an edition the
-  session title names, one side alone matches; still
-  `plausibly_same_work`, author-less records by title, else same
-  surname; several work keys → no match, `CitedEntry.ambiguous`;
+  ed.)`/`second edition`: digit ordinals of any size, word ordinals
+  first-tenth, not after the/a/an, not when it leaves no word; and,
+  on a side without authors only, a leading chapter number before a
+  title with no lower-case and some upper-case letter) on both titles;
+  `matched_by` `CHECK_BY_LOOSE_TITLE`; the bib's `edition` field, the
+  entries' optional third element, read by `edition_number`, else its
+  title's phrase (`entry_edition`), must equal an edition the session
+  title names, one side alone matches, candidates naming the entry's
+  edition drop those naming none; still `plausibly_same_work`,
+  author-less records by title, else same surname; candidates that
+  differ in (named edition, surname) → no match,
+  `CitedEntry.ambiguous`, else all their work keys. An entry naming an
+  edition that the first lookup found only by title on records naming
+  no or another edition takes the records naming that edition
+  (`same_edition=True`) when there are any; a DOI match stands;
   `audit_work_key` and `sessions check` deliberately unchanged)
   → `CitedEntry.works` (work keys) → `collect_audit_rows(...,
   cited_works=)` → `audit_reason(..., cited=True/False)` per copy
