@@ -487,6 +487,29 @@ show "failed". The keyed REST providers (S2/WoS/IEEE) set the generic
 OpenAlex (+ source-pinned), HAL and arXiv set specific reasons. A new
 provider should do the same.
 
+DOI lookups (#259, providers.nw `sec:lookup-outcome`): every
+`get_paper_by_doi` (S2, OpenAlex + subclasses, IEEE, WoS, arXiv,
+Scopus; DBLP and HAL have none) resets `last_lookup_error = None`
+first thing (its own attribute, so a lookup never overwrites a
+search's `last_error`) and sets a reason on every uncached failure
+path; an answer (record, 404/empty result, cache hit, arXiv's instant
+"not an arXiv DOI") leaves None. Reasons are worded once in
+network.nw (`sec:request-failure-reason`): `http_status_reason` ("rate
+limited (HTTP 429)", "HTTP 503") and `request_failure_reason`
+(`RetryError` -> `RETRIES_SPENT`, connection/timeout -> "connection
+failed (SSLError)", other `requests` exceptions -> class name only,
+since their text quotes the URL with DOI, key or address; anything
+else, e.g. the `OSError` "Could not find a suitable TLS CA certificate
+bundle, ..." -> its text, redacted, one line, <= 120 chars);
+`providers.lookup_failure_reason` adds the limiter's reason for
+`RateLimited`. WoS records `SEARCH_CUT_SHORT` from the tiers'
+`cacheable` flag (also for a limiter refusal); keyless IEEE/Scopus/WoS
+name their variable; Scopus without COMPLETE says "not asked: ..."
+(`_lookup_declined_reason`, counted as failed: Scopus was not asked).
+`UnpaywallClient` and `CrossrefClient` keep `last_lookup_error` the
+same way (module `last_lookup_error()`). Enrichment reads them
+Mock-safely (`enrich.lookup_error`, only a non-empty str counts).
+
 OpenAlex (#150, #151): a limiter refusal sets `last_error` to its
 reason; a refusal or failed request after some pages keeps those pages
 (`PagesCutShort` from the paging loop → `N, incomplete (reason)`,
@@ -703,6 +726,23 @@ against `enrich.ENRICHMENT_FIELD_NAMES` (unknown name: exit 2);
 leaving out `pdf_url` also skips Unpaywall and the preprint fallback
 (`--fields abstract` is the cheap run). The Crossref check always runs.
 
+Lookup tally (#259, enrich.nw `sec:enrich-lookup-outcomes`, cli.nw
+`sec:enrich-lookup-tally`): `enrich_paper(..., outcome=LookupOutcome())`
+/ `enrich_papers(..., outcomes=[])` (optional; TUI and `search
+--enrich` pass none, return types unchanged) record per paper the
+providers asked, the failed ones with reasons, and the Unpaywall
+failure. `scholar enrich` collects them per chunk and, when `abstract`
+is in `--fields`, ends (also on the exit-130 interrupt path, over the
+saved papers) with `abstract_tally_lines`: "Still without an abstract:
+N of M papers." then answered by every database asked / without a DOI
+/ no database asked / failed lookups per `provider: reason (count)`
+plus "Run again to retry the failed lookups." only when something
+failed. After the `Open access:` line, `open_access_tally_lines` splits
+unknown statuses into without a DOI / not in Unpaywall / failed (per
+reason). Existing lines unchanged. Nothing is stored in the session
+(the outcome is the run's). Stand-ins for `enrich_papers` must accept
+`outcomes=` (or `**kwargs`).
+
 **Batched OpenAlex DOI lookups.** `OpenAlexProvider.prefetch_dois(dois)`
 (`sec:openalex-doi-batch`) fills the `("doi", CACHE_VERSION, doi)` cache
 that `get_paper_by_doi` reads, 50 DOIs per request via
@@ -733,6 +773,16 @@ superseded, using Crossref's `updated-by` (Retraction-Watch-backed) and
 - `scholar verify "<session>"` reports per-paper status (with `--json`);
   `scholar enrich "<session>"` warns on issues as a side effect. Both
   persist the findings back to the session.
+- A failed check (any `fetch_currency` failure) leaves the paper
+  unchanged, so `updated_by` stays None ("never checked"). Both commands
+  count failures per reason (#259, crossref.nw
+  `sec:crossref-check-failures`): `noting_failures(counter, callback)`
+  wraps `annotate_papers`' progress callback (read right after each
+  lookup; `annotate_papers`' signature is unchanged, so stand-ins keep
+  working) and `check_failure_lines` prints "Crossref check failed for
+  N papers; their retraction status stays unknown:" + `crossref: reason
+  (n)` + `network.RUN_AGAIN_HINT`; enrich after its currency line,
+  verify on stderr (JSON stays pure). The run never aborts.
 
 ### Preprint Fallback (adopt a preprint when no PDF is found)
 
