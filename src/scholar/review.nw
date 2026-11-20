@@ -660,6 +660,10 @@ class ReviewDecision:
             "llm_confidence", "is_example", "trace", "note", "by"}`,
             `trace` only when the classifier left one), oldest first;
             see `reset_decision`.
+        abstract_set: Each time the paper's abstract was given by hand
+            (`{"at", "from", "by", "chars", "text", "previous"}`,
+            `previous` only when an abstract was replaced), oldest
+            first; see `set_abstract`.
         baseline_key: The decision's key in its session's baseline,
             given when the session was loaded or saved (not saved
             itself); `None` for a decision made since. See
@@ -678,6 +682,7 @@ class ReviewDecision:
     same_id_copies: list[dict] = field(default_factory=list)
     relabelled: list[dict] = field(default_factory=list)
     resets: list[dict] = field(default_factory=list)
+    abstract_set: list[dict] = field(default_factory=list)
     baseline_key: str | None = field(default=None, compare=False, repr=False)
 
     def __post_init__(self):
@@ -692,6 +697,8 @@ class ReviewDecision:
             self.relabelled = []
         if self.resets is None:
             self.resets = []
+        if self.abstract_set is None:
+            self.abstract_set = []
 
     def add_relabel(self, record: dict) -> None:
         """Note a correction of the source (`relabel_source`), once.
@@ -712,6 +719,16 @@ class ReviewDecision:
         if record not in self.resets:
             self.resets.append(record)
             self.resets.sort(key=lambda r: str(r.get("at") or ""))
+
+    def add_abstract_record(self, record: dict) -> None:
+        """Note an abstract given by hand (`set_abstract`), once.
+
+        Kept in the order of the `at` times, as `add_relabel` keeps its
+        records.
+        """
+        if record not in self.abstract_set:
+            self.abstract_set.append(record)
+            self.abstract_set.sort(key=lambda r: str(r.get("at") or ""))
 
     def add_same_id_copy(self, copy: dict) -> None:
         """Note another work returned under this paper's id, once."""
@@ -1974,6 +1991,726 @@ def test_concurrent_resets_are_united(self, tmp_path, monkeypatch):
 @
 
 
+\subsection{Abstracts given by hand}
+\label{sec:set-abstract}
+
+When [[scholar enrich]] finds no abstract for a record, a screener may
+look the DOI up by hand, on Crossref, OpenAlex or PubMed, and find one
+(\url{https://github.com/dbosk/scholarcli/issues/258}).  Before
+[[sessions set-abstract]] (in the CLI module) the text could only go
+into the decision's reason, so the record still counted as lacking an
+abstract, the next screener or classifier did not see the text the
+decision rested on, and nothing but that reason said where the text had
+come from.  The command stores the text as the paper's abstract and
+records, on the decision, where it was found.
+
+The abstract itself is a field of the paper like any other, so
+everything that reads abstracts (the classifier, the TUI, the reports)
+sees it without a change.  The record of its origin is on the
+decision, in [[abstract_set]], not on the [[Paper]]: a new paper field
+would need its own rule in the three-way merge of paper metadata
+(\cref{sec:session-integrity}) and in every merge of two copies of a
+paper, while a list on the decision travels like the reset history
+(\cref{sec:reset-decision}).  An older Scholar then keeps the abstract,
+which is an ordinary paper field to it, and drops only the record.
+Each record is [[{"at", "from", "by", "chars", "text", "previous"}]]:
+the UTC time; where the text was found, as the caller wrote it
+(\enquote{Crossref, 2026-11-20}); who gave it ([[None]] when not
+given, never guessed, as in a reset record); the length and the text
+itself as stored; and the abstract it replaced, only when one was
+replaced.  The record holds the text, not only its length, because the
+paper's abstract can be replaced afterwards (below), and then the text
+a decision rested on would otherwise be in no file at all; with it, a
+reader can also tell exactly whether the abstract the paper holds now
+is the one the record describes.  Abstracts are given by hand for a
+few records of a session, so the copies cost little space.
+
+The text is cleaned as provider text is at ingest
+([[clean_metadata_text]], \cref{sec:clean-provider-text} in the
+utilities module): a text copied from a publisher's page or an API
+response carries the same entities, inline tags and mojibake.  White
+space is collapsed to single spaces, since a text copied from a PDF
+breaks its lines wherever the column ended.  A text that is empty after
+cleaning is refused: it would set nothing but a record.  There is no
+upper limit, since abstracts vary in length, but the command warns
+above [[LONG_ABSTRACT_CHARS]] characters, where the text is more likely
+a whole page than an abstract.
+
+<<review data structures>>=
+LONG_ABSTRACT_CHARS = 10_000
+
+
+def clean_abstract_text(text: str) -> str:
+    """Clean an abstract given by hand as provider text is cleaned.
+
+    Entities are decoded, inline markup stripped and mojibake repaired
+    (`clean_metadata_text`); white space is collapsed to single spaces.
+    """
+    return " ".join(clean_metadata_text(text).split())
+@
+
+A paper can be held by more than one decision of a session: copies of
+one work decided apart under one id (\cref{sec:session-copies}), which
+share one [[Paper]] object once the session is loaded.  The abstract is
+a fact about the paper, so [[set_abstract]] takes every decision that
+holds it and gives each paper the text and each decision the record.
+A paper that already has an abstract is refused unless [[replace]] is
+given: the stored text may be what a decision rested on, and replacing
+it silently would make that decision read as if it rested on the new
+one.  With [[replace]] the old text is kept in the record.
+
+<<review data structures>>=
+def set_abstract(
+    decisions: list[ReviewDecision],
+    text: str,
+    origin: str,
+    at: str,
+    by: str | None = None,
+    replace: bool = False,
+) -> dict:
+    """Give the paper of `decisions` the abstract `text`, found at `origin`.
+
+    `decisions` are the decisions holding one paper (copies of one work
+    under one id). The text is cleaned (`clean_abstract_text`); every
+    decision gets the record `{"at", "from", "by", "chars", "text",
+    "previous"}` in `abstract_set` (`text` is the stored text;
+    `previous`, the replaced abstract, only when one was replaced),
+    which is returned.
+
+    Raises:
+        ValueError: For an empty text or origin, or a paper that has an
+            abstract when `replace` is false.
+    """
+    cleaned = clean_abstract_text(text)
+    if not cleaned:
+        raise ValueError("the abstract is empty after cleaning")
+    if not origin.strip():
+        raise ValueError("say where the abstract was found")
+    previous = next(
+        (d.paper.abstract for d in decisions if d.paper.abstract), None
+    )
+    if previous and not replace:
+        raise ValueError("the paper already has an abstract")
+    record = {
+        "at": at,
+        "from": origin.strip(),
+        "by": by,
+        "chars": len(cleaned),
+        "text": cleaned,
+        **({"previous": previous} if previous else {}),
+    }
+    for decision in decisions:
+        decision.paper.abstract = cleaned
+        decision.add_abstract_record(dict(record))
+    return record
+@
+
+A record says that the abstract the paper holds came from where it
+says, so it must not outlive the text unnoticed.  Enrichment from
+providers does not replace a stored abstract: [[enrich]] asks for an
+abstract only when the paper lacks one ([[needs_enrichment]] in the
+enrichment module), and its merge with a provider's copy keeps the
+stored values ([[Paper.merge_with]]).  Two things can replace it.  One
+is a fold of two copies ([[sessions reconcile]], and a save that
+settles a copy another process folded, \cref{sec:session-copies}): the
+survivor takes the DOI copy's abstract, filled from the other copy
+only when it has none ([[merge_version_of]]).  So the records always go to
+the survivor, with their texts: in the usual case, a DOI-less copy
+given the abstract by hand and its DOI twin without one, the text
+becomes the survivor's abstract and the record describes it.  When
+the twin had an abstract of its own, that one is kept, as a fold keeps
+it for any other filled-in field; the hand text then survives in the
+record, which [[hand_abstract_replaced]] (below) marks as replaced, and
+a warning names the copy and where the text was from.
+
+<<review data structures>>=
+def abstract_records_after_fold(
+    paper: Paper, copies: list[tuple[str, str | None, list[dict]]]
+) -> list[dict]:
+    """The abstract records of folded copies, united, oldest first.
+
+    `copies` gives each copy's paper id, the abstract it had before the
+    fold and its records. A copy whose abstract `paper` does not hold
+    is named in a warning; its records are kept, with their texts.
+    """
+    united: list[dict] = []
+    for paper_id, abstract, records in copies:
+        if not records:
+            continue
+        united.extend(r for r in records if r not in united)
+        if not abstract or abstract != paper.abstract:
+            logger.warning(
+                "%s: the abstract added by hand (from %s) was not kept; "
+                "the copy it was folded with has an abstract of its own "
+                "(the text stays in the record)",
+                paper_id, records[-1].get("from"),
+            )
+    return sorted(united, key=lambda r: str(r.get("at") or ""))
+@
+
+The other is a preprint adoption (\cref{preprint-module}): when
+enrichment finds no PDF and replaces the entry with a preprint, the
+preprint's own abstract wins ([[_adopt]]), since the entry then stands
+for the preprint.  The record stays, since it is still true that an
+abstract was given then, from there, but it no longer describes the
+text.  [[hand_abstract_replaced]] tells the displays so, by comparing
+the record's text with the paper's abstract.  A record without a text
+(written while the record held only the length, during the review of
+this change) is compared by its length.  The adoption is left as it
+is, since which version's abstract an adopted entry should carry is a
+question for the preprint fallback, not for this record; the hand text
+stays in the record either way.
+
+<<review data structures>>=
+def hand_abstract_replaced(decision: ReviewDecision) -> bool:
+    """Whether the abstract last given by hand has since been replaced.
+
+    False when no abstract was given by hand; otherwise true when the
+    paper's abstract is not the last record's text (a record without a
+    text: not of the length it noted).
+    """
+    if not decision.abstract_set:
+        return False
+    last = decision.abstract_set[-1]
+    if "text" in last:
+        return last["text"] != decision.paper.abstract
+    return last.get("chars") != len(decision.paper.abstract or "")
+@
+
+Let's check that an adoption whose preprint has an abstract of its own
+replaces the text and is noticed.
+
+<<test functions>>=
+class TestHandAbstractReplaced:
+  def test_an_adopted_preprint_replaces_it(self):
+    from scholar.preprint import _adopt
+
+    decision = ReviewDecision(
+      paper=Paper(title="Adopted", authors=["Ada Lovelace"], year=2021,
+                  doi="10.5555/hand-adopted"),
+      provider="openalex",
+    )
+    assert hand_abstract_replaced(decision) is False
+    set_abstract([decision], "Found by hand.", "Crossref",
+                 "2026-11-20T10:00:00+00:00")
+    assert hand_abstract_replaced(decision) is False
+    decision.paper = _adopt(decision.paper, Paper(
+      title="Adopted", authors=["Ada Lovelace"], year=2021,
+      doi="10.48550/arXiv.2101.00001", abstract="The preprint's own.",
+      pdf_url="https://arxiv.org/pdf/2101.00001",
+    ))
+    assert decision.paper.abstract == "The preprint's own."
+    assert hand_abstract_replaced(decision) is True
+
+  def test_a_text_of_the_same_length_is_noticed(self):
+    decision = ReviewDecision(
+      paper=Paper(title="Same length", authors=["A"]), provider="p",
+    )
+    set_abstract([decision], "Found by hand.", "Crossref",
+                 "2026-11-20T10:00:00+00:00")
+    decision.paper.abstract = "Found by mail."
+    assert hand_abstract_replaced(decision) is True
+
+  def test_a_record_without_a_text_is_compared_by_length(self):
+    decision = ReviewDecision(
+      paper=Paper(title="Old record", authors=["A"], abstract="12345"),
+      provider="p", abstract_set=[{"at": "2026-11-20", "from": "X",
+                                   "by": None, "chars": 5}],
+    )
+    assert hand_abstract_replaced(decision) is False
+    decision.paper.abstract = "123456"
+    assert hand_abstract_replaced(decision) is True
+@
+
+The record travels like the reset history: saved only when non-empty,
+so the file of a session nobody gave an abstract is unchanged; loaded
+as empty from a file without the key; copied with the decision when
+search results are appended (\cref{sec:review-create-strict}), where
+the stored abstract also stays, since the stored paper's values win
+([[stored_paper_with]]); and united with the file's by a save that
+merges another process's changes (\cref{sec:session-integrity}).
+
+Unlike the reset history, it is \emph{not} part of [[decision_state]].
+A reset changes the decision; giving an abstract does not.  The merge
+takes the whole decision from the file when this process's decision
+state is still the baseline's, and keeps this process's when it
+differs.  If the record were part of that state, a [[set-abstract]]
+run that loaded the session before another process saved a human's
+decision would hold a changed state, and its save would put the old
+pending decision back over the human's.  Left out, the record is
+united on its own and the decision follows the usual rule.  For the
+same reason a hand-given abstract does not make a pending copy
+screened ([[is_unscreened]]): it can still be folded into its twin,
+its record going along as described above.
+
+The abstract itself is a paper field and follows the paper-metadata
+merge: a field this process changed keeps its value, a field it left
+as loaded takes the file's.  Two races need more than that, because
+the rule does not know that one of the two values was given by hand.
+\begin{description}
+\item[A stale enrichment] A process loads the session, [[set-abstract]]
+  saves a hand text, and the first process fills the paper's abstract
+  from a provider (it had none when loaded) and saves.  Both changed
+  the field, so the usual rule keeps the later save's provider text,
+  while the record is united: the record would vouch for a text the
+  paper does not hold, and the hand text would be in no file.  So when
+  the file holds a hand record this process lacks, and the file's
+  abstract is that record's text, the file's abstract is taken,
+  whatever this process did to the field.  The user gave the text on
+  purpose, after the provider's had been looked for; an automatic fill
+  must not undo that.  If this process gave a hand text of its own as
+  well, both were given on purpose, and the usual rule decides.
+\item[A stale [[set-abstract]]] The reverse: [[set-abstract]] loads a
+  paper without an abstract, another process fills one and saves, and
+  [[set-abstract]] saves its text.  Its text is kept (the user gave it
+  on purpose, so a provider's text does not displace it), but it
+  replaced an abstract without [[--replace]], which the command would
+  have refused.  So the replaced abstract is written into the record's
+  [[previous]], as [[--replace]] would have kept it: when the file's
+  abstract differs from the one this process loaded and from ours, and
+  this process added a hand record, the newest of its records gets the
+  file's abstract as [[previous]].  A [[None]] on disk is a gap, not an
+  abstract, and replaces nothing.
+\end{description}
+The records this process and the file hold apart ([[mine_new]],
+[[their_new]]) are taken before the file's records are united into
+ours.
+
+<<settle the abstract against the file's hand records>>=
+loaded = dict(zip(PAPER_STATE_FIELDS, base_papers.get(paper_id) or ()))
+if (their_new and not mine_new
+        and their_new[-1].get("text") == theirs.paper.abstract):
+    decision.paper.abstract = theirs.paper.abstract
+elif (mine_new and paper_id in base_papers and theirs.paper.abstract
+        and theirs.paper.abstract
+        not in (loaded.get("abstract"), decision.paper.abstract)):
+    mine_new[-1]["previous"] = theirs.paper.abstract
+@
+
+Let's check that the text is cleaned and recorded, that an existing
+abstract is refused and kept in the record when replaced, that every
+copy of the paper gets it, that the DOI-less id does not move, and
+that a later enrichment does not replace it.  The enrichment test
+stands in a provider object for the registry's (rung five of the
+testing ladder): what is checked is the merge, and a recorded response
+would add a network dependency without testing more of it.
+
+<<test functions>>=
+class TestSetAbstract:
+  """An abstract given by hand, with where it came from (#258)."""
+
+  <<set abstract test methods>>
+
+<<set abstract test methods>>=
+AT = "2026-11-20T10:00:00+00:00"
+
+def _pending(self, doi=None, abstract=None):
+  return ReviewDecision(
+    paper=Paper(title="A Hand Abstract", authors=["Ada Lovelace"],
+                year=2021, doi=doi, abstract=abstract),
+    provider="openalex",
+  )
+
+def test_the_text_is_cleaned_and_recorded(self):
+  decision = self._pending()
+  record = set_abstract(
+    [decision], "We  <i>study</i>\n  cafÃ©s &amp; bars.\n",
+    " Crossref, 2026-11-20 ", self.AT, by="the screener",
+  )
+  assert decision.paper.abstract == "We study cafés & bars."
+  assert record == {
+    "at": self.AT, "from": "Crossref, 2026-11-20", "by": "the screener",
+    "chars": len("We study cafés & bars."),
+    "text": "We study cafés & bars.",
+  }
+  assert decision.abstract_set == [record]
+  assert decision.status is DecisionStatus.PENDING
+  assert is_unscreened(decision)
+
+def test_an_empty_text_or_origin_is_refused(self):
+  decision = self._pending()
+  with pytest.raises(ValueError, match="empty"):
+    set_abstract([decision], " <b> </b>\n", "Crossref", self.AT)
+  with pytest.raises(ValueError, match="where"):
+    set_abstract([decision], "Text.", "  ", self.AT)
+  assert decision.paper.abstract is None
+  assert decision.abstract_set == []
+
+def test_an_existing_abstract_is_refused_unless_replaced(self):
+  decision = self._pending(abstract="Old text.")
+  with pytest.raises(ValueError, match="already"):
+    set_abstract([decision], "New text.", "PubMed", self.AT)
+  assert decision.paper.abstract == "Old text."
+  assert decision.abstract_set == []
+  record = set_abstract([decision], "New text.", "PubMed", self.AT,
+                        replace=True)
+  assert record["previous"] == "Old text."
+  assert decision.paper.abstract == "New text."
+
+def test_every_copy_of_the_paper_gets_it(self):
+  first = self._pending()
+  second = ReviewDecision(
+    paper=Paper(title="A Hand Abstract", authors=["Ada Lovelace"],
+                year=2021),
+    provider="dblp", status=DecisionStatus.KEPT, tags=["t"],
+  )
+  set_abstract([first, second], "Text.", "OpenAlex", self.AT)
+  assert [d.paper.abstract for d in (first, second)] == ["Text."] * 2
+  assert len(first.abstract_set) == len(second.abstract_set) == 1
+
+def test_the_doi_less_id_does_not_move(self):
+  decision = self._pending()
+  before = get_paper_id(decision.paper)
+  set_abstract([decision], "Text.", "Crossref", self.AT)
+  assert get_paper_id(decision.paper) == before
+  assert before.startswith("hash:")
+
+def test_it_is_not_part_of_the_decision_state(self):
+  decision = self._pending()
+  before = decision_state(decision)
+  set_abstract([decision], "Text.", "Crossref", self.AT)
+  assert decision_state(decision) == before
+
+def test_a_later_enrichment_keeps_it(self, monkeypatch):
+  from scholar.enrich import enrich_paper
+
+  class OtherAbstract:
+    """A provider with another abstract and keywords."""
+
+    def get_paper_by_doi(self, doi):
+      return Paper(title="A Hand Abstract", authors=["Ada Lovelace"],
+                   doi=doi, abstract="A provider's abstract.",
+                   keywords=["k"])
+
+  monkeypatch.setattr("scholar.enrich.get_provider",
+                      lambda name: OtherAbstract())
+  decision = self._pending(doi="10.5555/hand-enrich")
+  set_abstract([decision], "Found by hand.", "Crossref", self.AT)
+  enriched = enrich_paper(decision.paper, fields=["abstract", "keywords"],
+                          providers=["other"])
+  assert enriched.keywords == ["k"]
+  assert enriched.abstract == "Found by hand."
+@
+
+The records follow the copy through a fold.  A DOI-less copy given the
+abstract and folded into its DOI twin passes on the text and its
+record; a copy whose twin had its own abstract passes on its record,
+which then reads as replaced, with a warning.
+
+<<set abstract test methods>>=
+def _copies(self, doi_abstract=None):
+  bare = self._pending()
+  set_abstract([bare], "Found by hand.", "Crossref", self.AT)
+  twin = self._pending(doi="10.5555/hand-twin", abstract=doi_abstract)
+  twin.status, twin.tags = DecisionStatus.KEPT, ["t"]
+  session = ReviewSession(query="q", providers=["openalex"],
+                          timestamp=datetime(2026, 11, 20))
+  session.decisions = [bare, twin]
+  return session, bare, twin
+
+def test_a_fold_passes_the_record_on(self, tmp_path, monkeypatch):
+  monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+  session, bare, twin = self._copies()
+  assert reconcile_copies(session) != []
+  assert session.decisions == [twin]
+  assert twin.paper.abstract == "Found by hand."
+  assert twin.abstract_set == bare.abstract_set != []
+
+def test_a_fold_keeps_the_record_of_a_lost_text(
+  self, tmp_path, monkeypatch, caplog,
+):
+  monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+  session, bare, twin = self._copies(doi_abstract="The twin's own.")
+  assert hand_abstract_replaced(twin) is False
+  assert reconcile_copies(session) != []
+  assert twin.paper.abstract == "The twin's own."
+  assert twin.abstract_set == bare.abstract_set
+  assert twin.abstract_set[0]["text"] == "Found by hand."
+  assert hand_abstract_replaced(twin) is True
+  assert "abstract added by hand (from Crossref) was not kept" \
+    in caplog.text
+@
+
+The record is saved only when there is one and survives an append.  A
+save by a process that loaded the session before the abstract was set
+keeps both the text and the record; the [[set-abstract]] run's own save
+does not undo a decision another process saved meanwhile, and keeps
+its text over an abstract that process saved.  Each of the two
+processes loads the session in a registry of its own
+([[isolated_registry]]): within one registry both would hold the same
+[[Paper]] object, and a change made through one would already be in
+the other before any save.
+
+<<set abstract test methods>>=
+def _session(self, name):
+  session = ReviewSession(
+    query="q", providers=["openalex"], timestamp=datetime(2026, 11, 20),
+    name=name,
+  )
+  session.decisions.append(self._pending(doi=f"10.5555/hand-{name}"))
+  return session
+
+def _load_apart(self, name):
+  from scholar.scholar import isolated_registry
+
+  with isolated_registry():
+    return load_session(name)
+
+def test_saved_only_when_non_empty(self, tmp_path, monkeypatch):
+  import json
+
+  monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+  path = save_session(self._session("hand-file"))
+  assert "abstract_set" not in json.loads(path.read_text())["decisions"][0]
+  session = load_session("hand-file")
+  assert session.decisions[0].abstract_set == []
+  record = set_abstract(session.decisions, "Text.", "Crossref", self.AT)
+  save_session(session)
+  stored = json.loads(path.read_text())["decisions"][0]
+  assert stored["abstract_set"] == [record]
+  assert stored["paper"]["abstract"] == "Text."
+  assert load_session("hand-file").decisions[0].abstract_set == [record]
+
+def test_append_keeps_it(self, tmp_path, monkeypatch):
+  from scholar.scholar import SearchResult
+
+  monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+  session = self._session("hand-append")
+  set_abstract(session.decisions, "Found by hand.", "Crossref", self.AT)
+  save_session(session)
+  stored = load_session("hand-append").decisions[0]
+  paper = Paper(title="A Hand Abstract", authors=["Ada Lovelace"],
+                year=2021, doi="10.5555/hand-hand-append",
+                abstract="A provider's abstract.", sources=["openalex"])
+  appended = create_review_session([SearchResult(
+    query="q", provider="openalex", timestamp="t", papers=[paper],
+  )], "q", session_name="hand-append")
+  decision = appended.decisions[0]
+  assert decision.paper.abstract == "Found by hand."
+  assert decision.abstract_set == stored.abstract_set != []
+
+def test_a_stale_save_keeps_text_and_record(self, tmp_path, monkeypatch):
+  monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+  save_session(self._session("hand-stale"))
+  stale = self._load_apart("hand-stale")
+  setter = self._load_apart("hand-stale")
+  record = set_abstract(setter.decisions, "Text.", "Crossref", self.AT)
+  save_session(setter)
+  stale.decisions[0].status = DecisionStatus.KEPT
+  stale.decisions[0].tags = ["t"]
+  save_session(stale)
+  decision = load_session("hand-stale").decisions[0]
+  assert decision.paper.abstract == "Text."
+  assert decision.abstract_set == [record]
+  assert decision.status is DecisionStatus.KEPT
+
+def test_its_save_keeps_a_decision_made_meanwhile(
+  self, tmp_path, monkeypatch,
+):
+  monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+  save_session(self._session("hand-late"))
+  setter = self._load_apart("hand-late")
+  decider = self._load_apart("hand-late")
+  decider.decisions[0].status = DecisionStatus.DISCARDED
+  decider.decisions[0].tags = ["off-topic-false-hit"]
+  save_session(decider)
+  record = set_abstract(setter.decisions, "Text.", "Crossref", self.AT)
+  save_session(setter)
+  decision = load_session("hand-late").decisions[0]
+  assert decision.status is DecisionStatus.DISCARDED
+  assert decision.tags == ["off-topic-false-hit"]
+  assert decision.paper.abstract == "Text."
+  assert decision.abstract_set == [record]
+
+def test_its_save_keeps_its_text_over_a_meanwhile_one(
+  self, tmp_path, monkeypatch,
+):
+  monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+  save_session(self._session("hand-both"))
+  setter = self._load_apart("hand-both")
+  enricher = self._load_apart("hand-both")
+  enricher.decisions[0].paper.abstract = "A provider's abstract."
+  save_session(enricher)
+  set_abstract(setter.decisions, "Found by hand.", "Crossref", self.AT)
+  save_session(setter)
+  decision = load_session("hand-both").decisions[0]
+  assert decision.paper.abstract == "Found by hand."
+  assert decision.abstract_set[0]["previous"] == "A provider's abstract."
+
+def test_a_stale_fill_does_not_replace_it(self, tmp_path, monkeypatch):
+  monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+  save_session(self._session("hand-fill"))
+  enricher = self._load_apart("hand-fill")
+  setter = self._load_apart("hand-fill")
+  record = set_abstract(setter.decisions, "Found by hand.", "Crossref",
+                        self.AT)
+  save_session(setter)
+  enricher.decisions[0].paper.abstract = "A provider's abstract."
+  save_session(enricher)
+  decision = self._load_apart("hand-fill").decisions[0]
+  assert decision.paper.abstract == "Found by hand."
+  assert decision.abstract_set == [record]
+
+def test_two_hand_texts_follow_the_usual_rule(self, tmp_path, monkeypatch):
+  monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+  save_session(self._session("hand-two"))
+  first = self._load_apart("hand-two")
+  second = self._load_apart("hand-two")
+  set_abstract(first.decisions, "First hand text.", "Crossref", self.AT)
+  save_session(first)
+  set_abstract(second.decisions, "Second hand text.", "PubMed",
+               "2026-11-20T11:00:00+00:00")
+  save_session(second)
+  decision = self._load_apart("hand-two").decisions[0]
+  assert decision.paper.abstract == "Second hand text."
+  assert [r["from"] for r in decision.abstract_set] == ["Crossref", "PubMed"]
+  assert hand_abstract_replaced(decision) is False
+@
+
+A process that gives the abstract to a DOI-less copy which [[sessions
+reconcile]] folded into its twin after the process loaded the session
+has its copy settled by the save ([[apply_tombstones]]): the copy is
+dropped, and its text and record go to the twin.
+
+<<set abstract test methods>>=
+def test_a_copy_folded_meanwhile_passes_it_on(self, tmp_path, monkeypatch):
+  from scholar.scholar import isolated_registry
+
+  monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+  session = ReviewSession(query="q", providers=["openalex"],
+                          timestamp=datetime(2026, 11, 20), name="hand-fold")
+  twin = self._pending(doi="10.5555/hand-fold-twin")
+  twin.status, twin.tags = DecisionStatus.KEPT, ["t"]
+  session.decisions = [self._pending(), twin]
+  save_session(session)
+  setter = self._load_apart("hand-fold")
+  with isolated_registry():
+    assert reconcile_session("hand-fold") != []
+  record = set_abstract(setter.decisions[:1], "Found by hand.",
+                        "Crossref", self.AT)
+  save_session(setter)
+  [decision] = self._load_apart("hand-fold").decisions
+  assert decision.paper.doi == "10.5555/hand-fold-twin"
+  assert decision.paper.abstract == "Found by hand."
+  assert decision.abstract_set == [record]
+
+def test_a_folded_copy_with_an_abstracted_twin_keeps_the_record(
+  self, tmp_path, monkeypatch,
+):
+  from scholar.scholar import isolated_registry
+
+  monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+  session = ReviewSession(query="q", providers=["openalex"],
+                          timestamp=datetime(2026, 11, 20),
+                          name="hand-fold-own")
+  twin = self._pending(doi="10.5555/hand-fold-own",
+                       abstract="The twin's own.")
+  twin.status, twin.tags = DecisionStatus.KEPT, ["t"]
+  session.decisions = [self._pending(), twin]
+  save_session(session)
+  setter = self._load_apart("hand-fold-own")
+  with isolated_registry():
+    assert reconcile_session("hand-fold-own") != []
+  record = set_abstract(setter.decisions[:1], "Found by hand.",
+                        "Crossref", self.AT)
+  save_session(setter)
+  [decision] = self._load_apart("hand-fold-own").decisions
+  assert decision.paper.abstract == "The twin's own."
+  assert decision.abstract_set == [record]
+  assert hand_abstract_replaced(decision) is True
+@
+
+The two races of the paper-metadata merge are played again in real
+processes, in both save orders, since that is how they happen: a
+[[set-abstract]] run and an enrichment that loaded the session before
+it.  The test reads the saved file itself, so that no registry stands
+between it and what was written.  Each process prints a line once it
+has loaded the session and waits for one before it changes anything.
+
+<<test functions>>=
+class TestHandAbstractRaces:
+  """Hand text and a provider's fill, saved in either order (#258)."""
+
+  <<hand abstract race test methods>>
+
+<<hand abstract race test methods>>=
+NAME = "hand-race"
+SET = """
+  from scholar.review import load_session, save_session, set_abstract
+  session = load_session("hand-race")
+  WAIT
+  set_abstract(session.decisions, "Found by hand.", "Crossref",
+               "2026-11-20T10:00:00+00:00")
+  save_session(session)
+"""
+FILL = """
+  from scholar.review import load_session, save_session
+  session = load_session("hand-race")
+  WAIT
+  session.decisions[0].paper.abstract = "A provider's abstract."
+  save_session(session)
+"""
+WAIT = 'import sys; print("loaded", flush=True); sys.stdin.readline()'
+
+def _first_save(self):
+  from scholar.scholar import isolated_registry
+
+  with isolated_registry():
+    session = ReviewSession(query="q", providers=["openalex"],
+                            timestamp=datetime(2026, 11, 20),
+                            name=self.NAME)
+    session.decisions = [ReviewDecision(
+      paper=Paper(title="A Race", authors=["Ada Lovelace"], year=2021,
+                  doi="10.5555/hand-race"),
+      provider="openalex",
+    )]
+    save_session(session)
+
+def _code(self, template, wait):
+  import textwrap
+
+  return textwrap.dedent(template).replace(
+    "WAIT", self.WAIT if wait else "")
+
+def _race(self, stale, other):
+  """`stale` loads and waits; `other` runs whole; then `stale` saves."""
+  import subprocess
+  import sys
+
+  self._first_save()
+  first = subprocess.Popen(
+    [sys.executable, "-c", self._code(stale, wait=True)],
+    stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+  )
+  try:
+    assert first.stdout.readline().strip() == "loaded"
+    subprocess.run([sys.executable, "-c", self._code(other, wait=False)],
+                   check=True, timeout=120)
+    first.communicate("go\n", timeout=120)
+  finally:
+    if first.poll() is None:
+      first.kill()
+  assert first.returncode == 0
+  import json
+  from scholar.review import _get_sessions_dir
+
+  path = _get_sessions_dir() / f"{self.NAME}.json"
+  return json.loads(path.read_text())["decisions"][0]
+
+def test_a_stale_fill_saved_last(self):
+  saved = self._race(self.FILL, self.SET)
+  assert saved["paper"]["abstract"] == "Found by hand."
+  [record] = saved["abstract_set"]
+  assert record["text"] == "Found by hand."
+  assert "previous" not in record
+
+def test_a_stale_set_abstract_saved_last(self):
+  saved = self._race(self.SET, self.FILL)
+  assert saved["paper"]["abstract"] == "Found by hand."
+  [record] = saved["abstract_set"]
+  assert record["previous"] == "A provider's abstract."
+@
+
 \subsection{Samples of machine decisions drawn for review}
 \label{sec:llm-sample-record}
 
@@ -2010,6 +2747,13 @@ sample saved before the files were kept has [[None]] there and is
 read by label, as before; it is saved back without the field, so its
 stored form does not change.
 
+A census takes every matching decision and draws nothing at random, so
+its [[seed]] may be [[None]]; and a stratified sample is stored as one
+sample per confidence band, tied together in the criteria
+(\cref{sec:llm-sample-bands} in the LLM review module, which says why
+not as one record).  Neither needs a new field: the criteria and the
+papers are stored whole, as dictionaries.
+
 <<review data structures>>=
 @dataclass
 class LLMSample:
@@ -2020,9 +2764,11 @@ class LLMSample:
     decision when the sample was drawn; `size` and `population` are those
     of the whole sample, over all `sessions`. `session_files` names the
     file of each of `sessions` (None in samples drawn before it was kept).
+    `seed` is None for a census drawn without one; a band of a stratified
+    sample says so in `criteria["stratum"]`.
     """
     sample_id: str
-    seed: int
+    seed: int | None
     drawn_at: str
     criteria: dict
     sessions: list[str]
@@ -5680,6 +6426,7 @@ for result in results:
                 same_id_copies=list(prev_dec.same_id_copies),
                 relabelled=list(prev_dec.relabelled),
                 resets=list(prev_dec.resets),
+                abstract_set=list(prev_dec.abstract_set),
             )
         elif prev_record:
             <<rebuild the decision from the old decision store>>
@@ -6606,7 +7353,11 @@ copy without overwriting anything ([[merge_version_of]]), so its id is
 the DOI.  The search links, the other-work notes and the provider names
 of both copies are united (the names joined by a comma, as a session
 records a paper several providers returned, \cref{sec:review-found-by}), so provenance points at every search that
-returned either copy.  A pair whose copies both carry a note is not
+returned either copy.  The records of abstracts given by hand, which
+hold their texts, are united too; a record whose text lost to the
+other copy's abstract then reads as replaced, and a warning says so
+([[abstract_records_after_fold]], \cref{sec:set-abstract}).  A pair
+whose copies both carry a note is not
 folded, because [[migrate_paper_id]] keeps the target's note and drops
 the moved one when both ids have a note.  If the notes file cannot be
 read, nothing is folded.
@@ -6715,7 +7466,12 @@ the record of a fold, its \emph{tombstone}, always maps the DOI-less id
 to the DOI id.
 
 <<fold [[absorbed]] into [[survivor]]>>=
+before_fold = [
+    (get_paper_id(d.paper), d.paper.abstract, d.abstract_set)
+    for d in (survivor, absorbed)
+]
 survivor.paper = merge_version_of(with_doi.paper, bare.paper)
+survivor.abstract_set = abstract_records_after_fold(survivor.paper, before_fold)
 for link in absorbed.found_by:
     survivor.record_search(*link)
 for copy in absorbed.same_id_copies:
@@ -6931,7 +7687,12 @@ def apply_tombstones(
 @
 
 <<unite the links of [[decision]] into [[target]]>>=
+before_fold = [
+    (get_paper_id(d.paper), d.paper.abstract, d.abstract_set)
+    for d in (target, decision)
+]
 target.paper = merge_version_of(target.paper, decision.paper)
+target.abstract_set = abstract_records_after_fold(target.paper, before_fold)
 for link in decision.found_by:
     target.record_search(*link)
 for copy in decision.same_id_copies:
@@ -8786,6 +9547,7 @@ def read_session_file(
                     same_id_copies=list(dec_data.get("same_id_copies") or []),
                     relabelled=list(dec_data.get("relabelled") or []),
                     resets=list(dec_data.get("resets") or []),
+                    abstract_set=list(dec_data.get("abstract_set") or []),
                 )
             )
         
@@ -8918,6 +9680,10 @@ data = {
             ),
             **({"relabelled": d.relabelled} if d.relabelled else {}),
             **({"resets": d.resets} if d.resets else {}),
+            **(
+                {"abstract_set": d.abstract_set}
+                if d.abstract_set else {}
+            ),
             "paper": d.paper.to_dict(include_refs_cites=True),
         }
         for d in session.decisions
@@ -9144,12 +9910,15 @@ a judgement, so the links the file holds for a paper are added to the
 links this process holds, whatever the decision rules decide.  The
 same goes for the other works a search returned under a paper's id
 ([[same_id_copies]], \cref{sec:session-copies}), for the
-corrections of its source ([[relabelled]], \cref{sec:relabel-source})
-and for its resets to pending ([[resets]], \cref{sec:reset-decision}).
-Those are also part of the decision's state, so this process's state
+corrections of its source ([[relabelled]], \cref{sec:relabel-source}),
+for its resets to pending ([[resets]], \cref{sec:reset-decision})
+and for the records of abstracts given by hand ([[abstract_set]],
+\cref{sec:set-abstract}).
+All but the last are also part of the decision's state, so this process's state
 is taken before the file's are added: otherwise the union itself would
 look like a change made here, and a process that changed nothing would
-keep its stale source over the file's corrected one.  After the
+keep its stale source over the file's corrected one.  Why the records
+of abstracts are not part of it is said with them.  After the
 decisions are merged, the tombstones of folded copies are united with
 the file's and applied ([[apply_tombstones]], \cref{sec:session-copies}),
 so that a copy that [[sessions reconcile]] folded after this process
@@ -9461,9 +10230,14 @@ def merge_concurrent_changes(
         theirs = paired.get(id(decision))
         mine = decision_state(decision)
         if theirs is not None:
+            mine_new = [r for r in decision.abstract_set
+                        if r not in theirs.abstract_set]
+            their_new = [r for r in theirs.abstract_set
+                         if r not in decision.abstract_set]
             decision.paper = paper_merged_from(
                 decision.paper, theirs.paper, base_papers.get(paper_id)
             )
+            <<settle the abstract against the file's hand records>>
             for link in theirs.found_by:
                 decision.record_search(*replaced.get(link, link))
             for copy in theirs.same_id_copies:
@@ -9472,6 +10246,8 @@ def merge_concurrent_changes(
                 decision.add_relabel(record)
             for record in theirs.resets:
                 decision.add_reset(record)
+            for record in theirs.abstract_set:
+                decision.add_abstract_record(record)
         base_state = base_states.get(base_key_of(decision, base))
         if theirs is None or base_state is None:
             continue
@@ -16925,6 +17701,7 @@ def build_review_provenance_latex(
     )
     <<add summary counts>>
     <<add the count of agent reasons>>
+    <<add the count of abstracts given by hand>>
     <<add the LLM screening paragraphs>>
     <<add snowballing section>>
     return lines
@@ -17116,6 +17893,81 @@ class TestReportAgentReasons:
         )]
         text = " ".join(build_review_provenance_latex(session))
         assert "an agent made" not in text
+@
+
+An abstract a screener found by hand and gave with [[sessions
+set-abstract]] (\cref{sec:set-abstract}) is one the providers did not
+supply, and the decision on that paper may rest on it.  A reader of
+the report should know that some of the screened text did not come
+from the searched databases, so one sentence after the summary counts
+the papers that still hold such an abstract
+([[hand_abstract_replaced]]); where each was found is in the session,
+the CSV and [[sessions show]].  Papers are counted, not
+decisions, since copies of one work under one id share one abstract.
+Nothing is said when there are none.
+
+<<review report generation>>=
+def hand_abstracts_sentence(decisions) -> str:
+    """One sentence counting the papers whose abstract was given by hand.
+
+    Empty when there are none.
+    """
+    papers = {
+        get_paper_id(d.paper) for d in decisions
+        if d.abstract_set and not hand_abstract_replaced(d)
+    }
+    if not papers:
+        return ""
+    if len(papers) == 1:
+        return ("1 paper has an abstract added by hand, with where it "
+                "was found recorded in the session.")
+    return (f"{len(papers)} papers have abstracts added by hand, with "
+            "where each was found recorded in the session.")
+<<add the count of abstracts given by hand>>=
+hand_abstracts = hand_abstracts_sentence(session.decisions)
+if hand_abstracts:
+    lines.extend([hand_abstracts, ""])
+@
+
+<<test functions>>=
+class TestReportHandAbstracts:
+  def _session(self, *decisions):
+    session = ReviewSession(
+      query="q", providers=["p"], timestamp=datetime(2026, 11, 20),
+    )
+    session.decisions = list(decisions)
+    return session
+
+  def _decision(self, n, **kwargs):
+    return ReviewDecision(
+      paper=Paper(title=f"P{n}", authors=["A"],
+                  doi=f"10.5555/hand-report-{n}"),
+      provider="p", **kwargs,
+    )
+
+  def test_the_report_counts_papers(self):
+    given = [self._decision(n) for n in (1, 2)]
+    for decision in given:
+      set_abstract([decision], "Text.", "Crossref",
+                   "2026-11-20T10:00:00+00:00")
+    copy = self._decision(2, status=DecisionStatus.KEPT, tags=["t"])
+    copy.abstract_set = list(given[1].abstract_set)
+    copy.paper.abstract = "Text."
+    replaced = self._decision(5)
+    set_abstract([replaced], "Text.", "Crossref",
+                 "2026-11-20T10:00:00+00:00")
+    replaced.paper.abstract = "A preprint's own abstract."
+    lines = build_review_provenance_latex(
+      self._session(*given, copy, self._decision(3), replaced),
+    )
+    assert ("2 papers have abstracts added by hand, with where each was "
+            "found recorded in the session.") in lines
+
+  def test_no_sentence_without_one(self):
+    text = " ".join(build_review_provenance_latex(
+      self._session(self._decision(4)),
+    ))
+    assert "added by hand" not in text
 @
 
 A session's decisions are records, not works: the copies of one work
@@ -22215,6 +23067,11 @@ agent's trace (\cref{sec:agent-audit-fields}), empty when no reason
 was recorded, so that a spreadsheet can check an agent's verdicts
 record by record as it can read the classifier's confidence.  They go
 before [[reset_from]]; [[paper_id]] stays last.
+[[abstract_from]] says where each abstract given by hand was found
+(\cref{sec:set-abstract}), as [[from time]] (with [[by NAME]]),
+separated by semicolons, so that a spreadsheet that reads the
+[[abstract]] column can tell a provider's text from one a screener
+found; it goes after [[reset_from]], before [[paper_id]].
 
 <<review report generation>>=
 def generate_csv_report(session: ReviewSession, output_path: Path) -> None:
@@ -22238,6 +23095,8 @@ def generate_csv_report(session: ReviewSession, output_path: Path) -> None:
       gave with `sessions decide --reason`, who gave it and when
     - reset_from: each earlier decision the record was reset from, as
       `status by source time [by NAME]`
+    - abstract_from: where each abstract given by hand was found, as
+      `from time [by NAME]`
 
     Args:
         session: The ReviewSession to report on.
@@ -22285,6 +23144,7 @@ def generate_csv_report(session: ReviewSession, output_path: Path) -> None:
                 "source_relabelled",
                 *AGENT_AUDIT_FIELDS,
                 "reset_from",
+                "abstract_from",
                 "paper_id",
             ]
         )
@@ -22325,6 +23185,7 @@ def generate_csv_report(session: ReviewSession, output_path: Path) -> None:
                         + (f" by {r['by']}" if r.get("by") else "")
                         for r in decision.resets
                     ),
+                    abstract_from_cell(decision),
                     get_paper_id(paper),
                 ]
             )
@@ -22396,9 +23257,9 @@ class TestCsvReportRelabelled:
         generate_csv_report(session, path)
         with path.open() as f:
             rows = list(csv.reader(f))
-        assert rows[0][-6:] == [
+        assert rows[0][-7:] == [
             "source_relabelled", "agent_reason", "agent_by",
-            "agent_decided_at", "reset_from", "paper_id",
+            "agent_decided_at", "reset_from", "abstract_from", "paper_id",
         ]
         records = [dict(zip(rows[0], row)) for row in rows[1:]]
         assert records[0]["source_relabelled"] == (
@@ -22477,6 +23338,54 @@ class TestCsvReportResetFrom:
             "kept by agent 2026-11-19T11:00:00+00:00 by the author"
         )
         assert record["status"] == "pending"
+@
+
+The cell of [[abstract_from]] is built by a function of its own, which
+the CSV writer calls; its records come from [[set_abstract]]
+(\cref{sec:set-abstract}).
+
+<<review report generation>>=
+def abstract_from_cell(decision: ReviewDecision) -> str:
+    """The CSV cell naming where each hand-given abstract was found."""
+    return "; ".join(
+        f"{r.get('from')} {r.get('at')}"
+        + (f" by {r['by']}" if r.get("by") else "")
+        for r in decision.abstract_set
+    )
+@
+
+Two abstracts given in turn, the second replacing the first, are both
+listed, oldest first, and a row without one leaves the cell empty:
+
+<<test functions>>=
+class TestCsvReportAbstractFrom:
+  def test_hand_abstracts_are_listed(self, tmp_path):
+    import csv
+
+    decision = ReviewDecision(
+      paper=Paper(title="Hand", authors=["A"], year=2024), provider="p",
+    )
+    set_abstract([decision], "First.", "OpenAlex",
+                 "2026-11-20T10:00:00+00:00")
+    set_abstract([decision], "Second.", "Crossref, 2026-11-20",
+                 "2026-11-20T11:00:00+00:00", by="the screener",
+                 replace=True)
+    plain = ReviewDecision(
+      paper=Paper(title="Plain", authors=["B"], year=2024), provider="p",
+    )
+    session = ReviewSession(
+      query="q", providers=["p"], timestamp=datetime(2026, 11, 20),
+    )
+    session.decisions = [decision, plain]
+    path = tmp_path / "r.csv"
+    generate_csv_report(session, path)
+    rows = list(csv.DictReader(path.open()))
+    assert rows[0]["abstract_from"] == (
+      "OpenAlex 2026-11-20T10:00:00+00:00; "
+      "Crossref, 2026-11-20 2026-11-20T11:00:00+00:00 by the screener"
+    )
+    assert rows[0]["abstract"] == "Second."
+    assert rows[1]["abstract_from"] == ""
 @
 
 
