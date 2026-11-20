@@ -1136,12 +1136,18 @@ confirmation goes to stderr so `-f json`/`-f bibtex` stdout stays pure.
 `sessions show` prints each paper's id (`doi:…`/`hash:…`, the value
 `--paper-id` takes) under its title, and `show -f json` carries `doi` and
 `paper_id`, so a decision never needs a CSV detour.
-Each paper list prints in one Rich call without the highlighter
-(`print_paper_lines`, #273; 10,000 decisions: ~26 s → ~10 s piped):
-the piped text is byte-identical (pinned by `TestShowPinnedOutput` at
-80 and 200 columns), on a terminal numbers and URLs in titles and ids
-are no longer coloured. The paper line escapes the stored provider
-too (`open[alex]` printed as `(open)` before).
+Each paper line is a `rich.text.Text` (`session_paper_line`; own
+pieces styled, stored strings appended as plain text: no markup, no
+emoji codes, no highlighter), printed `PAPER_LINES_PER_PRINT` (200)
+papers per call (`print_paper_lines`, #273; 10,000 decisions: ~3x
+faster piped); the console has `emoji=False`. Piped text is pinned by
+`TestShowPinnedOutput` (80 and 200 columns) and equals the old
+per-line output except where that was wrong: stored brackets
+(`open[alex]` printed `(open)`; tags `x[bold`, `a]b[c` formed Rich
+tags), emoji codes (`a:b:c`) and trailing backslashes (doubled). On a
+terminal numbers and URLs in titles and ids are no longer coloured.
+Other `show` lines (queries, themes, copies) still use markup with
+`escape`, so a trailing backslash there still prints doubled.
 `--source human|agent|llm` says who decided (#162). It defaults to
 `human` only when stdin is a terminal; otherwise (scripts, agents) a
 missing `--source` exits 2 before loading the session. `agent` (an AI
