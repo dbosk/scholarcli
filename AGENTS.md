@@ -1819,6 +1819,25 @@ in the preamble; fragment: in the body before first use, with a `%`
 header saying how to define it first (pdflatex Cyrillic:
 `\usepackage[T2A,T1]{fontenc}` +
 `\newcommand{\scholarnonlatin}[1]{{\fontencoding{T2A}\selectfont #1}}`).
+Separator (#262): where a wrapped run touches a letter or digit of the
+source (CJK written against Latin: `\u5b66\u4e60Mac OS X...`), both
+escapers write `\scholarnonlatinsep{}` between them (`NONLATIN_SEP`,
+`_touches_text`; never next to a space or punctuation, so such output
+is byte-identical). `nonlatin_definition(marker, separator=True)`
+prepends `NONLATIN_SEP_DEFINITION` (empty under XeTeX/LuaTeX, else
+`\ `; deliberately no test of whether `\scholarnonlatin` is defined:
+an earlier fragment or a cited scholar `.bib`'s `@preamble` defines it
+too, and the marker then ran into the Latin words), added by
+`latex_document`/`latex_fragment`/`nonlatin_bib_preamble` only when
+`uses_nonlatin_sep`; the fragment header then tells a host whose
+`\scholarnonlatin` prints the text to add
+`\newcommand{\scholarnonlatinsep}{}` (without it: a space where the
+scripts touch). `uses_nonlatin` detects either macro; `cli._unescape_bib`
+drops the separator before the wrapper; the `--cited-from` reader
+(bibtexparser decoding) already drops it (pinned). pdflatex prints
+"[non-Latin text] Mac OS X [non-Latin text]", also after an earlier
+fragment and after a cited new or old-style `.bib`
+(`TestNonLatinSeparatorCompiles`).
 An audit row whose title keeps no letter outside such runs
 (`only_nonlatin_letters`) also prints `(paper id)` (`doi:…`, else the
 hash id; `audit_title_cell`, `AuditRow.nonlatin_title`), and
@@ -1913,7 +1932,19 @@ fixture has a quoted query, a `[`-row, `ĸ`, `CO₂`, a ligature. About
   shown for unreviewed and human-confirmed LLM or agent rows, not for
   changed ones, and
   such a row without one shows `AUDIT_STRINGS[lang]["no_confidence"]`
-  (`n/a`, `saknas`) because the caption promises a confidence. The
+  (`n/a`, `saknas`) because the caption promises a confidence. Whose
+  confidence (#262): `audit_reason_and_confidence` also returns the
+  origin when the label shows one (`audit_confidence_origin`: agent
+  sources → `agent`, LLM and unknown sources → `llm`; `audit_reason`
+  drops it), kept as `AuditRow.confidence_by`; `audit_confidence_sentence`
+  picks `confidence_llm`/`confidence_agent`/`confidence_both` or none
+  from the *listed* rows (both caption forms, `{confidence}`). Numbers
+  (#262): `audit_number(value, strings, decimals=None)` with
+  `AUDIT_STRINGS[lang]["decimal_mark"]`/`["group_separator"]` (en `.`
+  `,`; sv `,` `\,`), grouping from 1000, for every confidence and every
+  caption count (categories, extras, k of n queries/searches, semantic
+  n); years, DOIs, ids, dates never. Column head `provider` is
+  "Database"/"Databas". The
   escapers decode HTML entities, strip inline markup, repair
   cp1252/Latin-1 mojibake and turn `"` into `\textquotedbl{}` (babel
   shorthand). Titles are printed whole unless `--truncate-titles`
@@ -1977,7 +2008,8 @@ fixture has a quoted query, a `[`-row, `ĸ`, `CO₂`, a ligature. About
   the rest as "other hits" (all localised). Criteria are the review's own labels, so
   there is no fixed list. The caption never
   names the session (it is a `%` comment in the fragment) and ends with
-  a full-name-first "Databases:" sentence built from the providers
+  a full-name-first "Databases searched:" ("Sökta databaser:", #262)
+  sentence built from the providers
   the session searched (search records that answered at least once,
   zero hits included, plus the rows; rows only for old sessions). A
   database known only from records without an outcome and from no row
@@ -1988,7 +2020,12 @@ fixture has a quoted query, a `[`-row, `ĸ`, `CO₂`, a ligature. About
   "failed for k of n queries" / "incomplete for k of n queries"
   (localised), and one that failed every query outright is not
   named. `--bearing-only` lists only orders 0-2 and states the other
-  counts in the caption. `all` stays csv + latex.
+  counts in the caption: without extras "the A adjacent and B false
+  hits" (`unlisted_pair`), with extras each group with its noun and
+  `audit_joined_list` putting "and"/"och" before the last ("the A
+  adjacent hits, the B false hits, 2 unclassified and 1 ..."); the
+  `extra_*` strings have no leading comma (the full caption adds ", ").
+  `all` stays csv + latex.
 - The TUI's `prompt_for_report` keeps the standalone default.
 
 ### Provider Text Cleaning
