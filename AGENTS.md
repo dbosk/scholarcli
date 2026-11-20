@@ -1003,8 +1003,9 @@ and error line numbers match an editor) is the selection (exit 2 with `--doi`/`-
 `--reason`); its confidence overrides `-c` per line, and with
 `--keep-trace` and no `-c` every line needs one. Usage errors (exit 2,
 before loading): `--reason`/`--reasons-file`/`--by` with `--source
-llm` (the classifier's reason is `llm classify`'s) or `human` (out of
-scope), `--by` alone, any bad file line (all named:
+llm` (the classifier's reason is `llm classify`'s), `--reason`/
+`--reasons-file` with `human` (out of scope; `--by` alone is accepted
+for a human since #257, below), `--by` alone for an agent, any bad file line (all named:
 `cli.parse_reasons_file`), empty or > `review.MAX_AGENT_REASON_CHARS`
 (2000, stripped, never truncated) reason. After loading: an unknown id
 exits 1 (like `--doi`), one paper given two different reasons or
@@ -1012,7 +1013,8 @@ confidences exits 2, both unsaved. `--source agent` without a reason
 warns on stderr and records the decision. Shown in `sessions show`
 (a `reason (by): …` line, cut at `SHOW_REASON_CHARS` = 160; JSON:
 the three fields, `null` when unset), the per-decision CSV (three
-columns before `reset_from`; `paper_id` stays last) and the report (one English sentence after
+columns after `source_relabelled`, before the human record's;
+`paper_id` stays last) and the report (one English sentence after
 the summary, `agent_reasons_sentence`: agent and agent_reviewed
 decisions with/without a reason). An older Scholar loads such files
 and drops the fields on its next save (checked with the installed
@@ -1189,19 +1191,136 @@ apply); else `keep_copy_before_run(session, "pre-reset")`, one
 is hidden on a still-pending reset paper and when the last relabel is
 older than the last reset, `relabel_after_reset`; JSON `resets`) and
 the CSV column `reset_from` (`status by source time [by NAME]; ...`,
-after the agent-trace columns, before `paper_id`). Effects: audit table and
+after the agent-trace and human-record columns, before
+`abstract_from`). Effects: audit table and
 report show pending; a sampled decision reset at or after the draw
 is gone from the sample (see Samples: `reset_since_draw`);
 `first_made_by_llm` is False for any pending
 paper; after a full reset the classifier vocabulary (tags of decided
 papers) is empty, so pass `llm classify --tag`.
+**Human review record (#257, review.nw `sec:human-review-record`).**
+`human` is the dataclass default and needed no evidence, so scripts
+writing through the API gave >1000 decisions a human source nobody
+gave. `ReviewDecision` now has `human_decided_at` (UTC ISO),
+`human_decided_via` (`tui` | `decide`, `HUMAN_DECISION_CHANNELS`) and
+`human_by` (as given, never guessed), named once in
+`review.HUMAN_AUDIT_FIELDS` (`human_record_of`; load, save only when
+set via `human_record_data`, `decision_state`, concurrent merge,
+`is_unscreened`; the append keeps the decision whole). NOT in
+`MACHINE_AUDIT_FIELDS` (so not cleared by `clear_machine_audit`, not
+in a reset's `trace`). Set only by `review.record_human_decision(d,
+via, by=None, at=None)` (raises unless decided with a source in
+`REVIEWED_BY_A_HUMAN` = human/llm_reviewed/agent_reviewed; `at`
+defaults to `_utcnow`), called by the TUI's keep/themes/discard/confirm
+in both screens (after `mark_as_reviewed`) and by `sessions decide`
+with a human source (`--source human` or the terminal default; one
+`utc_now_iso()` per run; `--by NAME` now accepted with human). The
+API (`ReviewDecision(source=HUMAN)`, `mark_as_reviewed` alone) sets
+nothing. A machine `decide` (with `--force` over a human/reviewed
+decision) calls `clear_human_record`; `relabel_source` clears it and
+keeps the set fields as `"human"` in its relabel record (key absent
+without a record); a reset only takes unreviewed decisions, which have
+none; a later human decision overwrites it (time included). Counted by
+`human_record_counts(decisions)` (decided papers with
+`human_decided_at` per `REVIEWED_BY_A_HUMAN` source) and
+`decision_source_rows(decisions, always_note=False)` → `(label, count,
+note)`, note "(k with a record of the review)" on those sources' rows
+with a count, when `always_note` or any such decision lacks a record
+(`source_row_text(count, note)`). `sessions show` "Decided by:" always
+notes (`human: 1200 (0 with a record of the review)`), JSON adds the
+three fields per decision (`null` when unset) and `review_records`
+(counts by stored value); the report's "Decided:" rows, its abstract
+sentence (`decision_sources_sentence`) and `llm synthesize`'s summary
+note only when a record is missing, so a fully recorded session reads
+as before; with the note they also give `REVIEW_RECORD_EXPLANATION`
+once (`review_record_sentence`: after the report's summary, in its
+abstract, after both synthesis summaries; no version or date in it).
+The CSV adds `human_decided_at, human_decided_via,
+human_by` after `agent_decided_at`. The audit table and its caption
+are deliberately unchanged: they neither count nor mention the
+records (tested byte-identical). Copies are compared by
+`decision_verdict` (= `decision_state` without `HUMAN_AUDIT_FIELDS`;
+LLM/agent fields stay in) in `_fold_direction`, `same_id_pairs` and
+`_decided_pairs` (alike/conflicting), so two copies a human decided
+alike at two moments still fold, are no alike pair and need no
+`--all-copies`; a fold keeps the newer record (`newer_human_record`:
+by `human_decided_at`, a record beats none; the fold also carries both copies' `abstract_set` records). `decision_state` (merge,
+baseline, `pair_with_file`, `apply_tombstones`) keeps the record: those
+compare one decision with itself across file versions. Wording: "without a record of the
+review", never "not human" (old decisions have none). The default
+source stays `human` (an undecided paper's). Checked 2026-11-20: the
+pipx build of 4ba7a23 loads such a file and drops the fields on save.
+**`scholar sessions set-abstract S (--paper-id ID | --doi D) --file F
+--from TEXT [--by NAME] [--replace] [--dry-run]`**, or `--abstracts-file
+F` (lines `ID<TAB>FROM<TAB>ABSTRACT`, split at the first two tabs, so
+tabs inside the abstract become spaces; fewer than three columns
+refused; the `--reasons-file` conventions: `utf-8-sig`, lines end at
+`\n`, blank/`#` skipped, ID = paper id or DOI bare/`doi:`;
+`cli.parse_abstracts_file`, every bad line named, exit 2 before
+loading) (#258, cli.nw `sec:sessions-set-abstract`, review.nw
+`sec:set-abstract`) stores an abstract found by hand. `--file -` reads
+stdin (a BOM is dropped, as `utf-8-sig` drops it from a file); `--from`
+is required. `review.set_abstract(decisions, text, origin, at, by,
+replace)` cleans the text (`clean_abstract_text` = `clean_metadata_text`
++ white space collapsed; empty → exit 2; above `LONG_ABSTRACT_CHARS` =
+10,000 only a stderr warning), sets `paper.abstract` on every decision
+holding the paper (one registry `Paper`) and records on each decision
+`ReviewDecision.abstract_set` = `[{"at", "from", "by", "chars", "text",
+"previous"}]` (`text` = the stored text, kept so that a replaced hand
+text survives somewhere; `previous` only when an abstract was replaced;
+`by` None unless given). A paper with an abstract is refused (exit 2,
+each named, unsaved) unless `--replace`; an unmatched selector exits 1
+unsaved; two batch lines giving one paper different texts/origins exit
+2. A possible or foldable copy (`cli.possible_twins` over
+`possible_copies` / `foldable_copies`, both directions) gets a stderr
+note naming it and `sessions reconcile`, plus a second note when the
+paper has no DOI and the copy is a DOI record with an abstract (a fold
+keeps that one); the abstract is still set. `--dry-run` writes
+nothing; else `keep_copy_before_run(session, "pre-set-abstract")`, one
+`_utcnow()` time, `save_session`. The record is on the decision, not
+on `Paper` (no new paper-merge rule): saved only when non-empty, old
+files `[]`, kept by the append copy (stored abstract wins via
+`stored_paper_with`), united in `merge_concurrent_changes`, but **not**
+in `decision_state` (it changes no decision: in the state, a
+`set-abstract` save would put a stale pending decision back over a
+decision another process saved meanwhile; tested). An older Scholar
+(checked with the pipx build, which has no `abstract_set`, on a file
+whose records hold `text`) keeps the abstract and drops the list on
+its next save. Not part of `is_unscreened` either, so a pending copy
+with a hand abstract still folds; the fold (`reconcile_copies` and
+`apply_tombstones`) always carries a copy's records, texts included,
+to the survivor (`abstract_records_after_fold`), with a WARNING when
+the survivor kept its own abstract. The abstract itself follows the
+#206 paper merge, plus two rules in `<<settle the abstract against the
+file's hand records>>` (records apart, `mine_new`/`their_new`, taken
+before the union): the file holds a hand record we lack whose `text`
+is the file's abstract and we added none → the file's abstract wins
+over ours (a stale enrichment never erases a hand text); we added a
+hand record and the file's abstract (not None) differs from the loaded
+one and ours → our text stays, and our newest record gets the file's
+abstract as `previous` (what `--replace` would have kept). Both races
+tested in real subprocesses, both save orders (`TestHandAbstractRaces`).
+`enrich` never replaces a hand abstract (`needs_enrichment`,
+`merge_with` keep stored values; tested), but a **preprint adoption**
+takes the preprint's own abstract (`preprint._adopt`).
+`hand_abstract_replaced(d)` (last record's `text` != the paper's
+abstract; a record without `text` compared by `chars`) then makes
+`sessions show` add ", since replaced" and the report not count it. The
+DOI-less hash id does not move (title and author only; tested). Shown
+by `sessions show` ("(abstract added by hand, from <from>)",
+`cli.abstract_mark`; JSON `abstract_set` when set, the records whole,
+`text` included: it is the record, and hand abstracts are few), the
+report (`hand_abstracts_sentence`, one English sentence counting
+papers, nothing when zero) and the CSV column `abstract_from` (`from
+time [by NAME]; ...`, no text, `review.abstract_from_cell`, after
+`reset_from`, before `paper_id`). The audit table is unchanged.
 Together these let scripted/agent-driven systematic reviews produce the same
 session record and `sessions export` audit trail as TUI reviews.
 
 ### Session Arguments
 
 Every command that takes a saved session (`sessions show/export/decide/
-relabel/reset/resume/reconcile/check`, `llm classify/status/context/
+relabel/reset/set-abstract/resume/reconcile/check`, `llm classify/status/context/
 synthesize/sample`, `enrich`, `verify`) opens it with
 `cli.open_session_argument` → `review.load_session_argument` →
 `resolve_session_argument` (#237, review.nw `sec:session-arguments`):
@@ -1770,6 +1889,29 @@ checked: `llm classify` answers, and `sessions decide --source llm`
 agent's "supports, excluded" (rendered on purpose by the audit table,
 #89) is recorded as given; existing records are not rewritten.
 Sessions without category tags are classified as before.
+A record whose category does not fit its status (a human's "supports,
+excluded", or a pre-#177 leftover) is no example, though (#255,
+llm_review.nw
+`sec:example-category`): `get_example_decisions` leaves out every
+candidate (`example_candidates`: tagged, kept/discarded, confirmed, or
+unreviewed with `--include-llm-examples`) whose `audit_category` (last
+category tag) is not in `STATUS_CATEGORIES[status]`
+(`category_contradicts_status`), before the sort and the cut to
+`max_kept`/`max_discarded`, so the lists stay full. Left out rather
+than shown without a category (the prompt demands exactly one). Not
+vocabulary-dependent; no category tag, no check. The INFO log says
+"Left out N examples whose category does not fit their decision";
+`llm status` counts the confirmed ones with the same
+`contradictory_examples(session)` (row "Confirmed, not examples
+(category does not fit decision)" only when > 0, apart from "Training
+examples", which counts `is_example`; JSON `examples_left_out`
+always). An example shows `example_tags(tags)` (llm_review.nw
+`sec:example-tags`): no note tags and only the deciding category, so a
+pre-#195 record tagged `supports-claim, off-topic-false-hit` shows
+`off-topic-false-hit`; records with one category or none print as
+before. The prompt version does not move (it hashes a fixed probe,
+not the session's examples). `sessions show` does not list such
+records.
 
 ### Snowball and Tuxedo Subcommands (lazy)
 
@@ -1863,11 +2005,53 @@ A human review leaves them untouched (they are the model's record).
   other sessions from those files (`load_listed_session`; a file gone
   -> its papers not found), old samples by label via `load`, each file
   once. The population digest still hashes labels (unchanged).
+- **Bounds, bands, census (#254).** `--max-confidence C` is exclusive
+  (`confidence_in_bounds`: `[min, max)`, a missing confidence meets no
+  bound); `--no-confidence` selects only decisions without one (exit 2
+  with a bound). `--bands 0.5,0.7,0.9` (`check_band_cuts`: strictly
+  increasing in (0, 1); exit 2 with any bound or `--no-confidence`)
+  draws `-n` per band, bands `below 0.5`, `0.5 to below 0.7`, ...,
+  `at least 0.9` (open outer ends, so disjoint and exhaustive) plus
+  `without a confidence` when any lack one (`band_strata`). Each band
+  has its own generator, `random.Random(int(sha256("seed/min!r/max!r/
+  no_confidence")[:8]))` (`band_random`), so adding a decision to one
+  band never changes another band's draw. A band with <= n members is
+  taken whole (`criteria["census"]`); `--census` takes everything (no
+  `-n`, which is refused, and no seed: `LLMSample.seed` None, id
+  `.../census/...`). A plain draw stores exactly the old criteria
+  (new keys only when used; `test_golden_draw` unchanged). Record: one
+  `LLMSample` per band with `criteria["stratum"] = {group, band, bands,
+  cuts}`, id `<group>/band=<i>`, its own population/digest/size, empty
+  bands recorded too; chosen over one record with a band list because
+  an older Scholar keeps `criteria` and paper dicts whole on save and
+  reports each band correctly as its own sample (it only misses the
+  upper bound in the sentence; a census it states as a random sample
+  "(seed None)" with an interval). `--report`: `group_sample_reports`
+  joins bands into a `StratifiedReport` (table: band, population,
+  drawn, reviewed, changed, rate, interval; census band no interval,
+  "census, all reviewed"/"k left"); JSON keeps old keys for plain
+  samples (`census` added only for a census), stratified: `stratified`,
+  `bands` (+`band`, `census`), `estimate` (null until complete).
+  `stratified_estimate`: p = sum N_h x_h/n_h / N and changed among the
+  not reviewed sum (N_h - n_h) x_h/n_h (Franco, Little, Louis, Slud
+  2019, JSSAM 7(3), eq. 10; read in full, authors' final version), given
+  only when every band of the group is present, has no decision not
+  found (a lost session is no random loss), has no unreviewed decision
+  and has a review left (resets are left out of n_h and named);
+  otherwise `StratifiedReport.withheld_reason()` gives the sentence's
+  reason (JSON `estimate_withheld`, null once given). **No interval for
+  the whole**: Franco et al.'s Wilson-with-effective-size results
+  exclude zero estimated variance (all bands agreeing) and their
+  smallest expected proportion is 0.05 (n >= 30). Per-band intervals
+  stay.
 - **Report.** `build_review_provenance_latex` calls
   `llm_review.build_llm_screening_latex` (one local import + call): an
   "LLM screening" section with models, prompt versions, dates, the
   truncated (from each decision's flag, no character count) and
-  unrecorded counts, and `sample_sentence` per sample
+  unrecorded counts, and `sample_report_sentence` per sample (one for
+  all bands of a stratified sample; old samples byte-identical, pinned
+  by `TestScreeningSectionWithBands`; a census says "A census of all
+  N ..." without seed or interval)
   (other pooled sessions are loaded read-only). Nothing when the
   session has no LLM decisions and no samples.
 

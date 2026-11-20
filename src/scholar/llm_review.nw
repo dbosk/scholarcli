@@ -284,6 +284,8 @@ For a paper to serve as an example:
 \item It must be classified (kept or discarded), not pending
 \item It must have at least one tag (theme or motivation)
 \item A human must have made or confirmed the decision
+\item Its category, if it has one, must fit its decision
+  (\cref{sec:example-category})
 \item Papers where the user corrected an LLM decision are prioritized
   (they represent edge cases the LLM got wrong)
 \end{enumerate}
@@ -326,6 +328,100 @@ def is_unreviewed_machine(decision: ReviewDecision) -> bool:
     return source_value(decision) in UNREVIEWED_MACHINE_SOURCES
 @
 
+The first three rules say which decisions are candidates at all; the
+fourth then removes some of them, and the fifth only orders what is
+left.  The candidates are one function, because the count of records
+left out for their category (below) must be taken over exactly the
+decisions the examples are drawn from.
+
+<<llm review example gathering>>=
+def example_candidates(
+    session: ReviewSession, include_unreviewed: bool = False
+) -> list[ReviewDecision]:
+    """Return the decided, tagged decisions that may serve as examples.
+
+    Those a human made or confirmed, and with `include_unreviewed` also
+    unreviewed LLM and agent decisions, in session order.
+    """
+    return [
+        decision for decision in session.decisions
+        if decision.tags
+        and decision.status in (DecisionStatus.KEPT, DecisionStatus.DISCARDED)
+        and (is_confirmed(decision)
+             or (include_unreviewed and is_unreviewed_machine(decision)))
+    ]
+@
+
+\subsection{Examples whose category contradicts their decision}
+\label{sec:example-category}
+
+The prompt's category section says that every paper carries exactly
+one category and that the category must fit the decision: a keep takes
+[[supports-claim]], [[qualifies-claim]] or [[adjacent-subtopic]], a
+discard [[adjacent-subtopic]] or [[off-topic-false-hit]]
+([[STATUS_CATEGORIES]], \cref{sec:category-fits-status}).  A session
+can still hold confirmed decisions that break the rule.  Before
+issue~\#177, a status change kept the old category, so a keep under
+[[supports-claim]] that a human later discarded stayed tagged
+[[supports-claim]]; when the discard corrected the classifier, the
+record was also marked [[is_example]], so it came \emph{first} among
+the discarded examples (issue~\#255).  A human may also discard a bearing paper on purpose,
+under a rule of the review, and the audit table shows that as
+\enquote{supports, excluded} (issue~\#89).  Either way, as an example
+the record teaches the very pairing the rule forbids, and the parser
+then withholds the model's answer when it follows the example.
+
+Such a record is left out of the examples rather than shown without
+its category.  Shown without one, it would break the other half of
+the rule, exactly one category per paper; and the reason a human
+excluded a bearing paper is usually a criterion of the review, which
+the prompt tells the model to leave to a human.  The record's
+category is the one the audit table reads, its last category tag
+([[audit_category]]), so a record whose status change appended a
+fitting category is an example again.  A decision without a category
+tag cannot contradict, so a session without categories gets the
+examples, and so the prompt, it got before.  The check needs nothing
+but the decision: a category tag on it is enough to judge it,
+whatever vocabulary the run offers.
+
+<<llm review imports>>=
+from scholar.review import audit_category
+<<llm review example gathering>>=
+def category_contradicts_status(decision: ReviewDecision) -> bool:
+    """Tell whether the decision's category does not fit its status.
+
+    The category is the last category tag, as in the audit table; a
+    decision without one, or a pending one, contradicts nothing.
+    """
+    category = audit_category(decision.tags)
+    status = getattr(decision.status, "value", decision.status)
+    return (
+        category is not None
+        and status in STATUS_CATEGORIES
+        and category not in STATUS_CATEGORIES[status]
+    )
+
+
+def contradictory_examples(
+    session: ReviewSession, include_unreviewed: bool = False
+) -> list[ReviewDecision]:
+    """Return the candidate examples left out for their category."""
+    return [
+        decision
+        for decision in example_candidates(session, include_unreviewed)
+        if category_contradicts_status(decision)
+    ]
+@
+
+The records are left out before the lists are sorted and cut to
+their maximum, so a record left out gives its place to the next
+fitting one instead of shrinking the prompt's examples.  The log that
+lists the chosen examples says how many were left out, and
+[[llm status]] counts them with the same function, so the two agree.
+The prompt version (\cref{sec:prompt-version}) does not move: it
+hashes a fixed probe in place of the session's examples, so which
+records are examples was never part of it.
+
 <<llm review example gathering>>=
 def get_example_decisions(
     session: ReviewSession,
@@ -338,7 +434,8 @@ def get_example_decisions(
 
     Only decisions a human made or confirmed are examples, unless
     `include_unreviewed` is set; then unreviewed machine decisions follow
-    the confirmed ones. Prioritizes user-corrected LLM decisions
+    the confirmed ones. A decision whose category does not fit its
+    status is left out. Prioritizes user-corrected LLM decisions
     (is_example=True) as these represent cases where the LLM's initial
     classification was wrong.
 
@@ -353,16 +450,11 @@ def get_example_decisions(
     """
     kept_examples: list[ReviewDecision] = []
     discarded_examples: list[ReviewDecision] = []
+    left_out = contradictory_examples(session, include_unreviewed)
 
-    for decision in session.decisions:
-        # Only include papers with tags (our example requirement)
-        if not decision.tags:
+    for decision in example_candidates(session, include_unreviewed):
+        if category_contradicts_status(decision):
             continue
-        if not is_confirmed(decision) and not (
-            include_unreviewed and is_unreviewed_machine(decision)
-        ):
-            continue
-
         if decision.status == DecisionStatus.KEPT:
             kept_examples.append(decision)
         elif decision.status == DecisionStatus.DISCARDED:
@@ -400,6 +492,11 @@ def get_example_decisions(
                 f"  DISCARDED example: {example.paper.title[:60]}... "
                 f"[tags: {', '.join(example.tags)}]"
             )
+    if left_out:
+        logger.info(
+            f"Left out {len(left_out)} examples whose category does not "
+            "fit their decision"
+        )
 
     return kept_result, discarded_result
 @
@@ -662,6 +759,214 @@ def test_unknown_source_is_not_confirmed(self):
     assert not is_unreviewed_machine(decision)
 @
 
+A decision whose category contradicts its decision is no example,
+whoever made it (issue~\#255).  The issue's case is a human's discard
+still tagged [[supports-claim]] and marked as a correction, which used
+to come first among the discarded examples.  Let's check that it, and
+a keep tagged [[off-topic-false-hit]], are neither among the examples
+nor in the prompt [[llm classify]] builds, while the fitting records
+are:
+
+<<test functions>>=
+class TestExamplesWhoseCategoryContradicts:
+    <<contradicting example test methods>>
+
+<<contradicting example test methods>>=
+def _decision(self, name, status, tags, source=ReviewSource.HUMAN,
+              is_example=False):
+    return ReviewDecision(
+        paper=Paper(title=f"Paper {name}", authors=["A"],
+                    abstract=f"About {name}.",
+                    doi=f"10.5555/contradicts-{name}"),
+        provider="p", status=status, tags=list(tags), source=source,
+        is_example=is_example,
+    )
+
+def _session(self, decisions):
+    session = ReviewSession(
+        query="q", providers=["p"], timestamp=datetime(2026, 11, 20),
+        research_context="Does the claim hold?",
+    )
+    session.decisions = list(decisions)
+    return session
+
+def _issue_session(self):
+    return self._session([
+        self._decision("excluded", DecisionStatus.DISCARDED,
+                       ["supports-claim"], is_example=True),
+        self._decision("offtopic", DecisionStatus.DISCARDED,
+                       ["off-topic-false-hit"]),
+        self._decision("supporting", DecisionStatus.KEPT,
+                       ["supports-claim"]),
+        self._decision("falsehit", DecisionStatus.KEPT,
+                       ["off-topic-false-hit"]),
+        self._decision("new", DecisionStatus.PENDING, []),
+    ])
+
+def test_contradicting_records_are_no_examples(self):
+    kept, discarded = get_example_decisions(self._issue_session())
+    assert [d.paper.title for d in kept] == ["Paper supporting"]
+    assert [d.paper.title for d in discarded] == ["Paper offtopic"]
+
+def test_nor_in_the_prompt(self):
+    prompt = classify_papers_with_llm(
+        self._issue_session(), enrich_missing=False, dry_run=True,
+    )
+    assert "## Category (exactly one per paper)" in prompt
+    assert "Title: Paper supporting" in prompt
+    assert "Title: Paper offtopic" in prompt
+    assert "Paper excluded" not in prompt
+    assert "Paper falsehit" not in prompt
+@
+
+The last category tag is the decision's category, as in the audit
+table, so a record whose status change appended a fitting category is
+an example and one whose last category contradicts is not.  The
+example the prompt shows carries that category only, beside its
+theme (\cref{sec:example-tags}):
+
+<<contradicting example test methods>>=
+def test_the_last_category_decides(self):
+    session = self._session([
+        self._decision("mended", DecisionStatus.DISCARDED,
+                       ["supports-claim", "theory", "off-topic-false-hit"]),
+        self._decision("stale", DecisionStatus.DISCARDED,
+                       ["off-topic-false-hit", "supports-claim"]),
+        self._decision("new", DecisionStatus.PENDING, []),
+    ])
+    _, discarded = get_example_decisions(session)
+    assert [d.paper.title for d in discarded] == ["Paper mended"]
+    assert [d.paper.title for d in contradictory_examples(session)] \
+        == ["Paper stale"]
+    prompt = classify_papers_with_llm(
+        session, enrich_missing=False, dry_run=True,
+    )
+    assert "Title: Paper mended" in prompt
+    assert "Tags: theory, off-topic-false-hit\n" in prompt
+    assert "Tags: supports-claim" not in prompt
+@
+
+Unreviewed machine decisions, examples only on request, are judged the
+same way, and are counted only then:
+
+<<contradicting example test methods>>=
+def test_unreviewed_examples_too(self):
+    session = self._session([
+        self._decision("guess", DecisionStatus.DISCARDED,
+                       ["qualifies-claim"],
+                       source=ReviewSource.LLM_UNREVIEWED),
+        self._decision("fits", DecisionStatus.DISCARDED,
+                       ["adjacent-subtopic"],
+                       source=ReviewSource.LLM_UNREVIEWED),
+    ])
+    _, discarded = get_example_decisions(session, include_unreviewed=True)
+    assert [d.paper.title for d in discarded] == ["Paper fits"]
+    assert contradictory_examples(session) == []
+    assert [d.paper.title for d in contradictory_examples(
+        session, include_unreviewed=True
+    )] == ["Paper guess"]
+@
+
+Leaving a record out must not cost the prompt an example: the records
+are filtered before the lists are cut to their maximum, so a
+contradicting correction, which would sort first, gives its place to
+the next fitting record:
+
+<<contradicting example test methods>>=
+def test_the_maximum_is_still_filled(self):
+    session = self._session([
+        self._decision("excluded", DecisionStatus.DISCARDED,
+                       ["supports-claim"], is_example=True),
+    ] + [
+        self._decision(f"off{i}", DecisionStatus.DISCARDED,
+                       ["off-topic-false-hit"])
+        for i in range(3)
+    ])
+    _, discarded = get_example_decisions(session, max_discarded=2)
+    assert [d.paper.title for d in discarded] == ["Paper off0", "Paper off1"]
+@
+
+A session without category tags has no such record, so its examples
+and prompt are what they were: every tagged confirmed record is an
+example, whatever its tags say.
+
+<<contradicting example test methods>>=
+def test_a_session_without_categories_is_unchanged(self):
+    session = self._session([
+        self._decision("kept", DecisionStatus.KEPT, ["theory"]),
+        self._decision("gone", DecisionStatus.DISCARDED, ["theory"],
+                       is_example=True),
+        self._decision("new", DecisionStatus.PENDING, []),
+    ])
+    kept, discarded = get_example_decisions(session)
+    assert contradictory_examples(session) == []
+    assert (kept, discarded) == ([session.decisions[0]],
+                                 [session.decisions[1]])
+    prompt = classify_papers_with_llm(
+        session, enrich_missing=False, dry_run=True,
+    )
+    assert prompt == build_classification_prompt(
+        papers_to_classify=[session.decisions[2]],
+        kept_examples=[session.decisions[0]],
+        discarded_examples=[session.decisions[1]],
+        research_context="Does the claim hold?",
+        available_themes={"theory"}, available_motivations={"theory"},
+        extra_tags=set(), allow_new_tags=False, category_tags=set(),
+    )
+@
+
+The log that lists the chosen examples says how many were left out,
+so a user who wonders why a correction is missing finds out:
+
+<<contradicting example test methods>>=
+def test_the_log_counts_them(self, caplog):
+    with caplog.at_level(logging.INFO, logger="scholar.llm_review"):
+        get_example_decisions(self._issue_session())
+    assert "Left out 2 examples whose category does not fit " \
+        "their decision" in caplog.text
+@
+
+The prompt version does not hash the session's examples, only a fixed
+probe, so leaving a record out does not move it: two runs that differ
+only in such a record carry the same version.
+
+<<contradicting example test methods>>=
+def _version(self, monkeypatch, session):
+    class FakeResponse:
+        def text(self):
+            return json.dumps({"classifications": [
+                {"paper_index": 0, "decision": "discarded",
+                 "tags": ["off-topic-false-hit"], "confidence": 0.8,
+                 "reasoning": "r"},
+            ]})
+
+    class FakeModel:
+        model_id = "fake"
+
+        def prompt(self, prompt):
+            return FakeResponse()
+
+    class FakeLLMModule:
+        def get_model(self, _model_id=None):
+            return FakeModel()
+
+    import scholar.llm_review as llm_review
+
+    monkeypatch.setattr(llm_review, "llm", FakeLLMModule(), raising=False)
+    return classify_papers_with_llm(
+        session, count=1, model_id="fake", enrich_missing=False,
+    ).prompt_version
+
+def test_the_prompt_version_does_not_move(self, monkeypatch):
+    with_it = self._issue_session()
+    without = self._session(
+        d for d in self._issue_session().decisions
+        if d.paper.title != "Paper excluded"
+    )
+    assert self._version(monkeypatch, with_it) \
+        == self._version(monkeypatch, without)
+@
+
 
 \section{Prompt Construction}
 \label{sec:prompt-construction}
@@ -750,8 +1055,7 @@ def _format_paper_for_prompt(
             abstract = abstract[:EXAMPLE_ABSTRACT_CHARS] + "..."
         lines.append(f"Abstract: {abstract}")
 
-    tags = [t for t in decision.tags if t.casefold() not in NOTE_TAGS]
-    lines.append(f"Tags: {', '.join(tags)}")
+    lines.append(f"Tags: {', '.join(example_tags(decision.tags))}")
 
     return "\n".join(lines)
 
@@ -802,6 +1106,96 @@ def _format_paper_to_classify(
             lines.append(f'- p.{quote.page}: "{quote.text}"')
 
     return "\n".join(lines)
+@
+
+
+\subsection{Which tags an example shows}
+\label{sec:example-tags}
+
+An example shows its record's tags, so that the model sees which tags
+go with which papers.  Note tags are left out, since they are the
+reviewer's own (\cref{sec:classifier-categories}).  Of the category
+tags only the deciding one is shown, the last, which is the one the
+audit table reads and the one by which the example was judged to fit
+its decision (\cref{sec:example-category}).  The prompt demands
+exactly one category per paper, so an example showing two would
+teach what the parser then refuses; a record discarded with
+[[supports-claim]] and later [[off-topic-false-hit]] would appear
+under the discarded examples as \enquote{supports-claim,
+off-topic-false-hit}.  Since issue~\#195, [[sessions decide]] keeps one
+category per record ([[tags_after_decision]] in the review module), so
+a record with two was written before that, or by a path that adds
+tags without that rule.  The earlier category tags are dropped, the
+deciding one shown once, at its own place; themes, motivations and
+other tags stay in their order.  A record with one category tag or
+none therefore shows exactly the tags it showed before.
+
+Only the examples go through this: [[_format_paper_for_prompt]] is
+called for the kept and discarded examples alone, and the papers to
+classify are pending and show no tags.
+
+<<llm review prompt construction>>=
+def example_tags(tags: list[str]) -> list[str]:
+    """Return the tags an example shows in the prompt.
+
+    Note tags are left out, and of the category tags only the deciding
+    (last) one is kept; the other tags keep their order.
+    """
+    deciding = max(
+        (i for i, t in enumerate(tags) if t in AUDIT_CATEGORIES),
+        default=None,
+    )
+    return [
+        t for i, t in enumerate(tags)
+        if t.casefold() not in NOTE_TAGS
+        and (t not in AUDIT_CATEGORIES or i == deciding)
+    ]
+@
+
+A record with one category or none prints exactly as before, alone
+and in the prompt; one with two shows the deciding one only:
+
+<<test functions>>=
+class TestExampleTags:
+    <<example tags test methods>>
+
+<<example tags test methods>>=
+def _example(self, status, tags):
+    return ReviewDecision(
+        paper=Paper(title="Golden", authors=["A", "B"], year=2020,
+                    venue="V", abstract="Short.",
+                    doi="10.5555/example-tags"),
+        provider="p", status=status, tags=tags,
+    )
+
+GOLDEN = "Title: Golden\nAuthors: A, B\nYear: 2020\nVenue: V\n" \
+    "Abstract: Short.\nTags: "
+
+def test_one_category_or_none_prints_as_before(self):
+    one = self._example(DecisionStatus.KEPT,
+                        ["theory", "supports-claim", "recorded-not-cited"])
+    none = self._example(DecisionStatus.DISCARDED, ["theory", "ml"])
+    assert _format_paper_for_prompt(one) \
+        == self.GOLDEN + "theory, supports-claim"
+    assert _format_paper_for_prompt(none) == self.GOLDEN + "theory, ml"
+    prompt = build_classification_prompt(
+        papers_to_classify=[], kept_examples=[one],
+        discarded_examples=[none], category_tags=set(AUDIT_CATEGORIES),
+    )
+    assert "## Examples of KEPT Papers\n\n" + self.GOLDEN \
+        + "theory, supports-claim\n" in prompt
+    assert "## Examples of DISCARDED Papers\n\n" + self.GOLDEN \
+        + "theory, ml\n" in prompt
+
+def test_only_the_deciding_category_is_shown(self):
+    two = self._example(
+        DecisionStatus.KEPT,
+        ["qualifies-claim", "theory", "supports-claim", "ml"],
+    )
+    assert _format_paper_for_prompt(two) \
+        == self.GOLDEN + "theory, supports-claim, ml"
+    assert example_tags(["supports-claim", "x", "supports-claim"]) \
+        == ["x", "supports-claim"]
 @
 
 
@@ -3652,6 +4046,38 @@ is at least that.  A decision without a confidence is left out when a
 minimum is asked for, since it cannot be shown to meet it.  Each
 decision appears once, keyed by its session's name and its paper id.
 
+A review that finds the classifier wrong mostly at low confidence wants
+to sample exactly there, so a population can also be bounded from
+above (\url{https://github.com/dbosk/scholarcli/issues/254}).  The
+upper bound [[max_confidence]] is exclusive: a confidence must be
+\emph{below} it.  With an inclusive lower bound and an exclusive upper
+one, the populations [[0.5 <= c < 0.7]] and [[0.7 <= c]] meet without
+overlapping, so two draws with adjacent bounds never draw the same
+decision.  A decision without a confidence fails either bound, as it
+fails the minimum.  Those decisions can still be selected on purpose,
+and only them, with [[no_confidence]]; that criterion cannot be
+combined with a bound, since together they would select nothing.
+
+<<llm review sampling>>=
+def confidence_in_bounds(
+    confidence: float | None,
+    min_confidence: float | None,
+    max_confidence: float | None,
+) -> bool:
+    """Tell whether `confidence` lies in `[min_confidence, max_confidence)`.
+
+    A missing bound is no constraint; a missing confidence meets no bound.
+    """
+    if min_confidence is None and max_confidence is None:
+        return True
+    if confidence is None:
+        return False
+    return (
+        (min_confidence is None or confidence >= min_confidence)
+        and (max_confidence is None or confidence < max_confidence)
+    )
+@
+
 The draw has to be reproducible from what is stored: given the seed
 and the population, anyone must get the same papers.  Python's
 [[random.sample]] is not enough for that, because the documentation of
@@ -3679,10 +4105,15 @@ was among them.
 <<llm review sampling>>=
 @dataclass
 class SampleDraw:
-    """The outcome of `draw_llm_sample`: the id and the drawn decisions."""
+    """The outcome of `draw_llm_sample`: the id and the drawn decisions.
+
+    `bands` has one entry per stratum of a stratified draw, as
+    `{"band", "population", "drawn", "census"}`, and is empty otherwise.
+    """
     sample_id: str
     population: int
     drawn: list[tuple[str, ReviewDecision]]
+    bands: list[dict] = field(default_factory=list)
 
 
 def session_label(session: ReviewSession) -> str:
@@ -3695,12 +4126,14 @@ def sample_population(
     *,
     statuses: set[str],
     min_confidence: float | None = None,
+    max_confidence: float | None = None,
+    no_confidence: bool = False,
 ) -> list[tuple[str, str, ReviewDecision]]:
     """Return the eligible decisions as sorted `(session, paper id, decision)`.
 
     Eligible are unreviewed LLM or agent decisions whose status value is in
-    `statuses` and, if `min_confidence` is given, whose confidence is at
-    least that.
+    `statuses` and whose confidence lies in `[min_confidence,
+    max_confidence)`, or, with `no_confidence`, that have no confidence.
     """
     from scholar.notes import get_paper_id
 
@@ -3712,81 +4145,202 @@ def sample_population(
                 continue
             if decision.status.value not in statuses:
                 continue
-            if min_confidence is not None and (
-                decision.llm_confidence is None
-                or decision.llm_confidence < min_confidence
+            if no_confidence:
+                if decision.llm_confidence is not None:
+                    continue
+            elif not confidence_in_bounds(
+                decision.llm_confidence, min_confidence, max_confidence
             ):
                 continue
             pool.setdefault((name, get_paper_id(decision.paper)), decision)
     return [(name, pid, d) for (name, pid), d in sorted(pool.items())]
+@
+
+The draw is one procedure for three kinds of sample.  A plain sample
+has one population, one stratum, drawn as described above.  A
+stratified sample (\cref{sec:llm-sample-bands}) has one stratum per
+confidence band, each drawn the same way with a random generator of its
+own.  A census takes every member of every stratum, and so needs
+neither a size nor a seed.  Each stratum is kept with its population,
+its generator and, after the draw, its drawn members, so that the
+recording step can store each one with its own population and digest.
+
+<<llm review sampling>>=
+@dataclass
+class SampleStratum:
+    """One stratum of a draw: its band (None for a plain sample) and pool."""
+    band: "ConfidenceBand | None"
+    pool: list[tuple[str, str, ReviewDecision]]
+    rng: random.Random | None
+    drawn: list[tuple[str, str, ReviewDecision]] = field(default_factory=list)
+    census: bool = False
 
 
 def draw_llm_sample(
     sessions: list[ReviewSession],
     *,
     statuses: set[str],
-    size: int,
-    seed: int,
+    seed: int | None,
+    size: int | None = None,
     min_confidence: float | None = None,
+    max_confidence: float | None = None,
+    no_confidence: bool = False,
+    bands: list[float] | None = None,
+    census: bool = False,
     now: datetime | None = None,
 ) -> SampleDraw:
     """Draw a seeded random sample of unreviewed machine decisions.
 
     Records the sample in every session of `sessions` (as an `LLMSample`
-    in `session.llm_samples`); the caller saves them.
+    in `session.llm_samples`); the caller saves them. With `bands`, cut
+    points strictly increasing in (0, 1), the draw is stratified: `size`
+    decisions from each confidence band (all of a band with no more),
+    each band recorded as its own `LLMSample` under one group id. With
+    `census`, every eligible decision is taken, and no seed is needed.
 
     Raises:
-        ValueError: `size` is not positive, or no decision is eligible.
+        ValueError: `size` or `seed` is missing without `census`, the
+            criteria contradict each other, or no decision is eligible.
     """
     from scholar.review import LLMSample, session_file_path
 
-    if size < 1:
-        raise ValueError("The sample size must be at least 1")
-    pool = sample_population(
-        sessions, statuses=statuses, min_confidence=min_confidence
-    )
-    if not pool:
+    <<check the criteria of the draw>>
+    if bands is None:
+        strata = [SampleStratum(
+            band=None,
+            pool=sample_population(
+                sessions, statuses=statuses, min_confidence=min_confidence,
+                max_confidence=max_confidence, no_confidence=no_confidence,
+            ),
+            rng=random.Random(seed) if seed is not None else None,
+        )]
+    else:
+        strata = band_strata(sessions, statuses=statuses, cuts=bands, seed=seed)
+    if not any(stratum.pool for stratum in strata):
         raise ValueError("No unreviewed LLM decisions match the criteria")
     <<draw the members with the smallest keys>>
     <<record the sample in each session>>
     return SampleDraw(
         sample_id=sample_id,
-        population=len(pool),
-        drawn=[(name, decision) for name, _, decision in drawn],
+        population=sum(len(stratum.pool) for stratum in strata),
+        drawn=[
+            (name, decision)
+            for stratum in strata for name, _, decision in stratum.drawn
+        ],
+        bands=[
+            {"band": stratum.band.label, "population": len(stratum.pool),
+             "drawn": len(stratum.drawn), "census": stratum.census}
+            for stratum in strata if stratum.band is not None
+        ],
     )
 @
 
+The criteria are checked before anything is read, so that a draw that
+cannot mean anything fails as a whole.  The command line checks the
+same rules and turns them into usage errors; they are repeated here
+because the function is also called directly.
+
+<<check the criteria of the draw>>=
+if bands is not None:
+    check_band_cuts(bands)
+    if min_confidence is not None or max_confidence is not None \
+            or no_confidence:
+        raise ValueError(
+            "Confidence bands cannot be combined with confidence bounds")
+if no_confidence and (min_confidence is not None
+                      or max_confidence is not None):
+    raise ValueError(
+        "Decisions without a confidence cannot be bounded by one")
+if not census and (size is None or size < 1):
+    raise ValueError("The sample size must be at least 1")
+if not census and seed is None:
+    raise ValueError("A random sample needs a seed")
+@
+
+A plain sample with a size at least its population draws all of it, in
+key order, as it always did, and is not marked as a census: its record
+must not change.  A band of a stratified sample with at most [[size]]
+members is taken whole and marked as a census, because the report
+treats such a band differently: every member of it is (or will be)
+reviewed, so its rate needs no interval.
+
 <<draw the members with the smallest keys>>=
-rng = random.Random(seed)
-keys = [rng.random() for _ in pool]
-order = sorted(range(len(pool)), key=lambda i: (keys[i], i))
-drawn = [pool[i] for i in order[:size]]
+for stratum in strata:
+    if census or (stratum.band is not None and len(stratum.pool) <= size):
+        stratum.census = True
+        stratum.drawn = list(stratum.pool)
+        continue
+    keys = [stratum.rng.random() for _ in stratum.pool]
+    order = sorted(range(len(stratum.pool)), key=lambda i: (keys[i], i))
+    stratum.drawn = [stratum.pool[i] for i in order[:size]]
+@
+
+Each stratum is recorded as an [[LLMSample]] with its own population,
+digest and drawn papers.  A plain sample keeps exactly the criteria it
+had before bounds from above existed; the new criteria are added only
+when used, so a draw made as before stores what it stored before.
+The bands of a stratified sample are tied together in their criteria
+(\cref{sec:llm-sample-bands} says why there).
+
 <<record the sample in each session>>=
 drawn_at = (now or datetime.now(timezone.utc)).isoformat(timespec="seconds")
-sample_id = f"{drawn_at}/seed={seed}/{uuid.uuid4().hex[:SAMPLE_ID_DIGITS]}"
-digest = hashlib.sha256(
-    "\n".join(f"{name}\t{pid}" for name, pid, _ in pool).encode("utf-8")
-).hexdigest()[:PROMPT_VERSION_DIGITS]
-criteria = {
-    "statuses": sorted(statuses),
-    "min_confidence": min_confidence,
-    "population_sources": sorted({source_value(d) for _, _, d in pool}),
-}
+sample_id = (
+    f"{drawn_at}/{'census' if seed is None else f'seed={seed}'}/"
+    f"{uuid.uuid4().hex[:SAMPLE_ID_DIGITS]}"
+)
+sources = sorted({source_value(d) for s in strata for _, _, d in s.pool})
 names = [session_label(s) for s in sessions]
 files = [session_file_path(s).name for s in sessions]
-for session in sessions:
-    session.llm_samples.append(LLMSample(
-        sample_id=sample_id, seed=seed, drawn_at=drawn_at,
-        criteria=dict(criteria), sessions=list(names),
-        session_files=list(files),
-        population=len(pool), population_digest=digest, size=len(drawn),
-        papers=[
-            {"paper_id": pid, "status": d.status.value,
-             "source": source_value(d), "confidence": d.llm_confidence}
-            for name, pid, d in drawn
-            if name == session_label(session)
-        ],
-    ))
+for index, stratum in enumerate(strata):
+    <<state the criteria of one stratum>>
+    digest = hashlib.sha256(
+        "\n".join(f"{name}\t{pid}" for name, pid, _ in stratum.pool)
+        .encode("utf-8")
+    ).hexdigest()[:PROMPT_VERSION_DIGITS]
+    for session in sessions:
+        session.llm_samples.append(LLMSample(
+            sample_id=(sample_id if stratum.band is None
+                       else f"{sample_id}/band={index}"),
+            seed=seed, drawn_at=drawn_at,
+            criteria=dict(criteria), sessions=list(names),
+            session_files=list(files),
+            population=len(stratum.pool), population_digest=digest,
+            size=len(stratum.drawn),
+            papers=[
+                {"paper_id": pid, "status": d.status.value,
+                 "source": source_value(d), "confidence": d.llm_confidence}
+                for name, pid, d in stratum.drawn
+                if name == session_label(session)
+            ],
+        ))
+@
+
+<<state the criteria of one stratum>>=
+if stratum.band is None:
+    criteria = {
+        "statuses": sorted(statuses),
+        "min_confidence": min_confidence,
+        "population_sources": sources,
+    }
+    if max_confidence is not None:
+        criteria["max_confidence"] = max_confidence
+    if no_confidence:
+        criteria["no_confidence"] = True
+else:
+    criteria = {
+        "statuses": sorted(statuses),
+        "min_confidence": stratum.band.min_confidence,
+        "max_confidence": stratum.band.max_confidence,
+        "population_sources": sources,
+    }
+    if stratum.band.no_confidence:
+        criteria["no_confidence"] = True
+    criteria["stratum"] = {
+        "group": sample_id, "band": index, "bands": len(strata),
+        "cuts": list(bands),
+    }
+if stratum.census:
+    criteria["census"] = True
 @
 
 <<llm review imports>>=
@@ -3946,6 +4500,371 @@ def test_golden_draw(self):
     assert [d.paper.title for _, d in draw.drawn] == [
         "draw-a 1", "draw-b 3", "draw-b 1", "draw-b 4", "draw-a 3"
     ]
+@
+
+The bounds select what they promise and nothing else: the minimum is
+inclusive, the maximum exclusive, so adjacent bounds split a population
+without overlap, and a decision without a confidence is drawn only when
+asked for by [[no_confidence]], which no bound may accompany.
+
+<<test functions>>=
+class TestSampleBounds:
+    <<sample bounds test methods>>
+
+<<sample bounds test methods>>=
+def _session(self):
+    s = ReviewSession(query="bounds", providers=["p"],
+                      timestamp=datetime(2026, 11, 20), name="bounds")
+    for i, confidence in enumerate([0.3, 0.5, 0.6, 0.7, 0.9, None]):
+        s.decisions.append(ReviewDecision(
+            paper=Paper(title=f"B {confidence}", authors=["A"],
+                        doi=f"10.5555/bounds-{i}"),
+            provider="p", status=DecisionStatus.DISCARDED, tags=["t"],
+            source=ReviewSource.LLM_UNREVIEWED, llm_confidence=confidence,
+        ))
+    return s
+
+def _titles(self, **criteria):
+    return sorted(d.paper.title for _, _, d in sample_population(
+        [self._session()], statuses={"discarded"}, **criteria))
+
+def test_adjacent_bounds_do_not_overlap(self):
+    below = self._titles(min_confidence=0.5, max_confidence=0.7)
+    above = self._titles(min_confidence=0.7)
+    assert below == ["B 0.5", "B 0.6"]
+    assert above == ["B 0.7", "B 0.9"]
+    assert self._titles(max_confidence=0.5) == ["B 0.3"]
+
+def test_no_confidence_selects_only_those(self):
+    assert self._titles(no_confidence=True) == ["B None"]
+    assert "B None" not in self._titles(max_confidence=0.99)
+
+def test_bounds_are_recorded_only_when_used(self):
+    plain = self._session()
+    draw_llm_sample([plain], statuses={"discarded"}, size=2, seed=1)
+    assert set(plain.llm_samples[0].criteria) == {
+        "statuses", "min_confidence", "population_sources"}
+    bounded = self._session()
+    draw_llm_sample([bounded], statuses={"discarded"}, size=2, seed=1,
+                    max_confidence=0.7)
+    assert bounded.llm_samples[0].criteria["max_confidence"] == 0.7
+    assert bounded.llm_samples[0].population == 3
+
+def test_no_confidence_with_a_bound_is_refused(self):
+    session = self._session()
+    with pytest.raises(ValueError, match="without a confidence"):
+        draw_llm_sample([session], statuses={"discarded"}, size=1,
+                        seed=1, no_confidence=True, min_confidence=0.5)
+    assert session.llm_samples == []
+@
+
+
+\subsection{Confidence bands: one stratified draw}
+\label{sec:llm-sample-bands}
+
+A review that checked its screens found the classifier's disagreements
+with a human at low and middle confidence, and none among its
+high-confidence discards (\url{https://github.com/dbosk/scholarcli/issues/254}).
+One simple random sample over all discards spends most of its draws
+where the discards are many, which need not be where the errors are.
+So the population can be split into confidence bands and a sample of
+the same size drawn from each: [[bands]] gives the cut points, say
+[[0.5, 0.7, 0.9]], and the bands are \emph{below 0.5}, \emph{0.5 to
+below 0.7}, \emph{0.7 to below 0.9} and \emph{at least 0.9}, with the
+same inclusive lower and exclusive upper bounds as a single draw.  The
+first and the last band are open at their outer end, so every decision
+with a confidence is in exactly one band; decisions without one form a
+band of their own when there are any.  The bands are therefore
+disjoint and together are the whole population, which is what lets the
+report weight each band's rate by its size
+(\cref{sec:llm-sample-stratified-report}).  The cut points must be
+strictly increasing and lie strictly between 0 and 1, else a band would
+be empty by construction, and bands cannot be combined with bounds or
+with [[no_confidence]]: a band structure over a bounded population
+would leave bands that the bound empties.
+
+<<llm review sampling>>=
+@dataclass(frozen=True)
+class ConfidenceBand:
+    """A confidence band `[min_confidence, max_confidence)`, or no confidence.
+
+    A missing bound leaves the band open at that end.
+    """
+    min_confidence: float | None
+    max_confidence: float | None
+    no_confidence: bool = False
+
+    @property
+    def label(self) -> str:
+        """Describe the band in words, e.g. '0.5 to below 0.7'."""
+        return confidence_criteria_text(
+            self.min_confidence, self.max_confidence, self.no_confidence
+        )
+
+
+def confidence_criteria_text(
+    min_confidence: float | None,
+    max_confidence: float | None,
+    no_confidence: bool = False,
+) -> str:
+    """Describe confidence bounds in words ('' when there are none)."""
+    if no_confidence:
+        return "without a confidence"
+    if min_confidence is not None and max_confidence is not None:
+        return f"{min_confidence:g} to below {max_confidence:g}"
+    if min_confidence is not None:
+        return f"at least {min_confidence:g}"
+    if max_confidence is not None:
+        return f"below {max_confidence:g}"
+    return ""
+
+
+def check_band_cuts(cuts: list[float]) -> None:
+    """Raise `ValueError` unless `cuts` increase strictly within (0, 1)."""
+    if not cuts:
+        raise ValueError("Give at least one confidence cut point")
+    if any(not 0 < cut < 1 for cut in cuts):
+        raise ValueError("Confidence cut points must lie between 0 and 1")
+    if any(a >= b for a, b in zip(cuts, cuts[1:])):
+        raise ValueError("Confidence cut points must increase strictly")
+
+
+def confidence_bands(cuts: list[float]) -> list[ConfidenceBand]:
+    """Return the bands the cut points make, lowest first."""
+    edges = [None, *cuts, None]
+    return [ConfidenceBand(low, high) for low, high in zip(edges, edges[1:])]
+@
+
+A draw in one band must not depend on what the other bands hold.  If
+the bands shared one generator, as a single draw does, adding one
+decision to the lowest band would consume one more random number before
+the next band's turn and shift every key after it: a re-draw with the
+same seed would give other papers in every band, although only one band
+changed.  So each band gets a generator of its own, seeded from the
+sample's seed and the band's own bounds, and draws keys only for its own
+members.  Its draw is then a function of its own population and the
+seed alone, and each band is a simple random sample of its band by the
+argument for a single draw.  The band's seed is the first eight bytes
+of a SHA-256 digest of the text [[seed/min/max/no_confidence]] (the
+bounds written with Python's [[repr]]), read as an integer, so that the
+generator is seeded with an integer as a single draw's is and the
+derivation depends on nothing but the stored seed and bounds.  Keying
+on the bounds rather than the band's position means that a band keeps
+its draw also when other cut points are added around it.
+
+<<llm review sampling>>=
+def band_random(seed: int | None, band: ConfidenceBand) -> random.Random:
+    """Return the random generator of one band of a stratified draw."""
+    text = (f"{seed}/{band.min_confidence!r}/{band.max_confidence!r}/"
+            f"{band.no_confidence}")
+    digest = hashlib.sha256(text.encode("utf-8")).digest()
+    return random.Random(int.from_bytes(digest[:8], "big"))
+
+
+def band_strata(
+    sessions: list[ReviewSession],
+    *,
+    statuses: set[str],
+    cuts: list[float],
+    seed: int | None,
+) -> list[SampleStratum]:
+    """Return one stratum per confidence band, plus one without confidence."""
+    bands = confidence_bands(cuts)
+    unknown = ConfidenceBand(None, None, no_confidence=True)
+    strata = [
+        SampleStratum(
+            band=band,
+            pool=sample_population(
+                sessions, statuses=statuses,
+                min_confidence=band.min_confidence,
+                max_confidence=band.max_confidence,
+                no_confidence=band.no_confidence,
+            ),
+            rng=band_random(seed, band),
+        )
+        for band in [*bands, unknown]
+    ]
+    if not strata[-1].pool:
+        strata.pop()
+    return strata
+@
+
+\paragraph{A census.}
+A band small enough to review whole should be reviewed whole: a sample
+of ten from twelve leaves two unknown for no gain.  So a band with at
+most [[size]] members is taken whole, and recorded as a census of that
+band.  [[census]] does the same for every band, or for the whole
+population of a single draw: all decisions that match the criteria are
+taken and recorded like a sample, so that the report covers them.  A
+census draws nothing at random and so needs no seed; one given is
+recorded, one not given is stored as [[None]].  An older Scholar
+(\texttt{4ba7a23}, whose [[sample_sentence]] and [[sample_reports]]
+were read for this) knows no census: it states one as a random sample
+\enquote{(seed None)} and gives it a modified Wilson interval.
+
+\paragraph{How a stratified sample is recorded.}
+A stratified sample has to be recognisable as one population split
+into disjoint bands, with each band's bounds, population size and
+digest, and each sampled paper's band.  It is stored as one
+[[LLMSample]] per band, which share a group id, rather than as one
+[[LLMSample]] with a list of bands.  A band needs exactly what a sample
+has: its own population, digest, size and drawn papers, and its own
+count of papers not found in the sessions reported on, which
+[[sample_reports]] computes from the size.  One record per band reuses
+all of that, so [[sample_reports]] reports each band as it reports a
+sample, and the papers' band is the record that holds them.  The band
+records carry the same session files, so the other pooled sessions are
+read as for any sample ([[pooled_sample_sessions]]), and each has its
+own id, so the concurrent merge, which keeps one sample per id, keeps
+every band.  The group, the band's index, the number of bands and the
+cut points are kept in the criteria under [[stratum]], and a band's id
+is the group id followed by [[/band=]] and its index.
+
+The deciding reason is the older Scholar installations.  They read the
+criteria as a whole dictionary and the drawn papers as dictionaries,
+and write both back unchanged ([[LLMSample.from_dict]] and
+[[to_dict]], \cref{sec:llm-sample-record} in the review module, read at
+\texttt{4ba7a23}), so a save by an older version keeps the group.
+Such a version reports each band as a sample of its own: its numbers
+are right for that band, only its sentence leaves out the upper bound
+and the missing confidence, which it does not know.  A single record
+with a list of bands would be read by such a version as one random
+sample of the whole population, and its rate added up over the bands
+without weights, which is not an estimate of anything.
+
+The banded draw is pinned like the single one.  Two sessions with
+twenty decisions are split by [[0.5, 0.7, 0.9]] into bands of 7, 3, 5
+and 2 decisions, with 3 decisions without a confidence; with two
+decisions per band, the band of 2 is a census.  The expected papers
+were computed separately, with Python's [[random]] and [[hashlib]]
+modules alone, from the rule above (each band sorted by session and
+paper id, the band's generator from the digest of
+[[42/None/0.5/False]] and so on, the two smallest keys), without this
+module.  The boundary values 0.5, 0.7 and 0.9 land in the band they
+open.
+
+<<test functions>>=
+class TestStratifiedDraw:
+    <<stratified draw test methods>>
+
+<<stratified draw test methods>>=
+CONFIDENCES = {
+    "band-a": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.75, 0.8, 0.85, 0.95,
+               None, None],
+    "band-b": [0.15, 0.25, 0.35, 0.65, 0.7, 0.88, 0.9, None],
+}
+
+def _sessions(self, extra=()):
+    sessions = []
+    for name, confidences in self.CONFIDENCES.items():
+        s = ReviewSession(query=name, providers=["p"],
+                          timestamp=datetime(2026, 11, 20), name=name)
+        for i, confidence in enumerate([*confidences, *extra]):
+            s.decisions.append(ReviewDecision(
+                paper=Paper(title=f"{name} {i}", authors=["A"],
+                            doi=f"10.5555/band-{name}-{i}"),
+                provider="p", status=DecisionStatus.DISCARDED,
+                tags=["t"], source=ReviewSource.LLM_UNREVIEWED,
+                llm_confidence=confidence,
+            ))
+        sessions.append(s)
+        extra = ()
+    return sessions
+
+def _draw(self, sessions, **options):
+    return draw_llm_sample(sessions, statuses={"discarded"}, size=2,
+                           seed=42, bands=[0.5, 0.7, 0.9], **options)
+
+def test_golden_banded_draw(self):
+    draw = self._draw(self._sessions())
+    assert [d.paper.title for _, d in draw.drawn] == [
+        "band-a 0", "band-b 2",
+        "band-a 5", "band-a 4",
+        "band-a 7", "band-a 6",
+        "band-a 9", "band-b 6",
+        "band-a 11", "band-b 7",
+    ]
+    assert [(b["band"], b["population"], b["drawn"], b["census"])
+            for b in draw.bands] == [
+        ("below 0.5", 7, 2, False), ("0.5 to below 0.7", 3, 2, False),
+        ("0.7 to below 0.9", 5, 2, False), ("at least 0.9", 2, 2, True),
+        ("without a confidence", 3, 2, False),
+    ]
+    assert draw.population == 20
+
+def test_each_band_is_recorded_with_its_population(self):
+    sessions = self._sessions()
+    draw = self._draw(sessions)
+    a, b = sessions
+    assert len(a.llm_samples) == len(b.llm_samples) == 5
+    for index, sample in enumerate(a.llm_samples):
+        stratum = sample.criteria["stratum"]
+        assert stratum == {"group": draw.sample_id, "band": index,
+                           "bands": 5, "cuts": [0.5, 0.7, 0.9]}
+        assert sample.sample_id == f"{draw.sample_id}/band={index}"
+        assert sample.size == 2
+    assert [s.population for s in a.llm_samples] == [7, 3, 5, 2, 3]
+    assert a.llm_samples[3].criteria["census"] is True
+    assert "census" not in a.llm_samples[0].criteria
+    assert a.llm_samples[4].criteria["no_confidence"] is True
+    assert len({s.population_digest for s in a.llm_samples}) == 5
+
+def test_a_band_draw_ignores_the_other_bands(self):
+    """One more decision below 0.5 leaves the other bands' draws alone."""
+    before = self._draw(self._sessions())
+    after = self._draw(self._sessions(extra=[0.05]))
+    assert after.bands[0]["population"] == 8
+    titles = lambda draw: [d.paper.title for _, d in draw.drawn]
+    assert titles(after)[2:] == titles(before)[2:]
+
+def test_no_band_without_confidence_when_none_lack_one(self):
+    sessions = self._sessions()
+    for s in sessions:
+        s.decisions = [d for d in s.decisions
+                       if d.llm_confidence is not None]
+    draw = self._draw(sessions)
+    assert [b["band"] for b in draw.bands][-1] == "at least 0.9"
+
+def test_bad_cuts_and_bounds_are_refused(self):
+    sessions = self._sessions()
+    for cuts in ([0.7, 0.5], [0.5, 0.5], [0, 0.5], [0.5, 1.0], []):
+        with pytest.raises(ValueError):
+            draw_llm_sample(sessions, statuses={"discarded"}, size=2,
+                            seed=1, bands=cuts)
+    with pytest.raises(ValueError, match="bands"):
+        self._draw(sessions, min_confidence=0.2)
+    assert all(s.llm_samples == [] for s in sessions)
+@
+
+A census takes everything, without a seed, and is recorded as such;
+with bands, every band is a census.
+
+<<test functions>>=
+class TestCensusDraw:
+    def test_census_takes_all_without_a_seed(self):
+        sessions = TestStratifiedDraw()._sessions()
+        draw = draw_llm_sample(sessions, statuses={"discarded"},
+                               seed=None, census=True, max_confidence=0.5)
+        assert len(draw.drawn) == draw.population == 7
+        [sample] = sessions[0].llm_samples
+        assert sample.seed is None and sample.criteria["census"] is True
+        assert "/census/" in sample.sample_id
+
+    def test_census_by_bands(self):
+        sessions = TestStratifiedDraw()._sessions()
+        draw = draw_llm_sample(sessions, statuses={"discarded"},
+                               seed=None, census=True, bands=[0.5])
+        assert all(b["census"] for b in draw.bands)
+        assert len(draw.drawn) == 20
+        [report] = group_sample_reports(sample_reports(sessions))
+        sentence = sample_report_sentence(report)
+        assert sentence.startswith("A census of the 20 unreviewed")
+        assert "seed" not in sentence
+
+    def test_a_sample_still_needs_a_seed(self):
+        with pytest.raises(ValueError, match="seed"):
+            draw_llm_sample(TestStratifiedDraw()._sessions(),
+                            statuses={"discarded"}, seed=None, size=2)
 @
 
 \subsection{The disagreement rate and its interval}
@@ -4159,6 +5078,13 @@ passes to [[sessions decide]] next: the session's label, or its file
 name when the label would open another session or fit two
 (\url{https://github.com/dbosk/scholarcli/issues/237}).
 
+A census (\cref{sec:llm-sample-bands}) is reported like a sample, but
+without an interval: once every member is reviewed, its rate is not an
+estimate but the rate of the population it was drawn from, at the time
+of the draw.  While part of it is unreviewed, the reviewed part is not
+a random sample of it unless the order of review was, and the sentence
+says how many are left instead.
+
 A sampled paper can also have been set back to pending after the draw
 ([[sessions reset]], \cref{sec:reset-decision} in the review module).
 The decision the sample drew is then gone: it lives on only in the
@@ -4201,11 +5127,12 @@ class SampleReport:
 
     `changed` counts reviewed decisions whose status differs from the
     machine's; `interval` is the 95% modified Wilson interval of
-    `changed` out of `reviewed`, or `None` while nothing is reviewed.
+    `changed` out of `reviewed`, or `None` while nothing is reviewed and
+    for a census, whose rate is that of its whole population.
     `unreviewed` holds `(session argument, paper id)` pairs.
     """
     sample_id: str
-    seed: int
+    seed: int | None
     drawn_at: str
     criteria: dict
     sessions: list[str]
@@ -4222,6 +5149,11 @@ class SampleReport:
     def rate(self) -> float | None:
         """Return the share of reviewed decisions the reviewer changed."""
         return self.changed / self.reviewed if self.reviewed else None
+
+    @property
+    def census(self) -> bool:
+        """Tell whether the sample took its whole population."""
+        return bool(self.criteria.get("census"))
 
 
 def sample_reports(sessions: list[ReviewSession]) -> list[SampleReport]:
@@ -4249,7 +5181,7 @@ def sample_reports(sessions: list[ReviewSession]) -> list[SampleReport]:
                 <<count one sampled decision>>
     for report in reports.values():
         <<count the papers of sessions not given>>
-        if report.reviewed:
+        if report.reviewed and not report.census:
             report.interval = modified_wilson_interval(
                 report.changed, report.reviewed
             )
@@ -4415,13 +5347,23 @@ def describe_sample_criteria(criteria: dict) -> str:
         else "decisions"
     )
     text = f"unreviewed {machine} {what}"
-    if criteria.get("min_confidence") is not None:
-        text += f" with a confidence of at least {criteria['min_confidence']:g}"
+    low = criteria.get("min_confidence")
+    high = criteria.get("max_confidence")
+    if criteria.get("no_confidence"):
+        text += " without a confidence"
+    elif low is not None and high is None:
+        text += f" with a confidence of at least {low:g}"
+    elif high is not None:
+        text += (" with a confidence "
+                 + ("of " if low is not None else "")
+                 + confidence_criteria_text(low, high))
     return text
 
 
 def sample_sentence(report: SampleReport) -> str:
     """State a sample and what its review has shown so far, in one sentence."""
+    if report.census:
+        return census_sentence(report)
     sessions = len(report.sessions)
     text = (
         f"A random sample of {report.size} of the {report.population} "
@@ -4445,6 +5387,12 @@ def sample_sentence(report: SampleReport) -> str:
                 "skipped rather than reviewed in the drawn order it may be "
                 "biased"
             )
+    return text + uncounted_text(report) + "."
+
+
+def uncounted_text(report: SampleReport) -> str:
+    """Name the sampled decisions a report could not count, if any."""
+    text = ""
     if report.reset_since_draw:
         text += (
             f"; {report.reset_since_draw} sampled decisions were reset to "
@@ -4455,7 +5403,36 @@ def sample_sentence(report: SampleReport) -> str:
             f"; {report.not_found} sampled decisions were not found in the "
             "sessions reported on and are not counted"
         )
-    return text + "."
+    return text
+@
+
+A census is stated as what it is, with the rate of what has been
+reviewed and no interval, and without a seed, which drew nothing.
+
+<<llm review sampling>>=
+def census_sentence(report: SampleReport) -> str:
+    """State a census and what its review has shown so far."""
+    sessions = len(report.sessions)
+    text = (
+        f"A census of all {report.population} "
+        f"{describe_sample_criteria(report.criteria)} in {sessions} "
+        f"session{'s' if sessions != 1 else ''} was taken on "
+        f"{report.drawn_at[:10]} for human review"
+    )
+    if not report.reviewed:
+        text += "; none of it has been reviewed yet"
+    elif report.unreviewed:
+        text += (
+            f"; of the {report.reviewed} reviewed so far, the reviewer "
+            f"changed {report.changed} ({report.rate:.1%}), and "
+            f"{len(report.unreviewed)} are not yet reviewed"
+        )
+    else:
+        text += (
+            f"; all {report.reviewed} counted were reviewed, and the "
+            f"reviewer changed {report.changed} ({report.rate:.1%})"
+        )
+    return text + uncounted_text(report) + "."
 @
 
 A sample of four over two sessions is reviewed in part: in the first
@@ -4636,6 +5613,575 @@ def test_reset_before_the_draw_counts_as_usual(self):
 @
 
 
+
+\subsection{Reporting a stratified sample}
+\label{sec:llm-sample-stratified-report}
+
+[[sample_reports]] reports each band of a stratified sample as the
+sample it is stored as, with its rate and its modified Wilson interval,
+computed as for a single sample: the band was drawn from its own
+population in the same way a single sample is.  The report then puts the
+bands of one draw back together, by the group recorded in their
+criteria, and states them as one sample with one line per band.
+
+What the user wants from the bands together is an estimate for the
+whole population: how many of all the machine's discards a reviewer
+would change, and how many of those are among the decisions nobody
+reviewed.  The rates of the bands cannot simply be added up over the
+reviewed decisions: each band drew the same number from populations of
+very different sizes, so a decision of a small band stands for few
+decisions and one of a large band for many.  Each band's rate has to be
+weighted by its band's size.
+
+The estimator is the survey-weighted estimator of a total under
+stratified sampling, as Franco, Little, Louis and Slud write it
+(\enquote{Comparative Study of Confidence Intervals for Proportions in
+Complex Sample Surveys}, \emph{Journal of Survey Statistics and
+Methodology} 7(3):334--364, 2019,
+\url{https://doi.org/10.1093/jssam/smy019}; read in full in the
+authors' final version of 2 August 2018,
+\url{https://math.umd.edu/~slud/s770/SurveyConfidenceIntervals/JSSAM-2017-065-FINAL.pdf},
+read 2026-11-20, whose pages are cited here).  For a sample of
+clusters drawn by simple random sampling within each stratum $h$, they
+estimate the population total $Y$ by
+\[
+  \hat Y = \sum_{h=1}^{H} \hat Y_{h++}, \qquad
+  \hat Y_{h++} = \frac{K_h}{n^C_h} \sum_{k \in S_h} Y_{hk+}
+\]
+(their equation~(10), p.~10), where $K_h$ is the number of clusters in
+stratum~$h$, $n^C_h$ the number sampled and $Y_{hk+}$ the count of
+successes in cluster~$k$; they call it \enquote{the Horvitz-Thompson
+estimator under stratified one stage sampling of clusters} (p.~29).
+Here every decision is a cluster of its own, the strata are the bands,
+and a success is a decision the reviewer changed, so with $N_h$
+decisions in band~$h$, $n_h$ of them reviewed and $x_h$ changed, the
+band's term is $N_h x_h / n_h$.  The estimated share of changed
+decisions is that total over the population size $N = \sum_h N_h$,
+\[
+  \hat p = \frac{1}{N} \sum_{h} N_h \frac{x_h}{n_h},
+\]
+the rate of each band weighted by its share of the population.  The
+changed decisions among those reviewed are known, $\sum_h x_h$, so the
+estimated number among the decisions not reviewed is the estimated
+total less that: $\sum_h (N_h - n_h)\, x_h / n_h$.  A census band
+contributes its known count and nothing to estimate.
+
+<<llm review sampling>>=
+@dataclass
+class StratifiedEstimate:
+    """The stratified estimate of the changed share of a whole population.
+
+    `rate` estimates the share of the `population` a reviewer would
+    change; `changed_not_reviewed` the number of such decisions among
+    those not reviewed. No interval is given (see the module's prose).
+    """
+    rate: float
+    changed_not_reviewed: float
+    population: int
+    reviewed: int
+    changed: int
+
+
+def stratified_estimate(
+    bands: list[tuple[int, int, int]],
+) -> StratifiedEstimate:
+    """Estimate from `(population, reviewed, changed)` of every band.
+
+    Raises:
+        ValueError: a band with members has no reviewed decision.
+    """
+    population = sum(size for size, _, _ in bands)
+    total = not_reviewed = 0.0
+    for size, reviewed, changed in bands:
+        if size == 0:
+            continue
+        if reviewed < 1:
+            raise ValueError("Every band with members needs a review")
+        total += size * changed / reviewed
+        not_reviewed += (size - reviewed) * changed / reviewed
+    return StratifiedEstimate(
+        rate=total / population,
+        changed_not_reviewed=not_reviewed,
+        population=population,
+        reviewed=sum(reviewed for _, reviewed, _ in bands),
+        changed=sum(changed for _, _, changed in bands),
+    )
+@
+
+The estimate is checked against numbers worked out by hand from the
+formula (the paper has no numerical example of it): three bands of
+100, 50 and 10 decisions, ten reviewed in each and 3, 1 and 0 of them
+changed, give $\hat p = (100 \cdot 0.3 + 50 \cdot 0.1 + 0)/160 =
+35/160 = 0.21875$ and $90 \cdot 0.3 + 40 \cdot 0.1 + 0 = 31$ changed
+decisions among the 130 not reviewed.  Equal bands reduce it to the
+plain rate, and an empty band changes nothing.
+
+<<test functions>>=
+class TestStratifiedEstimate:
+    def test_hand_computed(self):
+        estimate = stratified_estimate([(100, 10, 3), (50, 10, 1),
+                                        (10, 10, 0)])
+        assert estimate.rate == pytest.approx(35 / 160)
+        assert estimate.changed_not_reviewed == pytest.approx(31)
+        assert (estimate.population, estimate.reviewed,
+                estimate.changed) == (160, 30, 4)
+
+    def test_equal_bands_give_the_plain_rate(self):
+        estimate = stratified_estimate([(40, 10, 2), (40, 10, 4),
+                                        (0, 0, 0)])
+        assert estimate.rate == pytest.approx(6 / 20)
+        assert estimate.changed_not_reviewed == pytest.approx(18)
+
+    def test_a_band_without_review_has_no_estimate(self):
+        with pytest.raises(ValueError):
+            stratified_estimate([(40, 10, 2), (40, 0, 0)])
+@
+
+\paragraph{When the estimate is given.}
+The estimate treats the reviewed decisions of each band as a random
+sample of that band.  That holds when every drawn decision of every
+band has been reviewed, so it is given only then.  While some are not
+yet reviewed, the reviewed part is a random sample of its band only if
+which decisions got reviewed had nothing to do with the decisions, the
+same caveat as for a single sample, and here it would also weight one
+band's partial review against another's; so no estimate is given, and
+the sentence says how many decisions are left.  Decisions not found in
+the sessions reported on also withhold the estimate: they are lost
+whole sessions or papers, not a random part of a band.  Decisions reset
+since the draw cannot be reviewed any more; they are left out of $n_h$
+and named in the sentence.  Leaving them out is sound only if resetting
+them had nothing to do with whether the machine was right, which the
+sentence leaves to the reader to judge by saying how many there were.
+A band whose every drawn decision was reset has nothing left to
+estimate from, and withholds the estimate.  The populations $N_h$ are
+those of the draw, so the estimate is for the decisions as they were
+when the sample was drawn.  A band whose reviewed decisions were all confirmed contributes
+zero to the estimate; its own interval in the per-band lines shows how
+many changed decisions that observation leaves room for.
+
+\paragraph{Why no interval for the whole population.}
+Franco and colleagues compare intervals for exactly this kind of
+estimate.  For a proportion from a stratified or clustered sample they
+replace the sample size of a binomial interval by an effective sample
+size, $\hat n_{\mathrm{eff}} = n / \widehat{\mathit{Deff}}$, from an
+estimate of the design effect (their equations (9), p.~9, and (13) and
+(14), p.~11), and \enquote{recommend intervals of the Wilson or Bayes
+uniform-prior form} (abstract, p.~1).  Their results, though, are
+\enquote{conditional on a positive estimated variance}: \enquote{We set
+aside samples for which the estimated sampling variance is 0} (p.~3).
+Their variance estimate, equation~(13), adds up within-band sample
+variances, and a band in which every reviewed decision was confirmed
+has a sample variance of zero.  So when every band agrees with the
+machine, the estimated variance is zero and the effective sample size
+is not defined, and that is the case they set aside.  The smallest
+expected proportion in their simulations is 0.05, and the smallest
+sample 30 (the factorial design, p.~15); the samples [[llm sample]]
+draws, and the rates they find, can fall below both, where the paper
+reports nothing.  (The counter-search for this choice also found a
+study of intervals for proportions from stratified samples by Stehman
+and Xing, \url{https://doi.org/10.1016/j.rse.2022.113193}; its full
+text could not be obtained, and nothing here rests on it.)  An interval
+from the effective sample size would thus rest on a recommendation that
+does not cover the case of bands that all agree, nor proportions and
+samples as small as these.  The report gives the point estimate, which
+needs no such assumption, and the per-band intervals, which are
+computed as for a single sample, and states that no interval is given
+for the whole.
+
+\paragraph{Putting the bands back together.}
+[[group_sample_reports]] replaces the band reports of one group by one
+[[StratifiedReport]] at the place of its first band, so that the
+reports stay ordered by the time of the draw, and leaves every other
+report as it is.  A report that names a group but cannot find all of
+its bands (a hand-edited file) is still shown, with the bands it has,
+but without an estimate.
+
+<<llm review sampling>>=
+@dataclass
+class StratifiedReport:
+    """The bands of one stratified sample, reported together.
+
+    `bands` holds the report of each band, in band order; `criteria`
+    holds what the bands share (statuses, sources, cut points).
+    """
+    group: str
+    seed: int | None
+    drawn_at: str
+    criteria: dict
+    sessions: list[str]
+    expected_bands: int
+    bands: list[SampleReport] = field(default_factory=list)
+
+    @property
+    def population(self) -> int:
+        """Return the size of the whole population, over all bands."""
+        return sum(band.population for band in self.bands)
+
+    @property
+    def size(self) -> int:
+        """Return the number of decisions drawn, over all bands."""
+        return sum(band.size for band in self.bands)
+
+    @property
+    def reviewed(self) -> int:
+        """Return the number of reviewed decisions, over all bands."""
+        return sum(band.reviewed for band in self.bands)
+
+    @property
+    def changed(self) -> int:
+        """Return the number of changed decisions, over all bands."""
+        return sum(band.changed for band in self.bands)
+
+    @property
+    def not_found(self) -> int:
+        """Return the number of drawn decisions not found."""
+        return sum(band.not_found for band in self.bands)
+
+    @property
+    def reset_since_draw(self) -> int:
+        """Return the number of drawn decisions reset since the draw."""
+        return sum(band.reset_since_draw for band in self.bands)
+
+    @property
+    def unreviewed(self) -> list[tuple[str, str]]:
+        """Return the drawn decisions not yet reviewed, band by band."""
+        return [u for band in self.bands for u in band.unreviewed]
+
+    def withheld_reason(self) -> str | None:
+        """Say why no estimate is given, or return None when it is."""
+        <<say why the estimate is withheld>>
+        return None
+
+    def estimate(self) -> StratifiedEstimate | None:
+        """Return the estimate for the population, once fully reviewed."""
+        if self.withheld_reason() is not None:
+            return None
+        return stratified_estimate([
+            (band.population, band.reviewed, band.changed)
+            for band in self.bands
+        ])
+
+
+def band_label(report: SampleReport) -> str:
+    """Name the confidence band a band report covers."""
+    criteria = report.criteria
+    return confidence_criteria_text(
+        criteria.get("min_confidence"), criteria.get("max_confidence"),
+        bool(criteria.get("no_confidence")),
+    )
+
+
+def group_sample_reports(
+    reports: list[SampleReport],
+) -> list["SampleReport | StratifiedReport"]:
+    """Join the band reports of each stratified sample into one report."""
+    items: list[SampleReport | StratifiedReport] = []
+    groups: dict[str, StratifiedReport] = {}
+    for report in reports:
+        stratum = report.criteria.get("stratum")
+        if not isinstance(stratum, dict) or "group" not in stratum:
+            items.append(report)
+            continue
+        group = groups.get(stratum["group"])
+        if group is None:
+            group = groups[stratum["group"]] = StratifiedReport(
+                group=stratum["group"], seed=report.seed,
+                drawn_at=report.drawn_at,
+                criteria={
+                    "statuses": report.criteria.get("statuses"),
+                    "population_sources":
+                        report.criteria.get("population_sources"),
+                    "cuts": stratum.get("cuts"),
+                },
+                sessions=list(report.sessions),
+                expected_bands=stratum.get("bands", 0),
+            )
+            items.append(group)
+        group.bands.append(report)
+    for group in groups.values():
+        group.bands.sort(key=lambda b: b.criteria["stratum"].get("band", 0))
+    return items
+@
+
+The reasons for withholding the estimate are checked in an order that
+names the first thing the user can act on.  A band record missing from
+the sessions comes first, since nothing else can be judged without it.
+Decisions not found come next: a pooled session whose file is gone, or
+one not given to the report, takes a whole session's share of every
+band, and the bands' rates would then be one session's rates
+extrapolated to all, a loss that has everything to do with which
+decisions were lost.  Then decisions still waiting for a review, and
+last a band whose every drawn decision was reset since the draw, which
+has no review left to estimate its rate from; it is named, since
+nothing is waiting in it and the user would otherwise not see why.
+
+<<say why the estimate is withheld>>=
+if len(self.bands) != self.expected_bands:
+    return (f"only {len(self.bands)} of its {self.expected_bands} bands "
+            "are recorded, so no estimate is given")
+if self.not_found:
+    return ("no estimate for the whole population is given while sampled "
+            "decisions are not found in the sessions reported on (a lost "
+            "session or paper need not be a random loss)")
+if self.unreviewed and not self.reviewed:
+    return "none of it has been reviewed yet"
+if self.unreviewed:
+    return (f"of the {self.reviewed} reviewed so far, the reviewer changed "
+            f"{self.changed}, and {len(self.unreviewed)} are not yet "
+            "reviewed, so no estimate for the whole population is given")
+for band in self.bands:
+    if band.population and not band.reviewed:
+        return (f"the band {band_label(band)} has no reviewed decision "
+                "left, so no estimate for the whole population is given")
+@
+
+One sentence states a stratified sample, as one sentence states a
+single one: the population, the bands with what was drawn from each,
+and then what the review has shown, the estimate only once every band
+is reviewed.  The rates and intervals of the bands are left to the
+per-band lines of [[llm sample --report]]; a report paragraph that
+listed them all would bury the one number the bands exist for.
+
+<<llm review sampling>>=
+def stratified_sample_sentence(report: StratifiedReport) -> str:
+    """State a stratified sample and what its review has shown so far."""
+    sessions = len(report.sessions)
+    bands = ", ".join(
+        f"{band_label(band)}: "
+        + ("none" if not band.population
+           else f"all {band.population}" if band.census
+           else f"{band.size} of {band.population}")
+        for band in report.bands
+    )
+    kind = ("census" if all(band.census for band in report.bands)
+            else "stratified random sample")
+    seed = f" (seed {report.seed})" if report.seed is not None else ""
+    text = (
+        f"A {kind} of the {report.population} "
+        f"{describe_sample_criteria(report.criteria)} in {sessions} "
+        f"session{'s' if sessions != 1 else ''} was drawn on "
+        f"{report.drawn_at[:10]}{seed} for human review, "
+        f"in {len(report.bands)} confidence bands ({bands})"
+    )
+    estimate = report.estimate()
+    if estimate is not None:
+        not_reviewed = estimate.population - estimate.reviewed
+        text += (
+            f"; with every band reviewed, the reviewer changed "
+            f"{estimate.changed} of the {estimate.reviewed} reviewed, and "
+            f"weighting each band's rate by its size estimates that "
+            f"{estimate.rate:.1%} of all {estimate.population} would be "
+            f"changed, {estimate.changed_not_reviewed:.1f} of the "
+            f"{not_reviewed} not reviewed (no interval is given for this "
+            "estimate)"
+        )
+    else:
+        text += f"; {report.withheld_reason()}"
+    return text + uncounted_text(report) + "."
+
+
+def sample_report_sentence(
+    report: "SampleReport | StratifiedReport",
+) -> str:
+    """State a single or a stratified sample in one sentence."""
+    if isinstance(report, StratifiedReport):
+        return stratified_sample_sentence(report)
+    return sample_sentence(report)
+
+
+def report_sample_ids(report: "SampleReport | StratifiedReport") -> set[str]:
+    """Return the ids of the stored samples a report covers."""
+    if isinstance(report, StratifiedReport):
+        return {band.sample_id for band in report.bands}
+    return {report.sample_id}
+@
+
+A stratified sample of three bands over one session is drawn and then
+reviewed in two steps.  With part of a band unreviewed there is no
+estimate; once every band is reviewed, the estimate is the weighted one
+computed by hand from the bands' sizes, and the sentence states it.
+
+<<test functions>>=
+class TestStratifiedReport:
+    <<stratified report test methods>>
+
+<<stratified report test methods>>=
+def _drawn(self):
+    from datetime import timezone
+
+    session = ReviewSession(query="strat", providers=["p"],
+                            timestamp=datetime(2026, 11, 20), name="strat")
+    confidences = [0.1] * 6 + [0.6] * 3 + [0.9] * 10
+    session.decisions = [
+        ReviewDecision(
+            paper=Paper(title=f"T{i}", authors=["A"],
+                        doi=f"10.5555/strat-{i}"),
+            provider="p", status=DecisionStatus.DISCARDED, tags=["t"],
+            source=ReviewSource.LLM_UNREVIEWED, llm_confidence=confidence,
+        )
+        for i, confidence in enumerate(confidences)
+    ]
+    draw_llm_sample([session], statuses={"discarded"}, size=3, seed=4,
+                    bands=[0.5, 0.7],
+                    now=datetime(2026, 11, 20, 12, 0, tzinfo=timezone.utc))
+    return session
+
+def _review(self, session, changed, limit=None):
+    """Review the drawn decisions, changing those of the given titles."""
+    from scholar.notes import get_paper_id
+
+    drawn = {p["paper_id"] for s in session.llm_samples for p in s.papers}
+    reviewed = 0
+    for decision in session.decisions:
+        if get_paper_id(decision.paper) not in drawn:
+            continue
+        if limit is not None and reviewed == limit:
+            break
+        decision.source = ReviewSource.LLM_REVIEWED
+        if decision.paper.title in changed:
+            decision.status = DecisionStatus.KEPT
+        reviewed += 1
+
+def test_bands_are_grouped_in_order(self):
+    session = self._drawn()
+    [report] = group_sample_reports(sample_reports([session]))
+    assert isinstance(report, StratifiedReport)
+    assert [band_label(b) for b in report.bands] == [
+        "below 0.5", "0.5 to below 0.7", "at least 0.7"]
+    assert [(b.population, b.size, b.census) for b in report.bands] == [
+        (6, 3, False), (3, 3, True), (10, 3, False)]
+    assert report.estimate() is None
+    assert "none of it has been reviewed yet" \
+        in sample_report_sentence(report)
+
+def test_partly_reviewed_gives_no_estimate(self):
+    session = self._drawn()
+    self._review(session, changed=set(), limit=4)
+    [report] = group_sample_reports(sample_reports([session]))
+    assert report.estimate() is None
+    assert "5 are not yet reviewed, so no estimate" \
+        in sample_report_sentence(report)
+
+def test_one_unreviewed_decision_withholds_the_estimate(self):
+    """Every band has reviews, but one drawn decision still waits."""
+    from scholar.notes import get_paper_id
+
+    session = self._drawn()
+    self._review(session, changed=set())
+    waiting = session.llm_samples[2].papers[0]["paper_id"]
+    for decision in session.decisions:
+        if get_paper_id(decision.paper) == waiting:
+            decision.source = ReviewSource.LLM_UNREVIEWED
+    [report] = group_sample_reports(sample_reports([session]))
+    assert all(band.reviewed for band in report.bands)
+    assert report.estimate() is None
+    assert "1 are not yet reviewed" in sample_report_sentence(report)
+
+def test_fully_reviewed_gives_the_weighted_estimate(self):
+    session = self._drawn()
+    low_band = [p["paper_id"] for p in session.llm_samples[0].papers]
+    changed = {f"T{pid.rsplit('-', 1)[1]}" for pid in low_band[:1]}
+    self._review(session, changed=changed)
+    [report] = group_sample_reports(sample_reports([session]))
+    assert [b.interval is None for b in report.bands] == [
+        False, True, False]
+    estimate = report.estimate()
+    assert estimate.rate == pytest.approx(6 * (1 / 3) / 19)
+    assert estimate.changed_not_reviewed == pytest.approx(3 * (1 / 3))
+    sentence = sample_report_sentence(report)
+    assert sentence.startswith(
+        "A stratified random sample of the 19 unreviewed LLM discards in "
+        "1 session was drawn on 2026-11-20 (seed 4) for human review, in "
+        "3 confidence bands (below 0.5: 3 of 6, 0.5 to below 0.7: all 3, "
+        "at least 0.7: 3 of 10); with every band reviewed, the reviewer "
+        "changed 1 of the 9 reviewed, and weighting each band's rate by "
+        "its size estimates that 10.5% of all 19 would be changed, 1.0 "
+        "of the 10 not reviewed (no interval is given for this estimate)")
+
+def test_an_empty_band_is_recorded_and_named(self):
+    session = self._drawn()
+    session.llm_samples = []
+    draw_llm_sample([session], statuses={"discarded"}, size=3, seed=4,
+                    bands=[0.5, 0.7, 0.8])
+    [report] = group_sample_reports(sample_reports([session]))
+    assert [b.population for b in report.bands] == [6, 3, 0, 10]
+    assert "0.7 to below 0.8: none" in sample_report_sentence(report)
+
+def test_a_band_without_reviews_left_is_named(self):
+    """Every drawn decision of one band reset: that band blocks it."""
+    from scholar.notes import get_paper_id
+    from scholar.review import reset_decision
+
+    session = self._drawn()
+    lost = {p["paper_id"] for p in session.llm_samples[0].papers}
+    for decision in session.decisions:
+        if get_paper_id(decision.paper) in lost:
+            reset_decision(decision, "2026-11-21T10:00:00+00:00")
+    self._review(session, changed=set())
+    [report] = group_sample_reports(sample_reports([session]))
+    assert report.estimate() is None
+    sentence = sample_report_sentence(report)
+    assert "the band below 0.5 has no reviewed decision left, so no " \
+        "estimate for the whole population is given" in sentence
+    assert "0 are not yet reviewed" not in sentence
+
+def test_decisions_not_found_withhold_the_estimate(self):
+    """A lost decision is no random loss, so nothing is extrapolated."""
+    from scholar.notes import get_paper_id
+
+    session = self._drawn()
+    self._review(session, changed=set())
+    lost = session.llm_samples[2].papers[0]["paper_id"]
+    session.decisions = [d for d in session.decisions
+                         if get_paper_id(d.paper) != lost]
+    [report] = group_sample_reports(sample_reports([session]))
+    assert report.not_found == 1 and not report.unreviewed
+    assert report.estimate() is None
+    assert report.withheld_reason().startswith("no estimate")
+    assert "not found in the sessions reported on (a lost session " \
+        "or paper need not be a random loss)" \
+        in sample_report_sentence(report)
+
+def test_a_missing_band_record_withholds_the_estimate(self):
+    session = self._drawn()
+    self._review(session, changed=set())
+    del session.llm_samples[1]
+    [report] = group_sample_reports(sample_reports([session]))
+    assert report.estimate() is None
+    assert "only 2 of its 3 bands are recorded, so no estimate is " \
+        "given" in sample_report_sentence(report)
+
+def test_single_samples_pass_through(self):
+    first, second = TestSampleReports()._setup()
+    reports = sample_reports([first, second])
+    assert group_sample_reports(reports) == reports
+    assert sample_report_sentence(reports[0]) == sample_sentence(reports[0])
+@
+
+A census over a single population is stated as one, with its rate and
+no interval:
+
+<<test functions>>=
+class TestCensusReport:
+    def test_census_sentence(self):
+        from datetime import timezone
+
+        session = TestStratifiedReport()._drawn()
+        session.llm_samples = []
+        draw_llm_sample([session], statuses={"discarded"}, seed=None,
+                        census=True, max_confidence=0.5,
+                        now=datetime(2026, 11, 20, 12, 0,
+                                     tzinfo=timezone.utc))
+        TestStratifiedReport()._review(session, changed={"T0"})
+        [report] = sample_reports([session])
+        assert report.interval is None and report.rate == 1 / 6
+        assert sample_sentence(report) == (
+            "A census of all 6 unreviewed LLM discards with a confidence "
+            "below 0.5 in 1 session was taken on 2026-11-20 for human "
+            "review; all 6 counted were reviewed, and the reviewer "
+            "changed 1 (16.7%).")
+@
+
 \subsection{The screening paragraphs of the report}
 
 The review report describes the LLM step through
@@ -4644,9 +6190,10 @@ The review report describes the LLM step through
 many decisions an LLM made, with the models, the prompt versions and
 the dates the decisions record, how many of them saw a truncated
 abstract, and for how many none of this was recorded; then one
-sentence per sample stored in the session.  A session without LLM
-decisions and without samples gets nothing, so the report never
-describes a step that did not happen.  The truncation is stated from
+sentence per sample stored in the session, one for all the bands of a
+stratified sample (\cref{sec:llm-sample-stratified-report}).  A session
+without LLM decisions and without samples gets nothing, so the report
+never describes a step that did not happen.  The truncation is stated from
 each decision's own [[llm_abstract_truncated]], without a number of
 characters: the limit is today's [[MAX_ABSTRACT_CHARS]], but a decision
 made under an earlier limit was cut at that one, and only its prompt
@@ -4763,8 +6310,9 @@ def build_llm_screening_latex(
         pooled = pooled_sample_sessions([session], load=load)
         own_ids = {sample.sample_id for sample in session.llm_samples}
         sentences.extend(
-            sample_sentence(report) for report in sample_reports(pooled)
-            if report.sample_id in own_ids
+            sample_report_sentence(report)
+            for report in group_sample_reports(sample_reports(pooled))
+            if own_ids & report_sample_ids(report)
         )
     if not sentences:
         return []
@@ -4870,6 +6418,36 @@ class TestLLMScreeningLatex:
         sample = next(line for line in lines if "random sample" in line)
         assert "changed 1" in sample
         assert "1 sampled decisions were not found" in sample
+@
+
+The bands change nothing for a sample drawn without them: the
+paragraph of the pooled sample above is pinned to the text that the
+code before stratified samples (\texttt{4ba7a23}) writes for it,
+obtained by running that version on the same sessions.  A stratified
+sample gets one paragraph for all its bands.
+
+<<test functions>>=
+class TestScreeningSectionWithBands:
+    def test_an_old_sample_reads_as_before(self):
+        first, second = TestSampleReports()._setup()
+        lines = build_llm_screening_latex(first, load={"b": second}.get)
+        assert lines[4] == (
+            "A random sample of 4 of the 40 unreviewed LLM discards with a "
+            "confidence of at least 0.8 in 2 sessions was drawn on "
+            "2026-11-18 (seed 5) for human review; of the 2 reviewed so "
+            "far, the reviewer changed 1 (50.0\\%; 95\\% modified Wilson "
+            "interval 2.6\\% to 97.4\\%), and 1 are not yet reviewed; the "
+            "rate covers only the reviewed part, and if papers were "
+            "skipped rather than reviewed in the drawn order it may be "
+            "biased; 1 sampled decisions were not found in the sessions "
+            "reported on and are not counted.")
+
+    def test_a_stratified_sample_is_one_paragraph(self):
+        session = TestStratifiedReport()._drawn()
+        lines = build_llm_screening_latex(session)
+        samples = [line for line in lines if "sample" in line]
+        assert len(samples) == 1
+        assert samples[0].startswith("A stratified random sample of the 19")
 @
 
 A sample names its sessions by label, and a label is not a key: the
@@ -6220,11 +7798,17 @@ The provenance section's summary counts the decisions by source, as the
 review report does (\cref{sec:review-source}): a synthesis built on
 papers an agent or a model kept without a human reading them must say
 so where it gives the numbers (issue~\#163).  The rows come from
-[[decision_source_items]], so the synthesis and the report use the same
-wording.
+[[decision_source_rows]], so the synthesis and the report use the same
+wording, including the note on how many decisions of a source that
+claims a human carry a record of the review, when any lacks one, and
+the sentence after the summary that explains it
+(\cref{sec:human-review-record} in the review module).
 
 <<llm review imports>>=
-from scholar.review import decision_source_items, escape_latex
+from scholar.review import (
+    decision_source_rows, escape_latex, review_record_sentence,
+    source_row_text,
+)
 <<llm review synthesis>>=
 def build_research_question_section_markdown(
     session: ReviewSession,
@@ -6250,8 +7834,8 @@ def build_research_question_section_markdown(
     lines.append(f"- Discarded: {len(session.discarded_papers())}")
     lines.append(f"- Pending: {len(session.pending_papers())}")
     lines.extend(
-        f"- Decided ({label}): {count}"
-        for label, count in decision_source_items(session.decisions)
+        f"- Decided ({label}): {source_row_text(count, note)}"
+        for label, count, note in decision_source_rows(session.decisions)
     )
     if included_kept_papers != total_kept_papers:
         lines.append(
@@ -6259,6 +7843,9 @@ def build_research_question_section_markdown(
             "(due to --max-papers)"
         )
     lines.append("")
+    review_records = review_record_sentence(session.decisions)
+    if review_records:
+        lines.extend([review_records, ""])
 
     if session.snowball_rounds:
         lines.extend(["### Snowballing", ""])
@@ -6310,14 +7897,18 @@ def build_research_question_section_latex(
         ]
     )
     lines.extend(
-        f"\\item[Decided: {escape_latex(label)}] {count}"
-        for label, count in decision_source_items(session.decisions)
+        f"\\item[Decided: {escape_latex(label)}] "
+        f"{source_row_text(count, note)}"
+        for label, count, note in decision_source_rows(session.decisions)
     )
     if included_kept_papers != total_kept_papers:
         lines.append(
             f"\\item[Included kept papers] {included_kept_papers}/{total_kept_papers}"
         )
     lines.extend([r"\end{description}", ""])
+    review_records = review_record_sentence(session.decisions)
+    if review_records:
+        lines.extend([escape_latex(review_records), ""])
 
     if session.snowball_rounds:
         lines.extend([r"\subsection{Snowballing}", ""])
@@ -6369,14 +7960,37 @@ class TestSynthesisDecisionSources:
 
     def test_markdown_summary(self):
         text = build_research_question_section_markdown(self._session(), 4, 4)
-        assert "- Decided (human): 1\n" in text
-        assert "- Decided (LLM, reviewed by a human): 1\n" in text
+        assert "- Decided (human): 1 (0 with a record of the review)\n" \
+            in text
+        assert "- Decided (LLM, reviewed by a human): 1 (0 with a record " \
+            "of the review)\n" in text
         assert "- Decided (agent, unreviewed): 2\n" in text
 
     def test_latex_summary(self):
         text = build_research_question_section_latex(self._session(), 4, 4)
-        assert "\\item[Decided: human] 1\n" in text
+        assert "\\item[Decided: human] 1 (0 with a record of the " \
+            "review)\n" in text
         assert "\\item[Decided: agent, unreviewed] 2\n" in text
+
+    def test_a_recorded_review_reads_as_before(self):
+        from scholar.review import record_human_decision
+
+        session = self._session()
+        for decision in session.decisions:
+            if not decision.source.is_unreviewed:
+                record_human_decision(decision, "tui")
+        text = build_research_question_section_markdown(session, 4, 4)
+        assert "- Decided (human): 1\n" in text
+        assert "with a record" not in text
+        assert "Scholar records when" not in text
+
+    def test_the_note_is_explained(self):
+        from scholar.review import REVIEW_RECORD_EXPLANATION
+
+        for build in (build_research_question_section_markdown,
+                      build_research_question_section_latex):
+            text = build(self._session(), 4, 4)
+            assert text.count(REVIEW_RECORD_EXPLANATION) == 1, build
 @
 
 <<llm review synthesis>>=
