@@ -1167,8 +1167,9 @@ marks a decision whose `llm_model` is set but whose source is not
 `CLASSIFIER_SOURCES` duplicates `llm_review.LLM_SOURCES` so `show`
 does not import llm_review and its caches, a test keeps them equal)
 with "(llm trace: earlier classifier call)" and JSON `"llm_trace":
-"earlier classifier call"` (key absent otherwise). The CSV
-has no classifier-field columns, so it is unchanged.
+"earlier classifier call"` (key absent otherwise). The
+per-decision CSV shows the kept trace in its classifier columns (#281,
+see LLM Screening Record).
 **Agent reasons (#249).** `ReviewDecision` has an agent trace,
 `agent_reason`, `agent_by`, `agent_decided_at` (UTC ISO), named once in
 `review.AGENT_AUDIT_FIELDS` (`agent_audit_of`; load, `decision_state`,
@@ -1202,7 +1203,7 @@ confidences exits 2, both unsaved. `--source agent` without a reason
 warns on stderr and records the decision. Shown in `sessions show`
 (a `reason (by): …` line, cut at `SHOW_REASON_CHARS` = 160; JSON:
 the three fields, `null` when unset), the per-decision CSV (three
-columns after `source_relabelled`, before the human record's;
+columns after the classifier's, before the human record's;
 `paper_id` stays last) and the report (one English sentence after
 the summary, `agent_reasons_sentence`: agent and agent_reviewed
 decisions with/without a reason). An older Scholar loads such files
@@ -2424,6 +2425,11 @@ once in `review.LLM_AUDIT_FIELDS` (`llm_audit_of()`), which load, save,
 the append copy, `decision_state` and the concurrent merge all use; old
 files load them as `None` (unknown) and nothing fills them in later.
 A human review leaves them untouched (they are the model's record).
+The per-decision CSV has a column for each, in this order, after
+`source_relabelled` and before `agent_reason` (#281; the later columns
+moved five places, `paper_id` stays last): empty when unset,
+`llm_abstract_truncated` as `true`/`false`, the reason as stored (the
+`csv` module quotes commas, quote marks and line breaks).
 
 - **No invented values.** `parse_llm_response` returns one entry per
   paper; an unusable answer (no answer, decision not kept/discarded, a
@@ -2691,6 +2697,14 @@ subprocess with a fake `XDG_CACHE_HOME`.
 
 1. Add `@app.command()` decorated function in `cli.py`
 2. Add tests in `test_cli.py`
+
+A chunk tangled into a command function must not use one of that
+function's parameters as a `for`, `with ... as` or `except ... as`
+name: Python has no block scope, so it overwrites the option for the
+rest of the command (#280: `sessions decide --keep-trace` printed a
+field name as the session's name). `TestNoLoopRebindsAParameter` in
+`cli.nw` parses `cli.py` and fails on any such binding; plain
+assignments (`by = by.strip()`) are allowed.
 
 ## Literate Programming
 
