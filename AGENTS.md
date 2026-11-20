@@ -1804,11 +1804,50 @@ A human review leaves them untouched (they are the model's record).
   other sessions from those files (`load_listed_session`; a file gone
   -> its papers not found), old samples by label via `load`, each file
   once. The population digest still hashes labels (unchanged).
+- **Bounds, bands, census (#254).** `--max-confidence C` is exclusive
+  (`confidence_in_bounds`: `[min, max)`, a missing confidence meets no
+  bound); `--no-confidence` selects only decisions without one (exit 2
+  with a bound). `--bands 0.5,0.7,0.9` (`check_band_cuts`: strictly
+  increasing in (0, 1); exit 2 with any bound or `--no-confidence`)
+  draws `-n` per band, bands `below 0.5`, `0.5 to below 0.7`, ...,
+  `at least 0.9` (open outer ends, so disjoint and exhaustive) plus
+  `without a confidence` when any lack one (`band_strata`). Each band
+  has its own generator, `random.Random(int(sha256("seed/min!r/max!r/
+  no_confidence")[:8]))` (`band_random`), so adding a decision to one
+  band never changes another band's draw. A band with <= n members is
+  taken whole (`criteria["census"]`); `--census` takes everything (no
+  `-n`, which is refused, and no seed: `LLMSample.seed` None, id
+  `.../census/...`). A plain draw stores exactly the old criteria
+  (new keys only when used; `test_golden_draw` unchanged). Record: one
+  `LLMSample` per band with `criteria["stratum"] = {group, band, bands,
+  cuts}`, id `<group>/band=<i>`, its own population/digest/size, empty
+  bands recorded too; chosen over one record with a band list because
+  an older Scholar keeps `criteria` and paper dicts whole on save and
+  reports each band correctly as its own sample (it only misses the
+  upper bound in the sentence). `--report`: `group_sample_reports`
+  joins bands into a `StratifiedReport` (table: band, population,
+  drawn, reviewed, changed, rate, interval; census band no interval,
+  "census, all reviewed"/"k left"); JSON keeps old keys for plain
+  samples (`census` added only for a census), stratified: `stratified`,
+  `bands` (+`band`, `census`), `estimate` (null until complete).
+  `stratified_estimate`: p = sum N_h x_h/n_h / N and changed among the
+  not reviewed sum (N_h - n_h) x_h/n_h (Franco, Little, Louis, Slud
+  2019, JSSAM 7(3), eq. 10; read in full, authors' final version), given
+  only when every band of the group is present, has a review and has no
+  unreviewed decision; not found/reset are left out of n_h. **No
+  interval for the whole**: Franco et al.'s Wilson-with-effective-size
+  results exclude zero estimated variance (all bands agreeing) and start
+  at p = 0.05, and Stehman & Xing 2022 (abstract only; full text behind
+  a bot check) report the neff method rarely fixed undercoverage for
+  small proportions. Per-band intervals stay.
 - **Report.** `build_review_provenance_latex` calls
   `llm_review.build_llm_screening_latex` (one local import + call): an
   "LLM screening" section with models, prompt versions, dates, the
   truncated (from each decision's flag, no character count) and
-  unrecorded counts, and `sample_sentence` per sample
+  unrecorded counts, and `sample_report_sentence` per sample (one for
+  all bands of a stratified sample; old samples byte-identical, pinned
+  by `TestScreeningSectionWithBands`; a census says "A census of all
+  N ..." without seed or interval)
   (other pooled sessions are loaded read-only). Nothing when the
   session has no LLM decisions and no samples.
 
