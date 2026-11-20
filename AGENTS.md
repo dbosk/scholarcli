@@ -1453,6 +1453,47 @@ the summary, `agent_reasons_sentence`: agent and agent_reviewed
 decisions with/without a reason). An older Scholar loads such files
 and drops the fields on its next save (checked with the installed
 pre-#249 pipx build).
+**Batch ids (#292, cli.nw `sec:batch-ids-in-files`,
+`sec:batch-against-sheet`, `sec:sheet-batches`; review.nw
+`sec:stored-batches`).** `agent_batch` is the 4th field of
+`AGENT_AUDIT_FIELDS` (so load, save-when-set, `decision_state`, merge,
+`is_unscreened`, `clear_machine_audit`, the reset trace, `show -f
+json`, and the CSV column right after `agent_decided_at` all handle it;
+not in the text listing). A screening has key `batch` (in
+`SCREENING_KEYS` after `sample_id`, `new_screening(batch=)`; a
+snapshot takes `agent_batch` via `SNAPSHOT_FIELDS`/`verdict_screener`
+for agent verdicts). `parse_tab_file` entries are 4-tuples `(line, id,
+values, batch)`: a comment line `# batch: ID` (`BATCH_LINE`, `batch`
+any case) gives the lines after it that id until the next one (several
+batches concatenated; lines before the first: None); `ReasonLine`/
+`VerdictLine.batch`. `read_batch_id`: white space collapsed, empty or >
+`MAX_BATCH_ID_CHARS` = 100 → bad line (exit 2). Free text, never
+checked against a manifest. `decide --batch ID` (needs `--reason`/
+`--reasons-file`, exit 2) and `screen --batch ID` give the id to a
+run without batch lines; with a file that has them exit 2
+(`lines_with_batch`). The incoming batch check also runs per named
+batch (`<<check each batch the file names>>`, `rows_by_batch`, "In batch
+ID (n rows):" lines; skipped when one batch holds every row); `--strict`
+refuses on any. `--sheet FILE` (repeatable, both commands; decide needs
+a reason option): `read_screen_sheets` (comment/blank lines and an `id`
+header skipped, first column = id; no id, two batch lines, unreadable →
+exit 2 before loading); `compare_with_sheets` matches the sheet's batch
+rows (all rows for a sheet without `# batch:`) by `decisions_named_by`;
+stderr "NAME (batch B): returned R of N; M missing: …", "K id(s) not on
+the sheet: …", "Missing rows are fine …"; ids not on the sheet set
+`sheet_extras`, refused under `--strict` in `<<check the batch as a
+whole>>`. `sessions reset --batch ID` (repeatable, `read_batch_id`;
+alone or narrowing like `--source`) selects decisions by
+`agent_batch`, never screenings; an id no decision carries is a stderr
+note (a reset clears it). `stored_batch_check` → also
+`StoredBatchCheck.batches` (`stored_batches`: rows with a batch id per
+(what, kind, name, batch), `batch_findings` whole, confidence included,
+one-reason runs NOT pooled); `check-batches` lists them ("Stored
+batches …: N, …; k with findings", `BATCH_CONFIDENCE_NOTE` on a flat
+one: a `-c` for a whole run looks the same), JSON `batches`. The
+installed pre-#292 pipx build (no screenings) drops `agent_batch` and
+the screenings on save (checked); a build with screenings keeps the
+screening dicts verbatim (`list(dec_data.get("screenings"))`, read).
 **Quote check (#256, review.nw `sec:reason-quotes`, cli.nw
 `sec:decide-quote-check`).** Pure functions: `quotes_in_reason`
 (text between double marks `"…"`, `“…”`, `”…”`, `„…“`/`„…”`, `«…»`,
@@ -1558,10 +1599,12 @@ and `--strict` refuses it); shared reasons are looked for
 session-wide over the pooled rows, agent reasons and screening reasons
 apart (`shared["agent decisions"]`, `shared["screenings"]`), since a
 stored run is neither a screener's batch nor a superset of one; flat
-confidence is not judged there (needs a stored batch id, #292). Text:
-counts line, session-wide shared reasons, runs with one reason, then
-what a stored run is and that flat confidence is not judged. JSON:
-`shared_reasons`, `runs`, `flat_confidence`. The help states the
+confidence is not judged from runs, only per stored batch id (#292,
+above). Text:
+counts line, session-wide shared reasons, runs with one reason, stored
+batches, then what a stored run is and that flat confidence is judged
+per batch only. JSON:
+`shared_reasons`, `runs`, `batches`, `flat_confidence`. The help states the
 thresholds (a test ties them to the constants).
 **Records decided without an abstract (#293, review.nw
 `sec:abstract-lookup`, enrich.nw `sec:enrich-lookup-record`, cli.nw
@@ -1886,7 +1929,7 @@ Each record has every key of `review.SCREENING_KEYS` (`id` uuid4 hex,
 `confirmed_from`, `confirmed_name`, `status` kept|discarded, `tags`,
 `confidence`, `reason` whole, `at`, `recorded_at`, `prompt_version`,
 `abstract_truncated`, `blind`, `blind_basis` prompt|tui|declared,
-`sample_id`, `via`), built by `new_screening` (validates) or
+`sample_id`, `batch` (#292), `via`), built by `new_screening` (validates) or
 `decision_snapshot`. `record_screening(decision, record)` first adds a
 snapshot of a *decided* paper's current verdict (`origin: "decision"`,
 `via: "snapshot"`) unless a counted snapshot with the same
@@ -2230,6 +2273,17 @@ screeners)} over records screened twice, `screen_sample` (the one
   from tui.nw with `sample_holding`, review.nw `sec:sample-giveaway`;
   the TUI imports both) go to stderr. The two options with another
   format, or empty, exit 2; unknown sample exit 2 (screen's chunk).
+  `--batch-size N` (#292; screen sheet only, >= 1, else exit 2; no
+  default, the help gives the protocol's ~100 as a recommendation
+  only) writes `BASE-001.tsv`… of at most N rows, each starting
+  `# batch: <digest>-NNN`, `# session: <file name>`, `# records: n`,
+  then header and rows as the single sheet (hand-written: the
+  unquoted format, quote marks as stored); plus `BASE-manifest.tsv`
+  (`batch file records first_id last_id`, written with `csv`, tab,
+  `\n`, no comment line). Digest =
+  first `SHEET_DIGEST_CHARS` = 8 hex of SHA-256 of [session file name,
+  size, ids] (`screen_sheet_batches`): stable for one selection and
+  size. Without the option the output is unchanged.
   Prints "N paper(s) on the screen sheet." and no machine-review
   table. `all` stays csv + latex.
 
