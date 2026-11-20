@@ -1851,7 +1851,18 @@ fixture has a quoted query, a `[`-row, `ĸ`, `CO₂`, a ligature. About
   without title and DOI and counts unparsable blocks (stderr), and
   `match_cited_entries(entries, session)` reuses the sessions check's
   lookup (`matching_entries` over `session_match_index`: DOI incl.
-  version-link DOIs, else `audit_work_key` under `plausibly_same_work`)
+  version-link DOIs, else `audit_work_key` under `plausibly_same_work`;
+  failing both, a second chance, #272: `match_loose_title` on
+  `loose_title` (a trailing edition phrase `, 2nd edition`/`(3rd rev.
+  ed.)`/`second edition`, ordinals 1-10, and a leading chapter number
+  before a title with no lower-case and some upper-case letter, removed
+  from both titles; `matched_by` `CHECK_BY_LOOSE_TITLE`; the bib's
+  `edition` field, the entries' optional third element, read by
+  `edition_number`, else its title's phrase, must equal an edition the
+  session title names, one side alone matches; still
+  `plausibly_same_work`, author-less records by title, else same
+  surname; several work keys → no match, `CitedEntry.ambiguous`;
+  `audit_work_key` and `sessions check` deliberately unchanged)
   → `CitedEntry.works` (work keys) → `collect_audit_rows(...,
   cited_works=)` → `audit_reason(..., cited=True/False)` per copy
   (None = old rule). Copies are still ranked on the screening's order
@@ -1863,7 +1874,10 @@ fixture has a quoted query, a `[`-row, `ĸ`, `CO₂`, a ligature. About
   not cited in the text" (`audit_uncited_keep`, `AuditRow.uncited`;
   own caption count `extra_uncited`, ahead of duplicates). Caption
   gets `cited_rule` before the databases (en/sv), also when nothing
-  matched. stderr: match counts (DOI / title / not in session), then
+  matched. stderr: match counts (DOI / title / [title without
+  edition or chapter number, only when > 0] / not in session), the
+  loosened entries (key: bib -> session title) and the ambiguous ones
+  (nothing extra when all match as before), then
   `cited_text_disagreements` lists the excluded (any matched row
   discarded) and the not-held entries (key: short title); not in the
   caption. Without the option the output is byte-identical (checked on
