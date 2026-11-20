@@ -64,6 +64,7 @@ session persistence, and report generation.
 <<review data structures>>
 <<review session functions>>
 <<review filtering functions>>
+<<review quote check>>
 <<review report generation>>
 @
 
@@ -15730,6 +15731,667 @@ class TestFilterDecisions:
 @
 
 
+\section{Checking the quotes in machine reasons}
+\label{sec:reason-quotes}
+
+A machine decision can carry a reason: the classifier's [[llm_reason]]
+(\cref{sec:llm-audit-fields}) and an agent's [[agent_reason]]
+(\cref{sec:agent-audit-fields}).  Screeners are asked to quote the
+record's own words in it, and a reviewer reads such a quote as evidence:
+the abstract says this, so the verdict follows.  Scholar used to store a
+reason as given, and nothing compared it with the record it was attached
+to (\url{https://github.com/dbosk/scholarcli/issues/256}).  A check of
+an agent-screened session found a reason that quoted another record (the
+rows of the screener's output and of its reasons file had slipped
+against each other), quoted strings that were the screener's paraphrase
+inside quote marks, and reasons that were placeholders or a shifted
+column.  A quote that is not in the record is either a mix-up, and then
+the verdict may belong to another paper too, or the screener's wording
+passed off as the source's.  Either way the reader should be told.
+
+This section holds the check itself, as pure functions of a reason and a
+paper; \cref{sec:sessions-decide} in the CLI module runs it on a reasons
+file before saving, [[llm classify]] at the end of its run, and
+[[sessions show]] and the report (\cref{sec:report-provenance}) state
+its counts.  Nothing is stored: the reason, the title and the abstract
+are all in the session, so the check is computed whenever it is shown,
+and a stored verdict could only go stale.
+
+The check has limits, which every place that shows it inherits:
+\begin{itemize}
+\item It compares with the title and abstract the session holds
+  \emph{now}.  An abstract filled in or replaced after the decision
+  ([[scholar enrich]]) may no longer contain what the screener read.
+\item The classifier saw only the first [[MAX_ABSTRACT_CHARS]] of an
+  abstract (\cref{sec:llm-audit-fields}); a quote from the rest is
+  found here although the model cannot have read it.
+\item The passages [[llm classify --full-text]] shows the model are not
+  stored, so only that run can check a quote against them; afterwards
+  such a quote is reported as not found.
+\item A quote that is found shows that the words are the record's, not
+  that the decision is right.
+\end{itemize}
+
+\subsection{What counts as a quote}
+
+A quote is the text between two \emph{double} quote marks: straight
+ones ([["..."]]) and these typographic pairs, guillemets either way
+round:
+\enquote{\textquotedblleft\dots\textquotedblright},
+\enquote{\textquotedblright\dots\textquotedblright},
+\enquote{\quotedblbase\dots\textquotedblleft} (and
+\enquote{\quotedblbase\dots\textquotedblright}),
+\enquote{\guillemotleft\dots\guillemotright},
+\enquote{\guillemotright\dots\guillemotleft}.  Single quote marks are
+not quotes here: the apostrophe of \enquote{students' answers} is the
+same character as a closing single quote, typographic or straight, so
+pairing single marks would cut passages out of possessives and
+contractions and report them as unmatched.  The pattern lists each
+pair's closing mark explicitly and lets a quote span lines; it is
+written with [[\u]] escapes because this file is woven into a
+pdf\LaTeX{} document.  A quote mark without its partner opens nothing,
+and neither does a straight mark right after a letter or digit: that is
+an inch or seconds mark, as in [[5" disks]], and would otherwise pair
+with the next real mark and take the text between for a quote.
+Exactly one group of the pattern takes part in a match, so the last
+group that matched ([[lastindex]]) is the quote.
+
+<<review quote check>>=
+QUOTE_PATTERN = re.compile(
+    r'(?<![^\W_])"([^"]*)"'
+    r"|\u201c([^\u201c\u201d]*)\u201d"
+    r"|\u201d([^\u201d]*)\u201d"
+    r"|\u201e([^\u201c\u201d\u201e]*)[\u201c\u201d]"
+    r"|\u00ab([^\u00ab\u00bb]*)\u00bb"
+    r"|\u00bb([^\u00ab\u00bb]*)\u00ab"
+)
+
+
+def quotes_in_reason(reason: str | None) -> list[str]:
+    """Return the passages `reason` puts between double quote marks.
+
+    Straight and typographic double marks count (curly pairs, low-high
+    pairs, guillemets either way round); single marks do not, since an
+    apostrophe is the same character.
+    """
+    if not reason:
+        return []
+    return [
+        match.group(match.lastindex)
+        for match in QUOTE_PATTERN.finditer(reason)
+    ]
+@
+
+Let's check the inch mark: only the real quote is found.
+
+<<reason quote test methods>>=
+def test_an_inch_mark_opens_no_quote(self):
+    reason = ('Used 5" disks, the abstract says "students treated '
+              'recursion as a loop"')
+    assert quotes_in_reason(reason) == [
+        "students treated recursion as a loop",
+    ]
+    assert unmatched_quotes(reason, self.PAPER) == []
+@
+
+Only a quote of at least [[MIN_QUOTE_WORDS]] words is checked.  A
+screener who quotes one or two words is usually marking a term---the
+name of a method, a construct, a criterion of the review---rather than
+lifting a passage, and a term need not be in the abstract for the
+reason to be sound: \enquote{not about \enquote{pair programming}} is a
+fair reason to discard a paper whose abstract never says it.  Such a
+quote is counted as \emph{not checked}, never as matched, so a reason
+that holds only short quotes adds to no count of verified quotes.  A
+word is a run of letters or digits, joined by inner hyphens and
+apostrophes, so \enquote{e-learning} is one word and an ellipsis none.
+
+<<review quote check>>=
+MIN_QUOTE_WORDS = 3
+QUOTE_WORD = re.compile(r"[^\W_]+(?:['-][^\W_]+)*")
+
+
+def is_checked_quote(quote: str) -> bool:
+    """Whether `quote` is long enough to be checked (`MIN_QUOTE_WORDS`)."""
+    return _is_long_enough(normalized_for_quotes(quote))
+
+
+def _is_long_enough(folded: str) -> bool:
+    return len(QUOTE_WORD.findall(folded)) >= MIN_QUOTE_WORDS
+@
+
+\subsection{Comparing a quote with the record}
+
+A quote is compared with the record's title and abstract after both
+sides are folded the same way, so that differences a reader would not
+call a misquotation do not count:
+\begin{description}
+\item[Markup] [[clean_metadata_text]] (\cref{sec:clean-provider-text}
+  in the utilities) decodes entities and drops inline tags, which a
+  session recorded before ingest cleaning may still hold; the screener
+  read the rendered text.  It names the tags it drops, so tag-like
+  markup of other systems stays, such as the [[<jats:italic>]] and
+  [[</jats:p>]] of JATS abstracts: the check drops any [[<]] that is
+  followed by a name of letters, digits, [[:]] and [[-]] (starting with
+  a letter), optional [[name="value"]] attributes and [[>]]
+  ([[QUOTE_TAG]]).  A comparison in running text, [[x < y]] or
+  [[a <c and d> e]], has no such shape and stays.
+\item[Compatibility forms] NFKC folds ligatures (\enquote{fi} as one
+  character), full-width letters and the ellipsis character, which
+  becomes three full stops.
+\item[Case and white space] are folded and collapsed, since a copied
+  abstract brings its line breaks and a screener may change the case of
+  a quote's first word.
+\item[Soft hyphens] are dropped: they are invisible in the text the
+  screener copied.
+\item[Hyphens and dashes] are unified, so a hyphen typed for the
+  abstract's en dash is the same character on both sides.
+\item[Quote marks] of every kind, single ones and apostrophes included,
+  are removed from both sides: a reason that writes the abstract's inner
+  double quotes as single ones, inside its own double quotes, or a
+  straight apostrophe for a curly one, still matches.  Removing a mark
+  on both sides never makes words with different letters equal.
+\end{description}
+Accents are not folded, so a quote that writes \enquote{naive} for the
+abstract's \enquote{na\"{\i}ve} is reported, and neither is \LaTeX{}
+mathematics, which an abstract may hold as source and a screener may
+have read rendered.  Both are false alarms a reader can dismiss at a
+glance; folding them would make different words equal.
+A word broken at a line end, \enquote{exam- ple}, is not joined again:
+the same pattern is a real compound in \enquote{pre- and post-test},
+which joining would corrupt, so such a quote is reported.
+
+Folding is most of the cost of the check, and it is paid for every
+abstract of a session each time the session is shown: 30\,000 reasons
+in a screened session.  Four shortcuts keep it cheap without changing
+the result.  The tag pattern runs only on a text that holds a [[<]].
+NFKC and the unified characters touch only characters outside ASCII,
+so an ASCII text skips both; its own quote marks are removed apart.  The characters to unify
+are looked up one by one with [[in]] and replaced only when present,
+since an abstract holds few of them: [[str.translate]] with a mapping
+was about fifty times slower on a 1500-character abstract that held a
+dash and a pair of quote marks, and a regular expression about four
+times.  And splitting and joining at white space gives the stripped text back
+unchanged when the text holds no white space but single spaces, which
+a few [[in]] tests can tell; [[QUOTE_OTHER_SPACES]] lists the white
+space characters that NFKC leaves as they are.  On a short text, a
+quote or a title, these tests are not worth it (profiling showed them
+as the largest single cost while quotes took them too), so a text
+shorter than [[QUOTE_SHORT_TEXT]] characters is split and joined
+directly.
+
+<<review quote check>>=
+QUOTE_TEXT_FOLDS = {
+    "\u00ad": "",
+    **dict.fromkeys("\u2010\u2011\u2012\u2013\u2014\u2015\u2212", "-"),
+    **dict.fromkeys(
+        "\u201c\u201d\u201e\u201f\u00ab\u00bb\u2018\u2019\u201a\u201b"
+        "\u2039\u203a", ""
+    ),
+}
+QUOTE_ASCII_MARKS = "\"'`"
+QUOTE_TAG = re.compile(
+    r'</?[A-Za-z][A-Za-z0-9:-]*(?:\s+[A-Za-z0-9:-]+="[^"<>]*")*\s*/?>'
+)
+QUOTE_OTHER_SPACES = tuple(
+    character for character in map(chr, range(0x3001))
+    if character.isspace() and character != " "
+    and unicodedata.normalize("NFKC", character) != " "
+)
+QUOTE_SHORT_TEXT = 300
+
+
+def normalized_for_quotes(text: str | None) -> str:
+    """Fold `text` for the quote check.
+
+    Markup cleaned (tag-like markup too), NFKC, soft hyphens and quote
+    marks dropped, dashes unified, case-folded and white space
+    collapsed. Accents are kept.
+    """
+    text = clean_metadata_text(text or "")
+    if "<" in text:
+        text = QUOTE_TAG.sub("", text)
+    if not text.isascii():
+        text = unicodedata.normalize("NFKC", text)
+        for character, replacement in QUOTE_TEXT_FOLDS.items():
+            if character in text:
+                text = text.replace(character, replacement)
+    for mark in QUOTE_ASCII_MARKS:
+        if mark in text:
+            text = text.replace(mark, "")
+    text = text.casefold()
+    if (len(text) < QUOTE_SHORT_TEXT or "  " in text
+            or any(space in text for space in QUOTE_OTHER_SPACES)):
+        return " ".join(text.split())
+    return text.strip()
+@
+
+The shortcuts must give what the plain definition gives: tags
+dropped, NFKC, every unified character replaced and every quote mark
+removed, case-folded, split and joined.  Let's
+compare the two on texts that take each path, short and long, and
+check that [[QUOTE_OTHER_SPACES]] holds every white space character NFKC keeps,
+also beyond the range it is built from.
+
+<<reason quote test methods>>=
+def test_the_folding_shortcuts_change_nothing(self):
+    import sys
+    import unicodedata
+    from scholar.utils import clean_metadata_text
+
+    def plain(text):
+        text = QUOTE_TAG.sub("", clean_metadata_text(text))
+        text = unicodedata.normalize("NFKC", text)
+        for character, replacement in QUOTE_TEXT_FOLDS.items():
+            text = text.replace(character, replacement)
+        for mark in QUOTE_ASCII_MARKS:
+            text = text.replace(mark, "")
+        return " ".join(text.casefold().split())
+
+    texts = [
+        "Plain ASCII text.", " Leading and trailing ", "two  spaces",
+        "a\ttab", "a\nline", "no\u00a0break", "line\u2028separator",
+        "ogham\u1680space", "Stra\u00dfe \u201cquoted\u201d \u2013 dash",
+        "soft\u00adhyphen", "\ufb01ne \uff26ull-width", "&amp; <i>x</i>",
+        "<jats:p>it's \"x\"</jats:p>", "a <c and d> e",
+    ]
+    long_tail = " filler" * QUOTE_SHORT_TEXT
+    for text in texts + [text + long_tail for text in texts]:
+        assert normalized_for_quotes(text) == plain(text), text[:40]
+    others = {
+        chr(i) for i in range(sys.maxunicode + 1)
+        if chr(i).isspace() and unicodedata.normalize("NFKC", chr(i)) != " "
+    } - {" "}
+    assert set(QUOTE_OTHER_SPACES) == others
+@
+
+A screener shortens a long passage with an ellipsis: \enquote{\dots},
+three full stops (spaced or not), or either in brackets or
+parentheses.  The quote is
+split there into parts that must each occur, in that order, in the same
+text (title or abstract; a quote does not run from one into the other).
+Punctuation at the edges of a part is ignored, chiefly the full stop or
+comma a screener leaves inside the closing mark.  Only punctuation and
+brackets are dropped, never a letter or digit, so every word of the
+quote is still checked.
+
+A part must begin and end at a word boundary of the text, so
+\enquote{students learn} is not found in \enquote{students learned}.
+Nothing else is lenient: there is no similarity threshold, because a
+threshold would accept exactly the paraphrases the check is there to
+find.  A quote is matched or it is reported.
+
+<<review quote check>>=
+QUOTE_ELLIPSIS = re.compile(
+    r"[\[(]\s*\.(?:\s*\.){2,}\s*[\])]|\.(?:\s*\.){2,}"
+)
+QUOTE_EDGE_CHARACTERS = " .,;:()[]"
+
+
+def quote_parts(quote: str) -> list[str]:
+    """The folded parts of `quote` that must occur in order."""
+    return _parts_of(normalized_for_quotes(quote))
+
+
+def _parts_of(folded: str) -> list[str]:
+    stripped = (
+        part.strip(QUOTE_EDGE_CHARACTERS)
+        for part in QUOTE_ELLIPSIS.split(folded)
+    )
+    return [part for part in stripped if part]
+
+
+def _find_at_word_bounds(text: str, part: str, start: int) -> int:
+    """Index of `part` in `text` from `start`, at word bounds, or -1."""
+    while (found := text.find(part, start)) >= 0:
+        end = found + len(part)
+        cut_before = (found > 0 and text[found - 1].isalnum()
+                      and part[0].isalnum())
+        cut_after = (end < len(text) and text[end].isalnum()
+                     and part[-1].isalnum())
+        if not cut_before and not cut_after:
+            return found
+        start = found + 1
+    return -1
+
+
+def quote_occurs(parts: list[str], texts: Sequence[str]) -> bool:
+    """Whether some text in `texts` holds `parts`, in order."""
+    for text in texts:
+        position = 0
+        for part in parts:
+            found = _find_at_word_bounds(text, part, position)
+            if found < 0:
+                break
+            position = found + len(part)
+        else:
+            return True
+    return False
+
+
+def unmatched_quotes(reason: str | None, paper: Paper,
+                     extra_texts: Sequence[str] = ()) -> list[str]:
+    """The checked quotes of `reason` not found in `paper`'s record.
+
+    Compared with the title, the abstract and `extra_texts` (such as
+    the full-text passages a classifier was shown). Quotes shorter than
+    `MIN_QUOTE_WORDS` words are not checked and never returned.
+    """
+    return _unmatched_among(checked_quotes(reason), paper, extra_texts)
+@
+
+Each quote is folded once, and the record's texts only when the reason
+holds a quote to check, since folding is the cost of the check and most
+of it is the abstract.  [[checked_quotes]] pairs each checked quote, as
+written, with its folded parts; the quote as written is what a reader
+is shown.
+
+<<review quote check>>=
+def checked_quotes(reason: str | None) -> list[tuple[str, list[str]]]:
+    """The quotes of `reason` long enough to check, with folded parts."""
+    checked = []
+    for quote in quotes_in_reason(reason):
+        folded = normalized_for_quotes(quote)
+        if _is_long_enough(folded):
+            checked.append((quote, _parts_of(folded)))
+    return checked
+
+
+def _unmatched_among(checked, paper, extra_texts=()) -> list[str]:
+    if not checked:
+        return []
+    texts = [
+        normalized_for_quotes(text)
+        for text in (paper.title, paper.abstract, *extra_texts) if text
+    ]
+    return [quote for quote, parts in checked
+            if not quote_occurs(parts, texts)]
+@
+
+Let's check the cases of the issue on an invented record: an exact
+quote, one that differs in case, white space, dashes and quote marks,
+the typographic marks of several languages, ellipsis parts in and out of
+order, a quote from another record, a paraphrase, and a quote too short
+to be checked.  Each is a pure function call on real objects, so no
+test double is needed.
+
+<<test functions>>=
+class TestQuotesInReasons:
+    """Quotes in a machine reason are checked against the record."""
+
+    <<reason quote test methods>>
+
+<<reason quote test methods>>=
+PAPER = Paper(
+    title="Novice Programmers\u2019 Misconceptions of Recursion",
+    authors=["A"], doi="10.5555/quote-check",
+    abstract=(
+        "We interviewed 40 first-year students about recursive "
+        "functions.\nMost students treated recursion as a loop "
+        "\u2013 a misconception we call the \u201cpassive flow\u201d "
+        "model. The findings inform an introductory course."
+    ),
+)
+
+def test_quotes_between_double_marks_only(self):
+    reason = (
+        'Says "one" and \u201ctwo\u201d, \u201dthree\u201d, '
+        '\u201efour\u201c, \u00abfive\u00bb, \u00bbsix\u00ab; '
+        "the students' answers and \u2018single\u2019 marks are not."
+    )
+    assert quotes_in_reason(reason) == [
+        "one", "two", "three", "four", "five", "six",
+    ]
+    assert quotes_in_reason(None) == []
+    assert quotes_in_reason('an "unclosed quote') == []
+
+def test_an_exact_quote_matches(self):
+    reason = (
+        'Kept: "most students treated recursion as a loop," and '
+        '"the findings inform an introductory course;".'
+    )
+    assert unmatched_quotes(reason, self.PAPER) == []
+
+def test_case_space_dash_and_mark_differences_match(self):
+    reason = (
+        '"Most   students treated\nRECURSION as a loop - a '
+        'misconception we call the "'
+        " and \u201ca misconception we call the \"passive flow\" "
+        "model.\u201d and \u201cNovice programmers' misconceptions\u201d"
+    )
+    assert unmatched_quotes(reason, self.PAPER) == []
+
+def test_ellipsis_parts_in_order_only(self):
+    in_order = (
+        "\u201cWe interviewed 40 first-year students \u2026 an "
+        'introductory course\u201d and "we interviewed 40 [...] '
+        'recursive functions"'
+    )
+    assert unmatched_quotes(in_order, self.PAPER) == []
+    out_of_order = (
+        '"an introductory course ... we interviewed 40 first-year '
+        'students"'
+    )
+    assert unmatched_quotes(out_of_order, self.PAPER) == [
+        "an introductory course ... we interviewed 40 first-year "
+        "students",
+    ]
+
+def test_a_quote_from_another_record_is_reported(self):
+    reason = '"The compiler emits faster code for loops."'
+    assert unmatched_quotes(reason, self.PAPER) == [
+        "The compiler emits faster code for loops.",
+    ]
+
+def test_a_paraphrase_is_reported(self):
+    reason = (
+        'Kept: "students see recursion as a loop", the abstract '
+        'says.  Also "most students treated recursion as loops" and '
+        '"students treat recursion" and "ost students treated".'
+    )
+    assert unmatched_quotes(reason, self.PAPER) == [
+        "students see recursion as a loop",
+        "most students treated recursion as loops",
+        "students treat recursion",
+        "ost students treated",
+    ]
+
+def test_a_short_quote_is_not_checked(self):
+    reason = 'About "pair programming", not "recursion".'
+    assert [is_checked_quote(q) for q in quotes_in_reason(reason)] \
+        == [False, False]
+    assert unmatched_quotes(reason, self.PAPER) == []
+
+def test_extra_texts_are_searched_too(self):
+    reason = '"the tracing tasks were solved"'
+    assert unmatched_quotes(reason, self.PAPER) == [
+        "the tracing tasks were solved",
+    ]
+    assert unmatched_quotes(
+        reason, self.PAPER, ["All the tracing tasks were solved."]
+    ) == []
+
+def test_markup_in_the_record_is_cleaned(self):
+    paper = Paper(title="T", authors=["A"],
+                  abstract="Learners&apos; <i>mental models</i> of state")
+    assert unmatched_quotes(
+        "\u201clearners\u2019 mental models of state\u201d", paper
+    ) == []
+@
+
+Four false alarms of a check on real screens are gone, each with its
+own case, and one is kept on purpose: tag-like markup that
+[[clean_metadata_text]] leaves (while a lone [[<]] in text stays
+text), a spaced ellipsis, the abstract's inner double quotes written
+as single ones, and, still reported, a quote without the abstract's
+accent.
+
+<<reason quote test methods>>=
+def test_tag_like_markup_is_dropped(self):
+    paper = Paper(title="T", authors=["A"], abstract=(
+        '<jats:p>Most <jats:italic>students</jats:italic> treated '
+        '<sc-x lang="en">recursion</sc-x> as a loop.</jats:p>'
+    ))
+    assert unmatched_quotes(
+        '"most students treated recursion as a loop"', paper
+    ) == []
+    assert normalized_for_quotes("if a <c and d> e holds") \
+        == "if a <c and d> e holds"
+
+def test_a_spaced_ellipsis_splits_the_quote(self):
+    reason = '"we interviewed 40 . . . recursive functions"'
+    assert unmatched_quotes(reason, self.PAPER) == []
+
+def test_inner_quote_marks_of_any_kind_match(self):
+    reason = ("\"a misconception we call the 'passive flow' model\" and "
+              "\u201cwe call the \u2018passive flow\u2019 model\u201d")
+    assert unmatched_quotes(reason, self.PAPER) == []
+
+def test_accents_are_not_folded(self):
+    paper = Paper(title="T", authors=["A"],
+                  abstract="Novices hold a na\u00efve model of recursion.")
+    assert unmatched_quotes('"a naive model of recursion"', paper) \
+        == ["a naive model of recursion"]
+@
+
+\subsection{The checks of a decision and their counts}
+
+A decision can carry both kinds of reason, an agent's correction on top
+of a kept classifier call ([[sessions decide --keep-trace]]), so each
+reason is checked on its own and labelled with its kind.  The counts say,
+per kind, how many reasons there are, how many hold at least one checked
+quote, and how many hold a quote not found, and also how many quotes
+went unchecked for being short (a count of quotes, not of reasons); [[sessions show]] and the
+report compute them once per decision and share
+[[reason_quote_checks]], so the two can never disagree.
+
+<<review quote check>>=
+MACHINE_REASON_FIELDS = (("agent", "agent_reason"), ("llm", "llm_reason"))
+
+
+@dataclass(frozen=True)
+class ReasonQuoteCheck:
+    """The quote check of one machine reason of a decision."""
+
+    kind: str
+    checked: int
+    unmatched: tuple[str, ...]
+    short: int = 0
+
+
+def reason_quote_checks(decision: ReviewDecision) -> list[ReasonQuoteCheck]:
+    """Check each machine reason of `decision` against its record."""
+    checks = []
+    for kind, name in MACHINE_REASON_FIELDS:
+        reason = getattr(decision, name, None)
+        if not reason:
+            continue
+        checked = checked_quotes(reason)
+        unmatched = _unmatched_among(checked, decision.paper)
+        short = len(quotes_in_reason(reason)) - len(checked)
+        checks.append(ReasonQuoteCheck(
+            kind, len(checked), tuple(unmatched), short
+        ))
+    return checks
+
+
+def unmatched_quotes_of(checks: Sequence[ReasonQuoteCheck]) -> list[str]:
+    """The unmatched quotes of a decision's checks, each once."""
+    return list(dict.fromkeys(q for check in checks for q in check.unmatched))
+
+
+def quote_check_tally(checks_per_decision) -> dict[str, dict[str, int]]:
+    """Count reasons, reasons with checked quotes and with unmatched ones.
+
+    Takes one list of `ReasonQuoteCheck`s per decision; returns the
+    counts per kind (`agent`, `llm`).
+    """
+    tally = {
+        kind: {"reasons": 0, "checked": 0, "unmatched": 0,
+               "short_quotes": 0}
+        for kind, _ in MACHINE_REASON_FIELDS
+    }
+    for checks in checks_per_decision:
+        for check in checks:
+            counts = tally[check.kind]
+            counts["reasons"] += 1
+            counts["checked"] += bool(check.checked)
+            counts["unmatched"] += bool(check.unmatched)
+            counts["short_quotes"] += check.short
+    return tally
+@
+
+<<reason quote test methods>>=
+def test_each_reason_of_a_decision_is_checked_and_counted(self):
+    def decided(n, **reasons):
+        return ReviewDecision(
+            paper=Paper(title=self.PAPER.title, authors=["A"],
+                        doi=f"10.5555/quote-tally-{n}",
+                        abstract=self.PAPER.abstract),
+            provider="p", status=DecisionStatus.KEPT,
+            source=ReviewSource.AGENT_UNREVIEWED, **reasons,
+        )
+    good = '"treated recursion as a loop"'
+    bad = '"recursion is taught too late"'
+    decisions = [
+        decided(1, agent_reason=good),
+        decided(2, agent_reason=f"{good} and {bad}", llm_reason=bad),
+        decided(3, agent_reason='Only "recursion".'),
+        decided(4, llm_reason="No quote at all."),
+        decided(5),
+    ]
+    checks = [reason_quote_checks(d) for d in decisions]
+    assert unmatched_quotes_of(checks[1]) == ["recursion is taught too late"]
+    assert [unmatched_quotes_of(c) for c in checks[2:]] == [[], [], []]
+    assert quote_check_tally(checks) == {
+        "agent": {"reasons": 3, "checked": 2, "unmatched": 1,
+                  "short_quotes": 1},
+        "llm": {"reasons": 2, "checked": 1, "unmatched": 1,
+                "short_quotes": 0},
+    }
+@
+
+The check is computed whenever a session is shown, over every decision
+with a reason, and a screened session can hold 30\,000 of them.  For
+scale: 30\,000 synthetic decisions with two reasons each took 3.0 to
+4.4\,s of processor time in a review of this change, on a machine under
+heavy load from parallel test runs; that is a measurement, not a
+promise.  The test below is a guard against a regression, not a
+benchmark.  It times 10\,000 decisions with a quoted reason and an
+abstract of 400 words holding a dash and a pair of quote marks, in
+processor time, which waiting for a busy processor does not add to.
+The current folding took about 1.8\,s there, under load; folding with
+[[str.translate]], which was about fifty times slower on one abstract
+(above), took about 15\,s for the whole check.  The limit lies between
+the two, with room for a busy machine.
+
+<<reason quote test methods>>=
+def test_ten_thousand_reasons_are_checked_quickly(self):
+    import time
+
+    words = " ".join(f"word{i}" for i in range(400))
+    decisions = [
+        ReviewDecision(
+            paper=Paper(title=f"Title {n}", authors=["A"],
+                        doi=f"10.5555/quote-speed-{n}",
+                        abstract=f"Intro &amp; \u2013 \u201cq\u201d "
+                                 f"{words} end {n}."),
+            provider="p", status=DecisionStatus.DISCARDED,
+            source=ReviewSource.AGENT_UNREVIEWED,
+            agent_reason=f'Says "word10 word11 word12" and "not in {n} it".',
+        )
+        for n in range(10_000)
+    ]
+    started = time.process_time()
+    tally = quote_check_tally(reason_quote_checks(d) for d in decisions)
+    elapsed = time.process_time() - started
+    assert tally["agent"] == {
+        "reasons": 10_000, "checked": 10_000, "unmatched": 10_000,
+        "short_quotes": 0,
+    }
+    assert elapsed < 8.0, f"{elapsed:.2f} s for 10,000 reasons"
+@
+
+
 \section{Report Generation}
 
 The module produces three \LaTeX{} artefacts from a review session, plus a
@@ -18391,6 +19053,7 @@ def build_review_provenance_latex(
     )
     <<add summary counts>>
     <<add the count of agent reasons>>
+    <<add the quote check of the machine reasons>>
     <<add the explanation of the review records>>
     <<add the count of abstracts given by hand>>
     <<add the LLM screening paragraphs>>
@@ -18588,6 +19251,113 @@ class TestReportAgentReasons:
         )]
         text = " ".join(build_review_provenance_latex(session))
         assert "an agent made" not in text
+@
+
+A reason can also be checked against its record: the quotes in it
+should be the record's own words (\cref{sec:reason-quotes}).  The report
+states, after the agent's reasons, how many machine reasons quote the
+record and how many hold a quote that is not in its title or abstract,
+the agent's and the classifier's apart, since they come from different
+screeners and a reader weighs them differently.  The sentence counts
+every reason the session holds, including those of decisions a human
+has since reviewed, as [[sessions show]] does, and it is left out when
+the session holds no machine reason.  It counts and does not list: the
+quotes are in [[sessions show]], and a report is not the place to
+correct a screen.
+
+<<review report generation>>=
+def reason_quotes_sentence(decisions) -> str:
+    """One sentence with the quote check of the machine reasons.
+
+    Empty when no decision carries an agent's or a classifier's reason.
+    """
+    tally = quote_check_tally(reason_quote_checks(d) for d in decisions)
+    clauses = []
+    for kind, label in (("agent", "agent"), ("llm", "classifier")):
+        counts = tally[kind]
+        if not counts["reasons"]:
+            continue
+        reasons = "reason" if counts["reasons"] == 1 else "reasons"
+        hold = "holds" if counts["checked"] == 1 else "hold"
+        clauses.append(
+            f"of {counts['reasons']} {label} {reasons}, "
+            f"{counts['checked']} {hold} such a quote and "
+            f"{counts['unmatched']} a quote not found in the record"
+        )
+    if not clauses:
+        return ""
+    return (
+        f"Quotes of at least {MIN_QUOTE_WORDS} words in the machine "
+        "reasons were compared with each record's title and abstract: "
+        + "; ".join(clauses) + "."
+    )
+<<add the quote check of the machine reasons>>=
+reason_quotes = reason_quotes_sentence(session.decisions)
+if reason_quotes:
+    lines.extend([reason_quotes, ""])
+@
+
+<<test functions>>=
+class TestReportReasonQuotes:
+    def test_the_report_counts_the_quote_check(self):
+        def d(n, **reasons):
+            return ReviewDecision(
+                paper=Paper(title="Recursion misconceptions", authors=["A"],
+                            doi=f"10.5555/report-quotes-{n}",
+                            abstract="Most students treated recursion as "
+                                     "a loop."),
+                provider="p", status=DecisionStatus.DISCARDED, tags=["t"],
+                source=ReviewSource.AGENT_UNREVIEWED, **reasons,
+            )
+        session = ReviewSession(
+            query="q", providers=["p"], timestamp=datetime(2026, 11, 20),
+        )
+        session.decisions = [
+            d(1, agent_reason='"treated recursion as a loop"'),
+            d(2, agent_reason='"recursion was taught too late"'),
+            d(3, agent_reason="No quote."),
+            d(4, llm_reason='Says "students treated recursion as".'),
+        ]
+        lines = build_review_provenance_latex(session)
+        assert (
+            "Quotes of at least 3 words in the machine reasons were "
+            "compared with each record's title and abstract: of 3 agent "
+            "reasons, 2 hold such a quote and 1 a quote not found in the "
+            "record; of 1 classifier reason, 1 holds such a quote and 0 "
+            "a quote not found in the record."
+        ) in lines
+
+    def test_no_sentence_without_machine_reasons(self):
+        session = ReviewSession(
+            query="q", providers=["p"], timestamp=datetime(2026, 11, 20),
+        )
+        session.decisions = [ReviewDecision(
+            paper=Paper(title="H", authors=["A"],
+                        doi="10.5555/report-quotes-none"),
+            provider="p", status=DecisionStatus.KEPT, tags=["t"],
+        )]
+        text = " ".join(build_review_provenance_latex(session))
+        assert "machine reasons were compared" not in text
+
+    def test_the_audit_table_does_not_show_the_check(self):
+        def table(abstract):
+            session = ReviewSession(
+                query="q", providers=["openalex"],
+                timestamp=datetime(2026, 11, 20),
+            )
+            session.decisions = [ReviewDecision(
+                paper=Paper(title="Recursion misconceptions", authors=["A"],
+                            doi="10.5555/audit-quotes", abstract=abstract),
+                provider="openalex", status=DecisionStatus.DISCARDED,
+                tags=["off-topic-false-hit"], llm_confidence=0.8,
+                source=ReviewSource.AGENT_UNREVIEWED,
+                agent_reason='"treated recursion as a loop"',
+            )]
+            assert len(reason_quote_checks(session.decisions[0])) == 1
+            return build_audit_table_latex(session, label="t")
+        found = table("Students treated recursion as a loop.")
+        missing = table("Students wrote loops.")
+        assert found == missing
 @
 
 When the summary notes how many human decisions carry a record of the
