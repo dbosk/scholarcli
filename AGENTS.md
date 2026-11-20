@@ -1136,6 +1136,20 @@ confirmation goes to stderr so `-f json`/`-f bibtex` stdout stays pure.
 `sessions show` prints each paper's id (`doi:…`/`hash:…`, the value
 `--paper-id` takes) under its title, and `show -f json` carries `doi` and
 `paper_id`, so a decision never needs a CSV detour.
+Each paper line is a `rich.text.Text` (`session_paper_line`; own
+pieces styled, stored strings appended as plain text: no markup, no
+emoji codes, no highlighter), printed `PAPER_LINES_PER_PRINT` (200)
+papers per call (`print_paper_lines`, #273; 10,000 decisions: ~24 s
+→ ~7 s piped). Piped text is pinned by
+`TestShowPinnedOutput` (80 and 200 columns) and equals the old
+per-line output except where that was wrong: stored brackets
+(`open[alex]` printed `(open)`; tags `x[bold`, `a]b[c` formed Rich
+tags), emoji codes (`a:b:c`) and trailing backslashes (doubled). On a
+terminal numbers and URLs in titles and ids are no longer coloured.
+Every other line of `print_session_details` is a `Text` too
+(`print_show_line(con, *parts)`, parts as for `Text.assemble`, with
+the highlighter applied as `Console.print` applies it to a string, so
+terminal colours stay); no stored string goes through markup.
 `--source human|agent|llm` says who decided (#162). It defaults to
 `human` only when stdin is a terminal; otherwise (scripts, agents) a
 missing `--source` exits 2 before loading the session. `agent` (an AI
@@ -1710,9 +1724,8 @@ never changed (tested on the saved JSON). **Screener identity**
 the identity of the snapshot of a decision the same model made, else
 the latest-record rule hides the first verdict. Only `llm classify
 --second-screen` writes `via: "classify"`; snapshots are `"snapshot"`,
-`sessions screen` `"screen"`. Not yet built (later #253 PR E):
-report surfaces (LaTeX report, `llm synthesize`, audit caption), the
-screen sheet.
+`sessions screen` `"screen"`. Report surfaces and the screen sheet:
+see "Double screen in the documents" below.
 **TUI blind review (#253 part D, closes #254's last point; tui.nw
 `sec:tui-blind-review`).** `scholar sessions resume S --blind [--by
 NAME]` (`PaperReviewApp(..., blind=True)`) starts blind mode in
@@ -1757,7 +1770,7 @@ After the reveal K/T/d/C are the normal paths (`mark_as_reviewed` +
 `record_human_decision(..., by=reviewer)`): the adjudication. Leaving
 between keeps the screening; the decision stays unreviewed and listed,
 revealed. The start notice (`BLIND_MODE_NOTICE`) adds, after a
-newline, `sample_giveaway(session, queued)`: one line per queued sample
+newline, `sample_giveaway(session, queued)` (review.nw, also used by the screen sheet): one line per queued sample
 that tells something, "Sample <sample_id> (N listed paper(s)) holds
 <describe_sample_criteria of statuses+sources> only: their status is
 known." for a single-status sample, plus (or alone, "... was drawn by
@@ -1862,6 +1875,114 @@ TUI filter `x` (`conflicts`): decisions with an unresolved conflict;
 a TUI confirm resolves (tested with a pilot). A blind TUI screening
 that differs from the machine's is a status conflict, unresolved until
 the step-two confirm (`test_a_blind_verdict_is_a_conflict_until_confirmed`).
+
+#### Double screen in the documents (#253, part E)
+
+agreement.nw `sec:agreement-reports`; every number comes from
+`ScreeningOverview` / `screening_agreement` (no second computation),
+and every surface starts from `ScreeningOverview.of`, None without
+screenings, so documents of sessions without screenings are byte for
+byte as before (`TestDocumentsWithoutScreenings`: sha256 of report,
+CSV, synthesis summary md+latex, audit table en+sv of
+`_surface_session(False)`, pinned from b05c49e). Shared pieces:
+`kappa_clause(table, minus="-")` (kappa always with PI/BI, else "kappa
+undefined (reason)"; the report passes `MINUS` = U+2212),
+`_records(n)` ("1 record", also in PR B's block, header, bound
+sentence and show line), `ScreeningOverview.pair_summary(a, b)` →
+(names, numbers) (the `show` line is `Double screening: names:
+numbers`), `resolved_outcomes`, `sorted_outcomes`, `outcome_line`
+(moved from `sessions conflicts`, which calls them; same text),
+`blind_basis(record)` → `prompt`/`tui`/`declared` (blind True with that
+ground), `unstated` (blind True, unknown ground), `not blind`,
+`unknown` (None); `ScreenerProfile` counts `snapshots` and `bases`
+(latest verdict per record). **Screened twice** =
+`screened_twice(decision)`: counted verdicts of >= 2
+`screener_identity`s (unknown-kind snapshots count as one); a pending
+paper's lone screening (no snapshot) or a snapshot left alone by a
+reset is not. `ScreeningOverview.screened_again`,
+`screened_without_decision` (pending papers with a counted
+screening), `second_screen_groups()` → {(kind, ground): (decisions,
+screeners)} over records screened twice, `screen_sample` (the one
+`sample_id` of every second-screen verdict, else None).
+- **Report** (`double_screening_sentences(decisions)`, English, called
+  by `llm_review.build_llm_screening_latex`, escaped by `latex_text`:
+  `escape_latex` between `MINUS` signs, each `$-$`): after the LLM
+  sentence and the samples, `\paragraph{Double screening}`; with no
+  LLM step and no sample `<heading_command>{Double screening}` instead.
+  Sentences: "k of the N decisions were/was screened a second time."
+  (decisions, as the summary counts papers); "p pending paper(s)
+  has/have a screening but no decision to compare it with."; with
+  `screen_sample` "Every second-screen verdict was made for review
+  sample S; scholar sessions agreement --sample S gives the agreement
+  over that sample."; per screener (`screener_sentence`,
+  `REPORT_BLINDNESS`): "label: n records, all <phrase>." or "(c1
+  phrase1; c2 phrase2)" (snapshots: "copied from the decision when a
+  screening was recorded"); per pair (`pair_sentences`)
+  "Kept/discarded, A = …, B = …[ (same model)]: n records screened by
+  both; both kept x11, A kept and B discarded x12, A discarded and B
+  kept x21, both discarded x22; observed agreement, positive/negative
+  agreement, Cohen's kappa (PI, BI)." plus PR B's bound sentence; PR B's
+  kappa sentence once after all pairs; conflict counts ("… resolved by
+  a human who decided after the latest screening; … had conflicts on
+  the category only."; one record: ", and it was resolved by a human
+  …" / ", and it is unresolved"; none: no resolution clause) and one
+  `outcome_line` per pair and kind;
+  unknown-origin count. No interval.
+- **`llm synthesize`** summary (`summary_rows`): after the "Decided"
+  rows, md `- Double screening (names): numbers`, LaTeX
+  `\item[{Double screening: names}] numbers` (braced: names are user
+  text); the LaTeX row writes negatives as `$-$` (`summary_rows(...,
+  minus=MINUS)` + `latex_text`), the Markdown row keeps the hyphen.
+- **Audit caption** (`audit_screening_sentence(decisions, strings,
+  rows)`, in `build_audit_table_latex`'s `databases` join after
+  `cited_rule`, i.e. after the reason/confidence sentence and the cited
+  rule, before "Databases searched"). Counts unique hits by the rows'
+  `work` (`audit_work_key`; a work is screened twice when any copy is;
+  total = rows); without `rows` it counts records. en: "k of N hits
+  were/was screened a second time (c by <a language model / an agent /
+  a human / n agents>, <ground>; …)." (grounds: "blind by
+  construction of the prompt", "blind in Scholar's review screens",
+  "blind by the {agent's|model's|screener's; plural agents'|models'|
+  screeners'} own declaration", "marked blind", "not blind",
+  "blindness not recorded"; the report's declared phrase is "blind by
+  the agent's own declaration, which Scholar cannot check"); per pair "Agreement on
+  kept/discarded between <model m-1> and <agent a-2>[ (same model)]
+  (a same-model second screen: "model m-1 (second screen, same
+  model)", sv "(andra granskning, samma modell)"),
+  over n records screened by both: P\,\% (Cohen's kappa K, prevalence
+  index PI, bias index BI)." (or "undefined: reason"); "Status
+  conflicts: s, of which r resolved by a human; category-only
+  conflicts: c."; numbers via `audit_number`, negatives `$-$`; a
+  screener all human-confirmed snapshots → "the human-confirmed
+  decisions", partly → "human Hum (k of n records human-confirmed
+  decisions)". sv: "k av N träffar granskades en andra gång (c
+  granskade/granskad av en agent, blint enligt agentens egen uppgift;
+  …)." (grounds: "blint genom promptens utformning", "blint i Scholars
+  granskningsvyer", "blint enligt {owner} egen uppgift", "markerat som
+  blint", "inte blint", "utan uppgift om blindning"); "(samma
+  modell)"; "Statuskonflikter: s, varav r löst/lösta av en människa;
+  …". Pending papers with a lone screening are left out of the caption.
+  Strings in `AUDIT_STRINGS` (review.nw `sec:audit-double-screen`).
+  Rows, order and reasons unchanged (tested with/without screenings).
+  `TestDoubleScreeningCompiles` (marker `latex`) compiles report
+  fragment + sv table in the pdfLaTeX T1 host with a name full of
+  specials.
+- **Screen sheet** (cli.nw `sec:screen-sheet`): `scholar sessions
+  export S -f screen-sheet [--sample ID] [--undecided-by NAME] [-o
+  F[.tsv]]` writes a header line `id title year venue abstract` and
+  one line per paper id (copies once), tab-separated UTF-8, nothing
+  else; tabs and every `str.splitlines` break → space
+  (`sheet_field`). Papers (`screen_sheet_decisions`) =
+  `second_screen_candidates` (`over="all"`, or the sample: decided
+  only, since a second screen needs a first verdict; reset-since-draw
+  left out); `--undecided-by` drops papers where `has_verdict_by` (a
+  counted screening of that name, any kind, or `verdict_screener`
+  name). With `--sample`, the lines of `review.sample_giveaway` (moved
+  from tui.nw with `sample_holding`, review.nw `sec:sample-giveaway`;
+  the TUI imports both) go to stderr. The two options with another
+  format, or empty, exit 2; unknown sample exit 2 (screen's chunk).
+  Prints "N paper(s) on the screen sheet." and no machine-review
+  table. `all` stays csv + latex.
 
 ### Session Arguments
 
@@ -2458,6 +2579,11 @@ fixture has a quoted query, a `[`-row, `ĸ`, `CO₂`, a ligature. About
   adjacent hits, the B false hits, 2 unclassified and 1 ..."); the
   `extra_*` strings have no leading comma (the full caption adds ", ").
   `all` stays csv + latex.
+- Double screen (#253 E): the report's screening section ends with a
+  "Double screening" paragraph, the `llm synthesize` summary gets a row
+  per screener pair, and the audit caption a few sentences (en/sv) before
+  "Databases searched", all only when the session has screenings; see
+  "Double screen in the documents".
 - The TUI's `prompt_for_report` keeps the standalone default.
 
 ### Provider Text Cleaning
