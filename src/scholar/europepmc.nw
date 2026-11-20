@@ -7,18 +7,19 @@ hand were on PubMed, for journal articles whose records lacked them
 (\url{https://github.com/dbosk/scholarcli/issues/260}).
 This chapter asks Europe PMC for them.
 Europe PMC's web service answers a search by DOI with the work's
-record, abstract included, and needs no key; the life-science
-literature that PubMed indexes is what it holds, so one service covers
-that ground.
-We do not also ask PubMed's own E-utilities: a second service for the
-same literature would add requests and a second set of terms for little
-gain.
+record, abstract included, and needs no key.
+Each record names the data source it comes from with a three-letter
+code, of which the OpenAPI description below lists [[MED]], [[PMC]]
+and [[PPR]] among others; the record we recorded comes from [[MED]] and
+carries a PubMed identifier.
+What each source covers is described on pages we could not read (see
+below), so we make no claim about coverage.
+PubMed's own E-utilities are not added in this change.
 
 Like Unpaywall (\cref{unpaywall-module}), Europe PMC is not a search
 provider here but a per-DOI lookup: enrichment (\cref{enrich-module})
-asks it, after the search providers and Crossref
-(\cref{sec:crossref-abstract}), for a paper that still has no abstract,
-and it fills the abstract and nothing else.
+asks it, after Crossref (\cref{sec:crossref-abstract}), for a paper
+that still has no abstract, and it fills the abstract and nothing else.
 
 \section{What the service documents}
 
@@ -69,8 +70,8 @@ posted 2024-10-01, read 2026-11-20).
 A forum reply is not documentation, so the pace is scholar's own
 choice: five requests per second, half that figure, the same pace for
 any user, and slow enough that a burst of lookups stays far from it.
-A 429 is still handled, through the shared limiter, though the service
-documents none.
+The service documents no 429, but if one comes, the shared limiter
+sees it and starts a cooldown (see the session below).
 
 \paragraph{Terms.}
 The terms of use of EMBL-EBI, which runs the service, say that
@@ -95,7 +96,8 @@ Abstracts from Europe PMC.
 
 Looks up a paper's DOI with Europe PMC's RESTful search and returns the
 record's abstract. Used by ``scholar enrich`` (and ``search --enrich``)
-for papers the search providers and Crossref left without an abstract.
+for papers the providers asked before it, Crossref among them, left
+without an abstract.
 Results are cached per DOI; no key or address is sent.
 """
 
@@ -192,16 +194,23 @@ EUROPEPMC_REQUESTS_PER_SECOND = 5.0  # scholar's choice; see the prose
 
 The session is a [[ScholarSession]] (\cref{ch:network}), with
 scholar's User-Agent and the configured route, and the back-off the
-other clients use, so a transient 5xx is retried before it counts as a
-failure.
+other clients use for a 5xx, so a transient server error is retried
+before it counts as a failure.
+A 429 is deliberately not retried by the session, for the reason given
+for Crossref's (\cref{crossref-module}): [[urllib3]] would retry it out
+of the limiter's sight and end in [[RetryError]], so no cooldown would
+begin and every following paper would repeat the burst.
+Left to [[record_response]], one 429 starts a cooldown, and the
+following lookups are refused by the limiter without a request and
+counted as failed in the enrichment tally.
 
 <<europe pmc client methods>>=
 def _create_session(self) -> requests.Session:
-    """Create a session with exponential back-off retry logic."""
+    """Create a session that retries a 5xx; a 429 goes to the limiter."""
     retry = Retry(
         total=3,
         backoff_factor=1,  # 1s, 2s, 4s delays
-        status_forcelist=[429, 500, 502, 503, 504],
+        status_forcelist=[500, 502, 503, 504],
         allowed_methods=["GET"],
     )
     return network.new_session(retry)
@@ -219,6 +228,9 @@ the words of [[network.request_failure_reason]]
 (\cref{sec:request-failure-reason}).
 An answer that is JSON but has no result list is a failure too: we
 cannot tell it from an answer, so it must not be cached as one.
+The cache holds the abstract as the service sent it, and it is read
+into plain text when it is returned, as Crossref's is; a different
+reading then needs no new request.
 
 A DOI holding a double quote cannot be put inside the speech marks of a
 phrase, and the OpenAPI description says nothing about escaping one; we
@@ -236,7 +248,7 @@ def fetch_abstract(self, doi: str | None) -> str | None:
     """Return the abstract Europe PMC holds for `doi`, or None.
 
     None when there is no DOI, Europe PMC holds no record with an
-    abstract for it, the DOI cannot be asked for, or the lookup
+    abstract (with text) for it, the DOI cannot be asked for, or the lookup
     failed; the last two set `last_lookup_declined` and
     `last_lookup_error`.
     """
@@ -250,7 +262,7 @@ def fetch_abstract(self, doi: str | None) -> str | None:
     key = ("abstract", doi)
     if key in self._cache:
         logger.debug("europepmc: cache hit for DOI %s", doi)
-        return self._cache[key]
+        return abstract_text(self._cache[key])
     try:
         self._limiter.acquire()
         response = self._session.get(
@@ -277,26 +289,39 @@ def fetch_abstract(self, doi: str | None) -> str | None:
         self.last_lookup_error = network.request_failure_reason(e)
         return None
     self._cache[key] = abstract
-    return abstract
+    return abstract_text(abstract)
 <<constants>>=
 EUROPEPMC_UNQUOTABLE_DOI = "the DOI holds a double quote"
 @
 
 Reading the answer is a function of its own, so the tests can feed it
 the recorded bodies directly.
-The abstract is returned as the service sent it: the recorded one is
-plain text, and what markup other records may carry is not documented
-in what we could read.
-Whatever entities or inline tags arrive are removed by
-[[clean_metadata_text]] at the end of [[enrich_paper]], as for every
-provider (\cref{sec:clean-provider-text}).
+The recorded abstract is plain text; what markup other records may
+carry is not documented in what we could read.
+So the text is read with [[markup_to_text]], the reading Crossref's
+JATS abstracts get (\cref{sec:markup-to-text}): HTML headings,
+paragraphs and line breaks become spaces, inline tags vanish, entities
+are decoded; the limits of reading plain text that way are stated
+there.
+[[clean_metadata_text]] alone would not do: it removes a fixed list of
+inline tags and keeps [[<h4>]], [[<p>]] and [[<br/>]].
+A record whose abstract leaves no text is passed over for the next
+record under the same DOI, and a lookup that finds no text at all
+returns [[None]], never an empty string.
 
 <<module-level europe pmc interface>>=
-def abstract_for_doi(doi: str, answer: dict) -> str | None:
-    """Return the abstract of the first result under `doi` in `answer`.
+def abstract_text(raw: str | None) -> str | None:
+    """Return the plain text of an abstract as sent, or None if empty."""
+    return (markup_to_text(raw) or None) if raw else None
 
-    `answer` is a decoded search response. Raises `ValueError` when it
-    has no result list, since that cannot be told from "no record".
+
+def abstract_for_doi(doi: str, answer: dict) -> str | None:
+    """Return the abstract, as sent, of the first result under `doi`.
+
+    Results whose abstract is missing or leaves no text are passed
+    over. `answer` is a decoded search response. Raises `ValueError`
+    when it has no result list, since that cannot be told from "no
+    record".
     """
     try:
         results = answer["resultList"]["result"]
@@ -304,13 +329,13 @@ def abstract_for_doi(doi: str, answer: dict) -> str | None:
         raise ValueError("answer without a result list") from None
     wanted = doi.casefold()
     for record in results or []:
-        text = record.get("abstractText")
+        raw = record.get("abstractText")
         if (
             str(record.get("doi") or "").casefold() == wanted
-            and isinstance(text, str)
-            and text.strip()
+            and isinstance(raw, str)
+            and abstract_text(raw)
         ):
-            return text.strip()
+            return raw
     return None
 @
 
@@ -490,10 +515,123 @@ class TestEuropePMCAbstract:
         assert _client.last_lookup_error is None
 @
 
+The records and the refusals the recordings do not show come next.
+Several results under one DOI, the first without an abstract, and an
+abstract with HTML in it, are built from the recorded record by
+changing only what the case needs.
+A 429 needs the real session, since the defect was in its [[Retry]]: a
+loopback server answers every request with a 429 and counts them.
+One lookup must send one request and start a cooldown; the next lookup,
+made through [[enrich_paper]], must be refused by the limiter without a
+request and appear in the outcome as a failure of [[europepmc]].
+
+<<test functions>>=
+def _recorded_record(**changes):
+    """The recorded record with `changes` applied (None removes a key)."""
+    record = dict(RECORDED_HIT["resultList"]["result"][0])
+    for key, value in changes.items():
+        if value is None:
+            record.pop(key, None)
+        else:
+            record[key] = value
+    return record
+
+
+@pytest.fixture
+def refusing_server(monkeypatch):
+    """A loopback server answering every request with HTTP 429."""
+    import http.server
+    import threading
+
+    import scholar.europepmc
+
+    seen = []
+
+    class Refuser(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            seen.append(self.path)
+            self.send_response(429)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Refuser)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    monkeypatch.setattr(
+        scholar.europepmc, "EUROPEPMC_SEARCH_URL",
+        f"http://127.0.0.1:{server.server_port}/search",
+    )
+    yield seen
+    server.shutdown()
+
+
+class TestEuropePMCRecordsAndRefusals:
+    """Several records, HTML abstracts and a 429 (#260 review)."""
+
+    DOI = "10.7717/peerj.4375"
+
+    def _replay(self, *records):
+        answer = {"hitCount": len(records),
+                  "resultList": {"result": list(records)}}
+        return patch.object(
+            _client._session, "get", return_value=_mock_response(200, answer)
+        )
+
+    def test_a_matching_record_without_abstract_is_passed_over(self):
+        with self._replay(
+            _recorded_record(abstractText=None, source="PPR"),
+            _recorded_record(),
+        ):
+            assert fetch_abstract(self.DOI).startswith("Despite growing")
+
+    def test_a_record_whose_abstract_has_no_text_is_passed_over(self):
+        with self._replay(
+            _recorded_record(abstractText="<p> </p>"),
+            _recorded_record(),
+        ):
+            assert fetch_abstract(self.DOI).startswith("Despite growing")
+
+    def test_an_abstract_without_text_is_none(self):
+        with self._replay(_recorded_record(abstractText="<p></p>")):
+            assert fetch_abstract(self.DOI) is None
+            assert _client.get_paper_by_doi(self.DOI) is None
+        assert abstract_text("<p> </p>") is None
+
+    def test_html_in_an_abstract_is_read_as_text(self):
+        html = "<h4>Background</h4>First.<br/>Second.<p><i>Third</i>.</p>"
+        with self._replay(_recorded_record(abstractText=html)):
+            assert fetch_abstract(self.DOI) == (
+                "Background First. Second. Third."
+            )
+        assert _client._cache[("abstract", self.DOI)] == html
+
+    def test_a_429_starts_a_cooldown_and_is_tallied(self, refusing_server):
+        from scholar import Paper, ratelimit
+        from scholar.enrich import LookupOutcome, enrich_paper
+
+        assert fetch_abstract(self.DOI) is None
+        assert last_lookup_error() == "rate limited (HTTP 429)"
+        assert len(refusing_server) == 1
+        assert not ratelimit.check_available("europepmc").ok
+
+        outcome = LookupOutcome()
+        paper = Paper(title="Other", authors=["A B"], doi="10.1/other")
+        enrich_paper(
+            paper, fields=["abstract"], providers=["europepmc"],
+            outcome=outcome,
+        )
+        assert len(refusing_server) == 1
+        assert outcome.asked == ["europepmc"]
+        assert "europepmc" in outcome.failed
+@
+
 \section{Imports}
 
 The HTTP stack and the shared helpers the other clients use: the cache
-layer, the limiter, the network settings and [[Paper]].
+layer, the limiter, the network settings, [[Paper]] and
+[[markup_to_text]].
 
 <<imports>>=
 import logging
@@ -504,6 +642,7 @@ from urllib3.util.retry import Retry
 from scholar import Paper, network
 from scholar.cache import load_cache, register_cache
 from scholar.ratelimit import Limits, RateLimited, limiter_for
+from scholar.utils import markup_to_text
 
 logger = logging.getLogger(__name__)
 @
