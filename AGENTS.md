@@ -1824,7 +1824,8 @@ A human review leaves them untouched (they are the model's record).
   bands recorded too; chosen over one record with a band list because
   an older Scholar keeps `criteria` and paper dicts whole on save and
   reports each band correctly as its own sample (it only misses the
-  upper bound in the sentence). `--report`: `group_sample_reports`
+  upper bound in the sentence; a census it states as a random sample
+  "(seed None)" with an interval). `--report`: `group_sample_reports`
   joins bands into a `StratifiedReport` (table: band, population,
   drawn, reviewed, changed, rate, interval; census band no interval,
   "census, all reviewed"/"k left"); JSON keeps old keys for plain
@@ -1833,13 +1834,15 @@ A human review leaves them untouched (they are the model's record).
   `stratified_estimate`: p = sum N_h x_h/n_h / N and changed among the
   not reviewed sum (N_h - n_h) x_h/n_h (Franco, Little, Louis, Slud
   2019, JSSAM 7(3), eq. 10; read in full, authors' final version), given
-  only when every band of the group is present, has a review and has no
-  unreviewed decision; not found/reset are left out of n_h. **No
-  interval for the whole**: Franco et al.'s Wilson-with-effective-size
-  results exclude zero estimated variance (all bands agreeing) and start
-  at p = 0.05, and Stehman & Xing 2022 (abstract only; full text behind
-  a bot check) report the neff method rarely fixed undercoverage for
-  small proportions. Per-band intervals stay.
+  only when every band of the group is present, has no decision not
+  found (a lost session is no random loss), has no unreviewed decision
+  and has a review left (resets are left out of n_h and named);
+  otherwise `StratifiedReport.withheld_reason()` gives the sentence's
+  reason (JSON `estimate_withheld`, null once given). **No interval for
+  the whole**: Franco et al.'s Wilson-with-effective-size results
+  exclude zero estimated variance (all bands agreeing) and their
+  smallest expected proportion is 0.05 (n >= 30). Per-band intervals
+  stay.
 - **Report.** `build_review_provenance_latex` calls
   `llm_review.build_llm_screening_latex` (one local import + call): an
   "LLM screening" section with models, prompt versions, dates, the
