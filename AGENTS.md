@@ -1605,12 +1605,15 @@ nothing recorded. `blind_refuses_confirm`: C on a hidden paper refused.
 After the reveal K/T/d/C are the normal paths (`mark_as_reviewed` +
 `record_human_decision(..., by=reviewer)`): the adjudication. Leaving
 between keeps the screening; the decision stays unreviewed and listed,
-revealed. The start notice (`BLIND_MODE_NOTICE`) adds
-`sample_giveaway(session, queued)`: all queued samples of one status →
-"This sample holds <describe_sample_criteria of statuses+sources> only:
-their status is known." (different single statuses: "Each sample holds
-one status only ..."); any banded (`stratum`) or bounded draw → "It was
-drawn by confidence: each paper's range of confidence is known."
+revealed. The start notice (`BLIND_MODE_NOTICE`) adds, after a
+newline, `sample_giveaway(session, queued)`: one line per queued sample
+that tells something, "Sample <sample_id> (N listed paper(s)) holds
+<describe_sample_criteria of statuses+sources> only: their status is
+known." for a single-status sample, plus (or alone, "... was drawn by
+confidence ...") "It was drawn by confidence: the range of confidence
+of each of its papers is known." for a banded (`stratum`) or bounded
+draw; mixed samples get no line. The id is the one `llm sample` prints
+("Sample <id>"); the list does not show which sample drew a row.
 Saved by `sessions resume`'s `save_session`; PR A's merge sets aside a
 screening made while another process reset the paper
 (`TestBlindReview`, real subprocess, through `sessions resume
