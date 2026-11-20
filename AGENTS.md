@@ -1468,9 +1468,17 @@ only when `saving` (set before the chunk: decide True, screen
 `recorded_at` = `at`; `keep_copy_before_run(session, "pre-screen")`;
 `--dry-run` writes nothing. `--blind`/`--not-blind` → `blind`
 True/False, `blind_basis: "declared"`; neither → None. The decision is
-never changed (tested on the saved JSON). Not yet built (later #253
-PRs): agreement numbers, conflicts, `llm classify --second-screen`, the
-TUI's blind mode, report surfaces, the screen sheet.
+never changed (tested on the saved JSON). **Screener identity**
+(#253 C): `review.screener_identity(record)` = `(kind, name, via ==
+"classify")`; comparisons (agreement, conflicts) must pair by it, not by
+`(kind, name)`: a classifier second screen keeps `name` = the model id
+(so "same model" = both kind llm with equal names) but must not share
+the identity of the snapshot of a decision the same model made, else
+the latest-record rule hides the first verdict. Only `llm classify
+--second-screen` writes `via: "classify"`; snapshots are `"snapshot"`,
+`sessions screen` `"screen"`. Not yet built (later #253 PRs): agreement
+numbers, conflicts, the TUI's blind mode, report surfaces, the screen
+sheet.
 
 ### Session Arguments
 
@@ -2117,6 +2125,45 @@ A human review leaves them untouched (they are the model's record).
   Nothing is withheld or retried for it. Later checks (`sessions show`,
   report) see only title and abstract (see Headless Review Sessions).
   Answers without a valid `paper_index` are skipped (never index 0).
+- **Second screen (#253 C).** `scholar llm classify S --second-screen
+  [--over all|machine | --sample ID] [-n N] [--rescreen]`
+  (`llm_review.second_screen_with_llm`, llm_review.nw
+  `sec:second-screen`; cli.nw `sec:llm-classify-second-screen`)
+  classifies *decided* papers (never pending) and stores each usable
+  answer as a screening (`kind` llm, `name` = the model's reported
+  `model_id`, status, tags, confidence, `reason` cut by
+  `truncate_reason`, `at` = batch time, `prompt_version` (the ordinary
+  one), `abstract_truncated`, `blind` True, `blind_basis` "prompt",
+  `sample_id`, `via` "classify") via `record_screening` (snapshot
+  first); never `apply_llm_decisions`, decisions untouched (tested on
+  `decision_state`/`human_record_of` and the saved JSON). Selection
+  (`second_screen_candidates`): `all` (default) every decided paper,
+  `machine` = `is_unreviewed_machine`, `--sample` = a band's
+  `sample_id` (that band) or a banded draw's group id (`sample_group`,
+  all bands; each screening stores its band's id); sampled papers
+  `reset_since_draw` are skipped and counted. Session order, `-n` per
+  run (one request + the one retry, as classify); decisions with a
+  counted screening of identity `("llm", model, True)`
+  (`has_second_screen_by`) are skipped unless `--rescreen`; copies under
+  one id are shown once and all screened. `classify_papers_with_llm(...,
+  papers=)` classifies given decisions and takes examples and
+  themes/motivations from `visible` (shallow session copy without those
+  paper ids); whether categories are offered is read from the whole
+  session. Tested: the prompt is byte-identical when the screened
+  papers' verdicts are flipped. Refused (exit 2, before loading, no
+  model call): `--include-llm-examples` with it, `--sample/--over/
+  --rescreen` without it, `--sample` with `--over`, bad `--over`;
+  unknown sample exit 2 (screen's chunk). Nothing left → exit 1. A
+  decision the same model made (unreviewed `llm`, `llm_model` = model)
+  is screened, never refused, and announced ("Same model as the first
+  screen for N paper(s)"; `SecondScreen.same_model`). Withheld answers
+  store nothing (no snapshot) and are listed under "No screening
+  stored, ..." (`print_withheld_papers(lead=)`); the quote line checks
+  the screenings' reasons (`print_reason_quote_misses(reason_of=)`).
+  Saved only when something was recorded, after
+  `keep_copy_before_run(session, "pre-screen")`. Dry run prints the
+  prompt, stores nothing (resolves the model, to skip what it
+  screened). Prints "Left to screen: N".
 - **Abstracts.** `MAX_ABSTRACT_CHARS` = 4000 for papers to classify
   (marked `[abstract truncated]` in the prompt), `EXAMPLE_ABSTRACT_CHARS`
   = 1000 for examples.

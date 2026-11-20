@@ -75,6 +75,7 @@ learning from human-tagged examples in a round-based workflow.
 <<llm review decision application>>
 <<llm review statistics>>
 <<llm review sampling>>
+<<llm review second screen>>
 <<llm review synthesis>>
 @
 
@@ -1991,6 +1992,7 @@ def classify_papers_with_llm(
     vocabulary: set[str] | None = None,
     allow_new_tags: bool = False,
     include_llm_examples: bool = False,
+    papers: list[ReviewDecision] | None = None,
 ) -> LLMBatchResult | str:
     """
     Classify pending papers using LLM.
@@ -2027,6 +2029,10 @@ def classify_papers_with_llm(
             in the prompt, so classification can use evidence beyond the
             abstract. Requires the session to have a research context.
         max_quotes: Maximum supporting passages per paper when use_fulltext.
+        papers: Classify these decisions (the first `count`) instead of
+            the pending ones, as a second screen does; they are left out
+            of the examples and of the tag vocabulary, so the prompt
+            holds no verdict of theirs. The decisions are not changed.
 
     Returns:
         LLMBatchResult with decisions, or prompt string if dry_run=True
@@ -2035,10 +2041,11 @@ def classify_papers_with_llm(
         ValueError: If there are no pending papers to classify
         ImportError: If llm package is not installed
     """
+    <<hide the papers being screened from the examples and vocabulary>>
     # Gather examples (optional)
     if require_examples:
         kept_examples, discarded_examples = get_example_decisions(
-            session, include_unreviewed=include_llm_examples
+            visible, include_unreviewed=include_llm_examples
         )
 
         # Below-threshold examples are a quality concern, not a hard stop:
@@ -2054,17 +2061,22 @@ def classify_papers_with_llm(
         kept_examples = []
         discarded_examples = []
 
-    # Get pending papers
-    pending = [
-        d for d in session.decisions
-        if d.status == DecisionStatus.PENDING
-    ]
+    if papers is not None:
+        to_classify = list(papers[:count])
+        if not to_classify:
+            raise ValueError("No papers to screen")
+    else:
+        # Get pending papers
+        pending = [
+            d for d in session.decisions
+            if d.status == DecisionStatus.PENDING
+        ]
 
-    if not pending:
-        raise ValueError("No pending papers to classify")
+        if not pending:
+            raise ValueError("No pending papers to classify")
 
-    # Limit to requested count
-    to_classify = pending[:count]
+        # Limit to requested count
+        to_classify = pending[:count]
 
     # Check for papers needing enrichment.
     # Note: enrich_papers() returns new Paper objects, so we must apply the
@@ -2223,6 +2235,39 @@ showed them can check a quote against them (the quote check of the
 review module, \cref{sec:reason-quotes} there, which
 [[llm classify]] runs at the end, \cref{sec:llm-classify-quotes} in
 the CLI module).
+
+The same function classifies the papers of a second screen
+(\cref{sec:second-screen}), given as [[papers]].  Those papers are
+decided, and the prompt must hold no verdict of theirs.  The papers to
+classify never showed one (title, authors, year, venue, abstract and
+passages only), but the session's other parts would: a screened paper
+that a human confirmed is a candidate example, shown with its label,
+so the model would be handed the answer about the very paper it is
+asked to judge; and its tags join the vocabulary.  So the examples and
+the vocabulary are taken from [[visible]], a shallow copy of the
+session without the papers being classified (by paper id, so that
+another copy of one of them under the same id is left out too), and
+everything else (enrichment, passages, the answer's checks and retry)
+runs as for the pending papers.  Taking them out of the session before the examples
+are chosen, rather than out of the chosen examples, lets the next
+fitting example take a screened paper's place instead of shrinking
+the prompt.  An ordinary run passes no [[papers]], and [[visible]] is
+the session itself.
+
+<<hide the papers being screened from the examples and vocabulary>>=
+visible = session
+if papers is not None:
+    from scholar.notes import get_paper_id
+
+    screened = {get_paper_id(d.paper) for d in papers}
+    visible = copy.copy(session)
+    visible.decisions = [
+        d for d in session.decisions
+        if get_paper_id(d.paper) not in screened
+    ]
+<<llm review imports>>=
+import copy
+@
 
 \subsection{Keeping the classifier inside the vocabulary}
 
@@ -2464,6 +2509,17 @@ the themes and motivations stay the session's own, and the examples
 show the tags their records carry.  A session whose vocabulary holds
 no category tag is classified as before.
 
+The themes and motivations are read from [[visible]], which is the
+session itself except in a second screen (\cref{sec:second-screen}):
+there it lacks the decided papers being screened, because a tag only
+such a paper carries would tell the model how that paper was judged
+(a motivation such as \enquote{simulation-only} exists because some
+paper was discarded for it).  Whether the session uses categories is
+still read from the whole session: the answer offers all four or none,
+whichever paper carries one, so it says nothing about any paper's
+verdict, and a second screen over every decided paper would otherwise
+lose the categories its comparison with the first screen needs.
+
 <<llm review imports>>=
 from scholar.review import AUDIT_CATEGORIES, AUDIT_STRINGS
 <<llm review constants>>=
@@ -2471,11 +2527,13 @@ NOTE_TAGS: frozenset[str] = frozenset(
     tag for strings in AUDIT_STRINGS.values() for tag in strings["notes"]
 )
 <<sort the vocabulary into categories, notes and themes>>=
-themes, motivations = _collect_available_tags(session)
+themes, motivations = _collect_available_tags(visible)
 known = themes | motivations | set(vocabulary or ())
 notes = {t for t in known if t.casefold() in NOTE_TAGS}
+session_tags = set().union(*_collect_available_tags(session))
 categories = (
-    set(AUDIT_CATEGORIES) if any(t in AUDIT_CATEGORIES for t in known)
+    set(AUDIT_CATEGORIES)
+    if any(t in AUDIT_CATEGORIES for t in known | session_tags)
     else set()
 )
 known |= categories
@@ -6557,6 +6615,662 @@ class TestPooledSessionsByFile:
         assert [s.name for s in pooled_sample_sessions([a])] == ["a"]
 @
 
+
+\section{The classifier as second screener}
+\label{sec:second-screen}
+
+A review that screens its records twice has two verdicts of each
+record.  The review module keeps the second beside the decision as a
+\emph{screening} (\cref{sec:screenings} there), and [[sessions
+screen]] records an agent's or a human's
+(\url{https://github.com/dbosk/scholarcli/issues/253}).  This section
+lets the classifier be the second screener: [[second_screen_with_llm]],
+behind [[llm classify --second-screen]], runs the model over papers
+that are already decided and stores each usable answer as a screening.
+It decides nothing.  [[apply_llm_decisions]] is not called, so the
+decision's status, tags, source, classifier trace and human record stay
+as they were, and the paper is not made pending again.
+
+What such a run is good for is narrow, and the code claims no more.
+Vembye et al.\ evaluated GPT models as second screeners beside one
+human, and the workflow they propose ends with the reviewers
+investigating and solving the disagreements between the human and the
+automated screening decisions (Psychological Methods, 2025, accepted
+manuscript, Table~5, step~9, p.~34).  Cochrane's handbook found, at the
+time of writing in mid-2023, that \enquote{no sufficiently large and
+valid evaluations are available} of language models for study
+selection (Lefebvre et al., Cochrane Handbook, chapter~4,
+section~4.6.6.2).  So a second machine screen is treated as a check
+that brings up disagreements for a human to settle: nothing reads the
+screening to keep, cite or count a paper, and two machines agreeing is
+not taken as a decision.
+
+\paragraph{Blind by construction.}
+PRISMA 2020 asks a review to report whether its screeners worked
+independently, \enquote{that is, were unaware of each other's
+decisions} (Page et al., BMJ 2021, n160, item~8).  For an agent Scholar
+can only record that the caller said so.  For the classifier it builds
+the prompt itself, so it can make it hold.  The papers to classify are
+shown without any verdict, as they always were, and
+[[classify_papers_with_llm]] takes the examples and the tag vocabulary
+from the session without the screened papers
+(\cref{sec:llm-interaction}), so no confirmed paper appears as an
+example of itself and no tag that only a screened paper carries is
+offered.  The examples are confirmed decisions only:
+[[--include-llm-examples]] is refused with a second screen (in the CLI
+module), because it would show the model unreviewed machine verdicts of
+other papers, often the first screener's own, and the second screener
+would learn from the screener it is checked against.  Each screening
+records this as [[blind]] on the ground [[prompt]].
+
+\paragraph{Which papers.}
+Three selections are offered.  [[all]] (the default) takes every
+decided paper.  [[machine]] takes the unreviewed machine decisions, the
+classifier's and agents' calls that no human has confirmed, which are
+what a check is most needed for.  A review sample
+(\cref{sec:llm-sample}) takes the papers drawn in it.  A pending paper
+is never selected: it has no first verdict to check, and the ordinary
+[[llm classify]] is there for it.  Of a sample, a paper reset to
+pending since the draw ([[reset_since_draw]]) is skipped and counted,
+since the decision that was drawn is gone, as [[sampled_for_review]]
+skips it.  A draw in confidence bands is stored as one sample per band,
+tied by a group id (\cref{sec:llm-sample-bands}): a band's id selects
+that band, and the group id selects the whole draw, the two ids that
+[[sessions screen --sample]] accepts.  Each screening records the id of
+the sample its paper was drawn in, the band's for a banded draw, so
+that a report can find the sample, and so the band, from any screening.
+
+The selection is taken in session order, [[count]] papers per run, as
+the ordinary classifier takes pending papers: one request and at most
+one retry per run, so a second screen costs per paper what the first
+did.  A paper this model has already screened since its last reset (a
+counted screening of the model's second-screen identity,
+[[screener_identity]] in the review module) is skipped unless
+[[rescreen]] is given, so that repeated runs work through the selection
+a batch at a time.  The snapshot of a decision the model made is no
+such screening, so it never makes the model skip the paper.  A rescreen
+adds a new screening, which then counts for the model in place of the
+earlier one (the latest record of a screener counts), while the earlier
+one stays in the list.  Copies of one paper under one id are shown to
+the model once and each is given the screening, since what the model
+judges is the paper's record, which they share.
+
+<<llm review constants>>=
+SECOND_SCREEN_SCOPES: tuple[str, ...] = ("all", "machine")
+<<llm review second screen>>=
+def sample_group(sample) -> str | None:
+    """The group id a band of a stratified draw shares, or None."""
+    stratum = sample.criteria.get("stratum")
+    if isinstance(stratum, dict) and stratum.get("group"):
+        return stratum["group"]
+    return None
+
+
+@dataclass
+class SecondScreenSelection:
+    """The decided papers a second screen may classify, in session order.
+
+    `sample_of` maps `id(decision)` to the id of the sample the paper was
+    drawn in (with a sample); `reset_since_draw` counts the sampled
+    decisions reset to pending since their draw and `not_in_session` the
+    sampled papers the session no longer holds.
+    """
+
+    decisions: list[ReviewDecision]
+    sample_of: dict[int, str] = field(default_factory=dict)
+    reset_since_draw: int = 0
+    not_in_session: int = 0
+
+
+def second_screen_candidates(
+    session: ReviewSession, over: str = "all", sample: str | None = None,
+) -> SecondScreenSelection:
+    """Select the decided papers of `session` for a second screen.
+
+    `over` is `all` or `machine` (unreviewed machine decisions); a
+    `sample` id (a band's, or a banded draw's group id) selects the
+    papers drawn in it instead.
+
+    Raises:
+        ValueError: For an unknown `over` or a sample the session lacks.
+    """
+    from scholar.notes import get_paper_id
+
+    if sample is None:
+        if over not in SECOND_SCREEN_SCOPES:
+            raise ValueError(f"--over is all or machine, not {over!r}")
+        return SecondScreenSelection([
+            d for d in session.decisions
+            if d.is_decided and (over == "all" or is_unreviewed_machine(d))
+        ])
+    samples = [s for s in session.llm_samples
+               if sample in (s.sample_id, sample_group(s))]
+    if not samples:
+        raise ValueError(f"no review sample {sample!r} in this session")
+    drawn: dict[str, Any] = {}
+    for held in samples:
+        for entry in held.papers:
+            drawn.setdefault(entry.get("paper_id"), held)
+    selection = SecondScreenSelection([])
+    found: set[str] = set()
+    for decision in session.decisions:
+        held = drawn.get(get_paper_id(decision.paper))
+        if held is None:
+            continue
+        found.add(get_paper_id(decision.paper))
+        if reset_since_draw(decision, held.drawn_at):
+            selection.reset_since_draw += 1
+        elif decision.is_decided:
+            selection.decisions.append(decision)
+            selection.sample_of[id(decision)] = held.sample_id
+    selection.not_in_session = len(set(drawn) - found)
+    return selection
+
+
+def has_second_screen_by(decision: ReviewDecision, model_id: str) -> bool:
+    """Whether `model_id` second-screened `decision` since its last reset."""
+    from scholar.review import counted_screenings, screener_identity
+
+    return any(
+        screener_identity(record) == ("llm", model_id, True)
+        for record in counted_screenings(decision)
+    )
+@
+
+\paragraph{The record.}
+Each usable answer becomes a screening of kind [[llm]], named by the
+model's id, with the model's status, tags, confidence and reason.  Its
+time [[at]] is the batch's, as for a classified decision
+([[llm_decided_at]]); it has the prompt version and the truncation flag
+of the classifier's record (\cref{sec:llm-audit-fields} in the review
+module), [[blind]] on the ground [[prompt]], the sample id when one was
+given, and [[via]] [[classify]], the channel that [[screener_identity]]
+reads.  The reason is cut as a classified decision's is
+([[truncate_reason]]): the first screen's reason, in the snapshot of a
+classified decision, was cut so, the second screen's is kept alike, and
+either fits under the screening's own limit.  The prompt version is
+the ordinary one: the second screen uses the same procedure, and which
+records are examples was never part of the version
+(\cref{sec:prompt-version}).  [[record_screening]] snapshots the
+decision's verdict first, as for every screening.  An answer the
+classifier withholds (no usable answer, or no single category that
+fits it) is returned in the batch's [[withheld]], to be listed as the
+ordinary run lists it, and stores nothing, neither a screening nor a
+snapshot.
+
+\paragraph{The same model.}
+The model may be the one that made the decision.  That run is recorded
+like any other, never refused, and the result lists those papers
+([[same_model]]) so that the command can say so; the screening is told
+apart from the decision's snapshot by its channel
+([[screener_identity]]).  Issue~\#253 decided that such a screen is
+recorded and reported as \enquote{same model}: whether a model's second
+run is independent enough is the review's judgement, and the record
+gives the review what it needs to make it, the model of both screens
+and both prompt versions.
+
+<<llm review second screen>>=
+@dataclass
+class SecondScreen:
+    """What one second-screen run recorded.
+
+    `screened` pairs each decision given a screening with that
+    screening; `same_model` lists those whose decision is an unreviewed
+    call of the screening model itself; `snapshots` counts the decision
+    snapshots taken. `already_screened` counts the selected decisions
+    skipped because the model had screened them, and `remaining` the
+    papers of the selection still to screen after this run.
+    """
+
+    batch: LLMBatchResult
+    selection: SecondScreenSelection
+    screened: list[tuple[ReviewDecision, dict]] = field(default_factory=list)
+    same_model: list[ReviewDecision] = field(default_factory=list)
+    snapshots: int = 0
+    already_screened: int = 0
+    remaining: int = 0
+
+
+def second_screen_with_llm(
+    session: ReviewSession,
+    count: int = DEFAULT_BATCH_SIZE,
+    *,
+    model_id: str | None = None,
+    over: str = "all",
+    sample: str | None = None,
+    rescreen: bool = False,
+    dry_run: bool = False,
+    enrich_missing: bool = True,
+    require_examples: bool = True,
+    use_fulltext: bool = False,
+    max_quotes: int = 3,
+    vocabulary: set[str] | None = None,
+    allow_new_tags: bool = False,
+) -> SecondScreen | str:
+    """Screen decided papers again with the classifier, as a second screener.
+
+    Selects decided papers (`second_screen_candidates`), skips those the
+    model already second-screened since their last reset unless
+    `rescreen`, classifies the next `count` with a prompt that holds no
+    verdict of theirs and stores each usable answer as a screening
+    (`kind` llm, `via` classify). The decisions are not changed.
+
+    Returns:
+        A `SecondScreen`, or the prompt when `dry_run`.
+
+    Raises:
+        ValueError: For a bad selection, or when no paper is left.
+        ImportError: If the llm package is not installed.
+    """
+    from scholar.notes import get_paper_id
+
+    selection = second_screen_candidates(session, over, sample)
+    <<resolve the model of the second screen>>
+    copies: dict[str, list[ReviewDecision]] = {}
+    already = 0
+    for decision in selection.decisions:
+        if not rescreen and has_second_screen_by(decision, name):
+            already += 1
+            continue
+        copies.setdefault(get_paper_id(decision.paper), []).append(decision)
+    chosen = list(copies)[:count]
+    if not chosen:
+        raise ValueError(
+            f"No decided papers left to screen with {name}"
+            + (f": {already} already screened by it since their last "
+               "reset (--rescreen screens them again)" if already else "")
+        )
+    batch = classify_papers_with_llm(
+        session, count=count, model_id=name, enrich_missing=enrich_missing,
+        dry_run=dry_run, require_examples=require_examples,
+        use_fulltext=use_fulltext, max_quotes=max_quotes,
+        vocabulary=vocabulary, allow_new_tags=allow_new_tags,
+        papers=[copies[paper_id][0] for paper_id in chosen],
+    )
+    if dry_run:
+        return batch
+    result = SecondScreen(batch=batch, selection=selection,
+                          already_screened=already,
+                          remaining=len(copies) - len(chosen))
+    <<record the answers as screenings>>
+    return result
+@
+
+The model is resolved before the selection is cut to a batch, because
+which papers it has already screened depends on its id.  The id is the
+one the model reports ([[model_id]]), which [[apply_llm_decisions]]
+stores as [[llm_model]], so a second screen names the model as its
+decisions do, whatever alias was given on the command line.  The model
+is looked up through [[globals()]], the seam the classifier tests use,
+for a dry run too, which then shows the batch a real run would send.
+
+<<resolve the model of the second screen>>=
+try:
+    import llm as llm_module
+except ImportError:
+    raise ImportError(
+        "The 'llm' package is required for LLM classification. "
+        "Install it with: pip install llm"
+    )
+llm = globals().get("llm", llm_module)
+name = (llm.get_model(model_id) if model_id else llm.get_model()).model_id
+@
+
+Whether a screened decision is the model's own call is read before its
+screening is recorded, from the screener its snapshot names
+([[verdict_screener]]): an unreviewed classifier decision of this
+model.  A decision a human confirmed is the human's verdict, whichever
+model proposed it, so it is not the same model's.
+
+<<record the answers as screenings>>=
+from scholar.review import new_screening, record_screening, verdict_screener
+from scholar.utils import utc_now_iso
+
+recorded_at = utc_now_iso()
+for answer in batch.decisions:
+    for decision in copies.get(answer.paper_id, []):
+        first = verdict_screener(decision)
+        if (first["kind"], first["name"]) == ("llm", batch.model_id):
+            result.same_model.append(decision)
+        screening = new_screening(
+            kind="llm", name=batch.model_id, status=answer.status,
+            tags=list(answer.tags), recorded_at=recorded_at,
+            confidence=answer.confidence,
+            reason=truncate_reason(answer.reasoning), at=batch.timestamp,
+            prompt_version=batch.prompt_version,
+            abstract_truncated=answer.abstract_truncated,
+            blind=True, blind_basis="prompt",
+            sample_id=selection.sample_of.get(id(decision)), via="classify",
+        )
+        if record_screening(decision, screening) is not None:
+            result.snapshots += 1
+        result.screened.append((decision, screening))
+@
+
+Let's check the second screen with a fake model, through the
+[[globals()]] seam of the other classifier tests (no model is called).
+The session is invented: an unreviewed classifier discard and a
+human-confirmed keep, each with a tag and a reason no other record has,
+two human decisions that can serve as examples, and a pending paper.
+The fake answers every paper in its prompt, with an answer per index
+that a test can replace.
+
+<<test functions>>=
+class TestSecondScreen:
+  """The classifier as second screener records, never decides (#253)."""
+
+  <<second screen test methods>>
+
+<<second screen test methods>>=
+AT = "2026-11-01T09:00:00+00:00"
+NOW = "2026-11-20T10:00:00+00:00"
+
+@staticmethod
+def _paper(title, doi, abstract):
+  return Paper(title=title, authors=["Ada Lovelace"], year=2021,
+               doi=f"10.5555/ss-{doi}", abstract=abstract)
+
+def _session(self):
+  from scholar.review import record_human_decision
+
+  machine = ReviewDecision(
+    paper=self._paper("Compiler Course Design", "machine",
+                      "We describe a compiler course."),
+    provider="openalex", status=DecisionStatus.DISCARDED,
+    tags=["off-topic-false-hit", "zebra-motivation"],
+    source=ReviewSource.LLM_UNREVIEWED, llm_model="model-a",
+    llm_confidence=0.7, llm_reason="Zanzibar reason about compilers.",
+    llm_decided_at=self.AT, llm_prompt_version="0123456789abcdef",
+  )
+  confirmed = ReviewDecision(
+    paper=self._paper("Recursion as Loops", "confirmed",
+                      "Students traced recursion as a loop."),
+    provider="openalex", status=DecisionStatus.KEPT,
+    tags=["supports-claim", "quokka-theme"],
+    source=ReviewSource.LLM_REVIEWED, llm_model="model-a",
+    llm_reason="Quokka reason about loops.",
+  )
+  record_human_decision(confirmed, "tui", by="the author", at=self.AT)
+  kept = ReviewDecision(
+    paper=self._paper("Tracing Tables", "kept",
+                      "Tables helped novices trace calls."),
+    provider="openalex", status=DecisionStatus.KEPT,
+    tags=["supports-claim", "tracing"], source=ReviewSource.HUMAN,
+  )
+  record_human_decision(kept, "tui", at=self.AT)
+  dropped = ReviewDecision(
+    paper=self._paper("Cache Hierarchies", "dropped", "Memory systems."),
+    provider="openalex", status=DecisionStatus.DISCARDED,
+    tags=["off-topic-false-hit", "hardware"], source=ReviewSource.HUMAN,
+  )
+  record_human_decision(dropped, "tui", at=self.AT)
+  pending = ReviewDecision(
+    paper=self._paper("Loops in Practice", "pending", "A study of loops."),
+    provider="openalex",
+  )
+  return ReviewSession(
+    query="q", providers=["openalex"], timestamp=datetime(2026, 11, 20),
+    name="second", research_context="Do novices misread recursion?",
+    decisions=[machine, confirmed, kept, dropped, pending],
+  )
+
+def _fake(self, monkeypatch, model_id="model-b", answers=None):
+  import re
+  from types import SimpleNamespace
+  import scholar.llm_review as llm_review
+  import scholar.utils
+
+  answers = answers or {}
+
+  def answer(index):
+    return answers.get(index, {
+      "paper_index": index, "decision": "kept",
+      "tags": ["adjacent-subtopic"], "confidence": 0.6,
+      "reasoning": "Background only.",
+    })
+
+  class FakeModel:
+    def __init__(self):
+      self.model_id = model_id
+      self.prompts = []
+
+    def prompt(self, prompt):
+      self.prompts.append(prompt)
+      indices = sorted({int(i) for i in re.findall(r"\[Paper (\d+)\]",
+                                                   prompt)})
+      text = json.dumps({"classifications": [answer(i) for i in indices]})
+      return SimpleNamespace(text=lambda: text)
+
+  model = FakeModel()
+  monkeypatch.setattr(llm_review, "llm",
+                      SimpleNamespace(get_model=lambda *_: model),
+                      raising=False)
+  monkeypatch.setattr(scholar.utils, "utc_now_iso", lambda: self.NOW)
+  return model
+@
+
+The decisions stay as they were, the human's record included, and each
+answer is a screening after the snapshot of the decision's verdict,
+its reason cut as a classified decision's; the papers outside the
+batch and the pending paper get nothing.
+
+<<second screen test methods>>=
+def test_the_decisions_stay_and_the_answers_are_screenings(
+  self, monkeypatch
+):
+  from scholar.review import decision_state, human_record_of
+
+  session = self._session()
+  machine, confirmed, kept, dropped, pending = session.decisions
+  before = [(decision_state(d), human_record_of(d))
+            for d in session.decisions]
+  long_reason = "Not about recursion. " + "Details. " * 80
+  self._fake(monkeypatch, answers={1: {
+    "paper_index": 1, "decision": "discarded",
+    "tags": ["off-topic-false-hit"], "confidence": 0.9,
+    "reasoning": long_reason,
+  }})
+  result = second_screen_with_llm(session, count=2, enrich_missing=False)
+  assert [(decision_state(d), human_record_of(d))
+          for d in session.decisions] == before
+  assert [d for d, _ in result.screened] == [machine, confirmed]
+  snapshot, screening = machine.screenings
+  assert (snapshot["origin"], snapshot["kind"], snapshot["name"]) \
+    == ("decision", "llm", "model-a")
+  assert result.batch.prompt_version
+  assert {k: v for k, v in screening.items() if k != "id"} == {
+    "origin": "screen", "kind": "llm", "name": "model-b",
+    "confirmed_from": None, "confirmed_name": None, "status": "kept",
+    "tags": ["adjacent-subtopic"], "confidence": 0.6,
+    "reason": "Background only.", "at": result.batch.timestamp,
+    "recorded_at": self.NOW,
+    "prompt_version": result.batch.prompt_version,
+    "abstract_truncated": False, "blind": True, "blind_basis": "prompt",
+    "sample_id": None, "via": "classify",
+  }
+  human_snapshot, verdict = confirmed.screenings
+  assert (human_snapshot["kind"], human_snapshot["name"]) \
+    == ("human", "the author")
+  assert (verdict["status"], verdict["tags"], verdict["reason"]) \
+    == ("discarded", ["off-topic-false-hit"], truncate_reason(long_reason))
+  assert len(verdict["reason"]) == MAX_REASON_CHARS
+  assert kept.screenings == dropped.screenings == pending.screenings == []
+  assert (result.same_model, result.snapshots, result.remaining) \
+    == ([], 2, 2)
+@
+
+The prompt holds no verdict of a screened paper: neither its tags nor
+its reasons, its title appears once, among the papers to classify, and
+that part of the prompt has no status or category word.  The strongest
+form of the check: with the screened papers' verdicts turned round,
+the prompt is the same, byte for byte.  The other decided papers
+still serve as examples, with their tags; and a batch of every decided
+paper, which leaves no example and no tag of the session's, is still
+offered the categories.
+
+<<second screen test methods>>=
+def test_the_prompt_holds_no_verdict_of_the_screened_papers(
+  self, monkeypatch
+):
+  import re
+
+  session = self._session()
+  machine, confirmed = session.decisions[:2]
+  self._fake(monkeypatch)
+  prompt = second_screen_with_llm(session, count=2, dry_run=True,
+                                  enrich_missing=False)
+  for word in ("zebra-motivation", "quokka-theme", "Zanzibar", "Quokka"):
+    assert word not in prompt
+  assert prompt.count("Compiler Course Design") == 1
+  assert prompt.count("Recursion as Loops") == 1
+  for shown in ("Tracing Tables", "tracing", "Cache Hierarchies",
+                "hardware"):
+    assert shown in prompt
+  papers_part = prompt.split("## Papers to Classify")[1] \
+    .split("## Instructions")[0]
+  assert not re.search(r"kept|discarded|supports|off-topic", papers_part,
+                       re.IGNORECASE)
+  machine.status = DecisionStatus.KEPT
+  machine.tags = ["supports-claim", "walrus-theme"]
+  machine.source = ReviewSource.HUMAN
+  confirmed.status = DecisionStatus.DISCARDED
+  confirmed.tags = ["off-topic-false-hit", "yak-motivation"]
+  assert second_screen_with_llm(session, count=2, dry_run=True,
+                                enrich_missing=False) == prompt
+  every = second_screen_with_llm(session, count=4, dry_run=True,
+                                 enrich_missing=False)
+  assert "## Category (exactly one per paper)" in every
+  assert "hardware" not in every
+  assert all(d.screenings == [] for d in session.decisions)
+@
+
+An answer the classifier withholds (here a keep under a category that
+only fits a discard) stores nothing, after the one retry the ordinary
+run makes; the other paper of the batch is screened.
+
+<<second screen test methods>>=
+def test_a_withheld_answer_stores_nothing(self, monkeypatch):
+  from scholar.notes import get_paper_id
+
+  session = self._session()
+  machine, confirmed = session.decisions[:2]
+  model = self._fake(monkeypatch, answers={1: {
+    "paper_index": 1, "decision": "kept", "tags": ["off-topic-false-hit"],
+    "confidence": 0.5, "reasoning": "Unrelated, but kept.",
+  }})
+  result = second_screen_with_llm(session, count=2, enrich_missing=False)
+  assert len(model.prompts) == 2
+  assert [d.paper_id for d in result.batch.withheld] \
+    == [get_paper_id(confirmed.paper)]
+  assert confirmed.screenings == []
+  assert [r["origin"] for r in machine.screenings] == ["decision", "screen"]
+@
+
+Repeated runs work through the selection; a paper the model screened
+is skipped until [[rescreen]], and another model is not held back by
+the first one's screens.
+
+<<second screen test methods>>=
+def test_runs_skip_what_the_model_screened(self, monkeypatch):
+  session = self._session()
+  machine, confirmed, kept, dropped, _ = session.decisions
+  self._fake(monkeypatch)
+  second_screen_with_llm(session, count=2, enrich_missing=False)
+  second = second_screen_with_llm(session, count=2, enrich_missing=False)
+  assert [d for d, _ in second.screened] == [kept, dropped]
+  assert (second.already_screened, second.remaining) == (2, 0)
+  with pytest.raises(ValueError, match="4 already screened by it"):
+    second_screen_with_llm(session, count=2, enrich_missing=False)
+  again = second_screen_with_llm(session, count=1, rescreen=True,
+                                 enrich_missing=False)
+  assert [d for d, _ in again.screened] == [machine]
+  assert [r["origin"] for r in machine.screenings] \
+    == ["decision", "screen", "screen"]
+  self._fake(monkeypatch, model_id="model-c")
+  other = second_screen_with_llm(session, count=4, enrich_missing=False)
+  assert [d for d, _ in other.screened] == [machine, confirmed, kept,
+                                            dropped]
+@
+
+The model that made the decision screens it again: the run is
+recorded and the paper listed as the same model's.  The snapshot and
+the second screen both count and are two screeners.  A snapshot taken
+before, when an agent screened the paper, does not make the model skip
+it: only its own second screen does.  [[machine]] selects the
+unreviewed machine decision alone.
+
+<<second screen test methods>>=
+def test_the_same_model_is_recorded_and_named(self, monkeypatch):
+  from scholar.review import (
+    counted_screenings, new_screening, record_screening,
+    screener_identity,
+  )
+
+  session = self._session()
+  machine = session.decisions[0]
+  record_screening(machine, new_screening(
+    kind="agent", name="agent-2", status="discarded",
+    tags=["off-topic-false-hit"], recorded_at=self.AT,
+  ))
+  self._fake(monkeypatch, model_id="model-a")
+  assert second_screen_candidates(session, over="machine").decisions \
+    == [machine]
+  result = second_screen_with_llm(session, over="machine",
+                                  enrich_missing=False)
+  assert result.same_model == [machine]
+  counted = counted_screenings(machine)
+  assert [r["origin"] for r in counted] == ["decision", "screen", "screen"]
+  assert {screener_identity(r) for r in counted} == {
+    ("llm", "model-a", False), ("agent", "agent-2", False),
+    ("llm", "model-a", True),
+  }
+  with pytest.raises(ValueError, match="1 already screened"):
+    second_screen_with_llm(session, over="machine", enrich_missing=False)
+@
+
+A sample selects its papers: a band by its id, the whole banded draw by
+the group id, each screening naming the band its paper was drawn in.
+A paper reset since the draw is skipped and counted, and an id the
+session does not hold is refused.
+
+<<second screen test methods>>=
+def test_a_sample_selects_its_papers(self, monkeypatch):
+  from scholar.notes import get_paper_id
+  from scholar.review import LLMSample
+
+  session = self._session()
+  machine, _, _, dropped, _ = session.decisions
+  reset = ReviewDecision(
+    paper=self._paper("Reset Since", "reset", "Reset after the draw."),
+    provider="openalex",
+    resets=[{"at": "2026-11-15T00:00:00+00:00", "status": "discarded"}],
+  )
+  session.decisions.append(reset)
+
+  def band(index, decisions):
+    return LLMSample(
+      sample_id=f"g1/band={index}", seed=1,
+      drawn_at="2026-11-10T00:00:00+00:00",
+      criteria={"stratum": {"group": "g1", "band": index}},
+      sessions=["second"], population=len(decisions),
+      population_digest="", size=len(decisions),
+      papers=[{"paper_id": get_paper_id(d.paper), "status": "discarded"}
+              for d in decisions],
+    )
+
+  session.llm_samples = [band(0, [machine, reset]), band(1, [dropped])]
+  one = second_screen_candidates(session, sample="g1/band=0")
+  assert (one.decisions, one.reset_since_draw) == ([machine], 1)
+  self._fake(monkeypatch)
+  result = second_screen_with_llm(session, sample="g1",
+                                  enrich_missing=False)
+  assert [(d, s["sample_id"]) for d, s in result.screened] == [
+    (machine, "g1/band=0"), (dropped, "g1/band=1"),
+  ]
+  assert reset.screenings == []
+  with pytest.raises(ValueError, match="no review sample"):
+    second_screen_candidates(session, sample="g2")
+@
 
 \section{Literature Synthesis}
 \label{sec:literature-synthesis}
