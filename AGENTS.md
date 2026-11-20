@@ -1839,7 +1839,12 @@ screeners)} over records screened twice, `screen_sample` (the one
   `work` (`audit_work_key`; a work is screened twice when any copy is;
   total = rows); without `rows` it counts records. en: "k of N hits
   were/was screened a second time (c by <a language model / an agent /
-  a human / n agents>, <ground>; …)."; per pair "Agreement on
+  a human / n agents>, <ground>; …)." (grounds: "blind by
+  construction of the prompt", "blind in Scholar's review screens",
+  "blind by the {agent's|model's|screener's; plural agents'|models'|
+  screeners'} own declaration", "marked blind", "not blind",
+  "blindness not recorded"; the report's declared phrase is "blind by
+  the agent's own declaration, which Scholar cannot check"); per pair "Agreement on
   kept/discarded between <model m-1> and <agent a-2>[ (same model)],
   over n records screened by both: P\,\% (Cohen's kappa K, prevalence
   index PI, bias index BI)." (or "undefined: reason"); "Status
