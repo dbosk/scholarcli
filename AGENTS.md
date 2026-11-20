@@ -226,8 +226,12 @@ Providers self-register via `register_provider()` at module load time.
   `SearchRecord.retired` = `{"at", "by", "note"}` or None (saved only
   when set, old files load None; `retire_record`, `retired_label` /
   `retirement_label` "retired 2026-11-20 by X: note",
-  `current_records` / `retired_records`). Not in `key`, not in
-  `record_rank`. A re-run of the key (`create_review_session`) whose
+  `current_records` / `retired_records`; the note's white space is
+  collapsed, blank -> None). Not in `key`, not in `record_rank`.
+  `SearchRecord.record_id`: first 7 hex digits (`RECORD_ID_LENGTH`) of
+  SHA-256 of the key joined by `\x1f`; same across re-runs of the
+  key, unlike the list position (each run's records go first);
+  `records_with_id_prefix` (case-insensitive prefix). A re-run of the key (`create_review_session`) whose
   record wins replaces it unmarked (WARNING line "... running it again
   makes it current"); a kept retired record (failed/narrower re-run)
   keeps the mark (WARNING "... which stays retired"). A retired record
@@ -243,10 +247,17 @@ Providers self-register via `register_provider()` at module load time.
   `unsearched_providers`, `unrecorded_providers`,
   `searched_providers_text`, `searched_queries`, `search_period`; the
   report adds a "Retired" item and the abstract the caption sentence
-  (`audit_retired_count`); the provider table keeps every record,
+  (`audit_retired_count`); when every record is retired
+  (`all_searches_retired`) the parameters are one item "Searches: all
+  N searches of the session have been retired; see the table of
+  searches" and the abstract "The N papers (...) were found through
+  searches that have since been retired, in <full names>"
+  (`retired_databases_text`, semantic left out); the provider table keeps every record,
   query cell "q (retired ...)" (`search_retirements`, `query_cell`),
   and is shown whenever any record is retired. Checked: the pipx 1.29
-  build loads such a file and drops the mark on save.
+  build loads such a file and drops the mark on save; the searches
+  then count as current again in every report. Both sides retiring one
+  run with different notes: ours (the last save) wins.
 
 ### Search Flow
 
@@ -1491,16 +1502,19 @@ papers, nothing when zero) and the CSV column `abstract_from` (`from
 time [by NAME]; ...`, no text, `review.abstract_from_cell`, after
 `reset_from`, before `paper_id`). The audit table is unchanged.
 **`scholar sessions retire-search S (--query Q [-p P] [--filters-like
-T] | --record N ... | --all-failed-outright) [--undo] [--dry-run]
+T] | --record ID ... | --all-failed-outright) [--undo] [--dry-run]
 [--note T] [--by N]`** (#275, cli.nw `sec:sessions-retire-search`)
 marks search records retired (record and links stay). `--record`
-takes the numbers `sessions show` prints ("  2. s2: q", 1-based in
-file order; JSON `index`); `--query` is exact, a match with
+takes the ids `sessions show` prints ("  [3fa9c1e] s2: q", escaped
+for Rich; JSON `id`), each a unique prefix of at least 4 characters
+(`RECORD_ID_MIN_PREFIX`; shorter exit 2, ambiguous exit 2 naming the
+records, unknown exit 1, all checked before exiting); `--query` is
+exact and never matches a merged record (`q | q`), a match with
 different filters keys exits 2 naming them unless `--filters-like`
 (substring of the flags as `show` prints them, limit included) or
 `--record`; same filters on several providers are retired together;
 `--provider`/`--filters-like` need `--query` (exit 2); unmatched
-`--query`/out-of-range `--record` exit 1 unsaved;
+`--query` exits 1 unsaved; a blank `--note` exits 2;
 `--all-failed-outright` (`failed_outright`) matching nothing is not
 an error. Already retired (or, with `--undo`, current) records are
 named and left alone. `--undo` refuses `--note`/`--by` (exit 2).
@@ -2158,15 +2172,19 @@ fixture has a quoted query, a `[`-row, `ĸ`, `CO₂`, a ligature. About
   "failed for k of n queries" / "incomplete for k of n queries"
   (localised), and one that failed every query outright is not
   named. Retired search records (#275, review.nw `sec:audit-retired`)
-  are left out of the databases, semantic and dates sentences and the
-  shortfall notes (`build_audit_table_latex` passes `current_records`);
-  `audit_retired_sentence` then adds "{n} earlier searches, since
-  retired, are not counted here." / sv "{n} tidigare sökningar, som
-  sedan tagits ur bruk, räknas inte här." (singular `retired_one`;
-  `audit_number`), and a row code known only from retired records
-  (`retired_only_codes`) is not named among the databases but in that
-  sentence: "; some rows were found through them, in DBLP" (sv "; några
-  rader hittades genom dem, i ..."). Rows are untouched. Without
+  are left out of the databases and dates sentences and the shortfall
+  notes (`build_audit_table_latex` passes `current_records`);
+  `audit_retired_sentence` then adds "{n} earlier searches that have
+  since been retired are not counted here." / sv "{n} tidigare
+  sökningar som sedan har strukits räknas inte här." (singular
+  `retired_one`; `audit_number`), and a row code known only from
+  retired records (`retired_only_codes`) is not named among the
+  databases but in that sentence, code first (`audit_coded_names`):
+  "; rows coded WoS (Web of Science) were found only through them"
+  (sv "; rader märkta ... hittades bara genom dem"; singular "it" /
+  "den"). Semantic (ranked) codes are never named there; the semantic
+  sentence appears for a current semantic record or an OA-sem row and
+  counts from all semantic records, retired too. Rows are untouched. Without
   retired records the caption is byte-identical. `--bearing-only` lists only orders 0-2 and states the other
   counts in the caption: without extras "the A adjacent and B false
   hits" (`unlisted_pair`), with extras each group with its noun and
