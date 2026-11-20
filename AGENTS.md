@@ -895,6 +895,78 @@ switch them off with `scholar.enrich.abstract_source` → None
 - `cache clear --provider europepmc`, `providers limits` (imports
   europepmc), conftest `fresh_rate_limiters` imports it too (#131).
 
+### Doubtful Abstracts (#287)
+
+A service's abstract field can hold a disclosure statement, a keywords
+line, a table fragment, ... Flag, never drop.
+- **Check** `scholar.abstract_check.doubtful_abstract(text) -> reason |
+  None` (enrich.nw `sec:doubtful-abstracts`; its own module, tangled
+  from enrich.nw, stdlib only, so `sessions show` and the report do not
+  import providers or the Crossref cache). `DOUBTFUL_OPENINGS`: per
+  kind (the reason string) a few regexes matched only at the START of
+  the text, after `TEXT_START` (white space, inline tags, footnote
+  marks/quotes, a leading "Abstract"; `[` kept). Kinds:
+  conflict-of-interest statement, data-availability statement, funding
+  statement, acknowledgements, keywords line, author address or
+  correspondence, supplementary-material note, table fragment,
+  reference-list fragment; then `TOO_SHORT` = "fewer than 100
+  characters" (`MIN_ABSTRACT_CHARS`, after collapsing white space). A
+  word that can be a topic ("Disclosure of HIV status", "Funding
+  agencies", "Correspondence analysis", "Email-based", "Table tennis")
+  is a heading only with `heading()` evidence: a delimiter (`: .` en/em
+  dash, ` - `), the end of the text, or a capitalised run-in word from
+  a short case-sensitive list. All patterns and the floor are scholar's
+  own choice, uncalibrated: run `python -m scholar.abstract_check
+  FILE.json ...` (reads the JSON only, never the data dir; dedups by
+  paper id; skips hand-given abstracts; prints counts by reason and
+  each flagged text's first 80 characters) on copies of real sessions
+  before tuning. Not covered: an article's opening paragraph, non-English
+  boilerplate. 10,000 abstracts take about 0.1 s (test allows 1 s).
+- **enrich** (`sec:replace-doubtful-abstract`): `needs_enrichment(p,
+  fields, judge_abstract=False)`, `enrich_paper(..., judge_abstract=
+  False)`, `enrich_papers(..., judge_abstracts=[bool per paper])`.
+  Judging is opt-in: only `scholar enrich` turns it on, per paper
+  `not review.hand_given_abstract(d)` (a hand-given abstract, #258, is
+  never judged or replaced); TUI and `search --enrich` unchanged. When
+  judged, a doubtful abstract counts as missing (further sources incl.
+  Crossref/Europe PMC are asked, OpenAlex prefetch includes it); the
+  first non-doubtful abstract from a later source replaces it (merge
+  into `replace(result, abstract=None)`); else the doubtful text stays
+  (a later doubtful text never replaces it). A non-doubtful abstract is
+  never replaced. `LookupOutcome` gained `abstract_from` (source whose
+  abstract the call stored; dropped when a preprint adoption replaced
+  the abstract), `doubtful`, `doubtful_text`, `doubtful_from` (None =
+  held before the call) and property `doubtful_replaced`.
+  `LookupTally.doubtful` counts `(reason, replaced)`;
+  `doubtful_tally_lines` prints after the abstract tally (also on the
+  interrupt path): "Doubtful abstracts (...): N papers." then per
+  reason "k replaced by a later source's abstract, m kept, no better
+  one found", and `DOUBTFUL_KEPT_HINT` (sessions show,
+  `sessions set-abstract --replace`) when any was kept.
+- **Origin** (review.nw `sec:fetched-abstract`):
+  `ReviewDecision.abstract_fetched` = `[{"at", "from", "chars",
+  "digest", "replaced"}]` (`replaced` = `{"text", "reason", "from"}`
+  of the doubtful text it replaced), written by `scholar enrich` per
+  chunk via `note_fetched_abstract(decision, source, at, replaced)`.
+  On the decision like `abstract_set` (no paper-merge rule): saved only
+  when non-empty, old files `[]`, append copy, united by
+  `merge_concurrent_changes` and by both folds, not in
+  `decision_state`. No abstract text in it (would double the file):
+  `abstract_digest` (sha256[:16]) lets `fetched_abstract_source(d)`
+  name the source only while the paper still holds that text; old data
+  and changed abstracts show nothing. Search ingest records no source
+  (the merged paper's abstract provider is unknown there).
+- **Display**: `review.abstract_doubt(d)` (None for a hand-given
+  abstract) is computed when shown, nothing stored. `sessions show`:
+  "(doubtful abstract: REASON[, from SOURCE])" after the title
+  (`cli.doubtful_mark`), a "Doubtful abstracts: N papers have ...;
+  replace one with `scholar sessions set-abstract --replace`." line
+  after the summary, JSON `abstract_doubtful` and `abstract_from`
+  (each only when set); help text names `set-abstract --replace`.
+  Report: `doubtful_abstracts_sentence` after the hand-abstract
+  sentence (papers counted). Audit table and decisions unchanged (the
+  review's `no-abstract` criterion is the reviewer's).
+
 ### Currency / Retraction Checks
 
 `crossref.py` checks whether a paper has been retracted, corrected, or
