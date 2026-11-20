@@ -2401,6 +2401,31 @@ without tags. A session without tags imposes nothing unless
 prefer the vocabulary and new tags are not dropped. The `llm`
 module is looked up via `globals()` so tests can substitute a fake model.
 
+**Unknown model (#284).** Every model lookup (`classify_papers_with_llm`,
+`second_screen_with_llm`, `generate_literature_synthesis`,
+`suggest_theme_groups`, rq's `generate_provider_queries`, pdf's
+`rerank_passages_llm`) goes through `utils.resolve_llm_model(llm_module,
+model_id)` (utils.nw `sec:resolve-llm-model`): the `llm` package's
+`UnknownModelError` (a `KeyError`; caught by class, read from the module
+passed in, `KeyError` for a stand-in without it) becomes `ValueError("Unknown
+model: X; `llm models` lists the available models")`. `llm classify`
+(both runs), `llm synthesize` (also its `-i --suggest-groups` grouping,
+which before ended in a traceback, named model or default: only
+`ImportError` was caught there and `_resolve_themes` runs before the
+command's `try`), `rq` (before any search) and `pdf quote` with `-m`
+print it as one unwrapped line and exit 1. `pdf quote` without `-m`
+and an unknown *default* model (llm's `default_model.txt`) keeps the
+old fallback: `rerank_passages_llm` logs the message as a WARNING and
+returns None (lexical order, exit 0). Dry runs of the ordinary classify
+and of the synthesis resolve no model (a dry run works offline; resolving
+asks every plugin), so they do not notice a typo; `--dry-run`'s help
+says so. The second screen's dry run does resolve it: it needs the
+model's own id (what decisions store as `llm_model`, whatever alias
+was typed) to choose the papers the model has not screened. Tests use the real
+package with `get_model_aliases`/`get_async_model_aliases` patched to
+`{}` (resolving a model asks every plugin; llm-gpt4all fetches its list
+over the network) and a long model name, so a wrapped line would fail.
+
 Tag kinds: note tags (`NOTE_TAGS`, the union of every language's
 `AUDIT_STRINGS[lang]["notes"]`) are human-only, never offered (not even
 on examples' tag lines) and dropped if returned (`excluded_tags=`, also
@@ -2540,9 +2565,9 @@ moved five places, `paper_id` stays last): empty when unset,
   id, `version_link_dois`, `work:<audit_work_key>` when the title part
   is non-empty; no namesake guard, a hidden namesake costs an example;
   copies the keys miss are not hidden); whether categories are offered
-  is read from the whole session. An unknown model (`UnknownModelError`,
-  a `KeyError`) becomes a `ValueError`: one line, exit 1 (the ordinary
-  run still prints a traceback). Prose cites Vembye 2025 Table 5 steps
+  is read from the whole session. An unknown model becomes a
+  `ValueError` (`resolve_llm_model`, see Classifier Vocabulary): one
+  line, exit 1, a dry run too. Prose cites Vembye 2025 Table 5 steps
   1-5 (test with recall >= .75, specificity >= .8, which Scholar does
   not run) and 9, Page 2021 E&E Box 3 (partial checks); a `machine` or
   single-status sample selection makes agreement conditional on the
@@ -2703,6 +2728,12 @@ Key test files:
 - `tests/test_providers.py` - Provider unit tests (mocked HTTP)
 - `tests/test_scholar.py` - Data model tests
 - `tests/test_cli.py` - CLI integration tests
+
+A test that puts a stand-in module into `sys.modules` does it with
+`monkeypatch.setitem(sys.modules, name, module)`, never by assignment:
+an assigned fake stays for every later test in the process (#284: the
+rq test left a fake `llm` without `UnknownModelError`, and later tests
+passed or failed by order).
 
 Unit tests are offline by construction (`tests/conftest.py`, tangled from
 `cache.nw`): the autouse `isolate_cache` fixture unsets every provider
