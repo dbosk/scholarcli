@@ -282,6 +282,8 @@ For a paper to serve as an example:
 \item A human must have made or confirmed the decision
 \item Papers where the user corrected an LLM decision are prioritized
   (they represent edge cases the LLM got wrong)
+\item Its category, if it has one, must fit its decision
+  (\cref{sec:example-category})
 \end{enumerate}
 
 The third rule is the one that keeps the classifier from teaching
@@ -322,6 +324,99 @@ def is_unreviewed_machine(decision: ReviewDecision) -> bool:
     return source_value(decision) in UNREVIEWED_MACHINE_SOURCES
 @
 
+The first three rules say which decisions may be examples at all.
+They are one function, because the count of records left out for
+their category (below) must be taken over exactly the decisions the
+examples are drawn from.
+
+<<llm review example gathering>>=
+def example_candidates(
+    session: ReviewSession, include_unreviewed: bool = False
+) -> list[ReviewDecision]:
+    """Return the decided, tagged decisions that may serve as examples.
+
+    Those a human made or confirmed, and with `include_unreviewed` also
+    unreviewed LLM and agent decisions, in session order.
+    """
+    return [
+        decision for decision in session.decisions
+        if decision.tags
+        and decision.status in (DecisionStatus.KEPT, DecisionStatus.DISCARDED)
+        and (is_confirmed(decision)
+             or (include_unreviewed and is_unreviewed_machine(decision)))
+    ]
+@
+
+\subsection{Examples whose category contradicts their decision}
+\label{sec:example-category}
+
+The prompt's category section says that every paper carries exactly
+one category and that the category must fit the decision: a keep takes
+[[supports-claim]], [[qualifies-claim]] or [[adjacent-subtopic]], a
+discard [[adjacent-subtopic]] or [[off-topic-false-hit]]
+([[STATUS_CATEGORIES]], \cref{sec:category-fits-status}).  A session
+can still hold confirmed decisions that break the rule.  Before
+issue~\#177, a status change kept the old category, so a keep under
+[[supports-claim]] that a human later discarded stayed tagged
+[[supports-claim]]; when the discard corrected the classifier, the
+record was also marked [[is_example]], so it came \emph{first} among
+the discarded examples (issue~\#255).  A human may also discard a bearing paper on purpose,
+under a rule of the review, and the audit table shows that as
+\enquote{supports, excluded} (issue~\#89).  Either way, as an example
+the record teaches the very pairing the rule forbids, and the parser
+then withholds the model's answer when it follows the example.
+
+Such a record is left out of the examples rather than shown without
+its category.  Shown without one, it would break the other half of
+the rule, exactly one category per paper; and the reason a human
+excluded a bearing paper is usually a criterion of the review, which
+the prompt tells the model to leave to a human.  The record's
+category is the one the audit table reads, its last category tag
+([[audit_category]]), so a record whose status change appended a
+fitting category is an example again.  A decision without a category
+tag cannot contradict, so a session without categories gets the
+examples, and so the prompt, it got before.  The check needs nothing
+but the decision: a category tag on it is enough to judge it,
+whatever vocabulary the run offers.
+
+<<llm review imports>>=
+from scholar.review import audit_category
+<<llm review example gathering>>=
+def category_contradicts_status(decision: ReviewDecision) -> bool:
+    """Tell whether the decision's category does not fit its status.
+
+    The category is the last category tag, as in the audit table; a
+    decision without one, or a pending one, contradicts nothing.
+    """
+    category = audit_category(decision.tags)
+    status = getattr(decision.status, "value", decision.status)
+    return (
+        category is not None
+        and status in STATUS_CATEGORIES
+        and category not in STATUS_CATEGORIES[status]
+    )
+
+
+def contradictory_examples(
+    session: ReviewSession, include_unreviewed: bool = False
+) -> list[ReviewDecision]:
+    """Return the candidate examples left out for their category."""
+    return [
+        decision
+        for decision in example_candidates(session, include_unreviewed)
+        if category_contradicts_status(decision)
+    ]
+@
+
+The records are left out before the lists are sorted and cut to
+their maximum, so a record left out gives its place to the next
+fitting one instead of shrinking the prompt's examples.  The log that
+lists the chosen examples says how many were left out, and
+[[llm status]] counts them with the same function, so the two agree.
+The prompt version (\cref{sec:prompt-version}) does not move: it
+hashes a fixed probe in place of the session's examples, so which
+records are examples was never part of it.
+
 <<llm review example gathering>>=
 def get_example_decisions(
     session: ReviewSession,
@@ -334,7 +429,8 @@ def get_example_decisions(
 
     Only decisions a human made or confirmed are examples, unless
     `include_unreviewed` is set; then unreviewed machine decisions follow
-    the confirmed ones. Prioritizes user-corrected LLM decisions
+    the confirmed ones. A decision whose category does not fit its
+    status is left out. Prioritizes user-corrected LLM decisions
     (is_example=True) as these represent cases where the LLM's initial
     classification was wrong.
 
@@ -349,16 +445,11 @@ def get_example_decisions(
     """
     kept_examples: list[ReviewDecision] = []
     discarded_examples: list[ReviewDecision] = []
+    left_out = contradictory_examples(session, include_unreviewed)
 
-    for decision in session.decisions:
-        # Only include papers with tags (our example requirement)
-        if not decision.tags:
+    for decision in example_candidates(session, include_unreviewed):
+        if category_contradicts_status(decision):
             continue
-        if not is_confirmed(decision) and not (
-            include_unreviewed and is_unreviewed_machine(decision)
-        ):
-            continue
-
         if decision.status == DecisionStatus.KEPT:
             kept_examples.append(decision)
         elif decision.status == DecisionStatus.DISCARDED:
@@ -396,6 +487,11 @@ def get_example_decisions(
                 f"  DISCARDED example: {example.paper.title[:60]}... "
                 f"[tags: {', '.join(example.tags)}]"
             )
+    if left_out:
+        logger.info(
+            f"Left out {len(left_out)} examples whose category does not "
+            "fit their decision"
+        )
 
     return kept_result, discarded_result
 @
@@ -656,6 +752,205 @@ def test_unknown_source_is_not_confirmed(self):
     decision.source = Mock(value="robot")
     assert not is_confirmed(decision)
     assert not is_unreviewed_machine(decision)
+@
+
+A decision whose category contradicts its decision is no example,
+whoever made it (issue~\#255).  The issue's case is a human's discard
+still tagged [[supports-claim]] and marked as a correction, which used
+to come first among the discarded examples.  Let's check that it, and
+a keep tagged [[off-topic-false-hit]], are neither among the examples
+nor in the prompt [[llm classify]] builds, while the fitting records
+are:
+
+<<test functions>>=
+class TestExamplesWhoseCategoryContradicts:
+    <<contradicting example test methods>>
+
+<<contradicting example test methods>>=
+def _decision(self, name, status, tags, source=ReviewSource.HUMAN,
+              is_example=False):
+    return ReviewDecision(
+        paper=Paper(title=f"Paper {name}", authors=["A"],
+                    abstract=f"About {name}.",
+                    doi=f"10.5555/contradicts-{name}"),
+        provider="p", status=status, tags=list(tags), source=source,
+        is_example=is_example,
+    )
+
+def _session(self, decisions):
+    session = ReviewSession(
+        query="q", providers=["p"], timestamp=datetime(2026, 11, 20),
+        research_context="Does the claim hold?",
+    )
+    session.decisions = list(decisions)
+    return session
+
+def _issue_session(self):
+    return self._session([
+        self._decision("excluded", DecisionStatus.DISCARDED,
+                       ["supports-claim"], is_example=True),
+        self._decision("offtopic", DecisionStatus.DISCARDED,
+                       ["off-topic-false-hit"]),
+        self._decision("supporting", DecisionStatus.KEPT,
+                       ["supports-claim"]),
+        self._decision("falsehit", DecisionStatus.KEPT,
+                       ["off-topic-false-hit"]),
+        self._decision("new", DecisionStatus.PENDING, []),
+    ])
+
+def test_contradicting_records_are_no_examples(self):
+    kept, discarded = get_example_decisions(self._issue_session())
+    assert [d.paper.title for d in kept] == ["Paper supporting"]
+    assert [d.paper.title for d in discarded] == ["Paper offtopic"]
+
+def test_nor_in_the_prompt(self):
+    prompt = classify_papers_with_llm(
+        self._issue_session(), enrich_missing=False, dry_run=True,
+    )
+    assert "## Category (exactly one per paper)" in prompt
+    assert "Title: Paper supporting" in prompt
+    assert "Title: Paper offtopic" in prompt
+    assert "Paper excluded" not in prompt
+    assert "Paper falsehit" not in prompt
+@
+
+The last category tag is the decision's category, as in the audit
+table, so a record whose status change appended a fitting category is
+an example and one whose last category contradicts is not:
+
+<<contradicting example test methods>>=
+def test_the_last_category_decides(self):
+    session = self._session([
+        self._decision("mended", DecisionStatus.DISCARDED,
+                       ["supports-claim", "off-topic-false-hit"]),
+        self._decision("stale", DecisionStatus.DISCARDED,
+                       ["off-topic-false-hit", "supports-claim"]),
+    ])
+    _, discarded = get_example_decisions(session)
+    assert [d.paper.title for d in discarded] == ["Paper mended"]
+    assert [d.paper.title for d in contradictory_examples(session)] \
+        == ["Paper stale"]
+@
+
+Unreviewed machine decisions, examples only on request, are judged the
+same way, and are counted only then:
+
+<<contradicting example test methods>>=
+def test_unreviewed_examples_too(self):
+    session = self._session([
+        self._decision("guess", DecisionStatus.DISCARDED,
+                       ["qualifies-claim"],
+                       source=ReviewSource.LLM_UNREVIEWED),
+        self._decision("fits", DecisionStatus.DISCARDED,
+                       ["adjacent-subtopic"],
+                       source=ReviewSource.LLM_UNREVIEWED),
+    ])
+    _, discarded = get_example_decisions(session, include_unreviewed=True)
+    assert [d.paper.title for d in discarded] == ["Paper fits"]
+    assert contradictory_examples(session) == []
+    assert [d.paper.title for d in contradictory_examples(
+        session, include_unreviewed=True
+    )] == ["Paper guess"]
+@
+
+Leaving a record out must not cost the prompt an example: the records
+are filtered before the lists are cut to their maximum, so a
+contradicting correction, which would sort first, gives its place to
+the next fitting record:
+
+<<contradicting example test methods>>=
+def test_the_maximum_is_still_filled(self):
+    session = self._session([
+        self._decision("excluded", DecisionStatus.DISCARDED,
+                       ["supports-claim"], is_example=True),
+    ] + [
+        self._decision(f"off{i}", DecisionStatus.DISCARDED,
+                       ["off-topic-false-hit"])
+        for i in range(3)
+    ])
+    _, discarded = get_example_decisions(session, max_discarded=2)
+    assert [d.paper.title for d in discarded] == ["Paper off0", "Paper off1"]
+@
+
+A session without category tags has no such record, so its examples
+and prompt are what they were: every tagged confirmed record is an
+example, whatever its tags say.
+
+<<contradicting example test methods>>=
+def test_a_session_without_categories_is_unchanged(self):
+    session = self._session([
+        self._decision("kept", DecisionStatus.KEPT, ["theory"]),
+        self._decision("gone", DecisionStatus.DISCARDED, ["theory"],
+                       is_example=True),
+        self._decision("new", DecisionStatus.PENDING, []),
+    ])
+    kept, discarded = get_example_decisions(session)
+    assert contradictory_examples(session) == []
+    assert (kept, discarded) == ([session.decisions[0]],
+                                 [session.decisions[1]])
+    prompt = classify_papers_with_llm(
+        session, enrich_missing=False, dry_run=True,
+    )
+    assert prompt == build_classification_prompt(
+        papers_to_classify=[session.decisions[2]],
+        kept_examples=[session.decisions[0]],
+        discarded_examples=[session.decisions[1]],
+        research_context="Does the claim hold?",
+        available_themes={"theory"}, available_motivations={"theory"},
+        extra_tags=set(), allow_new_tags=False, category_tags=set(),
+    )
+@
+
+The log that lists the chosen examples says how many were left out,
+so a user who wonders why a correction is missing finds out:
+
+<<contradicting example test methods>>=
+def test_the_log_counts_them(self, caplog):
+    with caplog.at_level(logging.INFO, logger="scholar.llm_review"):
+        get_example_decisions(self._issue_session())
+    assert "Left out 2 examples whose category does not fit " \
+        "their decision" in caplog.text
+@
+
+The prompt version does not hash the session's examples, only a fixed
+probe, so leaving a record out does not move it: two runs that differ
+only in such a record carry the same version.
+
+<<contradicting example test methods>>=
+def _version(self, monkeypatch, session):
+    class FakeResponse:
+        def text(self):
+            return json.dumps({"classifications": [
+                {"paper_index": 0, "decision": "discarded",
+                 "tags": ["off-topic-false-hit"], "confidence": 0.8,
+                 "reasoning": "r"},
+            ]})
+
+    class FakeModel:
+        model_id = "fake"
+
+        def prompt(self, prompt):
+            return FakeResponse()
+
+    class FakeLLMModule:
+        def get_model(self, _model_id=None):
+            return FakeModel()
+
+    import scholar.llm_review as llm_review
+
+    monkeypatch.setattr(llm_review, "llm", FakeLLMModule(), raising=False)
+    return classify_papers_with_llm(
+        session, count=1, model_id="fake", enrich_missing=False,
+    ).prompt_version
+
+def test_the_prompt_version_does_not_move(self, monkeypatch):
+    with_it = self._issue_session()
+    without = self._session(
+        d for d in self._issue_session().decisions
+        if d.paper.title != "Paper excluded"
+    )
+    assert self._version(monkeypatch, with_it) \
+        == self._version(monkeypatch, without)
 @
 
 
