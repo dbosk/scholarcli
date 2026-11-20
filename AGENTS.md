@@ -29,6 +29,8 @@ Providers self-register via `register_provider()` at module load time.
 | `src/scholar/crossref.nw` | Literate source for currency checks |
 | `src/scholar/unpaywall.py` | Unpaywall open-access lookup (per DOI) |
 | `src/scholar/unpaywall.nw` | Literate source for open-access lookup |
+| `src/scholar/europepmc.py` | Europe PMC abstract lookup (per DOI) |
+| `src/scholar/europepmc.nw` | Literate source for the Europe PMC lookup |
 | `src/scholar/preprint.py` | Preprint fallback (adopt a preprint when no PDF found) |
 | `src/scholar/preprint.nw` | Literate source for the preprint fallback |
 | `src/scholar/ratelimit.py` | Persistent cross-session rate-limit/quota tracking |
@@ -636,7 +638,8 @@ direct) is deliberately not part of the key: what changes the data is
 the view the route entitles, and that is already keyed.
 
 `ScopusProvider.get_paper_by_doi()` (a one-result `DOI("...")` search)
-makes Scopus the *last* entry of `ENRICHMENT_PROVIDERS`. It returns
+makes Scopus the *last* entry of `ENRICHMENT_PROVIDERS` (after the
+abstract services `crossref`, `europepmc`, #260). It returns
 `None` unless the COMPLETE view is served (the default view has no
 abstract to add), and after one refusal it declines without a request,
 so an off-campus enrichment run costs Scopus a single request.
@@ -770,6 +773,91 @@ provider order, for the DOIs (or derived arXiv DOIs) of papers that
 `needs_enrichment`. S2 comes first in `ENRICHMENT_PROVIDERS` and is
 paced at 1 request / 3 s without a key, so
 `--enrich-providers openalex,s2,...` is the fast path.
+
+### Abstracts from Crossref and Europe PMC (#260)
+
+`ENRICHMENT_PROVIDERS` = s2, arxiv, openalex, ieee, wos, `crossref`,
+`europepmc`, scopus: the two per-DOI abstract services (not registered
+providers) come before Scopus, whose weekly metered quota they save;
+Scopus stays last. `enrich.enrichment_source(name)` resolves a name to
+`abstract_source(name)` (the module's shared client,
+`<module>.enrichment_source()`) for the names in
+`ABSTRACT_SOURCE_FIELDS`, else `get_provider`. Both clients have
+`get_paper_by_doi` (a `Paper` with only DOI, abstract and
+`sources=[name]`) and `last_lookup_error` (Europe PMC also
+`last_lookup_declined`, for a DOI holding `"`), so the loop, the merge,
+`Paper.sources` and the #259 tally treat them like any database. The
+loop asks them only while the abstract is requested and still missing
+(`<<skip an abstract service with nothing to fill>>`): a present
+(hand-given, #258) abstract is never asked about; `--fields` without
+`abstract` asks neither. `--enrich-providers` is validated
+(`cli.parse_enrich_providers`, exit 2, before loading/searching; an
+empty value is an error too; `search` checks it even without
+`--enrich`; both help texts say so) against
+`enrich.enrichment_source_names()` = registered providers with
+`get_paper_by_doi` + the two services. Test files with enrichment
+switch them off with `scholar.enrich.abstract_source` → None
+(test_enrich autouse fixture, `TestEnrichLookupTally._invoke`).
+- **Shared reading** `utils.markup_to_text` (utils.nw
+  `sec:markup-to-text`): keeps the MathML version of a JATS
+  `<alternatives>`, JATS/HTML block elements (p, sec, title, break, br,
+  h1-h6, li, td, ...; any namespace prefix) → space, other tags (`<`
+  directly followed by a letter) removed, entities decoded after, white
+  space collapsed. Limit: plain text like `a<b and c>d` loses its
+  middle. Both services return `None`, never `""`, for an abstract
+  without text.
+- **No double cleaning**: `enrich_paper` still cleans the whole paper
+  at the end (held title/venue/abstract included, so `enrich` repairs
+  old sessions' entities and mojibake), via
+  `clean_paper_text_except(result, plain_abstract)`: the one exception
+  is an abstract Crossref or Europe PMC supplied in that very call,
+  already plain (`clean_metadata_text` is not idempotent: it decodes
+  again, then strips `<i>`, so a JATS `&lt;i&gt;` would be lost).
+- **Crossref** (`crossref.nw` `sec:crossref-abstract`): no request of
+  its own. `_fetch_work` (shared by `fetch_currency` and
+  `fetch_abstract`) caches both the currency result and the raw JATS
+  abstract, a side entry `abstract_cache_key(doi)` = `("abstract",
+  doi)` (str or None; a 404 caches None in both). Chosen over bumping
+  `CURRENCY_CACHE_VERSION`, which would re-fetch every DOI's currency on
+  the next enrich; an old currency entry without the side entry costs
+  one request only when its abstract is asked for. `jats_to_text` =
+  drop a leading `<title>Abstract</title>` (also as the first `<sec>`'s
+  title) + `markup_to_text`. Docs (read 2026-11-20): the REST API page
+  (abstracts exposed; "Some abstracts ... may be subject to copyright
+  by publishers or authors"), the abstracts best-practice page (JATS),
+  swagger `abstract: string`.
+- **Crossref pools (#270)**: documented limits (access-and-authentication
+  page, updated 2025-10-16): public 5/s, concurrency 1; polite (mailto)
+  10/s, concurrency 3; announced in `x-rate-limit-limit` /
+  `x-rate-limit-interval` (a recorded anonymous answer of 2026-11-20:
+  5, 1s, concurrency 1). `CrossrefClient.LIMITS` 5/s,
+  `POLITE_LIMITS` 10/s, chosen per request by `_acquire()` from
+  `mailto` (as S2's keyed limits). The limiter does not read the
+  `x-rate-limit-*` headers (its sync knows only
+  `X-RateLimit-Remaining/Reset`).
+- **429s reach the limiter**: Crossref's and Europe PMC's sessions no
+  longer list 429 in urllib3's `Retry` `status_forcelist` (it retried
+  out of the limiter's sight and ended in `RetryError`, so no cooldown):
+  one 429 → `record_response` cooldown → later lookups refused without
+  a request, tallied as failed (loopback tests). Unpaywall's session
+  likewise (one 429 → cooldown → the next lookup refused without a
+  request, a failed open-access lookup).
+- **Europe PMC** (`europepmc.nw`, `EuropePMCClient`, cache
+  `europepmc.pkl`, limiter `europepmc`): `GET
+  https://www.ebi.ac.uk/europepmc/webservices/rest/search?query=DOI:"<doi>"
+  &resultType=core&format=json&pageSize=5`; `abstract_for_doi` returns
+  the raw `abstractText` of the first result whose `doi` matches
+  (case-folded) and whose abstract leaves text, passing over the
+  others; the cache holds it raw, read with `markup_to_text` on return;
+  no result list → failure (not cached). The optional `email` parameter
+  (registers the address for news) is never sent. Source: the API's
+  OpenAPI document `.../rest/v3/api-docs` (records carry a three-letter
+  source code: MED, PMC, PPR, ...; no coverage claim made); the
+  europepmc.org pages were behind a bot challenge (2026-11-20, not
+  read). Rate 5/s is scholar's choice (a forum reply says 10/s or
+  500/min). PubMed E-utilities are not added.
+- `cache clear --provider europepmc`, `providers limits` (imports
+  europepmc), conftest `fresh_rate_limiters` imports it too (#131).
 
 ### Currency / Retraction Checks
 
@@ -1911,6 +1999,25 @@ in the preamble; fragment: in the body before first use, with a `%`
 header saying how to define it first (pdflatex Cyrillic:
 `\usepackage[T2A,T1]{fontenc}` +
 `\newcommand{\scholarnonlatin}[1]{{\fontencoding{T2A}\selectfont #1}}`).
+Separator (#262): where a wrapped run touches a letter or digit of the
+source (CJK written against Latin: `\u5b66\u4e60Mac OS X...`), both
+escapers write `\scholarnonlatinsep{}` between them (`NONLATIN_SEP`,
+`_touches_text`; never next to a space or punctuation, so such output
+is byte-identical). `nonlatin_definition(marker, separator=True)`
+prepends `NONLATIN_SEP_DEFINITION` (empty under XeTeX/LuaTeX, else
+`\ `; deliberately no test of whether `\scholarnonlatin` is defined:
+an earlier fragment or a cited scholar `.bib`'s `@preamble` defines it
+too, and the marker then ran into the Latin words), added by
+`latex_document`/`latex_fragment`/`nonlatin_bib_preamble` only when
+`uses_nonlatin_sep`; the fragment header then tells a host whose
+`\scholarnonlatin` prints the text to add
+`\newcommand{\scholarnonlatinsep}{}` (without it: a space where the
+scripts touch). `uses_nonlatin` detects either macro; `cli._unescape_bib`
+drops the separator before the wrapper; the `--cited-from` reader
+(bibtexparser decoding) already drops it (pinned). pdflatex prints
+"[non-Latin text] Mac OS X [non-Latin text]", also after an earlier
+fragment and after a cited new or old-style `.bib`
+(`TestNonLatinSeparatorCompiles`).
 An audit row whose title keeps no letter outside such runs
 (`only_nonlatin_letters`) also prints `(paper id)` (`doi:…`, else the
 hash id; `audit_title_cell`, `AuditRow.nonlatin_title`), and
@@ -2005,7 +2112,19 @@ fixture has a quoted query, a `[`-row, `ĸ`, `CO₂`, a ligature. About
   shown for unreviewed and human-confirmed LLM or agent rows, not for
   changed ones, and
   such a row without one shows `AUDIT_STRINGS[lang]["no_confidence"]`
-  (`n/a`, `saknas`) because the caption promises a confidence. The
+  (`n/a`, `saknas`) because the caption promises a confidence. Whose
+  confidence (#262): `audit_reason_and_confidence` also returns the
+  origin when the label shows one (`audit_confidence_origin`: agent
+  sources → `agent`, LLM and unknown sources → `llm`; `audit_reason`
+  drops it), kept as `AuditRow.confidence_by`; `audit_confidence_sentence`
+  picks `confidence_llm`/`confidence_agent`/`confidence_both` or none
+  from the *listed* rows (both caption forms, `{confidence}`). Numbers
+  (#262): `audit_number(value, strings, decimals=None)` with
+  `AUDIT_STRINGS[lang]["decimal_mark"]`/`["group_separator"]` (en `.`
+  `,`; sv `,` `\,`), grouping from 1000, for every confidence and every
+  caption count (categories, extras, k of n queries/searches, semantic
+  n); years, DOIs, ids, dates never. Column head `provider` is
+  "Database"/"Databas". The
   escapers decode HTML entities, strip inline markup, repair
   cp1252/Latin-1 mojibake and turn `"` into `\textquotedbl{}` (babel
   shorthand). Titles are printed whole unless `--truncate-titles`
@@ -2035,7 +2154,25 @@ fixture has a quoted query, a `[`-row, `ĸ`, `CO₂`, a ligature. About
   without title and DOI and counts unparsable blocks (stderr), and
   `match_cited_entries(entries, session)` reuses the sessions check's
   lookup (`matching_entries` over `session_match_index`: DOI incl.
-  version-link DOIs, else `audit_work_key` under `plausibly_same_work`)
+  version-link DOIs, else `audit_work_key` under `plausibly_same_work`;
+  failing both, a second chance, #272: `match_loose_title` on
+  `loose_title` (a trailing edition phrase `, 2nd edition`/`(3rd rev.
+  ed.)`/`second edition`: digit ordinals of any size, word ordinals
+  first-tenth, not after the/a/an, not when it leaves no word; and,
+  on a side without authors only, a leading chapter number before a
+  title with no lower-case and some upper-case letter) on both titles;
+  `matched_by` `CHECK_BY_LOOSE_TITLE`; the bib's `edition` field, the
+  entries' optional third element, read by `edition_number`, else its
+  title's phrase (`entry_edition`), must equal an edition the session
+  title names, one side alone matches, candidates naming the entry's
+  edition drop those naming none; still `plausibly_same_work`,
+  author-less records by title, else same surname; candidates that
+  differ in (named edition, surname) → no match,
+  `CitedEntry.ambiguous`, else all their work keys. An entry naming an
+  edition that the first lookup found only by title on records naming
+  no or another edition takes the records naming that edition
+  (`same_edition=True`) when there are any; a DOI match stands;
+  `audit_work_key` and `sessions check` deliberately unchanged)
   → `CitedEntry.works` (work keys) → `collect_audit_rows(...,
   cited_works=)` → `audit_reason(..., cited=True/False)` per copy
   (None = old rule). Copies are still ranked on the screening's order
@@ -2047,7 +2184,10 @@ fixture has a quoted query, a `[`-row, `ĸ`, `CO₂`, a ligature. About
   not cited in the text" (`audit_uncited_keep`, `AuditRow.uncited`;
   own caption count `extra_uncited`, ahead of duplicates). Caption
   gets `cited_rule` before the databases (en/sv), also when nothing
-  matched. stderr: match counts (DOI / title / not in session), then
+  matched. stderr: match counts (DOI / title / [title without
+  edition or chapter number, only when > 0] / not in session), the
+  loosened entries (key: bib -> session title) and the ambiguous ones
+  (nothing extra when all match as before), then
   `cited_text_disagreements` lists the excluded (any matched row
   discarded) and the not-held entries (key: short title); not in the
   caption. Without the option the output is byte-identical (checked on
@@ -2069,7 +2209,8 @@ fixture has a quoted query, a `[`-row, `ĸ`, `CO₂`, a ligature. About
   the rest as "other hits" (all localised). Criteria are the review's own labels, so
   there is no fixed list. The caption never
   names the session (it is a `%` comment in the fragment) and ends with
-  a full-name-first "Databases:" sentence built from the providers
+  a full-name-first "Databases searched:" ("Sökta databaser:", #262)
+  sentence built from the providers
   the session searched (search records that answered at least once,
   zero hits included, plus the rows; rows only for old sessions). A
   database known only from records without an outcome and from no row
@@ -2080,7 +2221,12 @@ fixture has a quoted query, a `[`-row, `ĸ`, `CO₂`, a ligature. About
   "failed for k of n queries" / "incomplete for k of n queries"
   (localised), and one that failed every query outright is not
   named. `--bearing-only` lists only orders 0-2 and states the other
-  counts in the caption. `all` stays csv + latex.
+  counts in the caption: without extras "the A adjacent and B false
+  hits" (`unlisted_pair`), with extras each group with its noun and
+  `audit_joined_list` putting "and"/"och" before the last ("the A
+  adjacent hits, the B false hits, 2 unclassified and 1 ..."); the
+  `extra_*` strings have no leading comma (the full caption adds ", ").
+  `all` stays csv + latex.
 - The TUI's `prompt_for_report` keeps the standalone default.
 
 ### Provider Text Cleaning
@@ -2089,7 +2235,8 @@ fixture has a quoted query, a `[`-row, `ĸ`, `CO₂`, a ligature. About
 strip inline tags (`<i>`, `<sup>`, …) and repair cp1252/Latin-1 mojibake
 by a checked round trip. Applied at ingest in `Search.execute`,
 `ReviewSession.add_papers_from_snowball` and at the end of
-`enrich_paper`; the LaTeX escapers apply it too, for sessions recorded
+`enrich_paper` (except an abstract an abstract service supplied in
+that call, `clean_paper_text_except`, #260); the LaTeX escapers apply it too, for sessions recorded
 earlier. A DOI-less paper's hash id derives from the cleaned title, so a
 record with markup ingested before this change gets a new id when it is
 searched again.
@@ -2586,8 +2733,9 @@ requests/day and each `scholar` run is a fresh process.
   `Limits.per_second` is a rate, not the old seconds-between-requests
   `RATE_LIMIT` (those names are gone). Health probes pass `acquire()` too
   and record their responses, so a probed 429 starts a cooldown.
-  The Crossref and Unpaywall clients declare `LIMITS` too (10/s;
-  Unpaywall also its 100000/day) and go through `acquire()` /
+  The Crossref and Unpaywall clients declare `LIMITS` too (Crossref
+  5/s anonymous, 10/s with a mailto, #270; Unpaywall 10/s and its
+  100000/day; Europe PMC 5/s) and go through `acquire()` /
   `record_response()`; `all_status()` lists every in-process limiter, so
   `providers limits` shows them alongside the providers.
   Every WoS request (searches, probe, and the extended methods: related,
