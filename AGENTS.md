@@ -755,40 +755,63 @@ identity of every outgoing request:
 
 `pdf.py` caches PDFs in `<cache dir>/pdfs/<sha256(url)[:16]>.pdf`
 (`get_cached_pdf_path`); a DOI download resolves candidate URLs first
-and caches under whichever delivered. Where a publisher answers with a
-bot check (scholar stops there, see Network), the user hands over a
-PDF they got otherwise: `scholar pdf import FILE (--url URL | --doi
-DOI) [--from TEXT] [--replace]` (FILE takes the positional slot of
-`open`/`quote`'s URL, their usage unchanged) → `import_pdf` (pdf.nw
-`sec:pdf-import`):
-- **Check**: PDFium (the engine `extract_pdf_pages` uses) must open it
-  and find a page (`pdf_file_problem`); the download only checks the
-  Content-Type header, which a file lacks. HTML is named in the reason
-  (`looks_like_html`). Refusals (no file/key, both keys, not a PDF, bad
-  DOI, other content cached) exit 2.
+and caches under whichever delivered.
+- **Readable or absent** (pdf.nw `sec:pdf-import-check`): a cached file
+  is used only if PDFium (the engine `extract_pdf_pages` uses) opens it
+  and finds a page (`usable_cached_pdf` → `pdf_file_problem(path)`);
+  otherwise it is ignored with a WARNING and downloaded again (older
+  versions left truncated files that were returned as hits forever).
+  Downloads stream to a `temp_beside` file (`.<name>.<rand>.tmp`) and
+  `os.replace` into place, so a broken response or Ctrl-C leaves
+  nothing. `find_quote_candidates` turns a `PdfiumError` into `[]`, or
+  with `raise_errors=True` (what `pdf quote` passes) into a one-line
+  `PDFUnreadableError` (a `PDFDownloadError`); `pdf quote` now also
+  reports a failed download (exit 1) instead of "No candidate passages".
+- **Import**: where a publisher answers with a bot check (scholar stops
+  there, see Network), `scholar pdf import FILE (--url URL | --doi DOI)
+  [--from TEXT] [--replace]` (FILE takes the positional slot of
+  `open`/`quote`'s URL, their usage unchanged) → `import_pdf`
+  (`sec:pdf-import`). The file is copied to a temp file in `pdfs/`,
+  checked and hashed there (`file_sha256` = `hashlib.file_digest`;
+  PDFium opens the path; nothing held in memory), then renamed in.
+  Refusals exit 2: no file/key, both keys, not a PDF (HTML named,
+  `looks_like_html`; an encrypted PDF, PDFium's `FPDF_ERR_PASSWORD`:
+  "the PDF is encrypted; save an unencrypted copy"), bad DOI, other
+  readable content cached without `--replace` (says "a downloaded" or
+  "an imported" PDF and its sha256). An unreadable cached copy is
+  replaced without `--replace`. A PDF with no text on any page is
+  imported with a warning (`pdf_has_text`).
 - **Key**: by URL, the download's key. By DOI, the key of
-  `https://doi.org/<Paper._normalize_doi(doi)>` (`get_cached_doi_pdf_path`;
-  no index file); a `doi.org` `--url` counts as that DOI.
-  `download_doi_pdf` uses that file before resolving, and `get_pdf(paper)`
-  returns a cached `pdf_url` download or the DOI import before any
-  request, so `pdf quote <doi or doi.org URL>` and the full-text
+  `https://doi.org/<normalized_pdf_doi(doi)>` (`Paper._normalize_doi`
+  plus trailing `.,;:'"` stripped; `get_cached_doi_pdf_path`, no index
+  file); a `doi.org` `--url` counts as that DOI; the output says "Stored
+  under DOI …". `download_doi_pdf` uses that file before resolving;
+  `get_pdf(paper)` checks the DOI import first, then a cached `pdf_url`
+  download, before any request (a non-string or blank `doi` counts as
+  none), so `pdf quote <doi or doi.org URL>` and the full-text
   classification use it offline.
 - **Record**: `<hash>.import.json` beside the copy (`import_record_path`):
   `sha256`, `size`, `imported_at` (UTC), `file_name` (base name only),
-  `from`, `url`, `doi` as given. Written before the PDF, both with the
-  atomic helpers, compare-and-write under `file_lock(cache_path)`. The
-  user's file is only read.
-- **Overwrite**: other content under the key → refused naming the cached
-  sha256 unless `--replace`; same content → no-op ("unchanged"), or adds
-  the record to a same-content download ("recorded").
-- **Clear/info**: the record marks an import. `clear_pdf_cache` keeps
-  imports (and takes each PDF's lock while deciding) unless
-  `include_imported` (`pdf clear --include-imported`, which also deletes
-  the records); `pdf clear` says how many it kept. `get_pdf_cache_info`
-  adds `imported`/`imported_bytes`; `pdf info` shows them and
+  `from`, `url`, `doi` as given, `stored_doi`. Written (atomically)
+  before the PDF is renamed in. A PDF counts as imported only when its
+  record's `sha256` is the file's (`import_record_of`); other records
+  are orphans (`orphaned_import_records`): `pdf info` counts them,
+  `clear` and an import of that key delete them.
+- **Lock**: import and clear share one directory lock,
+  `pdfs/.import.lock` (`pdf_cache_lock`); no per-PDF lock files.
+  Downloads take none.
+- **Overwrite**: same content → no-op ("unchanged"), or adds the record
+  to a same-content download ("recorded").
+- **Clear/info**: `clear_pdf_cache` keeps imports unless
+  `include_imported` (`pdf clear --include-imported`); `pdf clear` says
+  how many it kept. `get_pdf_cache_info` adds `imported`,
+  `imported_bytes`, `orphaned_records`; `pdf info` shows them and
   `--list-imported` lists `list_imported_pdfs()`. `scholar cache clear`
   deletes only top-level `*.pkl` files and never touches `pdfs/`
   (tested).
+- Test PDFs are written by hand (`make_pdf` in pdf.nw, `make_cli_pdf` in
+  cli.nw: optional text line, optional `/Encrypt`); in a code chunk
+  every `<<` of PDF syntax must be written `@<<`.
 
 ### Open-Access Lookup (Unpaywall)
 

@@ -6184,6 +6184,7 @@ def pdf(
     """
     from scholar.pdf import (
         PDFDownloadError,
+        PDFUnreadableError,
         clear_pdf_cache,
         find_quote_candidates,
         get_pdf,
@@ -6310,6 +6311,13 @@ json_output: Annotated[
 We validate the same way the [[open]] action does---a missing URL or claim is a
 usage error---and additionally reject disabling both ranking stages, since then
 there is nothing to rank.
+The action asks [[find_quote_candidates]] to raise rather than return
+nothing when no PDF could be had ([[raise_errors]]): for the one source
+the user named, an empty result would read as \enquote{no passage
+supports the claim} when no PDF was read at all.
+A failed download is reported with every source it tried; a PDF that
+PDFium cannot read is one line naming the file and PDFium's reason,
+never PDFium's traceback.
 A model named with [[--model]] that the [[llm]] package does not know ends
 the action with one line too: the re-ranker passes it on as a [[ValueError]]
 rather than falling back (\cref{sec:resolve-llm-model}).  An unknown default
@@ -6341,7 +6349,11 @@ try:
         progress_callback=lambda msg: err_console.print(
             f"[dim]{escape(msg)}[/dim]"
         ),
+        raise_errors=True,
     )
+except PDFUnreadableError as e:
+    console.print(f"[red]Error: {escape(str(e))}[/red]", soft_wrap=True)
+    raise typer.Exit(1)
 except PDFDownloadError as e:
     console.print(f"[red]Download failed: {escape(str(e))}[/red]")
     raise typer.Exit(1)
@@ -6644,12 +6656,32 @@ else:
         f"(sha256 {digest}, {record['size']} bytes)."
     )
 console.print(escape(message), soft_wrap=True)
+if record.get("stored_doi"):
+    console.print(
+        f"Stored under DOI {escape(record['stored_doi'])}.", soft_wrap=True
+    )
 console.print(f"Cached at: {escape(str(outcome.path))}", soft_wrap=True)
+for warning in outcome.warnings:
+    console.print(
+        f"[yellow]Warning: {escape(warning)}[/yellow]", soft_wrap=True
+    )
 @
+
+The DOI the file is stored under is printed apart from the DOI given,
+since the two differ whenever the key's normalisation changed something
+(case, a resolver prefix, a trailing full stop,
+\cref{sec:pdf-import-key}), and that is the DOI a paper must have to
+find the file.
+A warning (a PDF without text) does not change the exit status: the
+file was imported.
+
 
 The counts come from [[get_pdf_cache_info]]; the row says what a plain
 [[clear]] would leave, as the cache command's row for the LLM caches
 does.
+Orphaned import records (\cref{sec:pdf-cache-imports}) get a row of
+their own when there are any: they are the trace of an import that
+failed half-way, which the user may want to repeat.
 The listing folds long cells instead of cutting them, since a cut
 cache file name or hash cannot be matched against anything.
 
@@ -6660,6 +6692,12 @@ if info["imported"]:
         "Imported by hand",
         f"{info['imported']} ({imported_mb:.1f} MB; kept by clear "
         "without --include-imported)",
+    )
+if info["orphaned_records"]:
+    table.add_row(
+        "Orphaned import records",
+        f"{info['orphaned_records']} (mark no file; the next clear "
+        "deletes them)",
     )
 <<list the imported PDFs>>=
 from scholar.pdf import list_imported_pdfs
@@ -6695,24 +6733,37 @@ if kept:
 The tests go through the command with real PDFs ([[make_pdf]] of the
 PDF module's tests, written again here since the two test files do not
 import each other) in a cache directory of their own.
-The DOI test then quotes from the DOI: the progress line shows that the
-imported file was used, and the conftest's network block shows that no
-resolver was asked.
-A blank page has no text, so the quote finds no passage; what matters
-here is which file was read.
+The DOI test imports a PDF with a line of text and then quotes from the
+DOI: the progress line shows that the imported file was used, the
+conftest's network block shows that no resolver was asked, and the
+passage comes from the file.
 
 <<test functions>>=
-def make_cli_pdf(path, width=200):
-  """Write a real one-page PDF, made by PDFium, to `path`."""
-  import io
-  import pypdfium2 as pdfium
-
-  document = pdfium.PdfDocument.new()
-  document.new_page(width, 200)
-  buffer = io.BytesIO()
-  document.save(buffer)
-  document.close()
-  path.write_bytes(buffer.getvalue())
+def make_cli_pdf(path, width=200, text=None):
+  """Write a real one-page PDF, optionally with a line of `text`."""
+  content = b""
+  if text:
+    content = b"BT /F1 12 Tf 20 100 Td (%s) Tj ET" % text.encode()
+  objects = [
+    b"@<< /Type /Catalog /Pages 2 0 R >>",
+    b"@<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+    b"@<< /Type /Page /Parent 2 0 R /MediaBox [0 0 %d 200] /Contents 4 0 R"
+    b" /Resources @<< /Font @<< /F1 5 0 R >> >> >>" % width,
+    b"@<< /Length %d >>\nstream\n%s\nendstream" % (len(content), content),
+    b"@<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+  ]
+  data = b"%PDF-1.4\n"
+  offsets = []
+  for number, body in enumerate(objects, 1):
+    offsets.append(len(data))
+    data += b"%d 0 obj\n%s\nendobj\n" % (number, body)
+  xref = len(data)
+  data += b"xref\n0 %d\n0000000000 65535 f \n" % (len(objects) + 1)
+  data += b"".join(b"%010d 00000 n \n" % offset for offset in offsets)
+  data += b"trailer\n@<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (
+    len(objects) + 1, xref
+  )
+  path.write_bytes(data)
   return path
 
 
@@ -6727,19 +6778,61 @@ def test_import_by_doi_then_quote_without_a_request(
   self, tmp_path, monkeypatch
 ):
   monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path / "cache"))
-  pdf = make_cli_pdf(tmp_path / "paper.pdf")
+  pdf = make_cli_pdf(
+    tmp_path / "paper.pdf",
+    text="Students traced recursive calls as loops.",
+  )
   result = runner.invoke(app, [
-    "pdf", "import", str(pdf), "--doi", "10.9999/ex.1",
+    "pdf", "import", str(pdf), "--doi", "10.9999/Ex.1.",
     "--from", "library website",
   ], env={"COLUMNS": "500"})
   assert result.exit_code == 0, result.output
-  assert "Imported paper.pdf for DOI 10.9999/ex.1" in result.output
+  assert "Imported paper.pdf for DOI 10.9999/Ex.1." in result.output
+  assert "Stored under DOI 10.9999/ex.1." in result.output
+  assert "Warning" not in result.output
   result = runner.invoke(app, [
-    "pdf", "quote", "https://doi.org/10.9999/ex.1", "--claim", "x",
-    "--no-llm",
+    "pdf", "quote", "https://doi.org/10.9999/ex.1", "--claim",
+    "recursive calls as loops", "--no-llm",
   ], env={"COLUMNS": "500"})
   assert result.exit_code == 0, result.output
   assert "Using imported PDF" in result.output
+  assert 'p.1  "Students traced recursive calls as loops."' in result.output
+
+def test_a_pdf_without_text_warns(self, tmp_path, monkeypatch):
+  monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path / "cache"))
+  result = runner.invoke(app, [
+    "pdf", "import", str(make_cli_pdf(tmp_path / "scan.pdf")),
+    "--doi", "10.9999/ex.1",
+  ], env={"COLUMNS": "500"})
+  assert result.exit_code == 0, result.output
+  assert "Warning: no page of this PDF has text" in result.output
+@
+
+A cached file that PDFium cannot read, and a download that brings the
+same truncated body again, end [[pdf quote]] with one line naming the
+file, not with PDFium's traceback.
+
+<<pdf import command test methods>>=
+def test_quote_on_an_unreadable_pdf_is_one_line(self, tmp_path, monkeypatch):
+  from unittest.mock import MagicMock, patch
+  from scholar.pdf import get_cached_pdf_path
+
+  monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path / "cache"))
+  url = "https://pub.example/a.pdf"
+  truncated = make_cli_pdf(tmp_path / "p.pdf").read_bytes()[:200]
+  get_cached_pdf_path(url).write_bytes(truncated)
+  response = MagicMock()
+  response.headers = {"content-type": "application/pdf"}
+  response.iter_content.return_value = [truncated]
+  with patch("scholar.pdf.requests.get", return_value=response):
+    result = runner.invoke(
+      app, ["pdf", "quote", url, "--claim", "x", "--no-llm"],
+      env={"COLUMNS": "500"},
+    )
+  assert result.exit_code == 1
+  assert isinstance(result.exception, SystemExit)
+  assert "Traceback" not in result.output
+  assert "Error: cannot read the PDF" in result.output
 
 def test_usage_and_refusals_exit_2(self, tmp_path, monkeypatch):
   monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path / "cache"))
@@ -6794,10 +6887,13 @@ def test_info_and_clear(self, tmp_path, monkeypatch):
     "pdf", "import", str(pdf), "--doi", "10.9999/ex.1", "--from", "ILL",
   ])
   get_cached_pdf_path("https://pub.example/b.pdf").write_bytes(b"x")
+  orphan = get_cached_pdf_path("https://pub.example/c.pdf")
+  orphan.with_name(orphan.stem + ".import.json").write_text("{}")
 
   result = runner.invoke(app, ["pdf", "info", "--list-imported"], env=env)
   assert result.exit_code == 0
   assert "Imported by hand" in result.output
+  assert "Orphaned import records" in result.output
   assert "paper.pdf" in result.output and "ILL" in result.output
   assert "10.9999/ex.1" in result.output
 
