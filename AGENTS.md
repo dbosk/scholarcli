@@ -2529,8 +2529,18 @@ screeners)} over records screened twice, `screen_sample` (the one
   rest does])."; a census: "every one was screened (...), a census
   since ..., so the count is exact"). Unlike `llm sample --report`,
   rate and interval are WITHHELD (`withheld_reason`, number agreement
-  via `llm_review.counted`) while any drawn paper is unscreened, not
-  found or undetermined, or when every screened one was excluded;
+  via `llm_review.counted`; the sentence then ends ". No rate is
+  given: <reason>.") while any drawn paper is unscreened, not found,
+  undetermined, or its decided copies give different verdicts
+  (`copies_apart`, ids named; whichever copy is first), or when every
+  screened one was excluded. A discard with a bearing category
+  (`audit_excluded`) counts as not bearing and is stated
+  (`discarded_bearing`: "k drawn record(s) was/were discarded although
+  categorised as bearing"). JSON adds `drawn`, `copies_apart`,
+  `discarded_bearing`. `tier_rule_words` fills values in through
+  `as_written` (a function replacement: `re.sub` would read `\d`, `\1`
+  as escapes) and `one_line` (line breaks/tabs -> space), also in
+  `tier_rule_flags`; one provider reads "of scopus", not "of one of";
   a complete census gets its rate, no interval. LaTeX report: after the
   search parameters, a sub-heading "Records outside the screening tier"
   and one sentence per draw (`build_tier_sample_latex`, nothing
