@@ -367,6 +367,47 @@ a newer or wider bulk re-run replaces a relevance record, as intended) → `sess
 (`scholar syntax` says so). Not verified live: what `-` does before a
 parenthesis or phrase.
 
+### Order of answers (#303)
+
+A limited search keeps the head of a provider's list, so each answer
+records its order (providers.nw `sec:answer-orders`, scholar.nw
+`sec:search-result-order`): `ANSWER_ORDERS` = `relevance`, `date`,
+`citations`, `unknown` (`None` = not recorded). Each provider class
+declares `ANSWER_ORDER` (the order scholar *asks for*, or the
+documented default when it asks none); `start_answer` copies it into
+`last_order`, reset with `last_error`; S2 sets it per search
+(`s2_order`: relevance search `relevance`, bulk with a limit
+`citations`, bulk without `unknown`) and a refused S2 search records
+None. Path as `via`: `provider_order` (Mock-safe, vocabulary only) in
+`search_provider` → `SearchResult.order` (`deduplicate` keeps it;
+`merge` gives `unknown` when either input has one, else None) →
+`result_order(part)` in `create_review_session` → `SearchRecord.order`
+(saved only when set, old files → None; not in the key nor in
+`record_rank`, so a re-run in the new order replaces the old record of
+the key as any newer run) → `sessions show` " — order: X" after the
+outcome for every recorded order, relevance included (shown only for
+non-relevance, an old record would look ranked), JSON `order` when
+set.
+
+| Provider | Order | Source (read 2026-11-23) |
+|---|---|---|
+| scopus | relevance: sends `sort=relevancy` on every page | Scopus Search API WADL (dev.elsevier.com/documentation/ScopusSearchAPI.wadl): `sort` options incl. `relevancy`; no default stated |
+| wos (both tiers) | relevance: sends `sortField=RS+D` | Starter/Expanded OpenAPI (developer.clarivate.com/apis/wos-starter/swagger, …/apis/wos/swagger): "RS+D" = "Relevance (Descending)"; no default stated |
+| openalex, source-pinned, openalex-semantic | relevance (no `sort` sent) | help.openalex.org/api/searching/: "sorted by it (descending) by default" |
+| s2 | per endpoint (above) | swagger.json (#161) |
+| arxiv | relevance (`sortBy=relevance&sortOrder=descending`) | info.arxiv.org/help/api/user-manual.html |
+| hal | relevance (`HAL_SORT` "score desc,docid asc") | api.archives-ouvertes.fr/docs/search: "Par défaut, les résultats sont triés par pertinence" |
+| ieee | unknown (no sort sent) | developer.ieee.org Sorting_and_Paging_Parameters: `sort_field` only article_number/article_title/publication_title, no default stated |
+| dblp | unknown (no sort sent) | dblp's search API FAQ served an anti-bot page: not read |
+
+Before #303 Scopus and WoS sent no sort and answered newest first
+(issue's measurement on twelve cached queries: Scopus all lists, WoS
+89 %). Both now key their cache by the order (`SCOPUS_ORDER_KEY`,
+`WOS_ORDER_KEY` = `"sortField=RS+D"`, plain strings, no
+`CACHE_VERSION` bump): old entries are unused, not deleted. Probes,
+DOI lookups and WoS's extended methods send no sort. No provider
+records `date` today.
+
 ### Title-and-Abstract Search (`--in`)
 
 `scholar search/rq --in title-abstract` sets `SearchFilters.search_in`
@@ -659,9 +700,11 @@ line, one wasted request). `SCOPUS_VIEW=auto|complete|standard`
 overrides: `standard` never asks, `complete` never falls back.
 `providers check` reports which view it got.
 
-The never-expiring cache is keyed by view: default-view results keep the
-historical 3-tuple key, COMPLETE results add `"COMPLETE"` as a fourth
-part. COMPLETE results are served to everyone (unless
+The never-expiring cache is keyed by view and order (#303):
+default-view results are `(query, limit, filters, "sort=relevancy")`
+(`SCOPUS_ORDER_KEY`), COMPLETE results add `"COMPLETE"` after it; the
+old 3-tuple / `"COMPLETE"` 4-tuple entries (newest first) are never
+served and stay unused until `cache clear --provider scopus`. COMPLETE results are served to everyone (unless
 `SCOPUS_VIEW=standard`); default-view results only when COMPLETE is not
 available, which a new process learns from one `count=1` probe
 (`_complete_confirmed()`); a failed probe still serves the cache.

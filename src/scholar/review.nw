@@ -112,6 +112,7 @@ from cachetools import cachedmethod
 from scholar.scholar import Paper, SearchFilters, merge_version_of
 from scholar.scholar import filters_key, filter_flags
 from scholar.scholar import hits_label, result_outcome, result_via
+from scholar.scholar import result_order
 from scholar.scholar import parts_returning, result_total, result_dates
 from scholar.scholar import RANKED_PROVIDERS, is_ranked_provider
 from scholar.notes import (
@@ -5759,6 +5760,8 @@ class SearchRecord:
     from the cache (``None`` when unknown).
     ``via`` names the endpoint that answered when the provider has
     several (``None``: the provider's default, or not recorded).
+    ``order`` is how the answer was ordered (``relevance``, ``date``,
+    ``citations`` or ``unknown``; ``None``: not recorded).
     ``retired`` is ``{"at", "by", "note"}`` when the search was retired
     from the review's searches (``None``: it is current).
     """
@@ -5776,6 +5779,7 @@ class SearchRecord:
     from_cache: bool | None = None
     via: str | None = None
     retired: dict | None = None
+    order: str | None = None
 
     @property
     def key(self) -> tuple[str, str, str]:
@@ -5812,6 +5816,24 @@ against a limit.
 It is stored with the record and read back with [[rec.get]], so a
 session saved before it existed loads with [[None]], which reads as
 \enquote{not recorded}, never as a claim about the endpoint.
+
+[[order]] says how the provider ordered its answer
+(\cref{sec:search-result-order} in the scholar module): [[relevance]],
+[[date]], [[citations]] or [[unknown]], and [[None]] when not recorded.
+It is a field of its own rather than a part of [[via]], because every
+provider has an order while few have a second endpoint, and because
+the place of a record in an answer
+(\url{https://github.com/dbosk/scholarcli/issues/302}) is read against
+it.  It follows the rules of [[via]]: not part of the key, since the
+order a provider is asked for follows from the provider (and, for
+Semantic Scholar, from query and limit, which the key and the limit
+hold); nor part of [[record_rank]].  So the first run of a search
+after Scopus and Web of Science began to be asked for relevance
+replaces the record of an earlier, newest-first run of the same key as
+any newer run does, by its date, and the limit, totals and dates rules
+choose between records as before.  It is saved only when set, and read
+back with [[rec.get]], so an older file loads with [[None]] and an
+older Scholar ignores the key.
 
 One kind of record cannot take part in that key.  Sessions written
 before filters were stored (\url{https://github.com/dbosk/scholar/issues/61},
@@ -6846,6 +6868,7 @@ def add_query_provider_pair(
     fetched_at: str | None = None,
     from_cache: bool | None = None,
     via: str | None = None,
+    order: str | None = None,
 ) -> None:
     """
     Record a search unless a record with its key is already present.
@@ -6865,7 +6888,7 @@ def add_query_provider_pair(
         hits=hits, error=error, retries=retries,
         total=total, total_estimated=total_estimated,
         searched_at=searched_at, fetched_at=fetched_at,
-        from_cache=from_cache, via=via,
+        from_cache=from_cache, via=via, order=order,
     ))
 
 def add_search_record(self, record: SearchRecord) -> None:
@@ -7544,6 +7567,7 @@ def create_review_session(
                 total=total, total_estimated=estimated,
                 searched_at=searched_at, fetched_at=fetched_at,
                 from_cache=from_cache, via=result_via(part),
+                order=result_order(part),
             )
 
     # Merge with previous session's searches (if any), preserving their filters
@@ -12641,6 +12665,7 @@ def read_session_file(
                     from_cache=rec.get("from_cache"),
                     via=rec.get("via"),
                     retired=rec.get("retired"),
+                    order=rec.get("order"),
                 )
                 for rec in data["search_records"]
             ]
@@ -12813,6 +12838,7 @@ data = {
             "fetched_at": r.fetched_at,
             "from_cache": r.from_cache,
             "via": r.via,
+            **({"order": r.order} if r.order else {}),
             **({"retired": r.retired} if r.retired is not None else {}),
         }
         for r in session.search_records
@@ -12922,6 +12948,66 @@ class TestSearchRecordVia:
                                        session_name="via-run")
         assert {r.query: r.via for r in second.search_records} \
             == {"c": None, "a AND b": "bulk"}
+@
+
+The order of an answer takes the same path, and an older file, or a
+record saved without it, has no [[order]] key and loads with [[None]].
+A re-run of the same key in the new order replaces the record of the
+old run, as a newer run does.
+
+<<test functions>>=
+class TestSearchRecordOrder:
+    """The order of an answer is kept in the session record."""
+
+    def test_round_trip_and_old_files(self):
+        import json
+        from scholar.review import _get_sessions_dir
+
+        session = ReviewSession(query="q", providers=["scopus"],
+                                timestamp=datetime.now(), name="order-new")
+        session.add_query_provider_pair("q", "scopus", None, 25, hits=3,
+                                        order="relevance")
+        session.add_query_provider_pair("r", "scopus", None, 25, hits=1)
+        save_session(session)
+        stored = json.loads(
+            (_get_sessions_dir() / "order-new.json").read_text()
+        )["search_records"]
+        assert [r.get("order") for r in stored] == ["relevance", None]
+        assert "order" not in stored[1]
+        assert [r.order for r in load_session("order-new").search_records] \
+            == ["relevance", None]
+
+        old = {
+            "query": "q", "name": "order-old", "providers": ["wos"],
+            "timestamp": datetime.now().isoformat(),
+            "search_records": [{"query": "q", "provider": "wos",
+                                "filters": None, "limit": 100,
+                                "hits": 3, "error": None, "retries": 0}],
+            "decisions": [],
+        }
+        (_get_sessions_dir() / "order-old.json").write_text(json.dumps(old))
+        [record] = load_session("order-old").search_records
+        assert (record.hits, record.order) == (3, None)
+
+    def test_a_rerun_in_relevance_order_replaces_the_old_record(self):
+        from scholar.scholar import SearchResult
+
+        newest_first = SearchResult(
+            query="q", provider="scopus", timestamp="t", papers=[],
+            limit=25, searched_at="2026-11-01T10:00:00+00:00",
+        )
+        first = create_review_session([newest_first], "q",
+                                      session_name="order-run")
+        save_session(first)
+        ranked = SearchResult(
+            query="q", provider="scopus", timestamp="t", papers=[],
+            limit=25, searched_at="2026-11-23T10:00:00+00:00",
+            order="relevance",
+        )
+        second = create_review_session([ranked], "q",
+                                       session_name="order-run")
+        assert [(r.order, r.searched_at) for r in second.search_records] \
+            == [("relevance", "2026-11-23T10:00:00+00:00")]
 @
 
 A link is written as an object rather than a list, so that the two
