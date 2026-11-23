@@ -24,9 +24,14 @@ SRC_TEX+=	../src/scholar/tutorials/enrich-verify-export.tex
 SRC_TEX+=	../src/scholar/tutorials/llm-synthesis.tex
 SRC_TEX+=	../src/scholar/tutorials/scholar-with-an-agent.tex
 
-.PHONY: all clean distclean
+.PHONY: all check clean distclean
 
 all: ${DOC}
+
+# `make check` builds the PDF and checks the build (check.mk); what it
+# accepts: src/scholar/cli.nw, sec:woven-document.
+CHECK_JOB=	scholar
+CHECK_SOURCES=	scholar.tex preamble.tex ${SRC_TEX}
 
 scholar.pdf: scholar.tex preamble.tex
 scholar.pdf: ${SRC_TEX}
@@ -38,15 +43,19 @@ scholar.pdf: noweb_lexer.py
 # because the generic ../src/scholar/%.tex rule also matches their path
 # (with stem tutorials/<id>) and would run make in the wrong directory.
 # GNU make prefers the rule with the shorter stem, so this one wins.
-../src/scholar/tutorials/%.tex::
+# Each rule names the .nw behind the .tex: without it, make found an
+# existing woven .tex up to date and built the PDF from a stale chapter
+# (#279).
+../src/scholar/tutorials/%.tex: ../src/scholar/tutorials/%.nw
 	${MAKE} -C ../src/scholar/tutorials $(notdir $@)
 
 # Build .tex files in src/scholar if they don't exist or are outdated
-../src/scholar/%.tex::
+../src/scholar/%.tex: ../src/scholar/%.nw
 	${MAKE} -C ../src/scholar $(notdir $@)
 
 INCLUDE_MAKEFILES=../makefiles
 include ${INCLUDE_MAKEFILES}/noweb.mk
+include check.mk
 
 clean:
 	${RM} ${DOC}
