@@ -4853,9 +4853,24 @@ for stratum in strata:
         stratum.census = True
         stratum.drawn = list(stratum.pool)
         continue
-    keys = [stratum.rng.random() for _ in stratum.pool]
-    order = sorted(range(len(stratum.pool)), key=lambda i: (keys[i], i))
-    stratum.drawn = [stratum.pool[i] for i in order[:size]]
+    stratum.drawn = smallest_keys(stratum.pool, stratum.rng, size)
+@
+
+The keys themselves are drawn by [[smallest_keys]], a function of its
+own because the sample of a screening tier's rest is drawn the same way
+(\cref{sec:tier-sample}): one draw, one test that pins it
+([[test_golden_draw]] below), for both.
+
+<<llm review sampling>>=
+def smallest_keys(pool: list, rng: random.Random, size: int) -> list:
+    """The `size` members of `pool` with the smallest keys, in key order.
+
+    Each member, in the order given, gets the next `rng.random()` as its
+    key; ties fall back on that order.
+    """
+    keys = [rng.random() for _ in pool]
+    order = sorted(range(len(pool)), key=lambda i: (keys[i], i))
+    return [pool[i] for i in order[:size]]
 @
 
 Each stratum is recorded as an [[LLMSample]] with its own population,
@@ -5451,6 +5466,7 @@ class TestCensusDraw:
 @
 
 \subsection{The disagreement rate and its interval}
+\label{sec:llm-sample-interval}
 
 Once some of the sampled decisions have been reviewed, the sample
 yields a proportion: of the $n$ reviewed, the reviewer changed the
@@ -7173,6 +7189,668 @@ class TestPooledSessionsByFile:
         a.llm_samples = [replace(
             sample, session_files=["a.json", "../outside.json"])]
         assert [s.name for s in pooled_sample_sessions([a])] == ["a"]
+@
+
+
+\section{Sampling the rest of a screening tier}
+\label{sec:tier-sample}
+
+A review that screens only a first tier of its records
+(\cref{sec:screening-tier} in the review module) leaves the rest
+unscreened, and nothing in the tier says what the rest holds; the
+issue that asked for this
+(\url{https://github.com/dbosk/scholarcli/issues/315}) reports a
+literature look by the author that found a fixed place cut to be no
+stopping rule.  What a review
+can state is an estimate from a random sample of the rest, screened
+like the tier: the share of the records outside the tier that bear on
+the question, as judged by whoever screened the sample.  It does not
+say which records they are, and a sample in which none bears does not
+show that none does; what it gives is an interval for the share.
+
+This section draws such a sample and reports it.  The draw is the one
+[[llm sample]] makes (\cref{sec:llm-sample}), over another population;
+the record is the review module's [[TierSample]]
+(\cref{sec:tier-sample-record} there); and the rate and its interval
+are those of the samples of machine decisions
+(\cref{sec:llm-sample-interval}), so the same source backs both.
+
+\subsection{The draw}
+
+The population is the pending papers the tier rule does not select,
+one per paper id, as [[pending_papers]] gives them and the screen sheet
+lists them: [[outside_tier]] keeps, of the papers a tier was selected
+from, those it left out.  No decided paper is in it, so the sample
+estimates what was not screened, and no tier paper, so it is not
+counted twice.
+
+<<llm review sampling>>=
+def outside_tier(decisions: list, tier) -> list:
+    """The decisions of `decisions` that the `TierSelection` left out."""
+    selected = {id(decision) for decision in tier.decisions}
+    return [d for d in decisions if id(d) not in selected]
+@
+
+The members are the paper ids, sorted, and the draw is the one
+[[draw_llm_sample]] makes ([[smallest_keys]]): each id in that order
+gets the next value of [[random.Random(seed).random()]] as its key and
+the sample is the [[size]] ids with the smallest keys, a simple random
+sample without replacement that the seed reproduces on any Python
+version, for the reasons given there.  The ids are kept in the order
+drawn, which is a random order, and the sheet lists them so.  When the
+rest holds no more papers than asked for, all of it is taken, still in
+key order, and the record calls it a census.  An empty rest draws
+nothing and records nothing.
+
+The digest of the rest is the first [[PROMPT_VERSION_DIGITS]]
+hexadecimal digits of the SHA-256 of the sorted ids, one per line,
+the form of the samples' population digest: a later draw, or a reader
+repeating this one, can tell whether the rest is the one drawn from.
+
+<<llm review sampling>>=
+def draw_tier_sample(
+    session: ReviewSession,
+    rest: list,
+    rule,
+    *,
+    size: int,
+    seed: int,
+    now: datetime | None = None,
+) -> "TierSample":
+    """Draw a seeded random sample of `rest`, the pending papers outside
+    the tier of `rule` (a `TierRule`), and record it in
+    `session.tier_samples`; the caller saves the session.
+
+    Raises:
+        ValueError: `size` is below 1, `seed` is missing, or `rest` is
+            empty.
+    """
+    from scholar.notes import get_paper_id
+    from scholar.review import TierSample
+
+    if size is None or size < 1:
+        raise ValueError("The sample size must be at least 1")
+    if seed is None:
+        raise ValueError("A random sample needs a seed")
+    ids = sorted({get_paper_id(d.paper) for d in rest})
+    if not ids:
+        raise ValueError("The tier leaves no pending paper to sample")
+    drawn_at = (now or datetime.now(timezone.utc)).isoformat(
+        timespec="seconds")
+    sample = TierSample(
+        sample_id=(f"{drawn_at}/rest/seed={seed}/"
+                   f"{uuid.uuid4().hex[:SAMPLE_ID_DIGITS]}"),
+        drawn_at=drawn_at, seed=seed, size=size, rule=rule.data(),
+        rest=len(ids),
+        rest_digest=hashlib.sha256(
+            "\n".join(ids).encode("utf-8")
+        ).hexdigest()[:PROMPT_VERSION_DIGITS],
+        papers=smallest_keys(ids, random.Random(seed), size),
+        census=len(ids) <= size,
+    )
+    session.tier_samples.append(sample)
+    return sample
+@
+
+The draw is pinned as [[llm sample]]'s is: the expected ids were
+computed separately, with Python's [[random]] module alone, from the
+rule above (the twelve ids sorted, a key from
+[[random.Random(315).random()]] for each, the four smallest).  The
+papers are given in another order, and with a copy under one id, to
+show that neither changes the draw.  A second draw with the same seed
+is another record with the same papers; a rest of three asked for four
+is a census of three.
+
+<<test functions>>=
+class TestDrawTierSample:
+  """A seeded sample of the pending papers outside a tier (#315)."""
+
+  <<draw tier sample test methods>>
+
+<<draw tier sample test methods>>=
+def _rest(self):
+  from scholar.review import ReviewDecision
+
+  rest = [
+    ReviewDecision(
+      paper=Paper(title=f"Rest {i}", authors=["Ada Lovelace"],
+                  doi=f"10.5555/rest-{i:02d}"),
+      provider="openalex",
+    )
+    for i in (5, 11, 0, 7, 2, 9, 4, 1, 10, 3, 8, 6)
+  ]
+  return rest + [rest[0]]
+
+def _session(self):
+  return ReviewSession(query="q", providers=["openalex"],
+                       timestamp=datetime(2026, 11, 23), name="rest")
+
+def test_golden_draw(self):
+  from datetime import timezone
+  from scholar.review import TierRule
+
+  session = self._session()
+  sample = draw_tier_sample(
+    session, self._rest(), TierRule(top=10), size=4, seed=315,
+    now=datetime(2026, 11, 23, 9, 0, tzinfo=timezone.utc),
+  )
+  assert sample.papers == [
+    "doi:10.5555/rest-02", "doi:10.5555/rest-09",
+    "doi:10.5555/rest-04", "doi:10.5555/rest-10",
+  ]
+  assert (sample.rest, sample.rest_digest) == (12, "33291b532a289223")
+  assert sample.census is False and sample.rule["top"] == 10
+  assert sample.sample_id.startswith(
+    "2026-11-23T09:00:00+00:00/rest/seed=315/")
+  assert session.tier_samples == [sample]
+
+def test_a_second_draw_is_a_new_record(self):
+  from scholar.review import TierRule
+
+  session = self._session()
+  first = draw_tier_sample(session, self._rest(), TierRule(top=10),
+                           size=4, seed=315)
+  again = draw_tier_sample(session, self._rest(), TierRule(top=10),
+                           size=4, seed=315)
+  assert again.papers == first.papers
+  assert again.sample_id != first.sample_id
+  assert len(session.tier_samples) == 2
+
+def test_a_small_rest_is_a_census(self):
+  from scholar.review import TierRule
+
+  session = self._session()
+  sample = draw_tier_sample(session, self._rest()[:3], TierRule(top=10),
+                            size=4, seed=315)
+  assert sample.census is True
+  assert sorted(sample.papers) == [
+    "doi:10.5555/rest-00", "doi:10.5555/rest-05", "doi:10.5555/rest-11",
+  ]
+  exactly = draw_tier_sample(session, self._rest()[:3], TierRule(top=10),
+                             size=3, seed=315)
+  short = draw_tier_sample(session, self._rest()[:3], TierRule(top=10),
+                           size=2, seed=315)
+  assert (exactly.census, short.census) == (True, False)
+  del session.tier_samples[1:]
+  with pytest.raises(ValueError, match="no pending paper"):
+    draw_tier_sample(session, [], TierRule(top=10), size=4, seed=1)
+  assert len(session.tier_samples) == 1
+@
+
+A draw and a decision made by two processes that loaded the session
+at the same time must both survive, whichever saves first: the draw is
+added to the file's list by its id, and the decision is merged as any
+decision is (\cref{sec:session-integrity} in the review module).  Two
+real processes check it, one waiting after its load until the other
+has saved.
+
+<<test functions>>=
+class TestTierSampleRaces:
+  """A draw here and a decision there, saved in either order (#315)."""
+
+  <<tier sample race test methods>>
+
+<<tier sample race test methods>>=
+DRAW = """
+  from scholar.llm_review import draw_tier_sample
+  from scholar.review import (
+    TierRule, load_session, pending_papers, save_session,
+  )
+  session = load_session("rest-race")
+  WAIT
+  draw_tier_sample(session, pending_papers(session), TierRule(top=1),
+                   size=2, seed=315)
+  save_session(session)
+"""
+DECIDE = """
+  from scholar.review import DecisionStatus, load_session, save_session
+  session = load_session("rest-race")
+  WAIT
+  decision = session.decisions[0]
+  decision.status = DecisionStatus.DISCARDED
+  decision.tags = ["off-topic-false-hit"]
+  save_session(session)
+"""
+WAIT = 'import sys; print("loaded", flush=True); sys.stdin.readline()'
+
+def _code(self, template, wait):
+  import textwrap
+
+  return textwrap.dedent(template).replace(
+    "WAIT", self.WAIT if wait else "")
+
+def _race(self, stale, other):
+  """`stale` loads and waits; `other` runs whole; then `stale` saves."""
+  import subprocess
+  import sys
+  from scholar.review import load_session, save_session
+  from scholar.scholar import isolated_registry
+
+  session = TestDrawTierSample()._session()
+  session.name = "rest-race"
+  session.decisions = TestDrawTierSample()._rest()[:4]
+  save_session(session)
+  first = subprocess.Popen(
+    [sys.executable, "-c", self._code(stale, wait=True)],
+    stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+  )
+  try:
+    assert first.stdout.readline().strip() == "loaded"
+    subprocess.run([sys.executable, "-c", self._code(other, wait=False)],
+                   check=True, timeout=120)
+    first.communicate("go\n", timeout=120)
+  finally:
+    if first.poll() is None:
+      first.kill()
+  assert first.returncode == 0
+  with isolated_registry():
+    return load_session("rest-race")
+
+def _assert_both_kept(self, final):
+  [draw] = final.tier_samples
+  assert len(draw.papers) == 2 and draw.rest == 4
+  assert final.decisions[0].status == DecisionStatus.DISCARDED
+  assert sum(d.is_decided for d in final.decisions) == 1
+
+def test_a_draw_saved_after_a_decision(self):
+  self._assert_both_kept(self._race(self.DRAW, self.DECIDE))
+
+def test_a_draw_saved_before_a_decision(self):
+  self._assert_both_kept(self._race(self.DECIDE, self.DRAW))
+@
+
+\subsection{The rate and its interval}
+
+A draw is reported over the session it is stored in
+([[tier_sample_counts]] in the review module): how many drawn papers
+were screened and how many of them bear on the question.  The rate is
+the bearing share of the screened ones, and its interval the 95\,\%
+modified Wilson interval of [[llm sample --report]]
+([[modified_wilson_interval]], \cref{sec:llm-sample-interval}, after
+Brown, Cai and DasGupta), chosen there for its coverage near a rate of
+zero, which is the rate of a sample of the rest in which none bears.
+No finite-population correction is made, as none is made for the
+samples of machine decisions.
+
+Unlike the report of a review sample, the rate and the interval are
+withheld while part of the draw is unscreened, and the reason is given
+instead.  The papers screened first are not a random part of the
+sample unless the order of screening was, and the rate of a sample half
+screened would be quoted as the rate of the rest; the stratified report
+withholds its estimate for the same reason
+(\cref{sec:llm-sample-stratified-report}).  They are withheld as well
+while a drawn paper is not found in the session, since a lost paper
+need not be a random loss, and while a keep has no category in a
+session that uses them, whose bearing is undetermined
+(\cref{sec:tier-sample-record} in the review module).  The papers
+excluded without a judgement of the work are left out of the rate, so
+it is the share among the [[judged]] ones; when every screened paper
+was excluded there is no rate.  A census needs no interval once every
+paper of it is screened: its count is that of the whole rest, when it
+was drawn.  Who screened is no reason to withhold: the sentence names
+the deciders instead.
+
+The reasons are counts, and each agrees with its number
+([[counted]]): \enquote{1 drawn record is}, \enquote{2 drawn records
+are}.
+
+<<llm review sampling>>=
+def counted(count: int, one: str, many: str) -> str:
+    """`count` followed by `one` or `many`, as the number takes it."""
+    return f"{count} {one if count == 1 else many}"
+
+
+@dataclass
+class TierSampleReport:
+    """A `TierSample` with what it shows so far and, once it is fully
+    screened, the bearing rate over the judged papers and its 95%
+    modified Wilson interval (`None` for a census, whose count is that
+    of the whole rest)."""
+    sample: "TierSample"
+    counts: "TierSampleCounts"
+    interval: tuple[float, float] | None = None
+
+    @property
+    def rate(self) -> float | None:
+        """The share of the judged drawn papers that bear, once given."""
+        if self.withheld_reason() is not None:
+            return None
+        return self.counts.bearing / self.counts.judged
+
+    def withheld_reason(self) -> str | None:
+        """Why no rate is given, as a clause, or None once it is."""
+        counts = self.counts
+        if counts.not_found:
+            return (counted(len(counts.not_found), "drawn record is",
+                            "drawn records are")
+                    + " not found in the session, and a lost record need "
+                    "not be a random loss")
+        if counts.unscreened and not counts.screened:
+            return "none of the sample has been screened yet"
+        if counts.unscreened:
+            return (f"{len(counts.unscreened)} of the "
+                    + counted(counts.drawn, "drawn record", "drawn records")
+                    + (" is" if len(counts.unscreened) == 1 else " are")
+                    + " not yet screened")
+        if counts.undetermined:
+            return (counted(len(counts.undetermined),
+                            "kept record has no category, so it is not "
+                            "known whether it bears",
+                            "kept records have no category, so it is not "
+                            "known whether they bear"))
+        if counts.copies_apart:
+            return ("the decided copies of "
+                    + counted(len(counts.copies_apart), "drawn record",
+                              "drawn records")
+                    + f" disagree ({', '.join(counts.copies_apart)})")
+        if not counts.judged:
+            return ("every screened record was excluded without a "
+                    "judgement of the work")
+        return None
+
+
+def tier_sample_report(
+    session: ReviewSession, sample: "TierSample"
+) -> TierSampleReport:
+    """Report `sample` over `session`."""
+    from scholar.review import tier_sample_counts
+
+    report = TierSampleReport(sample, tier_sample_counts(session, sample))
+    if report.withheld_reason() is None and not sample.census:
+        report.interval = modified_wilson_interval(
+            report.counts.bearing, report.counts.judged)
+    return report
+@
+
+One sentence states a draw, in the words a method section can quote:
+\enquote{Of the [[M]] records pending on [[DATE]] outside the first
+tier ([[RULE]]), a random sample of [[N]] (seed [[S]]) was screened
+(by [[DECIDERS]]); [[k]] bore on the question (rate, interval).}  The
+rule is in the words of its stored meaning ([[tier_rule_words]]) and
+the date is the draw's, since the rest is what was pending then.  The
+deciders are named with their counts, so that a reader can weigh an
+unreviewed verdict.  Excluded records are stated with their reasons
+before the count, with the denominator the rate is over.  When none
+bears, the sentence adds that this does not show there are none, next
+to the interval's upper end, which is how far the share may reach.  A
+census says that every record of the rest was screened, so that its
+count is exact.  Before the rate is given, the sentence says what has
+been screened so far and then, in a sentence of its own, why there is
+no rate.  A discard categorised as bearing is stated before the count
+it is part of.
+
+<<llm review sampling>>=
+def tier_sample_sentence(report: TierSampleReport) -> str:
+    """State a draw of a tier's rest and what its screening has shown."""
+    from scholar.review import (
+        tier_rule_words, tier_sample_deciders_text,
+        tier_sample_excluded_text,
+    )
+
+    sample, counts = report.sample, report.counts
+    reason = report.withheld_reason()
+    deciders = f"by {tier_sample_deciders_text(counts)}"
+    text = (
+        f"Of the {counted(sample.rest, 'record', 'records')} pending on "
+        f"{sample.drawn_at[:10]} outside the first tier "
+        f"({tier_rule_words(sample.rule)}), "
+    )
+    if sample.census and reason is None:
+        text += (f"every one was screened ({deciders}), a census since "
+                 f"the rest held no more than the {sample.size} asked for "
+                 "a random sample, so the count is exact")
+    elif sample.census:
+        text += (f"every one was taken for screening, a census since the "
+                 f"rest held no more than the {sample.size} asked for a "
+                 "random sample")
+    else:
+        text += (f"a random sample of {counts.drawn} (seed {sample.seed}) "
+                 + (f"was screened ({deciders})" if reason is None
+                    else "was drawn for screening"))
+    if reason is not None:
+        if counts.screened:
+            text += (f"; {counts.screened} "
+                     + ("has" if counts.screened == 1 else "have")
+                     + f" been screened so far ({deciders}), of which "
+                     f"{counts.bearing} bore on the question")
+        return text + f". No rate is given: {reason}."
+    if counts.excluded:
+        excluded = sum(counts.excluded.values())
+        text += ("; " + counted(excluded, "drawn record was",
+                                "drawn records were")
+                 + " excluded without a judgement of the work ("
+                 f"{tier_sample_excluded_text(counts)}), so the rate is "
+                 f"over the other {counts.judged}")
+    if counts.discarded_bearing:
+        text += ("; " + counted(counts.discarded_bearing,
+                                "drawn record was", "drawn records were")
+                 + " discarded although categorised as bearing and "
+                 + ("is" if counts.discarded_bearing == 1 else "are")
+                 + " counted as not bearing")
+    text += f"; {counts.bearing} bore on the question ({report.rate:.1%}"
+    if report.interval is not None:
+        low, high = report.interval
+        text += f"; 95% modified Wilson interval {low:.1%} to {high:.1%}"
+        if not counts.bearing:
+            text += (": a sample in which none bore does not show that "
+                     "none of the rest does")
+    return text + ")."
+@
+
+The report of the review gives each draw's sentence after the search
+parameters, under a heading of its own one level below theirs, and
+nothing for a session without a draw; the audit table's caption is not
+changed.
+
+<<llm review sampling>>=
+def build_tier_sample_latex(
+    session: ReviewSession, *, heading_command: str = r"\section"
+) -> list[str]:
+    """The report's sentences on the draws of a tier's rest, if any."""
+    from scholar.review import escape_latex, sub_heading
+
+    if not session.tier_samples:
+        return []
+    lines = [
+        f"{sub_heading(heading_command)}{{Records outside the screening "
+        "tier}", "",
+    ]
+    for sample in session.tier_samples:
+        lines.extend([
+            escape_latex(
+                tier_sample_sentence(tier_sample_report(session, sample))),
+            "",
+        ])
+    return lines
+@
+
+Let's verify the report on a draw of four papers screened in steps.
+With nothing screened, with two screened and with one paper gone, the
+rate is withheld with its reason; once all four are screened, with
+none bearing, the rate is 0 and the interval is the modified Wilson
+interval of 0 of 4, whose upper end the sentence gives; a bearing
+paper changes the count; a census fully screened has its rate and no
+interval; and the report has the sentence after the search
+parameters, and nothing without a draw.
+
+<<test functions>>=
+class TestTierSampleReport:
+  """The rate of a draw of a tier's rest and its interval (#315)."""
+
+  <<tier sample report test methods>>
+
+<<tier sample report test methods>>=
+def _drawn(self, size=4, rest=12):
+  from datetime import timezone
+  from scholar.review import TierRule
+
+  session = TestDrawTierSample()._session()
+  session.decisions = TestDrawTierSample()._rest()[:rest]
+  draw_tier_sample(session, list(session.decisions), TierRule(top=10),
+                   size=size, seed=315,
+                   now=datetime(2026, 11, 23, 9, 0, tzinfo=timezone.utc))
+  return session, session.tier_samples[0]
+
+def _screen(self, session, sample, count, tags=("off-topic-false-hit",),
+            status=DecisionStatus.DISCARDED):
+  from scholar.notes import get_paper_id
+
+  drawn = sample.papers[:count]
+  for decision in session.decisions:
+    if get_paper_id(decision.paper) in drawn:
+      decision.status, decision.tags = status, list(tags)
+
+def test_withheld_until_every_paper_is_screened(self):
+  session, sample = self._drawn()
+  report = tier_sample_report(session, sample)
+  assert report.rate is None and report.interval is None
+  assert tier_sample_sentence(report).endswith(
+    "(seed 315) was drawn for screening. No rate is given: none of the "
+    "sample has been screened yet.")
+  self._screen(session, sample, 2)
+  report = tier_sample_report(session, sample)
+  assert report.interval is None
+  assert tier_sample_sentence(report).endswith(
+    "2 have been screened so far (by human: 2), of which 0 bore on the "
+    "question. No rate is given: 2 of the 4 drawn records are not yet "
+    "screened.")
+  self._screen(session, sample, 3)
+  assert tier_sample_report(session, sample).withheld_reason() \
+    == "1 of the 4 drawn records is not yet screened"
+
+def test_a_lost_paper_withholds_the_rate(self):
+  session, sample = self._drawn()
+  self._screen(session, sample, 4)
+  session.decisions = [
+    d for d in session.decisions if d.paper.id != sample.papers[0]
+  ]
+  report = tier_sample_report(session, sample)
+  assert report.interval is None
+  assert (". No rate is given: 1 drawn record is not found in the "
+          "session, and a lost record need not be a random loss.") \
+    in tier_sample_sentence(report)
+
+RULE = ("(a place at most 10 in the answer of a current search ordered "
+        "by relevance)")
+
+def test_none_bearing_gives_the_upper_end(self):
+  session, sample = self._drawn()
+  self._screen(session, sample, 4)
+  report = tier_sample_report(session, sample)
+  low, high = modified_wilson_interval(0, 4)
+  assert report.interval == (low, high)
+  assert tier_sample_sentence(report) == (
+    "Of the 12 records pending on 2026-11-23 outside the first tier "
+    f"{self.RULE}, a random sample of 4 (seed 315) was screened (by "
+    "human: 4); 0 bore on the question (0.0%; 95% modified Wilson "
+    f"interval 0.0% to {high:.1%}: a sample in which none bore does not "
+    "show that none of the rest does)."
+  )
+
+def test_a_bearing_paper_is_counted(self):
+  session, sample = self._drawn()
+  self._screen(session, sample, 4)
+  self._screen(session, sample, 1, tags=("supports-claim",),
+               status=DecisionStatus.KEPT)
+  report = tier_sample_report(session, sample)
+  assert (report.counts.bearing, report.rate) == (1, 0.25)
+  assert report.interval == modified_wilson_interval(1, 4)
+  assert "; 1 bore on the question (25.0%; 95% modified Wilson" \
+    in tier_sample_sentence(report)
+@
+
+A keep the screener left without a category, in a session that uses
+categories, could bear or not; the rate waits for its category.  An
+unreviewed classifier's verdicts are named, not withheld.
+
+<<tier sample report test methods>>=
+def test_a_keep_without_a_category_withholds_the_rate(self):
+  session, sample = self._drawn()
+  self._screen(session, sample, 4)
+  self._screen(session, sample, 1, tags=("a theme",),
+               status=DecisionStatus.KEPT)
+  report = tier_sample_report(session, sample)
+  assert report.rate is None and report.interval is None
+  assert report.withheld_reason() == (
+    "1 kept record has no category, so it is not known whether it bears")
+
+def test_copies_decided_apart_withhold_the_rate(self):
+  from dataclasses import replace
+
+  session, sample = self._drawn()
+  self._screen(session, sample, 4)
+  first = next(d for d in session.decisions
+               if d.paper.id == sample.papers[0])
+  session.decisions.append(replace(
+    first, status=DecisionStatus.KEPT, tags=["supports-claim"]))
+  report = tier_sample_report(session, sample)
+  assert report.rate is None and report.interval is None
+  assert report.withheld_reason() == (
+    "the decided copies of 1 drawn record disagree "
+    f"({sample.papers[0]})")
+
+def test_a_discard_categorised_as_bearing_is_stated(self):
+  session, sample = self._drawn()
+  self._screen(session, sample, 4)
+  self._screen(session, sample, 1, tags=("supports-claim",))
+  sentence = tier_sample_sentence(tier_sample_report(session, sample))
+  assert ("(by human: 4); 1 drawn record was discarded although "
+          "categorised as bearing and is counted as not bearing; 0 bore "
+          "on the question") in sentence
+
+def test_unreviewed_verdicts_are_named(self):
+  from scholar.review import ReviewSource
+
+  session, sample = self._drawn()
+  self._screen(session, sample, 4)
+  for decision in session.decisions[:6]:
+    decision.source = ReviewSource.LLM_UNREVIEWED
+  report = tier_sample_report(session, sample)
+  assert report.interval is not None
+  deciders = "; ".join(f"{label}: {count}"
+                       for label, count in report.counts.deciders)
+  assert f"was screened (by {deciders});" in tier_sample_sentence(report)
+  assert "LLM, unreviewed" in deciders
+@
+
+Records discarded without a judgement of the work, for want of an
+abstract say, are left out of the rate and stated.
+
+<<tier sample report test methods>>=
+def test_records_excluded_without_a_judgement(self):
+  session, sample = self._drawn()
+  self._screen(session, sample, 4)
+  self._screen(session, sample, 2, tags=("no-abstract",))
+  report = tier_sample_report(session, sample)
+  assert report.interval == modified_wilson_interval(0, 2)
+  assert ("was screened (by human: 4); 2 drawn records were excluded "
+          "without a judgement of the work (no-abstract: 2), so the rate "
+          "is over the other 2; 0 bore on the question (0.0%;") \
+    in tier_sample_sentence(report)
+
+def test_a_census_has_no_interval(self):
+  session, sample = self._drawn(size=5, rest=3)
+  self._screen(session, sample, 3)
+  report = tier_sample_report(session, sample)
+  assert report.interval is None and report.rate == 0
+  assert tier_sample_sentence(report) == (
+    "Of the 3 records pending on 2026-11-23 outside the first tier "
+    f"{self.RULE}, every one was screened (by human: 3), a census since "
+    "the rest held no more than the 5 asked for a random sample, so the "
+    "count is exact; 0 bore on the question (0.0%)."
+  )
+
+def test_the_report_states_each_draw(self):
+  from scholar.review import build_review_provenance_latex
+
+  session, sample = self._drawn()
+  assert build_tier_sample_latex(TestDrawTierSample()._session()) == []
+  text = "\n".join(build_review_provenance_latex(session))
+  parameters = text.index("Search Parameters")
+  heading = text.index("Records outside the screening tier")
+  assert parameters < heading
+  assert "a random sample of 4 (seed 315) was drawn for screening." \
+    in text[heading:]
 @
 
 
