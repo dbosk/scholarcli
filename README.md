@@ -64,14 +64,16 @@ A search fetches every result unless `-l N` limits each provider to N;
 an unlimited search says on stderr when a provider reports 10,000
 records or more for it. `--in title-abstract` matches the query in titles and
 abstracts only, where the provider can (OpenAlex and its preprint
-servers, Scopus, Web of Science; the others ignore it with a warning).
+servers, Scopus, Web of Science); Semantic Scholar, DBLP, IEEE, arXiv
+and HAL ignore it with a warning, and the OpenAlex semantic search
+refuses it, as it refuses every filter.
 `scholar providers check` probes each configured provider once and
 exits 1 when one of them fails, so it can stand before a long search.
 
 | Provider | Name | Needs |
 |---|---|---|
 | Semantic Scholar | `s2` | `S2_API_KEY` optional |
-| OpenAlex | `openalex` | `OPENALEX_API_KEY` optional (ten times the daily budget), `SCHOLAR_EMAIL` optional |
+| OpenAlex | `openalex` | `OPENALEX_API_KEY` optional (a key raises the daily budget OpenAlex grants), `SCHOLAR_EMAIL` optional |
 | OpenAlex semantic search | `openalex-semantic` | as OpenAlex; opt-in, at most 50 ranked results |
 | DBLP | `dblp` | nothing |
 | arXiv | `arxiv` | nothing |
@@ -93,8 +95,9 @@ itself, and `scholar providers check` says which view you get.
 `scholar --proxy socks5h://127.0.0.1:1081 search ...` (or
 `SCHOLAR_PROXY`) routes the requests through a proxy, for example an
 SSH tunnel to that network. Searches are cached without expiry
-(`scholar cache info`, `scholar cache clear`), and the daily quotas of
-the providers that have one are tracked across runs
+(`scholar cache info`, `scholar cache clear`), and the quotas of the
+providers that have one (IEEE's requests a day, Scopus's weekly quota,
+OpenAlex's daily budget) are tracked across runs
 (`scholar providers limits`).
 
 ## Sessions
@@ -238,9 +241,11 @@ scholar sessions export my-review -f csv --spreadsheet-safe -o decisions
 its BibTeX file. `-f table` writes an audit table, a LaTeX fragment
 with one row per work and the reason it was kept or excluded; with
 `--cited-from` a row counts as cited when the text's `.bib` cites the
-work. `--spreadsheet-safe` puts a `'` in front of every CSV cell a
-spreadsheet program would read as a formula; the default CSV holds the
-stored text, for scripts. Lesson `enrich-verify-export`.
+work. `--spreadsheet-safe` puts a `'` in front of every CSV cell that
+begins with `=`, `+`, `-`, `@`, a tab, a carriage return or a line feed,
+the full-width forms of `= + - @`, or `'` itself (the list of OWASP's
+page on CSV injection); numbers in the numeric columns are left as
+they are, and the default CSV holds the stored text, for scripts. Lesson `enrich-verify-export`.
 
 ## Documentation
 
