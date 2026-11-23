@@ -1473,12 +1473,20 @@ checked against a manifest. `decide --batch ID` (needs `--reason`/
 run without batch lines; with a file that has them exit 2
 (`lines_with_batch`). The incoming batch check also runs per named
 batch (`<<check each batch the file names>>`, `rows_by_batch`, "In batch
-ID (n rows):" lines; skipped when one batch holds every row); `--strict`
+ID (n rows):" lines; skipped when one batch holds every row;
+`without_repeated_reasons`: a shared reason (`BatchFinding.reason`)
+is reported once, under the batch when its count equals the file's,
+else in the file's line with ", k of them in batch B"); `--strict`
 refuses on any. `--sheet FILE` (repeatable, both commands; decide needs
 a reason option): `read_screen_sheets` (comment/blank lines and an `id`
 header skipped, first column = id; no id, two batch lines, unreadable →
 exit 2 before loading); `compare_with_sheets` matches the sheet's batch
-rows (all rows for a sheet without `# batch:`) by `decisions_named_by`;
+rows (one sheet: all rows when it has no `# batch:` or the rows name
+no batch; several sheets must each have a distinct batch id, else exit
+2 before loading) by `decisions_named_by`; rows no sheet takes are
+`SheetCheck.uncompared` ("N row(s) of batch X / with no batch id were
+not compared with any sheet", refused under `--strict` as
+`sheet_uncompared`);
 stderr "NAME (batch B): returned R of N; M missing: …", "K id(s) not on
 the sheet: …", "Missing rows are fine …"; ids not on the sheet set
 `sheet_extras`, refused under `--strict` in `<<check the batch as a
@@ -1496,8 +1504,9 @@ fewer works: nothing); `check-batches` lists them ("Stored
 batches …: N, …; k with findings", `BATCH_CONFIDENCE_NOTE` on a flat
 one: a `-c` for a whole run looks the same), JSON `batches`. The
 installed pre-#292 pipx build (no screenings) drops `agent_batch` and
-the screenings on save (checked); a build with screenings keeps the
-screening dicts verbatim (`list(dec_data.get("screenings"))`, read).
+the screenings on save (checked); a build from main before #292 keeps
+a screening's `batch` (dicts kept verbatim, `list(dec_data.get(
+"screenings"))`, read) and drops only `agent_batch`.
 **Quote check (#256, review.nw `sec:reason-quotes`, cli.nw
 `sec:decide-quote-check`).** Pure functions: `quotes_in_reason`
 (text between double marks `"…"`, `“…”`, `”…”`, `„…“`/`„…”`, `«…»`,
@@ -2279,10 +2288,13 @@ screeners)} over records screened twice, `screen_sample` (the one
   format, or empty, exit 2; unknown sample exit 2 (screen's chunk).
   `--batch-size N` (#292; screen sheet only, >= 1, else exit 2; no
   default, the help gives the protocol's ~100 as a recommendation
-  only) writes `BASE-001.tsv`… of at most N rows, each starting
+  only: defaulted rows frequent at several hundred, rare at <= 100, in
+  one run still in batches of 100) writes `BASE-001.tsv`… of at most N rows, each starting
   `# batch: <digest>-NNN`, `# session: <file name>`, `# records: n`,
-  then header and rows as the single sheet (hand-written: the
-  unquoted format, quote marks as stored); plus `BASE-manifest.tsv`
+  then header and rows as the single sheet (`csv.writer`, tab,
+  `QUOTE_NONE`, `quotechar=None`, `\n`: quote marks as stored, bytes
+  as the old tab-join, checked on 3.12-3.14; the reasons/verdicts
+  reader stays own code, `csv.reader` splits at a lone `\r`); plus `BASE-manifest.tsv`
   (`batch file records first_id last_id`, written with `csv`, tab,
   `\n`, no comment line). Digest =
   first `SHEET_DIGEST_CHARS` = 8 hex of SHA-256 of [session file name,
