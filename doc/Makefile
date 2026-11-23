@@ -73,6 +73,14 @@ scholar.pdf: noweb_lexer.py
 ../src/scholar/%.tex: ../src/scholar/%.nw
 	${MAKE} -C ../src/scholar $(notdir $@)
 
+# latexmk stops after 5 pdflatex runs by default.  From a clean
+# ltxobj/ this document needs 7 before its .aux stops changing (the
+# didactic package's page records settle last), so latexmk gave up with
+# "Maximum runs" and `check` failed until pdflatex was run by hand
+# (#279).  10 leaves room.  The shared tex.mk sets PDFLATEX with ?=, so
+# this wins and LATEXFLAGS from the command line still applies.
+PDFLATEX=	latexmk -pdf -use-make -8bit -e '$$max_repeat=10'
+
 INCLUDE_MAKEFILES=../makefiles
 include ${INCLUDE_MAKEFILES}/noweb.mk
 
