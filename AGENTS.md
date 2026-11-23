@@ -2565,12 +2565,47 @@ context (#107). `review.save_session` now:
 - **locks**: the re-read, merge and replace run under
   `utils.file_lock` (`filelock`: `flock` on POSIX, `LockFileEx` on
   Windows) on a hidden sidecar `.<name>.json.lock`, so two processes
-  saving at once take turns. Held for milliseconds only, never from
-  load to save; after `LOCK_TIMEOUT` (10 s) it warns and writes
-  unlocked. Notes writers (`save_note`, `delete_note`, `get_note`,
+  saving at once take turns. Held for the merge and write only, never
+  from load to save. A session save NEVER writes unlocked (#316,
+  review.nw `sec:session-lock`): `session_lock(path)` =
+  `file_lock(..., required=True, timeout=SESSION_LOCK_TIMEOUT (300 s),
+  notice_after=SESSION_LOCK_NOTICE (= LOCK_TIMEOUT, 10 s))` logs one
+  WARNING naming the file after 10 s and raises `utils.LockNotTaken`
+  (also when no lock file can be made); `save_session` then writes
+  nothing to the session file, keeps the session beside it as
+  `<name>.json.unsaved-<UTC time>-<random>` (`keep_unsaved_session`,
+  mkstemp; `session_file_data(session)` + `UNSAVED_KEY`
+  `"scholar_unsaved"`: target name, the baseline pickled + base64, each
+  decision's `baseline_key`) and raises `SessionNotSaved(path,
+  unsaved, reason)`; `cli.main()` prints it as one unwrapped line,
+  exit 1. `scholar sessions recover FILE` (`recover_unsaved_session`)
+  restores baseline and keys, saves into the target through
+  `save_session` (same merge, under the lock) and deletes FILE; refused
+  again: FILE stays, the new copy is removed. `reconcile_session` takes
+  `session_lock` too (refused: `SessionNotSaved` with no kept file).
+  `scholar enrich` stops at a refused chunk save ("Stopped: saved K of
+  N ...", exit 1; earlier chunks saved, the chunk in the kept file);
+  the TUI's exit save raises through `run_review`/`sessions resume` to
+  `main`. `sessions list` warns about kept files
+  (`unsaved_session_files`). `keep_copy_before_run` keeps the plain
+  lock (reads the file, writes only the copy). Other `file_lock` users
+  are unchanged and still write unlocked after their timeout: notes
+  (`_holding_notes_lock`, 10 s) and caches (`CACHE_LOCK_TIMEOUT`,
+  60 s). Notes writers (`save_note`, `delete_note`, `get_note`,
   `import_notes`, `migrate_paper_id`) take the notes file's lock via
   `_holding_notes_lock`. Same machine only: no help across
   machines on a shared directory.
+- **cost** (#316, review.nw `sec:save-cost`/`sec:pairing-cost`): a
+  save is linear in the decisions. `pair_with_file` groups the
+  baseline's keys by paper id once (`base_keys_by_id`; it used to scan
+  every baseline key per paper id: 94 s at 30,000 decisions with five
+  links each), and `save_session` runs under
+  `paused_garbage_collection()` (gc off, then restored as it was;
+  halves the time at 30,000). Measured after a load, invented session,
+  5 links per decision: 5,000 / 10,000 / 30,000 decisions 1.2 / 2.9 /
+  8.1 s (before 4.1 / 15.5 / 172 s, under load). Tests keep the old
+  pairing as `reference_pair_with_file` (test_review.py; do not change
+  it) and compare on the #228 scenarios and 400 seeded random cases.
 - **writes atomically**: `utils.atomic_write_text` (temp file in the
   same directory, fsync, `os.replace`), keeping the previous file as
   `<name>.json.bak` (one generation).

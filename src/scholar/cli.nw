@@ -3504,7 +3504,7 @@ from collections import Counter
 
 from rich.progress import Progress
 from scholar.notes import get_paper_id, migrate_paper_id
-from scholar.review import keep_copy_before_run
+from scholar.review import SessionNotSaved, keep_copy_before_run
 
 originals: list = []
 processed: list = []
@@ -3528,6 +3528,28 @@ except KeyboardInterrupt:
     <<report the papers still without an abstract>>
     <<say where the pre-run copy is>>
     raise typer.Exit(130)
+except SessionNotSaved as error:
+    <<stop at a chunk whose save was refused>>
+@
+
+A chunk's save can be refused, when another process holds the session's
+lock for minutes (\cref{sec:session-lock} in the review chapter).  The
+chunks before it are saved, and the refused one is in the file the save
+kept beside the session, with the rest of this process's session; so
+the run stops there, says how far the session got and what the kept
+file holds, and exits with~1.  Going on would only pile up kept files,
+each a copy of the whole session.  After [[sessions recover]], a new
+run continues where this one stopped, as after an interruption.
+
+<<stop at a chunk whose save was refused>>=
+print_session_not_saved(error)
+console.print(
+    f"[yellow]Stopped: saved {len(processed)} of {len(selected)} "
+    f"{scope}; the chunk after them is only in the kept file. Recover "
+    "it, then run again to continue.[/yellow]"
+)
+<<say where the pre-run copy is>>
+raise typer.Exit(1)
 @
 
 Since [[.bak]] ends up holding only the state before the last chunk, we
@@ -8460,6 +8482,7 @@ def sessions_list(
 
     if not sessions:
         console.print("[dim]No saved sessions found.[/dim]")
+        warn_about_unsaved_sessions()
         return
 
     if output_format == "json":
@@ -8523,6 +8546,30 @@ if flagged:
         "the sessions directory or from an export."
     )
 <<warn about sessions stored under another name>>
+warn_about_unsaved_sessions()
+@
+
+A save refused for want of the lock keeps the session in a file beside
+its own (\cref{sec:session-lock} in the review chapter), and nothing
+reads that file until someone merges it.  So the list names such
+files, also when there is no session to list, and says how to merge
+them; the kept file's name ends in a time and a random part, not in
+[[.json]], so it is never listed as a session itself.
+
+<<sessions command>>=
+def warn_about_unsaved_sessions() -> None:
+    """Name the files of refused saves on stderr, if there are any."""
+    from scholar.review import unsaved_session_files
+
+    kept = unsaved_session_files()
+    if kept:
+        Console(stderr=True).print(
+            f"[yellow]Warning:[/yellow] {len(kept)} file(s) hold a "
+            "session that a save could not write, because another scholar "
+            f"process held the session's lock: "
+            f"{escape(', '.join(path.name for path in kept))}. Merge each "
+            "into its session with `scholar sessions recover FILE`."
+        )
 @
 
 A session file copied or renamed by hand still holds its old name
@@ -24114,6 +24161,199 @@ def sessions_reconcile(
     console.print(f"{verb} {len(folds)} copies in {escape(name)}.")
 @
 
+\subsection{Recovering a refused save}
+\label{sec:sessions-recover}
+
+A save that cannot take the session file's lock writes nothing to the
+file and keeps the session beside it instead
+(\cref{sec:session-lock} in the review chapter).  [[sessions recover]]
+merges such a file into its session, by the same merge a save makes,
+under the lock, and deletes it ([[recover_unsaved_session]]).  The
+file is named as the error and [[sessions list]] name it, by its path
+or by its name in the sessions directory.  A file that is not one a
+refused save kept is an error (exit~1), and so is a lock refused
+again, through the entry point (\cref{sec:cli-main}); either way the
+file stays.
+
+<<sessions command>>=
+@sessions_app.command("recover")
+def sessions_recover(
+    kept_file: Annotated[
+        str,
+        typer.Argument(
+            help="The file a refused save kept beside the session "
+            "(<name>.json.unsaved-...), as the error or `sessions list` "
+            "names it.",
+        ),
+    ],
+) -> None:
+    """
+    Merge a session that a refused save kept into its session file.
+
+    A save that could not take the session file's lock (another scholar
+    process held it) writes nothing to the file and keeps the session
+    beside it; this merges it in, as that save would have, and deletes
+    the kept file.
+    """
+    from scholar.review import SessionFileError, recover_unsaved_session
+
+    try:
+        target = recover_unsaved_session(kept_file)
+    except SessionFileError as error:
+        Console(stderr=True).print(
+            f"[red]{escape(str(error))}[/red]", soft_wrap=True
+        )
+        raise typer.Exit(1)
+    Console().print(
+        f"Merged {escape(kept_file)} into {escape(str(target))}, and "
+        "deleted it.", soft_wrap=True,
+    )
+@
+
+Let's verify the commands around a refused save with a real process
+holding the lock and a short timeout set through the review module's
+constants: [[sessions decide]] ends with the one line through the entry
+point and exit code~1, the session file unchanged; [[sessions list]]
+names the kept file; [[sessions recover]] merges it once the lock is
+free; and a session file given to it is refused.
+
+<<test functions>>=
+class TestRefusedSaveCommands:
+  """The CLI around a save the lock refused (#316)."""
+
+  HOLDER = """
+    import sys
+    from scholar.review import load_session, session_file_path
+    from scholar.utils import file_lock
+    with file_lock(session_file_path(load_session(sys.argv[1]))):
+      print("holding", flush=True)
+      sys.stdin.readline()
+  """
+
+  @staticmethod
+  def _session(tmp_path, monkeypatch, name="locked", count=2):
+    from scholar.review import ReviewDecision, ReviewSession, save_session
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+    session = ReviewSession(query="q", providers=["openalex"],
+                            timestamp=datetime(2026, 11, 23), name=name)
+    session.decisions = [
+      ReviewDecision(paper=Paper(title=f"Locked {i}", authors=["A"],
+                                 doi=f"10.5555/locked-{i}"),
+                     provider="openalex")
+      for i in range(count)
+    ]
+    return save_session(session)
+
+  @classmethod
+  def _hold(cls, name):
+    import subprocess
+    import textwrap
+    holder = subprocess.Popen(
+      [sys.executable, "-c", textwrap.dedent(cls.HOLDER), name],
+      stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+    )
+    assert holder.stdout.readline().strip() == "holding"
+    return holder
+
+  @staticmethod
+  def _short_wait(monkeypatch):
+    import scholar.review as review
+    monkeypatch.setattr(review, "SESSION_LOCK_TIMEOUT", 0.5)
+    monkeypatch.setattr(review, "SESSION_LOCK_NOTICE", 0.2)
+
+  def test_decide_list_and_recover(self, tmp_path, monkeypatch, capsys):
+    from scholar import isolated_registry
+    from scholar.review import (
+      SessionNotSaved, load_session, unsaved_session_files,
+    )
+    path = self._session(tmp_path, monkeypatch)
+    before = path.read_bytes()
+    holder = self._hold("locked")
+    try:
+      self._short_wait(monkeypatch)
+      monkeypatch.setattr(sys, "argv", [
+        "scholar", "sessions", "decide", "locked", "--keep",
+        "--doi", "10.5555/locked-0", "--source", "human",
+      ])
+      with isolated_registry(), pytest.raises(SystemExit) as exit_info:
+        main()
+      assert exit_info.value.code == 1
+      assert path.read_bytes() == before
+      [kept] = unsaved_session_files()
+      err = capsys.readouterr().err
+      lines = [line for line in err.splitlines()
+               if line.startswith("Session file")]
+      assert len(lines) == 1
+      assert str(path) in lines[0] and str(kept) in lines[0]
+      assert f"scholar sessions recover {kept}" in lines[0]
+      listed = runner.invoke(app, ["sessions", "list"])
+      assert kept.name in " ".join(listed.output.split())
+      with isolated_registry():
+        again = runner.invoke(app, ["sessions", "recover", kept.name])
+      assert isinstance(again.exception, SessionNotSaved)
+      assert unsaved_session_files() == [kept]
+    finally:
+      holder.communicate("go\n", timeout=60)
+    with isolated_registry():
+      done = runner.invoke(app, ["sessions", "recover", str(kept)])
+    assert done.exit_code == 0, done.output
+    assert unsaved_session_files() == []
+    with isolated_registry():
+      saved = load_session("locked")
+    assert [d.status.value for d in saved.decisions] == ["kept", "pending"]
+
+  def test_a_session_file_is_refused(self, tmp_path, monkeypatch):
+    path = self._session(tmp_path, monkeypatch)
+    before = path.read_bytes()
+    result = runner.invoke(app, ["sessions", "recover", path.name])
+    assert result.exit_code == 1
+    assert "not a session kept by a refused save" in result.output
+    assert path.read_bytes() == before
+@
+
+[[scholar enrich]] saves after every chunk; here the lock is taken by
+another process while the second chunk is enriched, so that the first
+chunk's save goes through and the second's is refused.  The run stops
+there with exit code~1, the first chunk saved, the second only in the
+kept file; after [[sessions recover]], every paper is enriched.
+
+<<test functions>>=
+class TestEnrichStopsAtARefusedSave:
+  """`scholar enrich` loses no more than a refused chunk (#316)."""
+
+  def test_the_first_chunk_is_saved(self, tmp_path, monkeypatch):
+    import scholar.cli as cli
+    from scholar import isolated_registry
+    from scholar.review import unsaved_session_files
+    TestRefusedSaveCommands._session(tmp_path, monkeypatch, "chunked", 4)
+    TestRefusedSaveCommands._short_wait(monkeypatch)
+    monkeypatch.setattr(cli, "ENRICH_SAVE_EVERY", 2)
+    holders = []
+
+    def enrich(papers, **kwargs):
+      if len(holders) == 0 and papers[0].doi.endswith("-2"):
+        holders.append(TestRefusedSaveCommands._hold("chunked"))
+      return TestEnrichSelectionAndSaving._enriched(papers)
+
+    try:
+      result = TestEnrichSelectionAndSaving._invoke(
+        ["chunked", "--fields", "abstract"], enrich)
+    finally:
+      for holder in holders:
+        holder.communicate("go\n", timeout=60)
+    assert result.exit_code == 1, result.output
+    assert "Stopped: saved 2 of 4" in " ".join(result.output.split())
+    saved = TestEnrichSelectionAndSaving._saved("chunked")
+    assert [saved[f"10.5555/locked-{i}"].paper.abstract
+            for i in range(4)] == ["Enriched.", "Enriched.", None, None]
+    [kept] = unsaved_session_files()
+    with isolated_registry():
+      assert runner.invoke(
+        app, ["sessions", "recover", str(kept)]).exit_code == 0
+    saved = TestEnrichSelectionAndSaving._saved("chunked")
+    assert all(d.paper.abstract == "Enriched." for d in saved.values())
+@
+
 The command is run on a saved session, once as a dry run and once for
 real; the second run finds nothing left to fold.
 
@@ -32529,6 +32769,15 @@ with an empty store and overwriting the file
 in every command, we catch it once here and turn it into one line that
 names the file and points to its [[.bak]], with exit code~1.
 
+A save of a session that cannot take the session file's lock in time
+raises [[SessionNotSaved]] (\cref{sec:session-lock} in the review
+chapter), from whichever command saved: a decision, an append, the
+TUI on exit.  It is caught here too, and printed as the one line it
+is, unwrapped, so that the command it ends with can be copied whole;
+the exit code is~1.  The review module is imported only when an error
+arrives, since importing it for every command would slow the commands
+that never touch a session.
+
 <<main entry point>>=
 def main() -> None:
     """Main entry point for the Scholar CLI."""
@@ -32544,6 +32793,20 @@ def main() -> None:
             f"previous version from {escape(str(backup_path(error.path)))}."
         )
         sys.exit(1)
+    except Exception as error:
+        from scholar.review import SessionNotSaved
+
+        if not isinstance(error, SessionNotSaved):
+            raise
+        print_session_not_saved(error)
+        sys.exit(1)
+
+
+def print_session_not_saved(error: Exception) -> None:
+    """Print a refused save's error on stderr as one unwrapped line."""
+    Console(stderr=True).print(
+        f"[red]{escape(str(error))}[/red]", soft_wrap=True
+    )
 @
 
 A corrupt notes file therefore ends [[scholar notes list]] with that line
