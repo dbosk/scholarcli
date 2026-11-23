@@ -2877,13 +2877,27 @@ count as another program's file: left in place, earlier version kept,
 listed in `others` ("Replaced by another program meanwhile"). NOT
 detected: a writer that restores size and mtime exactly; little to
 compare on a file system without inode numbers and with coarse times.
-SIGTERM is an interrupt during the moves
-(`utils.sigterm_as_keyboard_interrupt`, moved here from cli.nw;
-`enrich` imports it), so it is rolled back like Ctrl-C; an interrupt
-during the moves passes on as `MovesInterrupted` (a
-`KeyboardInterrupt` with `.failure`), and the export prints one line
-for Ctrl-C and SIGTERM alike ("Export stopped by an interrupt and was
-rolled back: no files were written or changed.", or the lists when a
+SIGINT and SIGTERM are HELD BACK for the whole transaction
+(`utils.InterruptHeldBack(HELD_SIGNALS)`, moved from review.nw, which
+imports it and still holds only SIGINT for the session keep; main
+thread only, elsewhere it does nothing): a signal is noted, the loop
+checks the note between moves (never inside one), then undoes with the
+signals still held, so a second or third signal changes nothing; the
+outcome is raised once as `MovesInterrupted` (a `KeyboardInterrupt`
+with `.failure`; `None` = the note came during the commit, every file
+in place). Each move records its intent before the rename
+(`pending_aside`, `placing`) and the undo settles a pending step from
+the file system (`_settle_pending`: earlier version found in the
+replaced-files directory = moved aside; target with the staged
+identity = placed), so an exception between a rename and its record
+(not only a signal) loses nothing. The replaced-files directory is
+deleted after an undo only when nothing in it is unaccounted
+(`strays`; else it stays and the error names the files, "Earlier
+versions left, not put back"). Restore errors go into the one message
+("Could not put back: ..."), not WARNING lines. The export prints one
+line for Ctrl-C and SIGTERM alike ("Export stopped by an interrupt and
+was rolled back: no files were written or changed.", or the lists when
+a
 restore failed) and exits 130. A replaced file's mode is kept
 (`shutil.copymode` onto the staged file). Each export holds
 `file_lock(staging / "staging")` (`.staging.lock` INSIDE the staging

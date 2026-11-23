@@ -12016,8 +12016,8 @@ except (Exception, KeyboardInterrupt) as caught:
     raise typer.Exit(130 if interrupted else 1)
 @
 
-An interrupt, Ctrl-C or the SIGTERM that the moves turn into one
-(\cref{sec:sigterm}), ends the export the same way, with exit
+An interrupt, Ctrl-C or SIGTERM, which the moves hold back until they
+are settled (\cref{sec:staged-outputs}), ends the export the same way, with exit
 code~130 (the status bash gives a command ended by SIGINT, as
 [[scholar enrich]] uses it, \cref{sec:enrich-chunks}).  During the moves
 it arrives as a [[MovesInterrupted]] that carries the outcome, which is
@@ -12044,6 +12044,9 @@ def export_failure_text(
     from scholar.utils import OutputsNotPlaced
 
     placing = isinstance(error, OutputsNotPlaced)
+    if interrupted and error is None:
+        return ("Export stopped by an interrupt after every file was in "
+                "place: the files are this export's.")
     if interrupted:
         what, reason = "Export stopped by an interrupt", ""
     else:
@@ -12268,6 +12271,136 @@ def test_an_interrupt_is_rolled_back_and_said(
   assert " ".join(result.output.split()) == (
     "Export stopped by an interrupt and was rolled back: no files were "
     "written or changed.")
+@
+
+The moments a reviewer of \url{https://github.com/dbosk/scholar/pull/324}
+found are tested on a real process: a child runs [[sessions export -f
+all]] over an earlier export (whose session has since gained a paper,
+so that every new file differs), with [[os.replace]] wrapped so that
+right after a chosen rename, before the code records it, the child
+sends itself a real signal or raises an exception.  The moments: after
+[[rep.csv]] was moved aside, after it was moved in, the same with a
+second and a third signal while the moves are undone, a restore that
+fails under an interrupt, and an exception at both moments, once with a
+target that did not exist before.  After each, the earlier files are
+byte for byte as they were (or, where a restore was made to fail, as
+the one message says), nothing of the export is left, the outcome is
+said once, and the exit code is 130 for a signal, 1 for an exception.
+
+<<test functions>>=
+class TestExportInterrupts:
+  """Signals and errors between a rename and its record (#320)."""
+
+  <<export interrupts test methods>>
+
+<<export interrupts test methods>>=
+CHILD = """
+import os, signal, sys
+from pathlib import Path
+import scholar.utils as utils
+
+out, plan = sys.argv[1], [step.split(":") for step in sys.argv[2:]]
+real_replace = os.replace
+
+def replace(source, target, *args, **kwargs):
+    source, target = Path(source), Path(target)
+    if utils.KEPT_PREFIX in str(source):
+        moment, name = "restore", target.name
+    elif utils.KEPT_PREFIX in str(target):
+        moment, name = "aside", source.name
+    elif utils.STAGING_PREFIX in str(source):
+        moment, name = "placed", target.name
+    else:
+        return real_replace(source, target, *args, **kwargs)
+    actions = [a for m, n, a in plan if (m, n) == (moment, name)]
+    if "fail" in actions:
+        raise OSError(28, "No space left on device")
+    real_replace(source, target, *args, **kwargs)
+    for action in actions:
+        if action == "raise":
+            raise RuntimeError("between the rename and its record")
+        if action.startswith("SIG"):
+            os.kill(os.getpid(), getattr(signal, action))
+
+os.replace = replace
+from scholar.cli import main
+sys.argv = ["scholar", "sessions", "export", "moves", "-f", "all",
+            "-o", str(Path(out) / "rep")]
+main()
+"""
+
+ROLLED_BACK = ("Export stopped by an interrupt and was rolled back: no "
+               "files were written or changed.")
+
+def _run(self, tmp_path, monkeypatch, plan, without=None):
+  import subprocess
+  import sys
+  import textwrap
+
+  out_dir = TestExportMoves()._earlier_export(tmp_path, monkeypatch)
+  if without:
+    (out_dir / without).unlink()
+  before = TestExportMoves()._content(out_dir)
+  child = subprocess.run(
+    [sys.executable, "-c", textwrap.dedent(self.CHILD), str(out_dir),
+     *plan],
+    capture_output=True, text=True, timeout=120,
+  )
+  return out_dir, before, child
+
+def _check_rolled_back(self, out_dir, before, child, code, message):
+  assert child.returncode == code, child.stderr
+  assert TestExportMoves()._content(out_dir) == before
+  text = " ".join((child.stdout + child.stderr).split())
+  assert text == message
+  assert "KeyboardInterrupt" not in child.stderr
+
+@pytest.mark.parametrize("signal_name", ["SIGINT", "SIGTERM"])
+@pytest.mark.parametrize("plan", [
+  ["aside:rep.csv:{s}"],
+  ["placed:rep.csv:{s}"],
+  ["placed:rep.csv:{s}", "restore:rep.csv:{s}"],
+  ["placed:rep.csv:{s}", "restore:rep.csv:{s}", "restore:rep.bib:{s}"],
+], ids=["aside", "placed", "second", "third"])
+def test_a_signal_is_held_back_and_rolled_back(
+  self, tmp_path, monkeypatch, plan, signal_name,
+):
+  out_dir, before, child = self._run(
+    tmp_path, monkeypatch, [step.format(s=signal_name) for step in plan])
+  self._check_rolled_back(out_dir, before, child, 130, self.ROLLED_BACK)
+
+@pytest.mark.parametrize("moment", ["aside", "placed"])
+@pytest.mark.parametrize("without", [None, "rep.csv"])
+def test_an_exception_after_a_rename_is_settled(
+  self, tmp_path, monkeypatch, moment, without,
+):
+  if moment == "aside" and without:
+    pytest.skip("nothing to move aside")
+  out_dir, before, child = self._run(
+    tmp_path, monkeypatch, [f"{moment}:rep.csv:raise"], without=without)
+  self._check_rolled_back(
+    out_dir, before, child, 1,
+    "Export failed and was rolled back, no files were written or changed: "
+    "RuntimeError: between the rename and its record")
+
+def test_a_failed_restore_under_an_interrupt_is_said_once(
+  self, tmp_path, monkeypatch,
+):
+  from scholar.utils import KEPT_PREFIX
+
+  out_dir, before, child = self._run(
+    tmp_path, monkeypatch, ["placed:rep.tex:SIGINT", "restore:rep.bib:fail"])
+  assert child.returncode == 130, child.stderr
+  [kept] = [p for p in out_dir.iterdir() if p.name.startswith(KEPT_PREFIX)]
+  assert (kept / "rep.bib").read_bytes() == before["rep.bib"]
+  text = " ".join((child.stdout + child.stderr).split())
+  assert text.count("Export stopped by an interrupt") == 1
+  assert text.startswith(
+    "Export stopped by an interrupt part-way and could not be rolled back "
+    f"Holding the new version: {out_dir / 'rep.bib'}")
+  assert "KeyboardInterrupt" not in text and "WARNING" not in text
+  assert (out_dir / "rep.csv").read_bytes() == before["rep.csv"]
+  assert (out_dir / "rep.tex").read_bytes() == before["rep.tex"]
 @
 
 \paragraph{A CSV for a spreadsheet program.}
@@ -13515,7 +13648,8 @@ draws the same papers.
 
 <<say that the draw is recorded although the export failed>>=
 sheet_written = (
-    "was not written" if not getattr(error, "changed", False)
+    "is in place" if error is None
+    else "was not written" if not getattr(error, "changed", False)
     else "may be among the files listed above"
 )
 console.print(

@@ -1467,8 +1467,7 @@ def place_staged_files(
                 _failure_reason(error), every_target, existed
             ) from error
         try:
-            <<move every file, undoing all moves on a failure>>
-            placement.commit()
+            <<move every file with interrupts held back>>
         finally:
             placement.release()
 
@@ -1478,40 +1477,75 @@ def _failure_reason(error: BaseException) -> str:
     return f"{type(error).__name__}: {error}"
 @
 
-A failure while moving is first undone, then reported.  An interrupt
-(Ctrl-C) is undone the same way but passes on as itself, since the
-caller handles it as an interrupt; if undoing it failed, a warning says
-what is left, because nothing else would.  The interrupt passes on as
-a [[MovesInterrupted]], a [[KeyboardInterrupt]] that carries the outcome,
-so that the caller can say what the interrupt left as it does after a
-failure.  SIGTERM, which a time limit
-or a process manager sends, would end Python on the spot with the moves
-half made, so while the moves run it is turned into the same interrupt
-([[sigterm_as_keyboard_interrupt]], \cref{sec:sigterm}).  It is turned
-back before the undoing starts, so a second SIGTERM then ends the
-process as it would have; SIGKILL can never be caught.
+A failure while moving is first undone, then reported.  An interrupt is
+another matter: Ctrl-C raises [[KeyboardInterrupt]] wherever the
+program happens to be, also between a rename and the line that records
+it, where the undo would not know the rename was made (a reviewer of
+\url{https://github.com/dbosk/scholar/pull/324} lost a file that way,
+and a second Ctrl-C during the undo left the undo half done); SIGTERM,
+which a time limit or a process manager sends, would end Python on the
+spot.  The moves are a handful of renames taking milliseconds, and
+nothing is gained by stopping in the middle of one.  So both signals
+are held back for the whole transaction, from before the first rename
+until it has reached a consistent end, every file placed and the kept
+ones deleted, or the undo finished (or failed and been reported), with
+[[InterruptHeldBack]] (\cref{sec:interrupt-held-back}): a signal that
+arrives meanwhile is only noted.  The loop looks at the note between
+moves, never inside one, and when it is set stops placing and undoes
+the moves, still with the signals held, so that a second or third
+signal changes nothing.  Only then, the handlers restored, is the
+outcome reported, once, as a [[MovesInterrupted]]: a
+[[KeyboardInterrupt]] that carries the outcome ([[None]] when the note
+came while the finished moves were committed, so that every file is in
+place), so that the caller can say what the interrupt left as it does
+after a failure.  Off the main thread Python delivers no signals, and
+the holding does nothing (\cref{sec:interrupt-held-back}); SIGKILL and
+a power loss can never be held back, and what they leave is reported by
+the next export (\cref{sec:staged-outputs-leftovers}).
 
-<<move every file, undoing all moves on a failure>>=
-try:
-    with sigterm_as_keyboard_interrupt():
-        for source, target in zip(staged, targets):
-            placement.put(source, target)
-        for target in removals:
-            placement.take_away(target)
-except BaseException as error:
-    moved = placement.moved()
-    undone = placement.roll_back()
-    failure = placement.failure(
-        _failure_reason(error), every_target, existed,
-        rolled_back=moved and undone,
-    )
-    if isinstance(error, KeyboardInterrupt):
-        if failure.changed:
-            logging.getLogger(__name__).warning("%s", failure)
-        raise MovesInterrupted(failure) from error
-    if not isinstance(error, Exception):
-        raise
-    raise failure from error
+<<move every file with interrupts held back>>=
+from functools import partial
+
+steps = [partial(placement.put, source, target)
+         for source, target in zip(staged, targets)]
+steps += [partial(placement.take_away, target) for target in removals]
+held = InterruptHeldBack(HELD_SIGNALS)
+failure = caught = None
+with held:
+    try:
+        for step in steps:
+            if held.arrived:
+                break
+            step()
+    except BaseException as error:
+        caught = error
+        failure = placement.undo(_failure_reason(error), every_target,
+                                 existed)
+    else:
+        if held.arrived:
+            failure = placement.undo("interrupted", every_target, existed)
+        else:
+            placement.commit()
+if caught is not None and not isinstance(
+    caught, (Exception, KeyboardInterrupt)
+):
+    raise caught
+if held.arrived or isinstance(caught, KeyboardInterrupt):
+    raise MovesInterrupted(failure) from caught
+if failure is not None:
+    raise failure from caught
+@
+
+The signals held are the two that end a command politely.  SIGKILL
+cannot be caught at all.
+
+<<utils functions>>=
+import signal
+
+HELD_SIGNALS = tuple(
+    getattr(signal, name) for name in ("SIGINT", "SIGTERM")
+    if hasattr(signal, name)
+)
 @
 
 <<utils functions>>=
@@ -1520,8 +1554,11 @@ class MovesInterrupted(KeyboardInterrupt):
     the moves were undone as far as they could be; `failure` (an
     `OutputsNotPlaced`) says where each file stands."""
 
-    def __init__(self, failure: "OutputsNotPlaced"):
-        super().__init__(str(failure))
+    def __init__(self, failure: "OutputsNotPlaced | None"):
+        super().__init__(
+            str(failure) if failure is not None
+            else "interrupted after every file was in place"
+        )
         self.failure = failure
 @
 
@@ -1552,7 +1589,7 @@ class OutputsNotPlaced(Exception):
     def __init__(
         self, reason: str, *, new=(), old=(), missing=(),
         not_written=(), others=(), kept=None,
-        rolled_back: bool = False,
+        rolled_back: bool = False, restore_errors=None, strays=(),
     ):
         super().__init__(reason)
         self.reason = reason
@@ -1563,11 +1600,14 @@ class OutputsNotPlaced(Exception):
         self.others = list(others)
         self.kept = dict(kept or {})
         self.rolled_back = rolled_back
+        self.restore_errors = dict(restore_errors or {})
+        self.strays = list(strays)
 
     @property
     def changed(self) -> bool:
         """Whether any target differs from what it was before."""
-        return bool(self.new or self.missing or self.others)
+        return bool(self.new or self.missing or self.others
+                    or self.strays)
 
     def file_lines(self) -> list[str]:
         """Say which target holds what, one line per kind there is."""
@@ -1586,8 +1626,17 @@ class OutputsNotPlaced(Exception):
             ("Not written", self.not_written),
             ("Replaced by another program meanwhile", self.others),
         )
-        return [f"{label}: {names(targets)}"
-                for label, targets in kinds if targets]
+        lines = [f"{label}: {names(targets)}"
+                 for label, targets in kinds if targets]
+        if self.restore_errors:
+            lines.append("Could not put back: " + ", ".join(
+                f"{target} ({reason})"
+                for target, reason in self.restore_errors.items()
+            ))
+        if self.strays:
+            lines.append("Earlier versions left, not put back: "
+                         + ", ".join(str(path) for path in self.strays))
+        return lines
 
     def __str__(self) -> str:
         if self.changed:
@@ -1618,6 +1667,9 @@ class _Move:
     placed: bool = False
     identity: tuple[int, int, int, int] | None = None
     taken_by_other: bool = False
+    pending_aside: Path | None = None
+    placing: bool = False
+    restore_error: str | None = None
 
 
 class _Placement:
@@ -1645,8 +1697,10 @@ def put(self, source: Path, target: Path) -> None:
     if move.existed:
         self._set_aside(move)
     move.identity = file_identity(source)
+    move.placing = True
     os.replace(source, target)
     move.placed = True
+    move.placing = False
 
 def take_away(self, target: Path) -> None:
     """Set `target` aside, to be deleted once everything succeeded."""
@@ -1667,8 +1721,10 @@ def _set_aside(self, move: _Move) -> None:
             file_lock(self.kept / KEPT_LOCK_NAME)
         )
     aside = self.kept / move.target.name
+    move.pending_aside = aside
     os.replace(move.target, aside)
     move.aside = aside
+    move.pending_aside = None
 
 def moved(self) -> bool:
     """Whether any file has been moved yet."""
@@ -1677,17 +1733,37 @@ def moved(self) -> bool:
 
 [[roll_back]] puts an earlier version back with one rename, over the
 new file if that was moved in, which is atomic for that name; a new file
-that replaced nothing is removed.  Each failure is logged with its
-reason, which the error's lists do not carry.  When everything was put
+that replaced nothing is removed.  Each failure keeps its
+reason, which the error lists ([[restore_errors]]).  When everything was put
 back, the directory of replaced files is empty and goes too, even when
-a step failed that had nothing aside.  But a
+a step failed that had nothing aside.  It goes only when the undo has
+checked that no earlier version is left in it that it did not put back
+([[strays]]); otherwise it stays, and the error names the files.  A
+step whose record was cut short (the move is marked [[pending_aside]] or
+[[placing]] before its rename, and the mark is cleared after) is
+settled from the file system first: an earlier version found in the
+directory of replaced files was moved aside, and a target that carries
+the staged file's identity was placed.  Something other than a signal
+can strike between a rename and its record (an exception from a
+logging handler, a [[MemoryError]]), so the records do not rely on the
+signals being held.  But a
 file this call placed is only removed or overwritten while it still is
 that file (\cref{sec:staged-outputs-lock}); one that is not is left
 where it is, with the earlier version kept, and the error lists it.
 
 <<placement methods>>=
+def undo(
+    self, reason: str, targets: list[Path], existed: dict
+) -> OutputsNotPlaced:
+    """Roll back and say where each of `targets` stands."""
+    moved = self.moved()
+    undone = self.roll_back()
+    return self.failure(reason, targets, existed,
+                        rolled_back=moved and undone)
+
 def roll_back(self) -> bool:
     """Undo every move, latest first; whether all were undone."""
+    self._settle_pending()
     undone = True
     for move in reversed(self.moves):
         try:
@@ -1707,12 +1783,44 @@ def roll_back(self) -> bool:
             move.placed = False
         except OSError as error:
             undone = False
-            logging.getLogger(__name__).warning(
-                "Could not restore %s: %s", move.target, error
-            )
+            move.restore_error = _failure_reason(error)
+    return self._drop_kept_if_accounted() and undone
+
+def _settle_pending(self) -> None:
+    for move in self.moves:
+        if move.pending_aside is not None:
+            if os.path.lexists(move.pending_aside):
+                move.aside = move.pending_aside
+            move.pending_aside = None
+        if move.placing:
+            try:
+                move.placed = file_identity(move.target) == move.identity
+            except FileNotFoundError:
+                move.placed = False
+            move.placing = False
+
+def strays(self) -> list[Path]:
+    """Files in the directory of replaced files that no move accounts
+    for: earlier versions the undo did not put back."""
+    if self.kept is None or not self.kept.exists():
+        return []
+    accounted = {move.aside for move in self.moves if move.aside}
+    lock_name = lock_path(Path(KEPT_LOCK_NAME)).name
+    return sorted(
+        path for path in self.kept.iterdir()
+        if path.name != lock_name and path not in accounted
+    )
+
+def _drop_kept_if_accounted(self) -> bool:
+    """Delete the directory of replaced files if it holds nothing but
+    its lock; whether nothing unaccounted was left in it."""
+    if self.kept is None:
+        return True
+    if self.strays():
+        return False
     if not any(move.aside for move in self.moves):
         self._drop_kept()
-    return undone
+    return True
 
 def commit(self) -> None:
     """Make the moves durable and delete the replaced files."""
@@ -1783,7 +1891,10 @@ def failure(
         else:
             lists["not_written"].append(target)
     return OutputsNotPlaced(
-        reason, kept=kept, rolled_back=rolled_back, **lists
+        reason, kept=kept, rolled_back=rolled_back,
+        restore_errors={move.target: move.restore_error
+                        for move in self.moves if move.restore_error},
+        strays=self.strays(), **lists
     )
 @
 
@@ -2137,8 +2248,58 @@ up, [[sigterm_as_keyboard_interrupt]] turns SIGTERM into the
 and puts the previous handler back afterwards.  [[signal.signal]] may
 only be called from the main thread, and the block can run elsewhere (a
 worker thread of a test runner or an application); there SIGTERM is left
-alone rather than fail.  [[scholar enrich]] uses it around its loop,
-[[place_staged_files]] around its moves.
+alone rather than fail.  [[scholar enrich]] uses it around its loop.
+The moves of [[place_staged_files]] hold SIGTERM back instead
+([[InterruptHeldBack]], below).
+
+\paragraph{Holding interrupts back.}
+\label{sec:interrupt-held-back}
+Some steps must not be cut short, and are short: keeping a session
+that could not be saved (\cref{sec:session-lock} in the review module),
+moving an export's files.  [[InterruptHeldBack]] holds signals back for
+such a step: while it is active, each signal of [[signal_numbers]]
+(SIGINT unless told otherwise) only sets [[arrived]] and is recorded in
+[[received]], and the previous handlers are restored on exit, so the
+caller decides what to do about it at a point of its choosing.  Python
+runs signal handlers only in the main thread, and only the main thread
+may install them, so elsewhere it installs nothing and holds nothing
+back: the step runs as it would without it, and a signal goes to the
+main thread's handlers as usual.  A previous handler that Python did
+not install (reported as [[None]]) is restored as the default.
+
+<<utils functions>>=
+class InterruptHeldBack:
+    """While active (`with`), the signals of `signal_numbers` (SIGINT by
+    default) only set `arrived` and are listed in `received`.
+
+    Only in the main thread, where Python handles signals; elsewhere it
+    does nothing. The previous handlers are restored on exit.
+    """
+
+    def __init__(self, signal_numbers=None) -> None:
+        self.signal_numbers = tuple(
+            (signal.SIGINT,) if signal_numbers is None else signal_numbers
+        )
+        self.arrived = False
+        self.received: list[int] = []
+        self._previous: dict = {}
+
+    def __enter__(self) -> "InterruptHeldBack":
+        if threading.current_thread() is threading.main_thread():
+            for number in self.signal_numbers:
+                self._previous[number] = signal.signal(number, self._note)
+        return self
+
+    def _note(self, signum, frame) -> None:
+        self.arrived = True
+        self.received.append(signum)
+
+    def __exit__(self, *exc) -> None:
+        for number, previous in self._previous.items():
+            signal.signal(
+                number, signal.SIG_DFL if previous is None else previous
+            )
+        self._previous = {}
 
 <<utils functions>>=
 import signal
@@ -2337,6 +2498,9 @@ def test_a_failed_restore_says_where_each_file_stands(
         f"Holding the earlier version: {out_dir / 'b.tex'}",
         f"Missing: {out_dir / 'c.txt'} (earlier version kept as "
         f"{failure.kept[out_dir / 'c.txt']})",
+        f"Could not put back: {out_dir / 'a.csv'} (OSError: [Errno 28] "
+        f"No space left on device), {out_dir / 'c.txt'} (OSError: "
+        "[Errno 28] No space left on device)",
     ]
 @
 
@@ -2743,6 +2907,37 @@ def test_an_undo_leaves_a_file_another_program_changed(
     assert placed.read_text() == theirs[0]
     assert failure.kept[placed].read_text() == "old a.csv"
     assert (out_dir / "b.tex").read_text() == "old b.tex"
+@
+
+The directory of replaced files is deleted after an undo only when it
+holds nothing the undo did not put back.  Here a file appears in it that
+no move accounts for: the directory stays, and the error names the file.
+
+<<staged output safety test methods>>=
+def test_an_unaccounted_earlier_version_keeps_the_directory(
+    self, out_dir, monkeypatch,
+):
+    for name in ("a.csv", "b.tex"):
+        (out_dir / name).write_text(f"old {name}")
+    strays = []
+
+    def before(who, source, target):
+        if STAGING_PREFIX in str(source) and target.name == "b.tex":
+            [kept] = out_dir.glob(f"{KEPT_PREFIX}*")
+            strays.append(kept / "c.txt")
+            strays[0].write_text("old c.txt")
+            raise OSError(28, "No space left on device")
+
+    self._hook(monkeypatch, before)
+    outcome = {}
+    self._export(out_dir, "A", outcome)
+    failure = outcome["A"]
+    assert isinstance(failure, OutputsNotPlaced)
+    assert failure.strays == strays and not failure.rolled_back
+    assert strays[0].read_text() == "old c.txt"
+    assert (out_dir / "a.csv").read_text() == "old a.csv"
+    assert f"Earlier versions left, not put back: {strays[0]}" \
+        in failure.file_lines()
 @
 
 A file that replaces a private one stays private; one that replaces
