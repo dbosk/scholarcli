@@ -1410,6 +1410,25 @@ after the first has written.  Three properties of the design matter.
   directory where no lock file can be created (a read-only data
   directory) is no reason to fail either: the write that follows will
   report the real problem.
+\item[A save that must not go unlocked says so] Writing unlocked is
+  right where the write is small and its loss is cheap, and wrong
+  where the write is a whole session that another process may be
+  saving too: two processes each saving a session of over 30\,000
+  records waited past the ten seconds, and the one that then wrote
+  without the lock replaced the other's search records
+  (\url{https://github.com/dbosk/scholarcli/issues/316}).  So a caller
+  can pass [[required=True]]: the lock is then never skipped, and if it
+  cannot be taken in time (or at all) [[file_lock]] raises
+  [[LockNotTaken]] before the body runs, so that the caller can keep
+  its data elsewhere and say so (the session's save does,
+  \cref{sec:session-lock}).  The error tells the two causes apart
+  ([[held]]): a lock another process holds, and a lock file that
+  cannot be opened or created (its permissions, a read-only
+  directory), which no wait will cure.  Such a caller also waits
+  longer, and a wait of minutes without a word would look like a hang,
+  so with [[notice_after]] it logs a line after that many seconds,
+  naming the file it is waiting for, and again every [[notice_every]]
+  seconds, with [[notice_hint]] added to say what the user can do.
 \end{description}
 One process can take the same lock again while it holds it (a note
 save inside a migration, say), and threads of one process exclude each
@@ -1419,6 +1438,38 @@ other as processes do (the TUI migrates notes in a background thread).
 objects for one file would each count only their own holder and
 deadlock against each other.
 
+The notices come from waiting in steps: the first step is
+[[notice_after]] long, each later one [[notice_every]] (or the rest of
+the timeout), and each step that ends without the lock logs a line
+with the time waited and the time left.  A process holding the lock is
+normally done in milliseconds or seconds, so the first line appears
+only when something is wrong (a holder suspended, or a queue of saves
+of a very large session); the later ones show that the wait goes on,
+not that the program hangs.  The steps are counted, not timed, so the
+time waited is the sum of the steps; a tiny remainder of the timeout,
+left by the rounding of that sum, ends the wait instead of logging
+another line.
+
+<<take [[lock]] within [[timeout]], saying when the wait is long>>=
+if notice_after is None or notice_after >= timeout:
+    lock.acquire(timeout=timeout)
+else:
+    waited, step = 0.0, notice_after
+    while True:
+        try:
+            lock.acquire(timeout=step)
+            break
+        except Timeout:
+            waited += step
+            if timeout - waited < 1e-3:
+                raise
+            logging.getLogger(__name__).warning(
+                "%s is locked by another scholar process; waited %g s, "
+                "waiting up to %g s more%s",
+                path, round(waited, 3), round(timeout - waited, 3),
+                notice_hint,
+            )
+            step = min(notice_every or timeout, timeout - waited)
 <<utils functions>>=
 import logging
 import threading
@@ -1437,15 +1488,41 @@ def lock_path(path: str | os.PathLike) -> Path:
     return path.with_name(f".{path.name}.lock")
 
 
+class LockNotTaken(Exception):
+    """`file_lock(..., required=True)` could not take its lock.
+
+    `path` is the file the lock protects; `reason` says why, in a few
+    words ("still locked after 300 s"); `held` is True when another
+    holder kept the lock, False when the lock file `lock_file` could not
+    be opened or created.
+    """
+
+    def __init__(
+        self, path: str | os.PathLike, reason: str, *, held: bool,
+        lock_file: str | os.PathLike,
+    ) -> None:
+        super().__init__(f"{path}: {reason}")
+        self.path = Path(path)
+        self.reason = reason
+        self.held = held
+        self.lock_file = Path(lock_file)
+
+
 @contextmanager
 def file_lock(
-    path: str | os.PathLike, timeout: float | None = None
+    path: str | os.PathLike, timeout: float | None = None, *,
+    required: bool = False, notice_after: float | None = None,
+    notice_every: float | None = None, notice_hint: str = "",
 ) -> Iterator[bool]:
     """Hold an exclusive lock on `path` for one read-modify-write.
 
     Yields True while the lock is held, or False if it could not be
     taken within `timeout` seconds (default `LOCK_TIMEOUT`) or the lock
-    file cannot be created; the body then runs unlocked.
+    file cannot be created; the body then runs unlocked. With
+    `required`, it raises `LockNotTaken` instead and the body does not
+    run. With `notice_after`, a wait longer than that many seconds is
+    logged, naming `path`, and again every `notice_every` seconds;
+    `notice_hint` is added to each such line.
     """
     if timeout is None:
         timeout = LOCK_TIMEOUT
@@ -1453,8 +1530,13 @@ def file_lock(
     with _FILE_LOCKS_GUARD:
         lock = _FILE_LOCKS.setdefault(target, FileLock(target))
     try:
-        lock.acquire(timeout=timeout)
+        <<take [[lock]] within [[timeout]], saying when the wait is long>>
     except Timeout:
+        if required:
+            raise LockNotTaken(
+                path, f"still locked after {timeout:g} s", held=True,
+                lock_file=target,
+            )
         logging.getLogger(__name__).warning(
             "%s is still locked after %g s; writing without the lock",
             path, timeout,
@@ -1462,6 +1544,11 @@ def file_lock(
         yield False
         return
     except OSError as error:
+        if required:
+            raise LockNotTaken(
+                path, f"cannot open the lock file {target}: {error}",
+                held=False, lock_file=target,
+            ) from error
         logging.getLogger(__name__).debug(
             "Cannot lock %s (%s); writing without the lock", path, error
         )
@@ -1530,6 +1617,98 @@ class TestFileLock:
             release.set()
             thread.join(5)
         assert "writing without the lock" in caplog.text
+@
+
+A lock that is [[required]] is never skipped: the body does not run,
+the error names the file, and the notice comes once, after the first
+wait, naming the file too.
+
+<<test functions>>=
+class TestRequiredFileLock:
+    """file_lock(required=True) raises instead of running unlocked."""
+
+    def test_refuses_after_the_timeout_and_says_it_waits(
+        self, tmp_path, caplog
+    ):
+        import threading
+
+        target = tmp_path / "s.json"
+        holding, release = threading.Event(), threading.Event()
+        ran = []
+
+        def holder():
+            with file_lock(target):
+                holding.set()
+                release.wait(5)
+
+        thread = threading.Thread(target=holder)
+        thread.start()
+        holding.wait(5)
+        try:
+            with pytest.raises(LockNotTaken) as raised:
+                with file_lock(target, timeout=0.3, required=True,
+                               notice_after=0.1):
+                    ran.append(True)
+        finally:
+            release.set()
+            thread.join(5)
+        assert ran == []
+        assert raised.value.path == target
+        assert raised.value.reason == "still locked after 0.3 s"
+        notices = [r for r in caplog.records
+                   if "locked by another scholar process" in r.message]
+        assert len(notices) == 1 and str(target) in notices[0].message
+        assert raised.value.held
+        assert "writing without the lock" not in caplog.text
+
+    def test_the_notice_repeats_with_its_hint(self, tmp_path, caplog):
+        import threading
+
+        target = tmp_path / "s.json"
+        holding, release = threading.Event(), threading.Event()
+
+        def holder():
+            with file_lock(target):
+                holding.set()
+                release.wait(5)
+
+        thread = threading.Thread(target=holder)
+        thread.start()
+        holding.wait(5)
+        try:
+            with pytest.raises(LockNotTaken):
+                with file_lock(target, timeout=0.5, required=True,
+                               notice_after=0.1, notice_every=0.15,
+                               notice_hint="; press Ctrl-C to stop"):
+                    pass
+        finally:
+            release.set()
+            thread.join(5)
+        assert [r.message for r in caplog.records] == [
+            f"{target} is locked by another scholar process; waited "
+            f"{waited} s, waiting up to {left} s more; press Ctrl-C to stop"
+            for waited, left in ((0.1, 0.4), (0.25, 0.25), (0.4, 0.1))
+        ]
+
+    def test_a_free_lock_is_taken_at_once(self, tmp_path, caplog):
+        with file_lock(tmp_path / "s.json", timeout=0.3, required=True,
+                       notice_after=0.1) as locked:
+            assert locked
+        assert caplog.text == ""
+
+    def test_a_lock_file_that_cannot_be_made_is_refused(self, tmp_path):
+        read_only = tmp_path / "read-only"
+        read_only.mkdir(mode=0o500)
+        try:
+            with pytest.raises(LockNotTaken) as raised:
+                with file_lock(read_only / "s.json", required=True):
+                    pass
+        finally:
+            read_only.chmod(0o700)
+        assert not raised.value.held
+        assert raised.value.reason.startswith(
+            f"cannot open the lock file {lock_path(read_only / 's.json')}"
+        )
 @
 
 

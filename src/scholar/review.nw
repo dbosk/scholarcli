@@ -127,6 +127,7 @@ from scholar.utils import (
     clean_metadata_text, clean_paper_text, derive_arxiv_doi,
     given_name_first, legacy_hash_paper_id, strip_dblp_homonym_number,
     atomic_write_text, backup_path, file_lock,
+    LOCK_TIMEOUT, LockNotTaken,
 )
 
 logger = logging.getLogger(__name__)
@@ -11593,11 +11594,15 @@ def reconcile_session(
         raise FileNotFoundError(f"Session not found: {name}")
     if dry_run:
         return reconcile_copies(session)
-    with file_lock(session_file_path(session)):
-        session = read_session_file(session_file_path(session))
-        folds = reconcile_copies(session)
-        if folds:
-            save_session(session)
+    try:
+        with session_lock(session_file_path(session),
+                          hint=NOTHING_CHANGED_HINT):
+            session = read_session_file(session_file_path(session))
+            folds = reconcile_copies(session)
+            if folds:
+                save_session(session)
+    except LockNotTaken as error:
+        raise lock_refusal(error) from error
     move_stranded_notes(session)
     return folds
 
@@ -13414,7 +13419,13 @@ Preprint adoption also rewrites the notes and the per-query decision
 stores ([[migrate_paper_id]]), so after restoring the session from a
 copy those stay keyed to the adopted ids.
 The copy is made under the session's lock, so that no save is half done
-when we read.
+when we read.  It takes the lock as a save does ([[session_lock]],
+\cref{sec:session-lock}), not the plain one, although it never writes
+the session file: the commands that make a copy save right after, and
+with the plain lock a held lock cost them ten seconds, a warning that
+the copy went ahead unlocked and then the save's own wait, which said
+the opposite.  Now one wait and one message cover the command, and a
+refusal comes before anything was changed.
 Its name does not end in [[.json]], which is what [[list_sessions]],
 [[sessions_mentioning]] and the other code that reads every session file
 look for, so the copy is not mistaken for a session (a test in the
@@ -13441,15 +13452,20 @@ def keep_copy_before_run(
     """
     keep = RUN_COPIES_KEPT if keep is None else keep
     path = session_file_path(session)
-    with file_lock(path):
-        if not path.exists():
-            return None
-        stamp = _utcnow().strftime("%Y%m%dT%H%M%SZ")
-        copy = path.with_name(f"{path.name}.{label}-{stamp}.bak")
-        atomic_write_text(copy, path.read_text(encoding="utf-8"))
-        older = sorted(path.parent.glob(f"{glob.escape(path.name)}.{label}-*.bak"))
-        for stale in older[:-keep] if keep > 0 else older:
-            stale.unlink(missing_ok=True)
+    try:
+        with session_lock(path, hint=NOTHING_CHANGED_HINT):
+            if not path.exists():
+                return None
+            stamp = _utcnow().strftime("%Y%m%dT%H%M%SZ")
+            copy = path.with_name(f"{path.name}.{label}-{stamp}.bak")
+            atomic_write_text(copy, path.read_text(encoding="utf-8"))
+            older = sorted(
+                path.parent.glob(f"{glob.escape(path.name)}.{label}-*.bak")
+            )
+            for stale in older[:-keep] if keep > 0 else older:
+                stale.unlink(missing_ok=True)
+    except LockNotTaken as error:
+        raise lock_refusal(error) from error
     return copy
 @
 
@@ -13468,15 +13484,27 @@ def save_session(session: ReviewSession) -> Path:
 
     Returns:
         Path to the saved session file.
+
+    Raises:
+        SessionNotSaved: The file's lock could not be taken (another
+            process held it for `SESSION_LOCK_TIMEOUT` seconds, the lock
+            file cannot be opened, or the wait was interrupted); nothing
+            was written to the file, and the session is kept beside it
+            where the directory allows.
     """
     session_path = session_file_path(session)
     logger.info("Saving session to %s", session_path)
 
-    with file_lock(session_path):
-        <<merge changes other processes saved>>
-        <<write the session file>>
-    session._baseline = SessionBaseline.of(session, from_file=True)
-    assign_baseline_keys(session)
+    with paused_garbage_collection():
+        with ExitStack() as held:
+            try:
+                held.enter_context(session_lock(session_path))
+            except (LockNotTaken, KeyboardInterrupt) as error:
+                raise refused_save(session, session_path, error) from error
+            <<merge changes other processes saved>>
+            <<write the session file>>
+        session._baseline = SessionBaseline.of(session, from_file=True)
+        assign_baseline_keys(session)
 
     logger.debug("Saved %d decisions (%d kept, %d discarded, %d pending)",
                 len(session.decisions), len(session.kept_papers()),
@@ -13713,17 +13741,37 @@ def warn_about_unknown_sources(session_path: Path, session) -> None:
     )
 @
 
-The file is re-read, merged and replaced under [[file_lock]]
-(\cref{sec:file-lock}), so that two processes saving one session at
-the same moment take turns: the second re-reads only after the first
-has written, and merges against what the first wrote.  The lock covers
-only those milliseconds, never the time between loading a session and
+The file is re-read, merged and replaced under the session file's
+lock ([[session_lock]], \cref{sec:file-lock,sec:session-lock}), so
+that two processes saving one session at the same moment take turns:
+the second re-reads only after the first has written, and merges
+against what the first wrote.  The lock covers only the merge and the
+write (seconds for the largest sessions, \cref{sec:save-cost}), never
+the time between loading a session and
 saving it, which may be hours of enrichment or a whole TUI session; the
 merge is what reconciles that.  The write itself serialises the merged
 session:
 
 <<write the session file>>=
-# Convert to serializable format
+data = session_file_data(session)
+<<warn if the save drops decisions>>
+atomic_write_text(
+    session_path,
+    json.dumps(data, indent=2, ensure_ascii=False),
+    backup=True,
+)
+@
+
+The object written is built by a function of its own, since the save
+is not its only writer: a save that cannot take the lock keeps the same
+object beside the file (\cref{sec:session-lock}).
+
+<<review session functions>>=
+def session_file_data(session: ReviewSession) -> dict:
+    """Return the JSON object that `save_session` writes for `session`."""
+    <<serialise the session>>
+    return data
+<<serialise the session>>=
 data = {
     "query": session.query,
     "name": session.name,
@@ -13801,13 +13849,6 @@ data = {
         for d in session.decisions
     ],
 }
-
-<<warn if the save drops decisions>>
-atomic_write_text(
-    session_path,
-    json.dumps(data, indent=2, ensure_ascii=False),
-    backup=True,
-)
 @
 
 Let's verify that the endpoint of a search survives the round trip
@@ -15140,6 +15181,7 @@ def pair_with_file(
         disk_by_id.setdefault(get_paper_id(theirs.paper), []).append(
             theirs
         )
+    <<group the baseline's keys by paper id>>
     paired: dict[int, ReviewDecision] = {}
     additions: list[ReviewDecision] = []
     for paper_id, copies in disk_by_id.items():
@@ -15202,8 +15244,8 @@ stays away, from the new one, which is added.
 
 <<add the file copies this session never loaded>>=
 carried = {base_key_of(d, base) for d in ours}
-gone = [key for key, i in base_ids.items()
-        if i == paper_id and key not in carried]
+gone = [key for key in base_keys_by_id.get(paper_id, ())
+        if key not in carried]
 unmatched = []
 for theirs in free:
     match = [key for key in gone
@@ -15213,6 +15255,229 @@ for theirs in free:
     else:
         unmatched.append(theirs)
 additions.extend(unmatched[len(gone):])
+@
+
+\paragraph{The cost of pairing.}
+\label{sec:pairing-cost}
+The loaded copies gone from here were first found by reading the whole
+baseline for every paper id in the file, so a save cost time in the
+square of the session's size
+(\url{https://github.com/dbosk/scholarcli/issues/316}).
+Under cProfile, a save of 10\,000 decisions took 37.7\,s, 24.9\,s of
+them in the pairing (\cref{sec:save-cost}).
+The baseline's keys are therefore grouped by paper id once per save,
+in the baseline's order, which is the order the scan visited them in;
+each id then reads only its own keys, and the rules above see the same
+keys in the same order.
+
+<<group the baseline's keys by paper id>>=
+base_keys_by_id: dict[str, list[str]] = {}
+for key, base_id in base_ids.items():
+    base_keys_by_id.setdefault(base_id, []).append(key)
+@
+
+The rules must give exactly the pairs they gave before, so the tests
+keep the pairing as it was, the scan included, as a reference
+([[reference_pair_with_file]], copied from the version before this
+change and not to be changed with the rules), and compare the two in
+two ways.  First, every scenario the tests of copies under one id build
+(\cref{sec:session-copies}) runs again with [[pair_with_file]] replaced
+by a check that calls both and compares their pairs and additions, by
+identity.  Second, a generator with a fixed seed (316) builds a few
+hundred pairs of sessions, ours and the file, from one loaded state:
+few papers, so that copies under one id are common, and on each side a
+few random changes of the kinds the scenarios name (renames, drops,
+inserts, swaps, changed decisions and links, folds), sometimes without
+a baseline.
+
+<<test functions>>=
+def reference_pair_with_file(session, on_disk):
+  """The pairing before #316, kept as a reference: do not change."""
+  base = session._baseline
+  base_states = base.decisions if base else {}
+  base_ids = base.decision_ids if base else {}
+  ours_by_id = {}
+  for decision in session.decisions:
+    ours_by_id.setdefault(get_paper_id(decision.paper), []).append(decision)
+  disk_by_id = {}
+  for theirs in on_disk.decisions:
+    disk_by_id.setdefault(get_paper_id(theirs.paper), []).append(theirs)
+  paired = {}
+  additions = []
+  for paper_id, copies in disk_by_id.items():
+    ours = ours_by_id.get(paper_id, [])
+    free = list(copies)
+    for decision in ours:
+      key = base_key_of(decision, base)
+      if decision.baseline_key != key or key not in base_states:
+        continue
+      same = [i for i, theirs in enumerate(free)
+              if decision_state(theirs) == base_states[key]]
+      if same:
+        best = min(same, key=lambda i: (
+          set(free[i].found_by) != set(decision.found_by),
+          free[i].provider != decision.provider,
+          i,
+        ))
+        paired[id(decision)] = free.pop(best)
+    rest = [d for d in ours if id(d) not in paired]
+    for decision, theirs in zip(rest, free):
+      paired[id(decision)] = theirs
+    free = free[len(rest):]
+    carried = {base_key_of(d, base) for d in ours}
+    gone = [key for key, i in base_ids.items()
+            if i == paper_id and key not in carried]
+    unmatched = []
+    for theirs in free:
+      match = [key for key in gone
+               if base_states[key] == decision_state(theirs)]
+      if match:
+        gone.remove(match[0])
+      else:
+        unmatched.append(theirs)
+    additions.extend(unmatched[len(gone):])
+  return paired, additions
+
+
+def pairing_by_identity(pairing):
+  """A pairing's pairs and additions, by the identity of the decisions."""
+  paired, additions = pairing
+  return ({ours: id(theirs) for ours, theirs in paired.items()},
+          [id(theirs) for theirs in additions])
+
+
+def assert_pairing_matches_reference(session, on_disk):
+  """Pair with both and compare; return the new pairing."""
+  pairing = pair_with_file(session, on_disk)
+  assert pairing_by_identity(pairing) == pairing_by_identity(
+    reference_pair_with_file(session, on_disk))
+  return pairing
+
+
+@pytest.fixture
+def pairing_checked(monkeypatch):
+  """Replace `pair_with_file` in the merge by a check against the
+  reference; yields the list of the checks made."""
+  import scholar.review as review
+  new = review.pair_with_file
+  checks = []
+
+  def checked(session, on_disk):
+    pairing = new(session, on_disk)
+    assert pairing_by_identity(pairing) == pairing_by_identity(
+      reference_pair_with_file(session, on_disk))
+    checks.append(len(on_disk.decisions))
+    return pairing
+
+  monkeypatch.setattr(review, "pair_with_file", checked)
+  yield checks
+  assert checks, "no save met a file to pair with"
+
+
+class TestSameIdDecisionsMatchTheReference(TestSameIdDecisions):
+  """The #228 scenarios of two copies, paired as before (#316)."""
+
+  @pytest.fixture(autouse=True)
+  def _checked(self, pairing_checked):
+    yield
+
+
+class TestSameIdPairsMatchTheReference(TestSameIdDecisionsPaired):
+  """The #228 scenarios of pairing, paired as before (#316)."""
+
+  @pytest.fixture(autouse=True)
+  def _checked(self, pairing_checked):
+    yield
+@
+
+The generator draws each decision from four titles and two spellings
+of the author, so that ids repeat and a rename (the other spelling)
+moves a copy to another id; statuses, tags, providers and links come
+from short lists, so that copies in one state, which the first pass
+must choose between, are frequent.  The file's decisions are copies of
+the loaded ones, without keys, as a read of the file gives them.
+
+<<test functions>>=
+class TestPairingMatchesTheReferenceAtRandom:
+  """Random sessions pair as the reference pairs them (#316)."""
+
+  TITLES = ["Work A", "Work B", "Work C", "Work D"]
+  AUTHORS = ["Ada Example", "Example A."]
+  CASES = 400
+
+  def _decision(self, rng):
+    return ReviewDecision(
+      paper=Paper(title=rng.choice(self.TITLES),
+                  authors=[self.AUTHORS[0]], year=2020),
+      provider=rng.choice(["openalex", "dblp"]),
+      status=rng.choice(list(DecisionStatus)),
+      tags=list(rng.choice([[], ["a"], ["b"]])),
+      found_by=list(rng.choice([[], [("q1", "openalex", "")],
+                                [("q2", "dblp", "")]])),
+    )
+
+  def _change(self, rng, decisions, folded=None):
+    kind = rng.choice(["rename", "drop", "insert", "swap", "decide",
+                       "link", "provider", "fold"])
+    if kind == "insert" or not decisions:
+      decisions.insert(rng.randint(0, len(decisions)), self._decision(rng))
+      return
+    i = rng.randrange(len(decisions))
+    decision = decisions[i]
+    if kind == "rename":
+      decision.paper = Paper(title=decision.paper.title,
+                             authors=[rng.choice(self.AUTHORS)], year=2020)
+    elif kind == "drop":
+      del decisions[i]
+    elif kind == "swap":
+      j = rng.randrange(len(decisions))
+      decisions[i], decisions[j] = decisions[j], decisions[i]
+    elif kind == "decide":
+      decision.status = rng.choice(list(DecisionStatus))
+      decision.tags = list(rng.choice([[], ["a"], ["b"]]))
+    elif kind == "link":
+      decision.record_search(rng.choice(["q1", "q2"]), "openalex", "")
+    elif kind == "provider":
+      decision.provider = rng.choice(["openalex", "dblp", "s2"])
+    elif folded is not None:
+      del decisions[i]
+      folded[get_paper_id(decision.paper)] = "doi:10.5555/target"
+
+  def _case(self, rng):
+    loaded = [self._decision(rng) for _ in range(rng.randint(0, 8))]
+    session = ReviewSession(query="q", providers=["openalex"],
+                            timestamp=datetime(2026, 11, 23))
+    session.decisions = loaded
+    if rng.random() < 0.9:
+      session._baseline = SessionBaseline.of(session, from_file=True)
+      assign_baseline_keys(session)
+    on_disk = ReviewSession(query="q", providers=["openalex"],
+                            timestamp=datetime(2026, 11, 23))
+    on_disk.decisions = [
+      replace(d, tags=list(d.tags), found_by=list(d.found_by),
+              baseline_key=None)
+      for d in loaded
+    ]
+    session.decisions = list(loaded)
+    for _ in range(rng.randint(0, 4)):
+      self._change(rng, session.decisions)
+    for _ in range(rng.randint(0, 4)):
+      self._change(rng, on_disk.decisions, on_disk.folded)
+    return session, on_disk
+
+  def test_random_sessions(self):
+    import random
+    rng = random.Random(316)
+    paired = additions = copies = 0
+    for _ in range(self.CASES):
+      session, on_disk = self._case(rng)
+      pairs, added = assert_pairing_matches_reference(session, on_disk)
+      paired += len(pairs)
+      additions += len(added)
+      ids = [get_paper_id(d.paper) for d in session.decisions]
+      copies += len(ids) - len(set(ids))
+    assert paired > 500 and additions > 50 and copies > 200, (
+      paired, additions, copies)
 @
 
 A legacy record (\cref{sec:search-record-key}) is replaced by a re-run
@@ -15403,6 +15668,1234 @@ if on_disk is not None:
 The window that remains, between reading the file and replacing it, is
 milliseconds instead of hours, and [[save_session]] closes it by holding
 [[file_lock]] across both.
+
+\paragraph{The cost of a save.}
+\label{sec:save-cost}
+The lock is held for the whole merge and write, so the time a save
+takes is time every other save of the session waits.  On an invented
+session of five search links per decision, saved once after a load as
+a command does, the save took the times of \cref{tab:save-cost} (on the
+developer's machine, under the load of other jobs, so the figures are
+rough: one run before, the median of three after), against the
+94\,s at 30\,000 decisions that a reviewer measured before.  Two things
+made the difference.
+\begin{description}
+\item[Pairing in one pass] The pairing read the whole baseline for
+  every paper id (\cref{sec:pairing-cost}); with cProfile on a save of
+  10\,000 decisions it took 24.9 of the save's 37.7\,s.  Profiled at
+  4\,000 and 16\,000 decisions with the garbage collector off, no step
+  of the save took more than 4.8 times as long at four times the
+  size, so no step but that one grows faster than the session.
+\item[No garbage collection during the save] A save reads a second
+  copy of the session from the file, millions of objects, and every
+  full collection meanwhile walks both copies.  So we hold the
+  collector off for the save and turn it back on after, as it was (a
+  process that had turned it off keeps it off); whatever cycles a save
+  leaves wait for the next collection after it.  What it gains was
+  measured four times, each on a machine busy with other jobs.  With
+  the pairing in one pass, a save at 30\,000 decisions took 12.3\,s
+  with the collector on throughout and 6.0\,s with it off throughout
+  (one run each, load average about 5); with the collector held off
+  for the save only, 7.7 to 8.4\,s in three runs.  The reviewer of the
+  change measured 8.5 and 12.6\,s with the pause against 13.3 and
+  18.8\,s without it at 30\,000 decisions, about a third less, and
+  1.7 to 2.1\,s against 2.6\,s at 5\,000.  So the gain is real and
+  grows with the session, but it is no fixed fraction.
+\end{description}
+
+\begin{table}
+\caption{The time of one save after a load, on an invented session
+with five search links per decision, before and after
+\url{https://github.com/dbosk/scholarcli/issues/316}.}
+\label{tab:save-cost}
+\begin{tabular}{rrrr}
+\toprule
+Decisions & File & Before & After \\
+\midrule
+5\,000 & 10.2\,MB & 4.1\,s & 1.2\,s \\
+10\,000 & 20.3\,MB & 15.5\,s & 2.9\,s \\
+30\,000 & 61.0\,MB & 172\,s & 8.1\,s \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+<<review session functions>>=
+@contextmanager
+def paused_garbage_collection() -> Iterator[None]:
+    """Hold off the cyclic garbage collector, then restore its state."""
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        yield
+    finally:
+        if was_enabled:
+            gc.enable()
+<<review imports>>=
+import gc
+from contextlib import contextmanager
+from collections.abc import Iterator
+@
+
+Let's check that a save at 3\,000 decisions stays well inside a
+generous bound of processor time, as the test of [[sessions show]]
+does, and, since a bound loose enough for a loaded machine would not
+notice a pairing in the square of the size at this size, that pairing
+four times the decisions takes well under nine times as long, where
+the pairing in the square of the size takes about fourteen.
+Both measure processor time, so that other jobs on the machine count
+as little as possible.  The pairing is timed with the garbage collector
+held off, as the save holds it, and as the best of five runs: with it on
+and the best of three, a collection landing in the small case (about
+20\,ms) made the ratio range from 2.4 to 7.8 in fifteen runs, against
+a bound of 8.  Held off and the best of five, ten runs gave ratios of
+3.6 to 5.4, and the pairing before this change 13.3 to 14.8 in three
+(load average about 4), so the bound is 9, between the two.
+
+<<test functions>>=
+class TestSaveCost:
+  """A save grows with the session, not with its square (#316)."""
+
+  @staticmethod
+  def _session(n, name=None):
+    records = [SearchRecord(f"q{i}", "openalex", None, 100, hits=n)
+               for i in range(20)]
+    session = ReviewSession(query="q", providers=["openalex"],
+                            timestamp=datetime(2026, 11, 23), name=name)
+    session.search_records = list(records)
+    for k in range(n):
+      decision = ReviewDecision(
+        paper=Paper(title=f"Invented paper {k}", authors=["Ada Example"],
+                    year=2020, doi=f"10.5555/cost-{k}",
+                    abstract="An invented abstract. " * 20),
+        provider="openalex",
+        status=DecisionStatus.KEPT if k % 3 == 0 else DecisionStatus.PENDING,
+        tags=["theme"] if k % 3 == 0 else [])
+      for j in range(5):
+        decision.record_link(records[(k + j) % 20].key)
+      session.decisions.append(decision)
+    return session
+
+  def test_a_save_of_3000_decisions(self, tmp_path, monkeypatch):
+    import time
+    from scholar.scholar import isolated_registry
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+    with isolated_registry():
+      save_session(self._session(3000, "cost"))
+    with isolated_registry():
+      session = load_session("cost")
+      session.decisions[1].status = DecisionStatus.DISCARDED
+      session.decisions[1].tags = ["off-topic"]
+      started = time.process_time()
+      save_session(session)
+      elapsed = time.process_time() - started
+    assert elapsed < 10, f"a save of 3000 decisions took {elapsed:.1f} s"
+
+  @staticmethod
+  def _pairing_time(n):
+    import copy
+    import time
+    session = TestSaveCost._session(n)
+    session._baseline = SessionBaseline.of(session)
+    assign_baseline_keys(session)
+    on_disk = copy.copy(session)
+    on_disk.decisions = [replace(d, baseline_key=None)
+                         for d in session.decisions]
+    best = None
+    with paused_garbage_collection():
+      for _ in range(5):
+        started = time.process_time()
+        pair_with_file(session, on_disk)
+        elapsed = time.process_time() - started
+        best = elapsed if best is None else min(best, elapsed)
+    return best
+
+  def test_pairing_grows_with_the_session(self):
+    small, large = self._pairing_time(1500), self._pairing_time(6000)
+    assert large < 9 * small, (small, large)
+@
+
+\paragraph{When the lock cannot be taken.}
+\label{sec:session-lock}
+A save that waited [[LOCK_TIMEOUT]] (ten seconds) for the lock used to
+go ahead without it, which is what every save did before the lock
+existed (\cref{sec:file-lock}).  For a session that is the lost update
+the lock is there to prevent, and it happened: two processes each
+saving a session of over 30\,000 decisions, when a save took a minute
+and a half, waited past the ten seconds, and the one that then wrote
+without the lock replaced the search records the other had saved
+(\url{https://github.com/dbosk/scholarcli/issues/316}).
+A save of a session therefore never writes the file without its lock
+([[session_lock]]).
+\begin{description}
+\item[It waits longer] up to [[SESSION_LOCK_TIMEOUT]], five minutes.
+  A holder that is working is done long before that (a save of
+  30\,000 decisions takes seconds, \cref{sec:save-cost}, and a few may
+  be queued), and a holder that is stuck (a process suspended with
+  Ctrl-Z in mid-save) is reported within minutes instead of hanging
+  every other command for good.  After the first [[LOCK_TIMEOUT]] it
+  says which file it is waiting for, and then again about once a
+  minute ([[SESSION_LOCK_REPEAT]]), since a silent wait of minutes
+  looks like a hang; each line says that Ctrl-C stops the wait.
+\item[It refuses rather than writes] If the lock still cannot be taken,
+  nothing is written to the session file.  This process's session is
+  kept beside it, in a file of its own, and [[SessionNotSaved]] names
+  both files and how to merge the kept one in later.  The command
+  fails: the CLI prints the error as one line and exits with status~1
+  (\cref{sec:cli-main}).
+\item[An interrupt keeps the session too] Ctrl-C during the wait is
+  the user's way to stop waiting, and the wait is now minutes long and
+  announced, so it must not cost the session: the lock is taken apart
+  from the merge, and a [[KeyboardInterrupt]] during the wait keeps the
+  session as a refusal does; the CLI then exits with 130, the status
+  of an interrupted command, after the one line and without a
+  traceback.  An interrupt after the lock is taken, in the merge or the
+  write, is as it always was: the file is replaced atomically, so it is
+  the old one or the new one.  A second Ctrl-C while the session is
+  being kept is held back until the kept file is written (below).
+  Only Ctrl-C (SIGINT) is an interrupt here.  Python does not handle
+  SIGTERM, so a SIGTERM ends [[sessions decide]], the TUI and the other
+  commands on the spot, without a kept file and with exit status 143,
+  as before this change; [[scholar enrich]] alone turns SIGTERM into an
+  interrupt while it runs (\cref{sec:enrich-chunks}), and so keeps its
+  session.
+\item[A lock file that cannot be opened is said so] A lock that cannot
+  be opened or created (another user's lock file in a shared
+  directory, a read-only directory) is no other process's doing, and
+  no wait helps, so the error names the lock file and says to check
+  its permissions.  The save still refuses, since writing without the
+  lock is what this section removes, and keeps the session beside the
+  file.  Where the directory itself is not writable, no file can be
+  kept there either, so the error says that in the same line and no
+  kept file is tried.
+\end{description}
+[[reconcile_session]], which loads, folds and saves under the lock, and
+the copy before a run ([[keep_copy_before_run]]) take the lock the same
+way, before they have changed anything: refused, they keep nothing,
+and the error says to run the command again.  Their notices say that
+nothing has been changed yet.
+
+<<review constants>>=
+SESSION_LOCK_TIMEOUT = 300  # seconds a session save waits for its lock
+SESSION_LOCK_NOTICE = LOCK_TIMEOUT  # after this many, it says it waits
+SESSION_LOCK_REPEAT = 60  # and again after each of this many
+KEEP_SESSION_HINT = (
+    "; Ctrl-C stops waiting and keeps this process's session beside "
+    "the file"
+)
+NOTHING_CHANGED_HINT = "; Ctrl-C stops waiting, nothing has been changed yet"
+<<review session functions>>=
+def session_lock(path: Path, hint: str = KEEP_SESSION_HINT):
+    """The lock of the session file `path`: never skipped.
+
+    Waits up to `SESSION_LOCK_TIMEOUT` seconds, saying so after
+    `SESSION_LOCK_NOTICE` and every `SESSION_LOCK_REPEAT` seconds after
+    that (with `hint`), and raises `LockNotTaken` if the lock cannot be
+    taken.
+    """
+    return file_lock(
+        path, timeout=SESSION_LOCK_TIMEOUT, required=True,
+        notice_after=SESSION_LOCK_NOTICE, notice_every=SESSION_LOCK_REPEAT,
+        notice_hint=hint,
+    )
+<<review imports>>=
+from contextlib import ExitStack
+@
+
+The error is meant to be read once and acted on, so it is one sentence
+per fact: the file, why it was not written, that nothing was written,
+and where this process's session is with the command that merges it
+in, or that it could not be kept, or, for a command that had changed
+nothing yet, to run it again.  The path in the command is quoted for
+the shell, so that it can be pasted.  The cause decides the words and
+the exit status: [[held]] (another process holds the lock),
+[[lock-file]] (the lock file cannot be opened) or [[interrupted]].
+
+<<review constants>>=
+SAVE_REFUSALS = {
+    "held": "is locked by another scholar process ({reason})",
+    "lock-file": "cannot be locked ({reason}; check its permissions)",
+    "interrupted": "was not locked: the wait for its lock was interrupted",
+}
+SAVE_RETRY_WHEN = {
+    "held": "once the other scholar process has finished",
+    "lock-file": "once its lock file can be opened",
+    "interrupted": "once the other scholar process has finished",
+}
+<<review session functions>>=
+class SessionNotSaved(Exception):
+    """A session could not be saved: its file's lock was not taken.
+
+    `path` is the session file, left as it was; `unsaved` the file that
+    holds this process's session instead (None if there is none);
+    `reason` why the lock was not taken; `cause` one of
+    `SAVE_REFUSALS`; `keep_error` why no file could be kept, if one was
+    tried and failed.
+    """
+
+    def __init__(
+        self, path: Path, unsaved: Path | None, reason: str, *,
+        cause: str = "held", keep_error: str | None = None,
+    ) -> None:
+        self.path = Path(path)
+        self.unsaved = unsaved
+        self.reason = reason
+        self.cause = cause
+        self.interrupted = cause == "interrupted"
+        when = SAVE_RETRY_WHEN[cause]
+        message = (
+            f"Session file {path} "
+            + SAVE_REFUSALS[cause].format(reason=reason)
+            + ", so nothing was written to it."
+        )
+        if unsaved is not None:
+            message += (
+                f" This process's session is kept in {unsaved} (scholar "
+                "sessions recover --discard deletes it); "
+                f"{when}, merge it in with: scholar sessions recover "
+                f"{shlex.quote(str(unsaved))}"
+            )
+        elif keep_error is not None:
+            message += (
+                " Keeping this process's session beside it failed too "
+                f"({keep_error}), so its changes are lost."
+            )
+        else:
+            message += f" Nothing was changed; run the command again {when}."
+        super().__init__(message)
+<<review imports>>=
+import shlex
+@
+
+[[refused_save]] turns what stopped the wait into that error, keeping
+the session first where it can; [[lock_refusal]] does it for the
+commands that have nothing to keep yet.  Whether a file can be kept is
+asked of the directory ([[os.access]]) before one is tried, so that a
+read-only directory gives one line that says so, not a second failure
+dressed as the first.
+
+<<review session functions>>=
+def save_refusal_cause(error: BaseException) -> tuple[str, str]:
+    """The cause (a key of `SAVE_REFUSALS`) and reason of a refusal."""
+    if isinstance(error, KeyboardInterrupt):
+        return "interrupted", "interrupted while waiting for the lock"
+    return ("held" if error.held else "lock-file"), error.reason
+
+
+def lock_refusal(error: LockNotTaken) -> SessionNotSaved:
+    """The error of a command refused its lock before changing anything."""
+    cause, reason = save_refusal_cause(error)
+    return SessionNotSaved(error.path, None, reason, cause=cause)
+
+
+def refused_save(
+    session: ReviewSession, session_path: Path, error: BaseException
+) -> SessionNotSaved:
+    """Keep `session` beside `session_path` where possible; return the
+    `SessionNotSaved` to raise for `error` (a `LockNotTaken` or a
+    `KeyboardInterrupt` during the wait)."""
+    cause, reason = save_refusal_cause(error)
+    directory = session_path.parent
+    if not os.access(directory, os.W_OK):
+        return SessionNotSaved(
+            session_path, None, reason, cause=cause,
+            keep_error=f"the directory {directory} is not writable",
+        )
+    interrupt = InterruptHeldBack()
+    try:
+        with interrupt:
+            unsaved = keep_unsaved_session(session, session_path)
+    except OSError as write_error:
+        return SessionNotSaved(
+            session_path, None, reason, cause=cause,
+            keep_error=str(write_error),
+        )
+    except KeyboardInterrupt:
+        refusal = SessionNotSaved(
+            session_path, None, reason, cause=cause,
+            keep_error="interrupted while it was being kept",
+        )
+        refusal.interrupted = True
+        return refusal
+    refusal = SessionNotSaved(session_path, unsaved, reason, cause=cause)
+    refusal.interrupted = refusal.interrupted or interrupt.arrived
+    return refusal
+@
+
+Keeping the session takes seconds for a large one (the whole session
+is serialised), and a user who pressed Ctrl-C once and sees nothing
+happen presses it again.  That second interrupt used to stop the keep
+half-way and leave an empty kept file, which [[sessions list]] then
+advertised and [[sessions recover]] refused.  Two things prevent it.
+The kept file is created only once its text is ready
+([[keep_unsaved_session]], below), and it is removed if anything stops
+the write, so an interrupted keep leaves no file.  And while the
+session is kept, Ctrl-C is held back ([[InterruptHeldBack]]): the
+handler of SIGINT only notes that it came, and the command ends as an
+interrupted one (exit status 130) once the file is written.  We chose holding back over
+giving up because the keep is the last chance for this process's
+changes, and it ends in seconds; giving up would lose a review for the
+sake of a few seconds.  The holding back works only in the main
+thread, the only one Python delivers signals to; elsewhere, or if the
+interrupt comes in the moment before it is installed, the keep stops
+and the error says in its one line that the session could not be kept.
+
+<<review session functions>>=
+class InterruptHeldBack:
+    """While active (`with`), SIGINT only sets `arrived`.
+
+    Only in the main thread, where Python handles signals; elsewhere it
+    does nothing. The previous handler is restored on exit.
+    """
+
+    def __init__(self) -> None:
+        self.arrived = False
+        self._previous = None
+
+    def __enter__(self) -> "InterruptHeldBack":
+        if threading.current_thread() is threading.main_thread():
+            self._previous = signal.signal(signal.SIGINT, self._note)
+        return self
+
+    def _note(self, signum, frame) -> None:
+        self.arrived = True
+
+    def __exit__(self, *exc) -> None:
+        if self._previous is not None:
+            signal.signal(signal.SIGINT, self._previous)
+<<review imports>>=
+import signal
+import threading
+@
+
+The kept file is named [[<name>.json.unsaved-<UTC time>-<random>]],
+made by [[tempfile.mkstemp]] as the caches' files beside an unreadable
+cache are (\cref{sec:cache-concurrency}): the name is created
+exclusively, so two refused saves never share one, and the time sorts
+the files by age.  The name does not end in [[.json]], so no listing of
+sessions reads it as a session; [[sessions list]] names it instead.
+It holds the object a save would have written ([[session_file_data]])
+and, under [[UNSAVED_KEY]], what a merge needs besides: the name of the
+session file, and the baseline with each decision's key in it
+(\cref{sec:copies-in-the-merge}), since a merge must know what this
+process changed and what it found as loaded.  Without the kept file the
+recovery would be to run the command again, which for a TUI review
+means the review.
+
+<<review constants>>=
+UNSAVED_MARK = ".unsaved-"
+UNSAVED_KEY = "scholar_unsaved"
+<<review session functions>>=
+def keep_unsaved_session(session: ReviewSession, session_path: Path) -> Path:
+    """Write `session` beside `session_path` for `recover_unsaved_session`.
+
+    Returns the new file, `<name>.json.unsaved-<UTC time>-<random>`.
+    """
+    text = json.dumps({
+        **session_file_data(session),
+        UNSAVED_KEY: {
+            "target": session_path.name,
+            "baseline": baseline_data(session._baseline),
+            "baseline_keys": [d.baseline_key for d in session.decisions],
+        },
+    }, indent=2, ensure_ascii=False)
+    written = _utcnow().strftime("%Y%m%dT%H%M%SZ")
+    fd, name = tempfile.mkstemp(
+        dir=session_path.parent,
+        prefix=f"{session_path.name}{UNSAVED_MARK}{written}-",
+    )
+    unsaved = Path(name)
+    try:
+        os.close(fd)
+        atomic_write_text(unsaved, text)
+    except BaseException:
+        unsaved.unlink(missing_ok=True)
+        raise
+    return unsaved
+
+
+def unsaved_session_files() -> list[Path]:
+    """The files of refused saves in the sessions directory, oldest first."""
+    return sorted(_get_sessions_dir().glob(f"*.json{UNSAVED_MARK}*"))
+<<review imports>>=
+import os
+import tempfile
+@
+
+\paragraph{The baseline as JSON.}
+The baseline is compared with [[==]]: tuples of decision fields,
+frozen paper fields, the record keys as a set, the retirement marks by
+record key.  JSON has no tuples, sets or enumerations, and a tuple read
+back as a list would make every decision look changed, so the kept
+file writes the [[SessionBaseline]] fields under their names through a
+small codec ([[baseline_data]], [[baseline_from_data]]).  Each value
+JSON lacks is written as an object with one key that names its type
+(tuple, list, dict as a list of pairs, frozenset, or enum with the
+enumeration's name and the value); the enumerations are the two a
+decision's state holds, [[DecisionStatus]] and [[ReviewSource]], from a
+fixed list; everything else must be a string, a number, a boolean or
+null.  Reading checks every tag, the field names and the fields'
+types, and anything else is an error ([[SessionFileError]]).
+A first version pickled the baseline.  The review of this change
+showed what that costs: a kept file whose baseline is a pickle runs the
+pickle's code when it is recovered, before anything can be checked,
+and session files are shared and committed, so a kept file may come
+from someone else.  A pickle from another Scholar version also read
+back without an error while holding that version's fields.  So nothing
+on this path unpickles, and a kept file of the pickled shape is refused
+as unreadable.
+
+<<review session functions>>=
+BASELINE_ENUMS = {"DecisionStatus": DecisionStatus,
+                  "ReviewSource": ReviewSource}
+
+
+def baseline_value_data(value):
+    """`value` (a part of a `SessionBaseline`) as plain JSON data."""
+    if isinstance(value, Enum):
+        name = type(value).__name__
+        if BASELINE_ENUMS.get(name) is not type(value):
+            raise TypeError(f"no enumeration of a baseline: {name}")
+        return {"enum": [name, value.value]}
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, tuple):
+        return {"tuple": [baseline_value_data(v) for v in value]}
+    if isinstance(value, list):
+        return {"list": [baseline_value_data(v) for v in value]}
+    if isinstance(value, frozenset):
+        return {"frozenset": [baseline_value_data(v) for v in value]}
+    if isinstance(value, dict):
+        return {"dict": [[baseline_value_data(k), baseline_value_data(v)]
+                         for k, v in value.items()]}
+    raise TypeError(f"no value of a baseline: {type(value).__name__}")
+
+
+def baseline_value(data):
+    """The value `baseline_value_data` wrote as `data`.
+
+    Raises `ValueError` for anything it does not write.
+    """
+    if data is None or isinstance(data, (bool, int, float, str)):
+        return data
+    if not (isinstance(data, dict) and len(data) == 1):
+        raise ValueError(f"not a baseline value: {data!r:.60}")
+    [(tag, body)] = data.items()
+    if not isinstance(body, list):
+        raise ValueError(f"not a baseline value: {data!r:.60}")
+    try:
+        if tag in ("tuple", "list", "frozenset"):
+            items = [baseline_value(v) for v in body]
+            return {"tuple": tuple, "list": list,
+                    "frozenset": frozenset}[tag](items)
+        if tag == "dict" and all(
+            isinstance(p, list) and len(p) == 2 for p in body
+        ):
+            return {baseline_value(k): baseline_value(v) for k, v in body}
+        if (tag == "enum" and len(body) == 2 and body[0] in BASELINE_ENUMS
+                and isinstance(body[1], str)):
+            return BASELINE_ENUMS[body[0]](body[1])
+    except TypeError as error:
+        raise ValueError(f"not a baseline value: {error}") from error
+    raise ValueError(f"not a baseline value: {data!r:.60}")
+@
+
+The fields are written under their names and read back only if the
+names are exactly [[SessionBaseline]]'s and each field has the type the
+merge reads it as; a baseline of [[None]] (a session constructed in
+code) is written as null.
+
+<<review session functions>>=
+BASELINE_FIELD_TYPES = {
+    "decisions": dict, "research_context": (str, type(None)),
+    "record_keys": frozenset, "papers": dict, "decision_ids": dict,
+    "retired": dict,
+}
+
+
+def baseline_data(base: "SessionBaseline | None") -> dict | None:
+    """`base` as plain JSON data, for a kept file."""
+    if base is None:
+        return None
+    return {name: baseline_value_data(getattr(base, name))
+            for name in BASELINE_FIELD_TYPES}
+
+
+def baseline_from_data(data) -> "SessionBaseline | None":
+    """The baseline `baseline_data` wrote; `ValueError` if it is not one."""
+    if data is None:
+        return None
+    if not isinstance(data, dict) or set(data) != set(BASELINE_FIELD_TYPES):
+        raise ValueError("not a baseline: its fields differ")
+    values = {name: baseline_value(data[name]) for name in data}
+    for name, kind in BASELINE_FIELD_TYPES.items():
+        if not isinstance(values[name], kind):
+            raise ValueError(f"not a baseline: {name} has the wrong type")
+    if not all(isinstance(k, str) and isinstance(v, tuple)
+               for k, v in [*values["decisions"].items(),
+                            *values["papers"].items()]):
+        raise ValueError("not a baseline: a state is not a tuple")
+    if not all(isinstance(k, str) and isinstance(v, str)
+               for k, v in values["decision_ids"].items()):
+        raise ValueError("not a baseline: a paper id is not a string")
+    if not all(isinstance(k, tuple) for k in
+               [*values["record_keys"], *values["retired"]]):
+        raise ValueError("not a baseline: a record key is not a tuple")
+    return SessionBaseline(**values)
+@
+
+Let's verify the codec on what baselines hold: the baseline of an
+invented session of 5\,000 decisions, and an awkward one: a source no
+Scholar wrote ([[manual]]), a reset whose record holds a trace dict, a
+relabel holding a human record, a retired search, a confidence of
+$0.1+0.2$, a research context and none.  Each goes through
+[[json.dumps]] and back and must be equal ([[==]]) to the original.
+Then what it refuses: a pickle in place of the baseline (the old shape),
+an unknown tag, an enumeration not on the list, a field more or less, a
+state that is a list.
+
+<<test functions>>=
+class TestKeptBaselineCodec:
+  """The kept file's baseline is plain JSON, read back exactly (#316)."""
+
+  @staticmethod
+  def _awkward():
+    record = SearchRecord("q", "openalex", None, 10, hits=1,
+                          searched_at="2026-11-01T00:00:00+00:00")
+    record.retired = {"at": "2026-11-20T10:00:00+00:00", "by": None,
+                      "note": "draft"}
+    session = ReviewSession(query="q", providers=["openalex"],
+                            timestamp=datetime(2026, 11, 23))
+    session.search_records = [record]
+    session.decisions = [
+      ReviewDecision(paper=Paper(title="Odd", authors=["A"]),
+                     provider="openalex", status=DecisionStatus.KEPT,
+                     tags=["t"], source=ReviewSource("manual"),
+                     llm_confidence=0.1 + 0.2,
+                     resets=[{"at": "2026-11-21T00:00:00+00:00",
+                              "status": "kept", "tags": ["t"],
+                              "source": "llm", "llm_confidence": 0.5,
+                              "is_example": False,
+                              "trace": {"llm_model": "invented-model"},
+                              "note": None, "by": None}],
+                     relabelled=[{"from": "human", "to": "agent",
+                                  "at": "2026-11-22T00:00:00+00:00",
+                                  "note": None, "by": None,
+                                  "is_example": False,
+                                  "human": {"human_by": "Reviewer"}}]),
+      ReviewDecision(paper=Paper(title="Plain", authors=["B"],
+                                 doi="10.5555/plain"), provider="dblp"),
+    ]
+    return session
+
+  @staticmethod
+  def _round_trip(base):
+    import json
+    return baseline_from_data(json.loads(json.dumps(baseline_data(base))))
+
+  @pytest.mark.parametrize("context", [None, "Does X support Y?"])
+  def test_an_awkward_baseline(self, context):
+    session = self._awkward()
+    session.research_context = context
+    base = SessionBaseline.of(session, from_file=True)
+    assert base.retired and 0.1 + 0.2 in base.decisions[
+      get_paper_id(session.decisions[0].paper)]
+    assert self._round_trip(base) == base
+
+  def test_a_large_baseline(self):
+    base = SessionBaseline.of(TestSaveCost._session(5000),
+                              from_file=True)
+    assert self._round_trip(base) == base
+
+  def test_no_baseline(self):
+    assert self._round_trip(None) is None
+
+  @pytest.mark.parametrize("change", [
+    lambda d: d.update(decisions="gASVAAAAAAAAAAA="),
+    lambda d: d.update(decisions={"pickle": []}),
+    lambda d: d.update(decisions={"dict": [["k", {"enum": ["Path", "x"]}]]}),
+    lambda d: d.update(decisions={"dict": [["k", {"list": []}]]}),
+    lambda d: d.update(extra=None),
+    lambda d: d.pop("papers"),
+  ])
+  def test_what_is_refused(self, change):
+    data = baseline_data(SessionBaseline.of(self._awkward()))
+    change(data)
+    with pytest.raises(ValueError):
+      baseline_from_data(data)
+@
+
+The recovery reads the kept file as a session, gives it back its
+baseline and keys, points it at its session file and saves it: the
+same merge under the same lock as the save that was refused, only
+later, so the other process's changes and this one's both survive, by
+the rules of \cref{sec:session-integrity}.  Then the kept file is
+deleted.  If the lock is refused again, the kept file stays as it was,
+and the copy the refused save just made of it is deleted, so that one
+refused save never leaves two files.  The session file it writes is
+the one the kept file names, and only if that is a plain session file
+name ([[<name>.json]], no directory, not hidden) that the kept file's
+own name begins with, in the sessions directory: a kept file handed on
+could otherwise name any file to be written.  A baseline that cannot be
+read back is an error: without it the merge would take every
+difference from the file for a change of ours.
+
+A kept file is read as JSON first, and only an object holding
+[[UNSAVED_KEY]] is taken for one ([[read_kept_file]]).  JSON nested
+deep enough makes the reader, and the baseline's decoder, recurse past
+Python's limit; that [[RecursionError]] is a refusal too, as are
+baseline keys that are not strings, so that no crafted file ends in a
+traceback.
+
+<<review session functions>>=
+def read_kept_file(path: Path) -> dict:
+    """The JSON object of the kept file `path`.
+
+    Raises `SessionFileError` unless it is an object holding
+    `UNSAVED_KEY` whose value is an object.
+    """
+    try:
+        kept = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, RecursionError) as error:
+        raise SessionFileError(path, error) from error
+    if not (isinstance(kept, dict)
+            and isinstance(kept.get(UNSAVED_KEY), dict)):
+        raise SessionFileError(
+            path, ValueError("not a session kept by a refused save")
+        )
+    return kept
+
+
+def recover_unsaved_session(path: str | os.PathLike) -> Path:
+    """Merge the session kept in `path` by a refused save into its file.
+
+    `path` may be a name in the sessions directory. Returns the session
+    file. Deletes `path` once merged.
+
+    Raises:
+        SessionFileError: `path` is not such a file, or cannot be read.
+        SessionNotSaved: the lock was refused again; `path` is kept.
+    """
+    path = Path(path)
+    if not path.exists() and not path.is_absolute():
+        path = _get_sessions_dir() / path
+    <<read what the refused save kept in [[path]]>>
+    session = read_session_file(path, record_baseline=False)
+    if len(keys) != len(session.decisions):
+        raise SessionFileError(
+            path, ValueError("its baseline keys do not fit its decisions")
+        )
+    for decision, key in zip(session.decisions, keys):
+        decision.baseline_key = key
+    session._baseline = baseline
+    session._loaded_from = target
+    try:
+        save_session(session)
+    except SessionNotSaved as error:
+        if error.unsaved is not None:
+            error.unsaved.unlink(missing_ok=True)
+        raise SessionNotSaved(
+            target, path, error.reason, cause=error.cause
+        ) from error
+    path.unlink()
+    return target
+<<read what the refused save kept in [[path]]>>=
+kept = read_kept_file(path)
+try:
+    meta = kept[UNSAVED_KEY]
+    target_name = meta["target"]
+    keys = meta["baseline_keys"]
+    if not (isinstance(keys, list)
+            and all(k is None or isinstance(k, str) for k in keys)):
+        raise ValueError("its baseline keys are not strings")
+    baseline = baseline_from_data(meta["baseline"])
+except (KeyError, TypeError, ValueError, RecursionError) as error:
+    raise SessionFileError(path, error) from error
+if not (isinstance(target_name, str) and target_name.endswith(".json")
+        and target_name == Path(target_name).name
+        and not target_name.startswith(".")
+        and path.name.startswith(f"{target_name}{UNSAVED_MARK}")):
+    raise SessionFileError(path, ValueError(
+        f"it names {target_name!r}, not its own session file"
+    ))
+target = _get_sessions_dir() / target_name
+@
+
+\paragraph{Kept files pile up.}
+Every refused save keeps a whole copy of its session: a command tried
+three times while the lock stays held leaves three kept files, each a
+full session.  (A refused recovery adds none: it removes the copy its
+save made, since the file it recovers already holds that session.)
+They are not removed automatically, since each holds the changes of
+its own run, which the others may lack, and only the user knows which
+to merge: the newest run of a TUI review holds that review, but a
+second run of [[sessions decide]] holds only its own decisions.  So
+[[sessions list]] names them, and [[sessions recover --discard]]
+deletes one ([[discard_unsaved_session]]), after checking that it is a
+kept file: its name has the kept files' mark and it reads as one.
+
+<<review session functions>>=
+def discard_unsaved_session(path: str | os.PathLike) -> Path:
+    """Delete the kept file `path` (a path, or a name in the sessions
+    directory); return it.
+
+    Raises `SessionFileError`, deleting nothing, unless its name holds
+    `.json` + `UNSAVED_MARK` and it reads as a kept file.
+    """
+    path = Path(path)
+    if not path.exists() and not path.is_absolute():
+        path = _get_sessions_dir() / path
+    if f".json{UNSAVED_MARK}" not in path.name:
+        raise SessionFileError(
+            path, ValueError("not the name of a kept session")
+        )
+    read_kept_file(path)
+    path.unlink()
+    return path
+@
+
+Let's verify it with real processes: another process loads the
+session, saves a decision of its own and keeps holding the lock, as a
+process stuck in mid-save would.  Our save, with a short timeout set
+through the module's constants, must say that it waits, then leave the
+session file byte for byte as it was, keep our session beside it and
+name both files.  A recovery while the lock is still held changes
+nothing and leaves one kept file; once the other process has let go, it
+merges: both decisions are in the file, and the kept file is gone.
+
+<<test functions>>=
+class TestSaveWhenTheLockIsHeld:
+  """A save that cannot take the lock writes nothing to the file (#316)."""
+
+  HOLDER = """
+    import sys
+    from scholar.review import (
+      DecisionStatus, load_session, save_session, session_file_path,
+    )
+    from scholar.utils import file_lock
+    session = load_session("held")
+    with file_lock(session_file_path(session)):
+      session.decisions[1].status = DecisionStatus.KEPT
+      session.decisions[1].tags = ["theirs"]
+      save_session(session)
+      print("holding", flush=True)
+      sys.stdin.readline()
+  """
+
+  @staticmethod
+  def _make(tmp_path, monkeypatch):
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+    session = ReviewSession(query="q", providers=["openalex"],
+                            timestamp=datetime(2026, 11, 23), name="held")
+    session.decisions = [
+      ReviewDecision(paper=Paper(title=f"Held {i}", authors=["A"],
+                                 doi=f"10.5555/held-{i}"),
+                     provider="openalex")
+      for i in range(3)
+    ]
+    return save_session(session)
+
+  def _hold(self):
+    import subprocess
+    import sys
+    import textwrap
+    holder = subprocess.Popen(
+      [sys.executable, "-c", textwrap.dedent(self.HOLDER)],
+      stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+    )
+    assert holder.stdout.readline().strip() == "holding"
+    return holder
+
+  @staticmethod
+  def _release(holder):
+    holder.communicate("go\n", timeout=60)
+    assert holder.returncode == 0
+
+  @staticmethod
+  def _short_wait(monkeypatch):
+    import scholar.review as review
+    monkeypatch.setattr(review, "SESSION_LOCK_TIMEOUT", 0.6)
+    monkeypatch.setattr(review, "SESSION_LOCK_NOTICE", 0.2)
+
+  def test_nothing_is_written_and_the_session_is_kept(
+    self, tmp_path, monkeypatch, caplog
+  ):
+    import json
+    path = self._make(tmp_path, monkeypatch)
+    ours = load_session("held")
+    ours.decisions[0].status = DecisionStatus.KEPT
+    ours.decisions[0].tags = ["ours"]
+    holder = self._hold()
+    try:
+      before = path.read_bytes()
+      self._short_wait(monkeypatch)
+      with caplog.at_level("WARNING"):
+        with pytest.raises(SessionNotSaved) as raised:
+          save_session(ours)
+      assert path.read_bytes() == before
+    finally:
+      if holder.poll() is None:
+        holder.kill()
+    error = raised.value
+    assert error.path == path and error.unsaved.parent == path.parent
+    assert error.unsaved.name.startswith("held.json.unsaved-")
+    assert str(path) in str(error) and str(error.unsaved) in str(error)
+    assert "\n" not in str(error)
+    kept = json.loads(error.unsaved.read_text())
+    assert kept.pop(UNSAVED_KEY)["target"] == "held.json"
+    assert kept == json.loads(json.dumps(session_file_data(ours)))
+    assert [r.message for r in caplog.records].count(
+      f"{path} is locked by another scholar process; waited 0.2 s, "
+      f"waiting up to 0.4 s more{KEEP_SESSION_HINT}") == 1
+    assert unsaved_session_files() == [error.unsaved]
+
+  def test_recovery_merges_once_the_lock_is_free(
+    self, tmp_path, monkeypatch
+  ):
+    from scholar.scholar import isolated_registry
+    path = self._make(tmp_path, monkeypatch)
+    ours = load_session("held")
+    ours.decisions[0].status = DecisionStatus.KEPT
+    ours.decisions[0].tags = ["ours"]
+    holder = self._hold()
+    try:
+      self._short_wait(monkeypatch)
+      with pytest.raises(SessionNotSaved) as raised:
+        save_session(ours)
+      unsaved = raised.value.unsaved
+      before = path.read_bytes()
+      with isolated_registry(), pytest.raises(SessionNotSaved) as again:
+        recover_unsaved_session(unsaved)
+      assert again.value.unsaved == unsaved
+      assert path.read_bytes() == before
+      assert unsaved_session_files() == [unsaved]
+      self._release(holder)
+    finally:
+      if holder.poll() is None:
+        holder.kill()
+    with isolated_registry():
+      assert recover_unsaved_session(unsaved.name) == path
+    assert unsaved_session_files() == []
+    with isolated_registry():
+      saved = load_session("held")
+    assert [(d.status.value, d.tags) for d in saved.decisions] == [
+      ("kept", ["ours"]), ("kept", ["theirs"]), ("pending", []),
+    ]
+
+  def test_a_session_file_is_not_a_kept_one(self, tmp_path, monkeypatch):
+    path = self._make(tmp_path, monkeypatch)
+    with pytest.raises(SessionFileError):
+      recover_unsaved_session(path)
+@
+
+The copy before a run waits as a save does: with the lock held, it
+gives up after the session's timeout with the error of a command that
+changed nothing, and never says that it went ahead without the lock.
+
+<<test functions>>=
+class TestCopyBeforeARunTakesTheSessionLock:
+  """keep_copy_before_run waits once, as a save does (#316)."""
+
+  def test_refused_without_an_unlocked_copy(
+    self, tmp_path, monkeypatch, caplog
+  ):
+    path = TestSaveWhenTheLockIsHeld._make(tmp_path, monkeypatch)
+    session = load_session("held")
+    holder = TestSaveWhenTheLockIsHeld()._hold()
+    try:
+      TestSaveWhenTheLockIsHeld._short_wait(monkeypatch)
+      with caplog.at_level("WARNING"):
+        with pytest.raises(SessionNotSaved) as raised:
+          keep_copy_before_run(session, "pre-test")
+    finally:
+      holder.communicate("go\n", timeout=60)
+    assert raised.value.unsaved is None
+    assert "Nothing was changed; run the command again" in str(raised.value)
+    assert "without the lock" not in caplog.text
+    assert NOTHING_CHANGED_HINT in caplog.text
+    assert list(path.parent.glob("*.pre-test-*.bak")) == []
+@
+
+A kept file is data, never code.  The tests write kept files by hand:
+one of the old shape, whose baseline is a pickle that would create a
+marker file when unpickled, and ones that name another file to write:
+a path, a file its own name does not begin with, a hidden or
+non-session name.  Each is
+refused before anything is read as a session, the marker is never
+made and no session file is written.
+
+<<test functions>>=
+class TestKeptFilesAreData:
+  """A kept file cannot run code or name another file (#316)."""
+
+  @staticmethod
+  def _kept(tmp_path, monkeypatch, target="held.json", baseline=None,
+            name=None):
+    import json
+    path = TestSaveWhenTheLockIsHeld._make(tmp_path, monkeypatch)
+    data = json.loads(path.read_text())
+    data[UNSAVED_KEY] = {
+      "target": target, "baseline": baseline,
+      "baseline_keys": [None] * len(data["decisions"]),
+    }
+    kept = path.with_name(name or f"held.json{UNSAVED_MARK}20261123T0-x")
+    kept.write_text(json.dumps(data))
+    return path, kept
+
+  def test_a_pickled_baseline_is_not_run(self, tmp_path, monkeypatch):
+    import base64
+    import pickle
+    import scholar.review as review
+    marker = tmp_path / "marker"
+
+    class Payload:
+      def __reduce__(self):
+        return (open, (str(marker), "w"))
+
+    path, kept = self._kept(
+      tmp_path, monkeypatch,
+      baseline=base64.b64encode(pickle.dumps(Payload())).decode())
+    before = path.read_bytes()
+    with pytest.raises(SessionFileError) as raised:
+      recover_unsaved_session(kept)
+    assert not marker.exists()
+    assert "not a baseline" in str(raised.value)
+    assert path.read_bytes() == before and kept.exists()
+    assert not hasattr(review, "pickle")
+
+  @pytest.mark.parametrize("target", [
+    "../held.json", "/tmp/held.json", "other.json", ".held.json",
+    "held.txt", 7,
+  ])
+  def test_only_its_own_session_file(self, tmp_path, monkeypatch, target):
+    name = (f"{target}{UNSAVED_MARK}20261123T0-x"
+            if target in (".held.json", "held.txt") else None)
+    path, kept = self._kept(tmp_path, monkeypatch, target=target,
+                            name=name)
+    before = sorted(p.name for p in path.parent.iterdir())
+    with pytest.raises(SessionFileError):
+      recover_unsaved_session(kept)
+    assert sorted(p.name for p in path.parent.iterdir()) == before
+@
+
+A kept file nested ten thousand levels deep, or with baseline keys that
+are not strings, is refused like any other that is not one.
+
+<<test functions>>=
+class TestCraftedKeptFiles:
+  """Crafted kept files are refused, never a traceback (#316)."""
+
+  @staticmethod
+  def _write(tmp_path, monkeypatch, meta_text):
+    path = TestSaveWhenTheLockIsHeld._make(tmp_path, monkeypatch)
+    kept = path.with_name(f"held.json{UNSAVED_MARK}20261123T0-x")
+    text = path.read_text().rstrip()
+    assert text.endswith("}")
+    kept.write_text(text[:-1] + f', "{UNSAVED_KEY}": {meta_text}}}')
+    return path, kept
+
+  def test_a_deep_baseline(self, tmp_path, monkeypatch):
+    deep = '{"tuple": [' * 10000 + "null" + "]}" * 10000
+    path, kept = self._write(
+      tmp_path, monkeypatch,
+      '{"target": "held.json", "baseline_keys": [null, null, null], '
+      f'"baseline": {deep}}}')
+    before = path.read_bytes()
+    with pytest.raises(SessionFileError):
+      recover_unsaved_session(kept)
+    assert path.read_bytes() == before
+
+  @pytest.mark.parametrize("keys", ["[{}, null, null]", "[[1], null, null]",
+                                    '"abc"'])
+  def test_keys_that_are_not_strings(self, tmp_path, monkeypatch, keys):
+    path, kept = self._write(
+      tmp_path, monkeypatch,
+      f'{{"target": "held.json", "baseline_keys": {keys}, '
+      '"baseline": null}')
+    before = path.read_bytes()
+    with pytest.raises(SessionFileError):
+      recover_unsaved_session(kept)
+    assert path.read_bytes() == before
+@
+
+An interrupted keep leaves no file: an interrupt while the session is
+serialised comes before the file exists, and an interrupt that stops
+the keep (where it cannot be held back) gives the one line that says
+the session is lost.  The case of two real interrupts, the second held
+back, is tested through the command line (\cref{sec:sessions-recover}).
+
+<<test functions>>=
+class TestInterruptedKeep:
+  """An interrupted keep leaves no empty kept file (#316)."""
+
+  def test_no_file_before_the_text_is_ready(self, tmp_path, monkeypatch):
+    import scholar.review as review
+    path = TestSaveWhenTheLockIsHeld._make(tmp_path, monkeypatch)
+    monkeypatch.setattr(review, "session_file_data",
+                        Mock(side_effect=KeyboardInterrupt))
+    with pytest.raises(KeyboardInterrupt):
+      keep_unsaved_session(load_session("held"), path)
+    assert unsaved_session_files() == []
+
+  def test_a_stopped_keep_is_said_in_one_line(self, tmp_path, monkeypatch):
+    import scholar.review as review
+    from scholar.utils import LockNotTaken
+    path = TestSaveWhenTheLockIsHeld._make(tmp_path, monkeypatch)
+    monkeypatch.setattr(review, "keep_unsaved_session",
+                        Mock(side_effect=KeyboardInterrupt))
+    refusal = refused_save(load_session("held"), path, LockNotTaken(
+      path, "still locked after 1 s", held=True, lock_file=path))
+    assert refusal.unsaved is None and refusal.interrupted
+    assert "interrupted while it was being kept" in str(refusal)
+    assert "its changes are lost" in str(refusal)
+    assert "\n" not in str(refusal)
+    assert unsaved_session_files() == []
+
+  def test_an_interrupt_is_held_back(self):
+    import os
+    import signal
+    import time
+    held = InterruptHeldBack()
+    with held:
+      os.kill(os.getpid(), signal.SIGINT)
+      time.sleep(0.05)
+    assert held.arrived
+@
+
+[[sessions recover --discard]] deletes a kept file and nothing else: a
+session file, a file named like a kept one that does not read as one, a
+kept file's content under another name, and a missing file are
+refused, and the file stays.
+
+<<test functions>>=
+class TestDiscardKeptFile:
+  """discard_unsaved_session deletes only kept files (#316)."""
+
+  def test_a_kept_file_is_deleted(self, tmp_path, monkeypatch):
+    path = TestSaveWhenTheLockIsHeld._make(tmp_path, monkeypatch)
+    kept = keep_unsaved_session(load_session("held"), path)
+    assert discard_unsaved_session(kept.name) == kept
+    assert not kept.exists() and path.exists()
+
+  def test_anything_else_stays(self, tmp_path, monkeypatch):
+    path = TestSaveWhenTheLockIsHeld._make(tmp_path, monkeypatch)
+    fake = path.with_name(f"held.json{UNSAVED_MARK}20261123T0-x")
+    fake.write_text('{"query": "q"}')
+    renamed = path.with_name("renamed-kept-file")
+    renamed.write_text(
+      keep_unsaved_session(load_session("held"), path).read_text())
+    for target in (path, fake, renamed,
+                   path.with_name("gone.json.unsaved-x")):
+      with pytest.raises(SessionFileError):
+        discard_unsaved_session(target)
+    assert path.exists() and fake.exists() and renamed.exists()
+@
+
+A lock file that cannot be opened is no other process's doing.  With
+the session's lock file made read-only (as another user's would be),
+the save is refused at once, the error names the lock file and its
+permissions, not another process, and the session is kept.  With the
+sessions directory read-only and no lock file in it yet, the error
+says in the same line that nothing could be kept, and no kept file is
+tried.  (A lock file left there by an earlier save can still be locked
+in a read-only directory; the write then fails as any write there does,
+with the system's error.)
+
+<<test functions>>=
+class TestLockFileThatCannotBeOpened:
+  """A lock file that cannot be opened is said so (#316)."""
+
+  def _session(self, tmp_path, monkeypatch):
+    path = TestSaveWhenTheLockIsHeld._make(tmp_path, monkeypatch)
+    session = load_session("held")
+    session.decisions[0].status = DecisionStatus.KEPT
+    return path, session
+
+  def test_a_read_only_lock_file(self, tmp_path, monkeypatch):
+    from scholar.utils import lock_path
+    path, session = self._session(tmp_path, monkeypatch)
+    lock = lock_path(path)
+    lock.touch()
+    lock.chmod(0o400)
+    before = path.read_bytes()
+    try:
+      with pytest.raises(SessionNotSaved) as raised:
+        save_session(session)
+    finally:
+      lock.chmod(0o600)
+    message = str(raised.value)
+    assert f"cannot open the lock file {lock}" in message
+    assert "check its permissions" in message
+    assert "another scholar process" not in message
+    assert "once its lock file can be opened" in message
+    assert raised.value.unsaved.exists()
+    assert path.read_bytes() == before
+
+  def test_a_read_only_directory(self, tmp_path, monkeypatch):
+    from scholar.utils import lock_path
+    path, session = self._session(tmp_path, monkeypatch)
+    before = path.read_bytes()
+    lock_path(path).unlink(missing_ok=True)
+    path.parent.chmod(0o500)
+    try:
+      with pytest.raises(SessionNotSaved) as raised:
+        save_session(session)
+      kept = list(path.parent.glob(f"*{UNSAVED_MARK}*"))
+    finally:
+      path.parent.chmod(0o700)
+    message = str(raised.value)
+    assert "check its permissions" in message
+    assert f"the directory {path.parent} is not writable" in message
+    assert "\n" not in message
+    assert raised.value.unsaved is None and kept == []
+    assert path.read_bytes() == before
+@
+
+The collector must be back as it was after every save: a normal one, a
+refused one and one that fails in the merge; and a save made while the
+caller had turned it off leaves it off.
+
+<<test functions>>=
+class TestSaveRestoresGarbageCollection:
+  """save_session puts the garbage collector back as it found it (#316)."""
+
+  def test_after_a_save_a_refusal_and_a_failure(self, tmp_path, monkeypatch):
+    import gc
+    import scholar.review as review
+    path = TestSaveWhenTheLockIsHeld._make(tmp_path, monkeypatch)
+    assert gc.isenabled()
+    save_session(load_session("held"))
+    assert gc.isenabled()
+    with monkeypatch.context() as patched:
+      patched.setattr(review, "merge_concurrent_changes",
+                      Mock(side_effect=RuntimeError("merge failed")))
+      with pytest.raises(RuntimeError):
+        save_session(load_session("held"))
+    assert gc.isenabled()
+    from scholar.utils import lock_path
+    lock_path(path).unlink(missing_ok=True)
+    path.parent.chmod(0o500)
+    try:
+      with pytest.raises(SessionNotSaved):
+        save_session(load_session("held"))
+    finally:
+      path.parent.chmod(0o700)
+    assert gc.isenabled()
+
+  def test_a_collector_turned_off_stays_off(self, tmp_path, monkeypatch):
+    import gc
+    TestSaveWhenTheLockIsHeld._make(tmp_path, monkeypatch)
+    gc.disable()
+    try:
+      save_session(load_session("held"))
+      assert not gc.isenabled()
+    finally:
+      gc.enable()
+@
+
+The ordinary race, two saves at once, still merges under the session
+lock: [[test_simultaneous_saves_keep_both]] above makes one in one
+process, and [[TestLinkPlaces]] runs two in real processes, in both
+orders.
 
 Let's verify the paper merge with the race of
 \url{https://github.com/dbosk/scholarcli/issues/194}, in real
@@ -16789,7 +18282,8 @@ def warn_about_foreign_name(session_path: Path, session) -> None:
     """Warn once that the file holds a session whose name maps elsewhere."""
     own = own_session_file_name(session.name, session.query)
     key = (str(session_path), own)
-    if session_path.name == own or key in _WARNED_FOREIGN_NAMES:
+    if (session_path.name == own or key in _WARNED_FOREIGN_NAMES
+            or UNSAVED_MARK in session_path.name):
         return
     _WARNED_FOREIGN_NAMES.add(key)
     logger.warning(
