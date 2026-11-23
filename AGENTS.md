@@ -2977,7 +2977,16 @@ export (or a failed restore) leaves. Under the directory lock
 export of another cache directory is never reported; one WARNING each
 (`leftover_warning`; the replaced-files one says it holds the versions
 from before the unfinished export and that the files in the directory
-are the latest finished export's), deleting nothing. A failure raises
+are the latest finished export's), deleting nothing. The export's own
+staging directory is skipped BEFORE any lock is tried (#335:
+`file_lock` is reentrant, so `left_over` took the export's own lock,
+and a relative `-o` made `mkdtemp`'s absolute path differ from the
+relative entries): `leftover_directories(dir, own=[...])` compares
+`Path.resolve()` (`own_directory`), and `left_over` also answers held
+for a lock this thread holds under that path (`is_locked`). The
+replaced-files directory is made after the scan. Tested with relative,
+`./`, `..` and symlinked spellings (`TestStagedOutputOwnDirectories`,
+`TestExportRelativeOutput`). A failure raises
 `OutputsNotPlaced` (`new`/`old`/`missing`/`not_written`/`others`, `kept`,
 `rolled_back`, `changed`); `cli.export_failure_text` words the message
 from it: "no files were written or changed" (with "and was rolled
