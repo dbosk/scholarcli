@@ -173,7 +173,8 @@ Providers self-register via `register_provider()` at module load time.
   IEEE `total_records`, HAL `numFound`, Scopus
   `opensearch:totalResults`, arXiv feed header; none with arXiv's
   client-side year filter; an absent field is `None`, not 0), reset
-  next to `last_error`. `search_provider` reads them Mock-safely
+  next to `last_error`, and announce it there through
+  `first_total_known` (#301, see Search Limit). `search_provider` reads them Mock-safely
   (`provider_total`) into `SearchResult.total`/`total_estimated`,
   stored on `SearchRecord`. `hits_label(..., total=, limit=,
   estimated=)` / `count_label`: "100 of 2,130 (capped at 100)" (capped
@@ -261,6 +262,41 @@ Providers self-register via `register_provider()` at module load time.
   then count as current again in every report. Both sides retiring one
   run with different notes: ours (the last save) wins.
 
+### Search Limit (#301)
+
+`scholar search` and `scholar rq` fetch everything unless `--limit` is
+given (cli.nw `sec:no-limit-default`): the option is `Optional[int] =
+None`; None and 0 both go to providers as `UNLIMITED_PROVIDER_LIMIT`
+(`effective_limit = UNLIMITED_PROVIDER_LIMIT if not limit else
+limit`), `-l N` limits. `DEFAULT_SEARCH_LIMIT` (1000) is gone; help
+text `SEARCH_LIMIT_HELP` points to `scholar syntax`, whose table
+"Searches without --limit (the default)" states the costs from the
+code's constants: S2 always bulk (relevance only with `-l N`;
+`S2_BULK_SAFETY_CAP`), `openalex-semantic` keeps 50 (lowered before
+the search), IEEE `LIMITS.daily` 200 requests of `MAX_LIMIT` 200,
+OpenAlex pages of 200 against the metered budget.
+- **Reproduced commands always carry the limit**: `_search_flags`
+  prints `--limit N` whenever the record knows it (`--limit 0` for the
+  sentinel), legacy records (limit None) none. Changed output for
+  existing sessions: records of limit 1000 (the old default) now show
+  `--limit 1000` in `sessions show`, `prov found-via`, `bibtex+prov`
+  FOUND-VIA and `retire-search` record lines (before: no flag).
+- **Notice**: providers call `first_total_known(name, total,
+  estimated)` (providers.nw `sec:first-total`) where they read the
+  first page's total: OpenAlex (+ source-pinned), DBLP, WoS Starter and
+  Expanded, IEEE, HAL, Scopus, arXiv (client, `_try_index == 0`), S2
+  bulk (request without `token`). Not S2's relevance search (total
+  known only at the end; an unlimited search never uses it) and never
+  a cache hit. The listener lives in a `ContextVar`, installed by
+  `listening_for_totals(listener)` (None = nothing); `search`/`rq`
+  install `cli.notice_large_total` only when `--limit` was not given,
+  which prints one stderr line for a total >= `LARGE_RESULT_NOTICE`
+  (10,000): "<provider>: [about ]<total> results for this query;
+  fetching all of them (give --limit N to take fewer)". `-l 0` gets
+  none. Nothing is refused or cut.
+- Tutorials keep `-l 5` on every practice search;
+  `test_tutorial_searches_carry_a_limit` checks every lesson command.
+
 ### Search Flow
 
 1. CLI parses args → `cli.py:search()`
@@ -274,7 +310,7 @@ Providers self-register via `register_provider()` at module load time.
 
 | Provider | Name | API | Auth |
 |----------|------|-----|------|
-| Semantic Scholar | `s2` | REST API (`requests`): relevance search, or bulk search for operators / `-l 0` | `S2_API_KEY` (optional) |
+| Semantic Scholar | `s2` | REST API (`requests`): relevance search with `-l N`, else bulk search (operators, or no limit: the default) | `S2_API_KEY` (optional) |
 | OpenAlex | `openalex` | `pyalex` client | `OPENALEX_API_KEY` (optional, 10x daily budget), `SCHOLAR_EMAIL` (optional) |
 | DBLP | `dblp` | REST API | None required |
 | Web of Science | `wos` | REST API | `WOS_API_KEY` (required) |
@@ -459,7 +495,7 @@ refusal sets `last_error` (else it would read as 0 works).
   needs no change there, only in `SearchFilters.is_empty`.
 - **`rq`** refuses `-p openalex-semantic` (exit 2) before asking for the
   question: its LLM writes keyword queries, mixes providers in one
-  session, records the keyword default limit and applies filters.
+  session, records a keyword search's limit and applies filters.
 - **Audit table**: ranked records/rows are left out of the
   "Databases:" sentence and of `audit_search_shortfalls`; code `OA-sem`;
   `audit_semantic_sentence` adds `AUDIT_STRINGS[lang]["semantic"]` (en,
@@ -3343,6 +3379,10 @@ frozen into the persistent cache.
 `ratelimit.py` tracks provider rate limits and quotas **persistently
 across CLI invocations** — necessary because e.g. IEEE allows only 200
 requests/day and each `scholar` run is a fresh process.
+Searches fetch everything by default (#301, see Search Limit), so one
+broad IEEE search (200 requests of 200 records) can spend the day, and
+every OpenAlex page counts against its budget; the large-total notice
+appears while such a search runs.
 
 - Providers declare limits as class attributes read via `getattr`:
   `LIMITS = Limits(per_second=10.0, daily=200)` (IEEE), plus optional

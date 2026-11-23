@@ -667,13 +667,12 @@ name: Annotated[
     ),
 ] = None,
 limit: Annotated[
-    int,
+    Optional[int],
     typer.Option(
         "--limit", "-l",
-        help="Maximum results per provider (default: 1000). "
-             "Use 0 for unlimited (fetch all pages).",
+        help=SEARCH_LIMIT_HELP,
     ),
-] = DEFAULT_SEARCH_LIMIT,
+] = None,
 enrich: Annotated[
     bool,
     typer.Option(
@@ -938,14 +937,14 @@ class TestSearchInOption:
       app, ["prov", "found-via", broad.id, "-f", "json"]
     )
     assert [r["command"] for r in json.loads(found.output)] == [
-      "scholar search q -p fake"
+      "scholar search q -p fake --limit 0"
     ]
     found = runner.invoke(
       app, ["prov", "found-via", narrow.id, "-f", "json"]
     )
     assert sorted(r["command"] for r in json.loads(found.output)) == [
-      "scholar search q -p fake",
-      "scholar search q -p fake --in title-abstract",
+      "scholar search q -p fake --in title-abstract --limit 0",
+      "scholar search q -p fake --limit 0",
     ]
 
   def test_rq_passes_it_to_the_provider(self, tmp_path, monkeypatch):
@@ -997,14 +996,98 @@ The results are then passed to the appropriate formatter.
 
 Since providers automatically paginate to fetch results beyond their per-request
 limits, users can request more than a single page of results.
-The [[--limit/-l]] option controls the maximum results per provider, and
-[[--limit 0]] fetches all available pages.
-Large (or unlimited) searches may take time and consume API quotas, but the
-provider implementations handle paging and rate limiting automatically:
+
+\paragraph{No limit by default.}
+\label{sec:no-limit-default}
+A search without [[--limit]] fetches every result each provider has,
+as [[--limit 0]] does; [[-l N]] takes at most [[N]] per provider
+(\url{https://github.com/dbosk/scholar/issues/301}).  The default used
+to be a thousand per provider.  A user who did not know the option
+then got a truncated result, which read as capped only where the
+provider reports a total (\cref{sec:reported-total} in the providers
+chapter), and a record's count was not the database's count but that
+of a default nobody had chosen.  What is screened is decided after the
+search; the search itself should not lose anything.
+
+The option's default is therefore [[None]], \enquote{not given}, rather
+than [[0]]: both search without a limit, but only a search that was
+not asked to fetch everything gets the notice below.  Both reach the
+providers as [[UNLIMITED_PROVIDER_LIMIT]] (the [[scholar]] module), so
+the session records them alike, and a reproduced command says
+[[--limit 0]] for both (\cref{sec:search-flags}).
+
+What \enquote{everything} costs differs per provider; each of these is
+in the providers chapter, and [[scholar syntax]] lists them in its
+table of searches without a limit (\cref{ch:syntax-cli}):
+\begin{description}
+\item[Semantic Scholar] An unlimited search goes to the bulk search
+  whatever the query ([[s2_uses_bulk]]), so plain words are no longer
+  ranked by relevance unless a limit is given, and the bulk search
+  stops at its safety cap of a hundred thousand papers
+  ([[S2_BULK_SAFETY_CAP]]), recorded as incomplete.
+\item[OpenAlex semantic search] It keeps its fifty: the limit is lowered
+  to the provider's maximum before the search
+  ([[<<refuse what a semantic search cannot do>>]]).
+\item[IEEE Xplore] Its limiter allows two hundred requests a day
+  ([[LIMITS]]) of at most two hundred records each, so one broad
+  unlimited search can spend the day.
+\item[OpenAlex] Every page of two hundred works is a request against
+  the metered daily budget, and the source-pinned preprint servers
+  share that budget.
+\end{description}
+The other providers page as before, paced by their limiters.
+
+The help says this in one sentence, without the number it used to
+carry; the per-provider costs are too many for a help line.
+
+<<constants>>=
+SEARCH_LIMIT_HELP = (
+    "Maximum results per provider; without it, or with 0, every result "
+    "is fetched (see scholar syntax for what that costs per provider)."
+)
+@
+
+A search that fetches everything should say so when everything is a
+lot, while there is still time to stop it and give a limit.  The
+providers announce the total they read from the first page
+([[first_total_known]], \cref{sec:first-total} in the providers
+chapter); during a search without [[--limit]] the command listens, and
+for a total of at least [[LARGE_RESULT_NOTICE]] it prints one line on
+standard error, so that [[-f json]] and [[-f bibtex]] output stays
+pure.  The threshold is our own choice: ten pages of a thousand, well
+above what a focused query returns and well below the safety cap.
+Nothing is refused or cut: the notice informs, and the user who
+typed [[-l 0]] has said already that everything is wanted, so gets no
+notice.  The total is the provider's, so Semantic Scholar's estimate
+is marked \enquote{about}.  Which providers can announce, and which
+cannot, is the providers chapter's business: every provider that
+reports a total reads it from the first page, except Semantic
+Scholar's relevance search, which an unlimited search never uses.
+
+<<constants>>=
+LARGE_RESULT_NOTICE = 10_000
+<<search command>>=
+def notice_large_total(name: str, total: int, estimated: bool) -> None:
+    """Print one notice on stderr when a search will fetch many results."""
+    if total < LARGE_RESULT_NOTICE:
+        return
+    about = "about " if estimated else ""
+    Console(stderr=True).print(Text(
+        f"{name}: {about}{total:,} results for this query; fetching all "
+        f"of them (give --limit N to take fewer)",
+        style="yellow",
+    ))
+@
+
+The search itself follows.  Large (or unlimited) searches may take time
+and consume API quotas, but the provider implementations handle paging
+and rate limiting automatically:
 
 <<execute search and display results>>=
 from scholar import Search, SearchFilters, SearchResult
-from scholar.providers import get_default_providers, expand_provider_names
+from scholar.providers import (
+    get_default_providers, expand_provider_names, listening_for_totals,
+)
 import sys
 
 # Determine which providers will be used. Group aliases (e.g.
@@ -1018,8 +1101,8 @@ else:
 <<refuse what a semantic search cannot do>>
 providers_for_enrich = parse_enrich_providers(enrich_providers)
 
-effective_limit = UNLIMITED_PROVIDER_LIMIT if limit == 0 else limit
-limit_label = "unlimited" if limit == 0 else str(limit)
+effective_limit = UNLIMITED_PROVIDER_LIMIT if not limit else limit
+limit_label = "unlimited" if not limit else str(limit)
 
 logger.info(f"Searching with providers: {', '.join(provider_names)}")
 logger.debug(f"Search query: '{query}'")
@@ -1041,11 +1124,12 @@ if any([
 <<refuse filters for a semantic search>>
 
 s = Search(query)
-results = s.execute(
-    providers=None if provider is None else provider_names,
-    limit=effective_limit,
-    filters=filters,
-)
+with listening_for_totals(notice_large_total if limit is None else None):
+    results = s.execute(
+        providers=None if provider is None else provider_names,
+        limit=effective_limit,
+        filters=filters,
+    )
 
 logger.debug(f"Retrieved {len(results)} result sets")
 
@@ -1082,6 +1166,165 @@ if output_format == "auto":
     actual_format = "table" if sys.stdout.isatty() else "csv"
 
 display_results(merged_results, actual_format)
+@
+
+Let's verify the default and the notice
+(\url{https://github.com/dbosk/scholar/issues/301}).  The provider is a
+small stand-in that announces its total the way every real provider does
+on its first page ([[first_total_known]]); the real providers'
+announcements are tested against recorded answers in the providers
+chapter.  What is tested here is the command's side: which limit reaches
+the provider, what the session records and shows, and when the notice is
+printed.  The search is recorded in a session so that the record's limit
+and the flags [[sessions show]] prints for it can be checked too.
+
+<<test functions>>=
+class AnnouncingProvider:
+  """A provider whose first page reports `total` matches (no service)."""
+
+  MAX_LIMIT = None
+
+  def __init__(self, total, estimated=False):
+    self.name = "announcing"
+    self.total = total
+    self.estimated = estimated
+    self.seen = []
+    self.last_error = None
+    self.last_retries = 0
+    self.last_total = None
+
+  def search(self, query, limit=100, filters=None):
+    from scholar.providers import first_total_known
+
+    self.seen.append(limit)
+    self.last_total = self.total
+    first_total_known(self.name, self.total, self.estimated)
+    return [Paper(title="Found", authors=["A"], doi="10.1/no-limit")]
+
+
+class TestNoLimitByDefault:
+  """search fetches everything unless --limit is given (#301)."""
+
+  NOTICE = (
+    "announcing: 25,000 results for this query; fetching all of them "
+    "(give --limit N to take fewer)"
+  )
+
+  <<no limit by default test methods>>
+<<no limit by default test methods>>=
+def _search(self, monkeypatch, tmp_path, total, *args, estimated=False):
+  from scholar import providers
+
+  monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+  provider = AnnouncingProvider(total, estimated)
+  monkeypatch.setattr(providers, "PROVIDERS", {provider.name: provider})
+  result = runner.invoke(app, [
+    "search", "q", "-p", provider.name, "-n", "s", "-f", "json", *args,
+  ])
+  assert result.exit_code == 0, result.output
+  return provider, result
+
+def test_no_limit_reaches_the_provider_as_unlimited(
+  self, monkeypatch, tmp_path
+):
+  from scholar.providers import s2_uses_bulk
+  from scholar.review import load_session
+
+  provider, _ = self._search(monkeypatch, tmp_path, 3)
+  assert provider.seen == [UNLIMITED_PROVIDER_LIMIT]
+  assert s2_uses_bulk("plain words", provider.seen[0])
+  [record] = load_session("s").search_records
+  assert record.limit == UNLIMITED_PROVIDER_LIMIT
+  shown = runner.invoke(app, ["sessions", "show", "s"])
+  assert "announcing: q --limit 0" in shown.stdout
+
+def test_a_given_limit_limits(self, monkeypatch, tmp_path):
+  from scholar.review import load_session
+
+  provider, result = self._search(monkeypatch, tmp_path, 25_000, "-l", "5")
+  assert provider.seen == [5]
+  [record] = load_session("s").search_records
+  assert record.limit == 5
+  shown = runner.invoke(app, ["sessions", "show", "s"])
+  assert "announcing: q --limit 5" in shown.stdout
+  assert "fetching all" not in result.stderr
+
+def test_large_total_without_a_limit_gets_the_notice(
+  self, monkeypatch, tmp_path
+):
+  _, result = self._search(monkeypatch, tmp_path, 25_000)
+  stderr = " ".join(result.stderr.split())
+  assert stderr.count(self.NOTICE) == 1
+  assert "fetching all" not in result.stdout
+  json.loads(result.stdout)
+
+def test_no_notice_for_l_0_or_below_the_threshold(
+  self, monkeypatch, tmp_path
+):
+  _, result = self._search(monkeypatch, tmp_path, 25_000, "-l", "0")
+  assert "fetching all" not in result.stderr
+  _, result = self._search(
+    monkeypatch, tmp_path, LARGE_RESULT_NOTICE - 1
+  )
+  assert "fetching all" not in result.stderr
+  _, result = self._search(monkeypatch, tmp_path, LARGE_RESULT_NOTICE)
+  assert "10,000 results for this query" in result.stderr
+
+def test_an_estimate_says_about(self, monkeypatch, tmp_path):
+  _, result = self._search(monkeypatch, tmp_path, 18_149, estimated=True)
+  assert "announcing: about 18,149 results" in result.stderr
+@
+
+[[rq]] follows the same default.  Its language model is a stand-in
+that answers the two prompts [[rq]] sends (no service), as in the test
+of [[--in]] above.
+
+<<no limit by default test methods>>=
+def _rq(self, monkeypatch, tmp_path, *args):
+  import sys
+  import types
+  from scholar import providers
+
+  monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+  provider = AnnouncingProvider(25_000)
+  monkeypatch.setattr(providers, "PROVIDERS", {provider.name: provider})
+
+  class Answer:
+    def __init__(self, text):
+      self._text = text
+
+    def text(self):
+      return self._text
+
+  class Model:
+    model_id = "dummy"
+
+    def prompt(self, prompt):
+      if "Papers to Classify" in prompt:
+        return Answer(json.dumps({"classifications": []}))
+      return Answer(json.dumps(
+        {"queries": [{"provider": "announcing", "query": "rq query"}]}
+      ))
+
+  llm_mod = types.ModuleType("llm")
+  llm_mod.get_model = lambda model_id=None: Model()
+  monkeypatch.setitem(sys.modules, "llm", llm_mod)
+  result = runner.invoke(app, [
+    "rq", "Is there a limit?", "-p", provider.name, "--count", "1",
+    "--no-enrich", *args,
+  ])
+  assert result.exit_code == 0, result.output
+  return provider, result
+
+def test_rq_without_a_limit_fetches_everything(self, monkeypatch, tmp_path):
+  provider, result = self._rq(monkeypatch, tmp_path)
+  assert provider.seen == [UNLIMITED_PROVIDER_LIMIT]
+  assert "fetching all of them" in result.stderr
+
+def test_rq_with_a_limit_limits(self, monkeypatch, tmp_path):
+  provider, result = self._rq(monkeypatch, tmp_path, "-l", "7")
+  assert provider.seen == [7]
+  assert "fetching all" not in result.stderr
 @
 
 \subsection{Persisting named sessions without review}
@@ -1555,12 +1798,16 @@ Each is a usage error, exit code 2 with one line saying what to change,
 as for any other malformed command line.
 
 The limit is different: a limit above fifty is not wrong, only more
-than exists, and [[-l 0]] (\enquote{all}) means all fifty.  So the
+than exists, and [[-l 0]] (\enquote{all}) means all fifty, as does no
+[[--limit]] at all (the default, \cref{sec:no-limit-default}).  So the
 limit is lowered to the provider's maximum rather than refused.  It is
 lowered here, before the search, because the session records the limit
 that was asked for, and [[prov found-via]] reproduces the search from
 that record: the record should say [[--limit 50]], what was actually
-asked for, not the [[1000]] of the default.
+asked for, not the [[--limit 0]] of the default.  Lowered, the limit
+is also no longer \enquote{not given}, so the semantic search never
+gets the notice of a large total; it could not have one anyway, since
+it fetches one page.
 
 <<refuse what a semantic search cannot do>>=
 ranked_names = [n for n in provider_names if is_ranked_provider(n)]
@@ -1584,7 +1831,7 @@ if ranked_names:
         Console(stderr=True).print(f"[red]{escape(refusal)}[/red]")
         raise typer.Exit(2)
     ranked_max = getattr(get_provider(ranked_name), "MAX_LIMIT", None)
-    if ranked_max and (limit == 0 or limit > ranked_max):
+    if ranked_max and (not limit or limit > ranked_max):
         limit = ranked_max
 <<refuse filters for a semantic search>>=
 if ranked_names and filters is not None and not filters.is_empty():
@@ -1996,13 +2243,13 @@ def rq(
         ),
     ] = None,
     limit: Annotated[
-        int,
+        Optional[int],
         typer.Option(
             "--limit",
             "-l",
-            help="Maximum results per provider (default: 1000). Use 0 for unlimited.",
+            help=SEARCH_LIMIT_HELP,
         ),
-    ] = DEFAULT_SEARCH_LIMIT,
+    ] = None,
     count: Annotated[
         int,
         typer.Option(
@@ -2062,17 +2309,19 @@ def rq(
     Examples:
         scholar rq "How do LLMs support novice programming?" -p openalex -p dblp
         scholar rq --year 2020- --open-access --count 20
-        scholar rq "..." --limit 0  # Fetch all pages
+        scholar rq "..." --limit 200  # At most 200 per provider
     """
     <<execute rq workflow>>
 @
 
 \subsection{Executing an RQ workflow}
 
-We treat [[--limit 0]] as \enquote{unlimited} by passing a very large limit to
-provider implementations.
+Without [[--limit]], or with [[--limit 0]], [[rq]] searches without a
+limit, as [[search]] does (\cref{sec:no-limit-default}): it passes a very
+large limit to provider implementations.
 This avoids changing provider signatures while still enabling a fully paged
-search.
+search.  A search without [[--limit]] prints the same notice of a large
+total as [[search]] does, from the same listener.
 
 <<execute rq workflow>>=
 from datetime import datetime
@@ -2084,6 +2333,7 @@ from scholar.providers import (
     get_default_providers,
     get_provider,
     expand_provider_names,
+    listening_for_totals,
 )
 from scholar.scholar import SearchResult, search_provider
 from scholar.review import create_review_session, save_session
@@ -2124,7 +2374,7 @@ provider assumes a keyword search: the model writes one keyword query
 per provider, with boolean operators where the provider's rule allows
 them, and none of the rules describes a question in plain words; the
 providers' results go into one session next to each other; the limit
-recorded is the keyword default; and the filters are applied to every
+recorded is that of a keyword search (none by default); and the filters are applied to every
 provider, which the semantic search refuses.  Run through [[rq]], it
 would record a keyword-style query as a semantic search, mixed with
 counts from the other providers.  So [[rq]] refuses it before the
@@ -2170,7 +2420,7 @@ if any([
 @
 
 <<compute rq effective limit>>=
-effective_limit = UNLIMITED_PROVIDER_LIMIT if limit == 0 else limit
+effective_limit = UNLIMITED_PROVIDER_LIMIT if not limit else limit
 @
 
 The model is first asked for the provider queries, before anything is
@@ -2211,9 +2461,12 @@ for pname in provider_names:
         continue
 
     q = provider_queries.get(pname, rq_text)
-    results.append(search_provider(
-        p, q, effective_limit, filters, timestamp=timestamp,
-    ))
+    with listening_for_totals(
+        notice_large_total if limit is None else None
+    ):
+        results.append(search_provider(
+            p, q, effective_limit, filters, timestamp=timestamp,
+        ))
 
 if not results:
     console.print("[yellow]No results returned[/yellow]")
@@ -5815,8 +6068,8 @@ def syntax() -> None:
 We display the information in a table for easy comparison.
 Semantic Scholar's rows describe two endpoints
 (\cref{sec:s2-two-searches} in the providers chapter): a query with
-operators or quotes, or a search without a limit, goes to its bulk
-search, which reads the operators, stems the terms and matches title
+operators or quotes, or a search without a limit (the default,
+\cref{sec:no-limit-default}), goes to its bulk search, which reads the operators, stems the terms and matches title
 and abstract only; plain words with a limit go to the relevance
 search, which stops at a thousand results.
 The bulk search does not rank by relevance: with a limit it returns
@@ -5846,7 +6099,7 @@ table.add_column("Grouping", style="green")
 table.add_column("Notes", style="dim")
 
 table.add_row("s2", "[green]✓[/]", "[green]✓[/]", "[green]✓[/]", "[green]✓[/]",
-              "UPPERCASE; operators, quotes or -l 0 use the bulk search "
+              "UPPERCASE; operators, quotes or no limit use the bulk search "
               "(stems terms, title+abstract); group AND/OR with ( ); "
               "no other database's field codes")
 table.add_row("openalex", "[green]✓[/]", "[green]✓[/]", "[green]✓[/]", "[green]✓[/]",
@@ -5879,7 +6132,7 @@ table2.add_row("s2", "[green]✓[/] prefix* (bulk)", '[green]✓[/] "..." (bulk)
                "[red]✗[/]",
                "Plain words with a limit: relevance search, top 1000; "
                "bulk with a limit: most cited first, not ranked; "
-               "-l 0 stops at 100000")
+               "without a limit stops at 100000")
 table2.add_row("openalex", "[red]✗[/]", '[green]✓[/] "..."', "[red]✗[/]",
                "Stemming enabled")
 table2.add_row("dblp", "[green]✓[/] prefix*", '[red]✗[/] disabled', "[green]✓[/] author:",
@@ -5899,6 +6152,7 @@ console.print(table2)
 console.print()
 
 <<default search fields table>>
+<<searches without a limit table>>
 
 # Examples
 console.print("[bold]Examples:[/bold]")
@@ -6001,6 +6255,62 @@ class TestSyntaxSearchFields:
         assert "Default Search Fields" in result.stdout
         assert "--in title-abstract" in result.stdout
         assert "TITLE-ABS-KEY()" in result.stdout
+@
+
+\subsection{What a search without a limit costs}
+
+A search fetches everything unless [[--limit]] is given
+(\cref{sec:no-limit-default}), and the search help points here for what
+that means per provider.  Each row states what scholar's own code does,
+with the place in the providers chapter: Semantic Scholar's routing
+([[s2_uses_bulk]]) and safety cap ([[S2_BULK_SAFETY_CAP]]), the semantic
+search's maximum ([[MAX_LIMIT]]), IEEE's limiter ([[LIMITS]], two hundred
+requests a day) and page size ([[MAX_LIMIT]]), and OpenAlex's page size
+and its metered budget.  The numbers are read from those constants, so
+that the table follows a change in them.  Providers not listed page
+through everything at their limiter's pace.
+
+<<searches without a limit table>>=
+from scholar.providers import (
+    IEEEXploreProvider, OPENALEX_SEMANTIC_MAX_RESULTS, S2_BULK_SAFETY_CAP,
+)
+
+table4 = Table(title="Searches without --limit (the default)",
+               box=box.HORIZONTALS)
+table4.add_column("Provider", style="cyan")
+table4.add_column("What fetching everything means")
+
+table4.add_row("s2", "bulk search for every query (no relevance ranking "
+               f"unless -l N is given); stops at {S2_BULK_SAFETY_CAP} "
+               "papers, recorded as incomplete")
+table4.add_row("openalex-semantic",
+               f"top {OPENALEX_SEMANTIC_MAX_RESULTS}, as always")
+table4.add_row("ieee", f"{IEEEXploreProvider.LIMITS.daily} requests a day "
+               f"of {IEEEXploreProvider.MAX_LIMIT} records each; a broad "
+               "query can spend the day")
+table4.add_row("openalex, ssrn, ...", "every page of 200 is a request "
+               "against OpenAlex's metered daily budget")
+table4.add_row("others", "every page, at the provider's pace")
+
+console.print(table4)
+console.print()
+@
+
+Let's verify that the table is shown with the numbers of the code:
+
+<<test functions>>=
+class TestSyntaxWithoutLimit:
+    """scholar syntax says what a search without --limit costs."""
+
+    def test_table_names_the_costs(self):
+        from scholar.providers import S2_BULK_SAFETY_CAP
+
+        result = runner.invoke(app, ["syntax"])
+        assert result.exit_code == 0
+        text = " ".join(result.stdout.split())
+        assert "Searches without --limit" in text
+        assert str(S2_BULK_SAFETY_CAP) in text
+        assert "200 requests a day" in text
 @
 
 \subsection{Testing syntax command}
@@ -26363,18 +26673,26 @@ here.  We take
 them as a plain dict and an integer rather than off a result object, because two
 callers reconstruct flags from different sources: the [[bibtex+prov]] formatter
 reads them off a live [[SearchResult]], while [[prov found-via]] reads them off
-a stored [[SearchRecord]].  The [[--limit]] is shown only when it differs from
-the default, and the unlimited sentinel maps back to the [[0]] the user actually
-typed rather than the large internal cap.  Output and enrichment options such as
+a stored [[SearchRecord]].  The [[--limit]] is shown for every search that
+knows its limit, and the unlimited sentinel maps back to [[0]] rather than the
+large internal cap.  It used to be left out when it equalled the default, but
+the default has changed once already, from a thousand to none
+(\cref{sec:no-limit-default}): a command without [[--limit]] would then mean a
+thousand results in one version and everything in the next, so the command
+would not reproduce the search it was printed for.  Always printing it makes
+the command mean the same in every version.  A record from before limits were
+stored (a legacy record, [[limit]] [[None]]) prints none, since its limit is
+unknown.  Output and enrichment options such as
 [[--enrich]] are deliberately omitted: they change how results are displayed or
 augmented, not \emph{which} papers match, so they are irrelevant to reproducing
 the found set.
 
+\label{sec:search-flags}
 <<formatter classes>>=
 def _search_flags(filters: dict | None, limit: int | None) -> list[str]:
     """Reconstruct the filter and limit CLI flags from a filters dict."""
     flags = filter_flags(filters)
-    if limit is not None and limit != DEFAULT_SEARCH_LIMIT:
+    if limit is not None:
         shown = 0 if limit >= UNLIMITED_PROVIDER_LIMIT else limit
         flags.append(f"--limit {shown}")
     return flags
@@ -26657,7 +26975,7 @@ fixed order, so the [[FOUND-VIA]] command reproduces the original search.  A
 
 <<test functions>>=
     def test_found_via_reconstructs_filters_and_limit(self, capsys):
-        """Active filters and a non-default limit become CLI flags."""
+        """Active filters and the limit become CLI flags."""
         results = [
             SearchResult(
                 query="deep learning",
@@ -26685,23 +27003,22 @@ fixed order, so the [[FOUND-VIA]] command reproduces the original search.  A
         assert expected in out
 @
 
-The default limit is implicit and so omitted, while the unlimited search maps
-back to the [[0]] the user typed rather than the internal cap:
+A limit equal to the old default of a thousand is printed like any other,
+while the unlimited search maps back to [[0]] rather than the internal cap:
 
 <<test functions>>=
-    def test_found_via_omits_default_limit(self, capsys):
-        """The default per-provider limit is not emitted."""
+    def test_found_via_prints_the_old_default_limit(self, capsys):
+        """A limit of 1000, once the default, is printed like any other."""
         results = [
             SearchResult(
                 query="q", provider="dblp", timestamp="t",
                 papers=[Paper(title="P", authors=["Alice"])],
-                limit=DEFAULT_SEARCH_LIMIT,
+                limit=1000,
             )
         ]
         BibTeXProvFormatter().format(results)
         out = capsys.readouterr().out
-        assert "% FOUND-VIA: scholar search q -p dblp\n" in out
-        assert "--limit" not in out
+        assert "% FOUND-VIA: scholar search q -p dblp --limit 1000\n" in out
 
     def test_found_via_maps_unlimited_to_zero(self, capsys):
         """The unlimited sentinel reconstructs as ``--limit 0``."""
@@ -28583,6 +28900,56 @@ def test_bundled_tutorial_parses(name):
         )
 @
 
+A search without [[--limit]] fetches everything
+(\cref{sec:no-limit-default}), so a practice search copied from a lesson
+must carry a small limit, or one lesson step could page through a whole
+database.  The test reads every command a lesson shows (lines of its
+code blocks, joined where they end in a backslash) and requires a
+positive [[-l]] or [[--limit]] on each [[scholar search]] and
+[[scholar rq]].  It reads the tangled [[.md]], the text the learner
+copies from.
+
+<<test functions>>=
+TUTORIAL_LIMIT = re.compile(r"(?:^|\s)(?:-l|--limit)[\s=]+[1-9]\d*\b")
+
+
+def tutorial_commands(text: str) -> list[str]:
+    """The commands shown in a lesson's code blocks, continuations joined."""
+    commands, in_block, pending = [], False, ""
+    for line in text.splitlines():
+        if line.startswith("```"):
+            in_block, pending = not in_block, ""
+            continue
+        if not in_block:
+            continue
+        line = pending + line.strip()
+        if line.endswith("\\"):
+            pending = line[:-1].rstrip() + " "
+            continue
+        pending = ""
+        commands.append(line)
+    return commands
+
+
+@pytest.mark.parametrize("name", TUTORIAL_FILES)
+def test_tutorial_searches_carry_a_limit(name):
+    """Every practice search of a lesson asks for a few results only."""
+    text = (TUTORIAL_DIR / name).read_text(encoding="utf-8")
+    searches = [
+        c for c in tutorial_commands(text)
+        if re.match(r"scholar\s+(?:search|rq)\b", c)
+    ]
+    unlimited = [c for c in searches if not TUTORIAL_LIMIT.search(c)]
+    assert not unlimited, f"{name}: searches without a limit: {unlimited}"
+
+
+def test_tutorial_commands_join_continuations():
+    text = "```\nscholar search q -p openalex \\\n    -l 5 -n x\n```\n"
+    assert tutorial_commands(text) == ["scholar search q -p openalex -l 5 -n x"]
+    assert TUTORIAL_LIMIT.search(tutorial_commands(text)[0])
+    assert not TUTORIAL_LIMIT.search("scholar search q -l 0")
+@
+
 
 \section{Lazily loaded subcommands}
 \label{sec:lazy-subcommands}
@@ -29154,9 +29521,7 @@ from rich.text import Text
 <<constants>>=
 logger = logging.getLogger(__name__)
 
-# The default per-provider cap, shared by the --limit option default and the
-# FOUND-VIA reconstruction so the two cannot drift; 0 maps to the sentinel,
-# which the providers must recognise too, hence defined in scholar.scholar.
-DEFAULT_SEARCH_LIMIT = 1000
+# What --limit 0 (and no --limit) is passed on as; the providers must
+# recognise it too, hence defined in scholar.scholar.
 from scholar.scholar import UNLIMITED_PROVIDER_LIMIT
 @
