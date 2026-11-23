@@ -8568,7 +8568,8 @@ def warn_about_unsaved_sessions() -> None:
             f"[yellow]Warning:[/yellow] {len(kept)} file(s) hold a "
             "session that a save could not write to its session file: "
             f"{escape(', '.join(path.name for path in kept))}. Merge each "
-            "into its session with `scholar sessions recover FILE`."
+            "into its session with `scholar sessions recover FILE`, or "
+            "delete it with `scholar sessions recover FILE --discard`."
         )
 @
 
@@ -24173,7 +24174,11 @@ file is named as the error and [[sessions list]] name it, by its path
 or by its name in the sessions directory.  A file that is not one a
 refused save kept is an error (exit~1), and so is a lock refused
 again, through the entry point (\cref{sec:cli-main}); either way the
-file stays.
+file stays.  [[--discard]] deletes the kept file instead of merging it
+([[discard_unsaved_session]]), for the copies a user does not want
+(\enquote{Kept files pile up} in the review chapter); it deletes only a
+file that is a kept file, and anything else is a usage error (exit~2),
+since the argument then names something the option is not for.
 
 <<sessions command>>=
 @sessions_app.command("recover")
@@ -24186,6 +24191,13 @@ def sessions_recover(
             "names it.",
         ),
     ],
+    discard: Annotated[
+        bool,
+        typer.Option(
+            "--discard",
+            help="Delete the kept file instead of merging it.",
+        ),
+    ] = False,
 ) -> None:
     """
     Merge a session that a refused save kept into its session file.
@@ -24193,10 +24205,22 @@ def sessions_recover(
     A save that could not take the session file's lock (another scholar
     process held it) writes nothing to the file and keeps the session
     beside it; this merges it in, as that save would have, and deletes
-    the kept file.
+    the kept file. With --discard it only deletes the kept file.
     """
-    from scholar.review import SessionFileError, recover_unsaved_session
+    from scholar.review import (
+        SessionFileError, discard_unsaved_session, recover_unsaved_session,
+    )
 
+    if discard:
+        try:
+            deleted = discard_unsaved_session(kept_file)
+        except SessionFileError as error:
+            Console(stderr=True).print(
+                f"[red]{escape(str(error))}[/red]", soft_wrap=True
+            )
+            raise typer.Exit(2)
+        Console().print(f"Deleted {escape(str(deleted))}.", soft_wrap=True)
+        return
     try:
         target = recover_unsaved_session(kept_file)
     except SessionFileError as error:
@@ -24396,6 +24420,76 @@ class TestInterruptedWait:
     statuses = [d["status"] for d in json.loads(kept.read_text())[
       "decisions"]]
     assert statuses == ["kept", "pending"]
+@
+
+A second Ctrl-C while the session is being kept is held back: the kept
+file is written whole, and the command still ends with the one line and
+exit code 130.  The saver's serialisation is slowed by a second and
+announces itself, so that the second interrupt lands inside the keep.
+Then [[sessions recover --discard]] deletes the kept file, and refuses
+the session file itself with exit code~2.
+
+<<test functions>>=
+class TestSecondInterruptDuringTheKeep:
+  """A second Ctrl-C does not leave an empty kept file (#316)."""
+
+  SLOW_KEEP = """
+    import time
+    import scholar.review as review
+    serialise = review.session_file_data
+    def slow(session):
+      print("keeping", file=sys.stderr, flush=True)
+      time.sleep(1)
+      return serialise(session)
+    review.session_file_data = slow
+  """
+
+  def test_held_back_then_discarded(self, tmp_path, monkeypatch):
+    import json
+    import signal
+    import subprocess
+    import textwrap
+    from scholar.review import unsaved_session_files
+    path = TestRefusedSaveCommands._session(tmp_path, monkeypatch)
+    before = path.read_bytes()
+    holder = TestRefusedSaveCommands._hold("locked")
+    code = textwrap.dedent(TestInterruptedWait.SAVER).replace(
+      "from scholar.cli import main",
+      textwrap.dedent(self.SLOW_KEEP) + "from scholar.cli import main")
+    try:
+      saver = subprocess.Popen(
+        [sys.executable, "-c", code],
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, text=True,
+      )
+      seen = []
+      for wanted in ("is locked by another scholar process", "keeping"):
+        for line in saver.stderr:
+          seen.append(line)
+          if wanted in line:
+            break
+        saver.send_signal(signal.SIGINT)
+      _, rest = saver.communicate(timeout=60)
+    finally:
+      holder.communicate("go\n", timeout=60)
+    err = "".join(seen) + rest
+    assert saver.returncode == 130, err
+    assert "Traceback" not in err
+    assert "is kept in" in err and "--discard" in err
+    assert path.read_bytes() == before
+    [kept] = unsaved_session_files()
+    statuses = [d["status"] for d in json.loads(kept.read_text())[
+      "decisions"]]
+    assert statuses == ["kept", "pending"]
+    listed = runner.invoke(app, ["sessions", "list"])
+    assert "--discard" in " ".join(listed.output.split())
+    refused = runner.invoke(app, ["sessions", "recover", str(path),
+                                  "--discard"])
+    assert refused.exit_code == 2 and path.read_bytes() == before
+    deleted = runner.invoke(app, ["sessions", "recover", kept.name,
+                                  "--discard"])
+    assert deleted.exit_code == 0, deleted.output
+    assert unsaved_session_files() == [] and path.read_bytes() == before
 @
 
 [[scholar enrich]] saves after every chunk; here the lock is taken by

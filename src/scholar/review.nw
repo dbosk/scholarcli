@@ -15170,7 +15170,14 @@ A save of a session therefore never writes the file without its lock
   of an interrupted command, after the one line and without a
   traceback.  An interrupt after the lock is taken, in the merge or the
   write, is as it always was: the file is replaced atomically, so it is
-  the old one or the new one.
+  the old one or the new one.  A second Ctrl-C while the session is
+  being kept is held back until the kept file is written (below).
+  Only Ctrl-C (SIGINT) is an interrupt here.  Python does not handle
+  SIGTERM, so a SIGTERM ends [[sessions decide]], the TUI and the other
+  commands on the spot, without a kept file and with exit status 143,
+  as before this change; [[scholar enrich]] alone turns SIGTERM into an
+  interrupt while it runs (\cref{sec:enrich-chunks}), and so keeps its
+  session.
 \item[A lock file that cannot be opened is said so] A lock that cannot
   be opened or created (another user's lock file in a shared
   directory, a read-only directory) is no other process's doing, and
@@ -15262,8 +15269,9 @@ class SessionNotSaved(Exception):
         )
         if unsaved is not None:
             message += (
-                f" This process's session is kept in {unsaved}; {when}, "
-                "merge it in with: scholar sessions recover "
+                f" This process's session is kept in {unsaved} (scholar "
+                "sessions recover --discard deletes it); "
+                f"{when}, merge it in with: scholar sessions recover "
                 f"{shlex.quote(str(unsaved))}"
             )
         elif keep_error is not None:
@@ -15312,14 +15320,71 @@ def refused_save(
             session_path, None, reason, cause=cause,
             keep_error=f"the directory {directory} is not writable",
         )
+    interrupt = InterruptHeldBack()
     try:
-        unsaved = keep_unsaved_session(session, session_path)
+        with interrupt:
+            unsaved = keep_unsaved_session(session, session_path)
     except OSError as write_error:
         return SessionNotSaved(
             session_path, None, reason, cause=cause,
             keep_error=str(write_error),
         )
-    return SessionNotSaved(session_path, unsaved, reason, cause=cause)
+    except KeyboardInterrupt:
+        refusal = SessionNotSaved(
+            session_path, None, reason, cause=cause,
+            keep_error="interrupted while it was being kept",
+        )
+        refusal.interrupted = True
+        return refusal
+    refusal = SessionNotSaved(session_path, unsaved, reason, cause=cause)
+    refusal.interrupted = refusal.interrupted or interrupt.arrived
+    return refusal
+@
+
+Keeping the session takes seconds for a large one (the whole session
+is serialised), and a user who pressed Ctrl-C once and sees nothing
+happen presses it again.  That second interrupt used to stop the keep
+half-way and leave an empty kept file, which [[sessions list]] then
+advertised and [[sessions recover]] refused.  Two things prevent it.
+The kept file is created only once its text is ready
+([[keep_unsaved_session]], below), and it is removed if anything stops
+the write, so an interrupted keep leaves no file.  And while the
+session is kept, Ctrl-C is held back ([[InterruptHeldBack]]): the
+handler of SIGINT only notes that it came, and the command ends as an
+interrupted one (exit status 130) once the file is written.  We chose holding back over
+giving up because the keep is the last chance for this process's
+changes, and it ends in seconds; giving up would lose a review for the
+sake of a few seconds.  The holding back works only in the main
+thread, the only one Python delivers signals to; elsewhere, or if the
+interrupt comes in the moment before it is installed, the keep stops
+and the error says in its one line that the session could not be kept.
+
+<<review session functions>>=
+class InterruptHeldBack:
+    """While active (`with`), SIGINT only sets `arrived`.
+
+    Only in the main thread, where Python handles signals; elsewhere it
+    does nothing. The previous handler is restored on exit.
+    """
+
+    def __init__(self) -> None:
+        self.arrived = False
+        self._previous = None
+
+    def __enter__(self) -> "InterruptHeldBack":
+        if threading.current_thread() is threading.main_thread():
+            self._previous = signal.signal(signal.SIGINT, self._note)
+        return self
+
+    def _note(self, signum, frame) -> None:
+        self.arrived = True
+
+    def __exit__(self, *exc) -> None:
+        if self._previous is not None:
+            signal.signal(signal.SIGINT, self._previous)
+<<review imports>>=
+import signal
+import threading
 @
 
 The kept file is named [[<name>.json.unsaved-<UTC time>-<random>]],
@@ -15345,25 +15410,23 @@ def keep_unsaved_session(session: ReviewSession, session_path: Path) -> Path:
 
     Returns the new file, `<name>.json.unsaved-<UTC time>-<random>`.
     """
-    written = _utcnow().strftime("%Y%m%dT%H%M%SZ")
-    fd, name = tempfile.mkstemp(
-        dir=session_path.parent,
-        prefix=f"{session_path.name}{UNSAVED_MARK}{written}-",
-    )
-    os.close(fd)
-    unsaved = Path(name)
-    data = {
+    text = json.dumps({
         **session_file_data(session),
         UNSAVED_KEY: {
             "target": session_path.name,
             "baseline": baseline_data(session._baseline),
             "baseline_keys": [d.baseline_key for d in session.decisions],
         },
-    }
+    }, indent=2, ensure_ascii=False)
+    written = _utcnow().strftime("%Y%m%dT%H%M%SZ")
+    fd, name = tempfile.mkstemp(
+        dir=session_path.parent,
+        prefix=f"{session_path.name}{UNSAVED_MARK}{written}-",
+    )
+    unsaved = Path(name)
     try:
-        atomic_write_text(
-            unsaved, json.dumps(data, indent=2, ensure_ascii=False)
-        )
+        os.close(fd)
+        atomic_write_text(unsaved, text)
     except BaseException:
         unsaved.unlink(missing_ok=True)
         raise
@@ -15596,7 +15659,32 @@ could otherwise name any file to be written.  A baseline that cannot be
 read back is an error: without it the merge would take every
 difference from the file for a change of ours.
 
+A kept file is read as JSON first, and only an object holding
+[[UNSAVED_KEY]] is taken for one ([[read_kept_file]]).  JSON nested
+deep enough makes the reader, and the baseline's decoder, recurse past
+Python's limit; that [[RecursionError]] is a refusal too, as are
+baseline keys that are not strings, so that no crafted file ends in a
+traceback.
+
 <<review session functions>>=
+def read_kept_file(path: Path) -> dict:
+    """The JSON object of the kept file `path`.
+
+    Raises `SessionFileError` unless it is an object holding
+    `UNSAVED_KEY` whose value is an object.
+    """
+    try:
+        kept = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, RecursionError) as error:
+        raise SessionFileError(path, error) from error
+    if not (isinstance(kept, dict)
+            and isinstance(kept.get(UNSAVED_KEY), dict)):
+        raise SessionFileError(
+            path, ValueError("not a session kept by a refused save")
+        )
+    return kept
+
+
 def recover_unsaved_session(path: str | os.PathLike) -> Path:
     """Merge the session kept in `path` by a refused save into its file.
 
@@ -15631,20 +15719,16 @@ def recover_unsaved_session(path: str | os.PathLike) -> Path:
     path.unlink()
     return target
 <<read what the refused save kept in [[path]]>>=
-try:
-    kept = json.loads(path.read_text(encoding="utf-8"))
-except (OSError, ValueError) as error:
-    raise SessionFileError(path, error) from error
-if not isinstance(kept, dict) or UNSAVED_KEY not in kept:
-    raise SessionFileError(
-        path, ValueError("not a session kept by a refused save")
-    )
+kept = read_kept_file(path)
 try:
     meta = kept[UNSAVED_KEY]
     target_name = meta["target"]
-    keys = list(meta["baseline_keys"])
+    keys = meta["baseline_keys"]
+    if not (isinstance(keys, list)
+            and all(k is None or isinstance(k, str) for k in keys)):
+        raise ValueError("its baseline keys are not strings")
     baseline = baseline_from_data(meta["baseline"])
-except (KeyError, TypeError, ValueError) as error:
+except (KeyError, TypeError, ValueError, RecursionError) as error:
     raise SessionFileError(path, error) from error
 if not (isinstance(target_name, str) and target_name.endswith(".json")
         and target_name == Path(target_name).name
@@ -15654,6 +15738,39 @@ if not (isinstance(target_name, str) and target_name.endswith(".json")
         f"it names {target_name!r}, not its own session file"
     ))
 target = _get_sessions_dir() / target_name
+@
+
+\paragraph{Kept files pile up.}
+Every refused save keeps a whole copy of its session: a command tried
+three times while the lock stays held leaves three kept files, each a
+full session.  (A refused recovery adds none: it removes the copy its
+save made, since the file it recovers already holds that session.)
+They are not removed automatically, since each holds the changes of
+its own run, which the others may lack, and only the user knows which
+to merge: the newest run of a TUI review holds that review, but a
+second run of [[sessions decide]] holds only its own decisions.  So
+[[sessions list]] names them, and [[sessions recover --discard]]
+deletes one ([[discard_unsaved_session]]), after checking that it is a
+kept file: its name has the kept files' mark and it reads as one.
+
+<<review session functions>>=
+def discard_unsaved_session(path: str | os.PathLike) -> Path:
+    """Delete the kept file `path` (a path, or a name in the sessions
+    directory); return it.
+
+    Raises `SessionFileError`, deleting nothing, unless its name holds
+    `.json` + `UNSAVED_MARK` and it reads as a kept file.
+    """
+    path = Path(path)
+    if not path.exists() and not path.is_absolute():
+        path = _get_sessions_dir() / path
+    if f".json{UNSAVED_MARK}" not in path.name:
+        raise SessionFileError(
+            path, ValueError("not the name of a kept session")
+        )
+    read_kept_file(path)
+    path.unlink()
+    return path
 @
 
 Let's verify it with real processes: another process loads the
@@ -15878,6 +15995,119 @@ class TestKeptFilesAreData:
     with pytest.raises(SessionFileError):
       recover_unsaved_session(kept)
     assert sorted(p.name for p in path.parent.iterdir()) == before
+@
+
+A kept file nested ten thousand levels deep, or with baseline keys that
+are not strings, is refused like any other that is not one.
+
+<<test functions>>=
+class TestCraftedKeptFiles:
+  """Crafted kept files are refused, never a traceback (#316)."""
+
+  @staticmethod
+  def _write(tmp_path, monkeypatch, meta_text):
+    path = TestSaveWhenTheLockIsHeld._make(tmp_path, monkeypatch)
+    kept = path.with_name(f"held.json{UNSAVED_MARK}20261123T0-x")
+    text = path.read_text().rstrip()
+    assert text.endswith("}")
+    kept.write_text(text[:-1] + f', "{UNSAVED_KEY}": {meta_text}}}')
+    return path, kept
+
+  def test_a_deep_baseline(self, tmp_path, monkeypatch):
+    deep = '{"tuple": [' * 10000 + "null" + "]}" * 10000
+    path, kept = self._write(
+      tmp_path, monkeypatch,
+      '{"target": "held.json", "baseline_keys": [null, null, null], '
+      f'"baseline": {deep}}}')
+    before = path.read_bytes()
+    with pytest.raises(SessionFileError):
+      recover_unsaved_session(kept)
+    assert path.read_bytes() == before
+
+  @pytest.mark.parametrize("keys", ["[{}, null, null]", "[[1], null, null]",
+                                    '"abc"'])
+  def test_keys_that_are_not_strings(self, tmp_path, monkeypatch, keys):
+    path, kept = self._write(
+      tmp_path, monkeypatch,
+      f'{{"target": "held.json", "baseline_keys": {keys}, '
+      '"baseline": null}')
+    before = path.read_bytes()
+    with pytest.raises(SessionFileError):
+      recover_unsaved_session(kept)
+    assert path.read_bytes() == before
+@
+
+An interrupted keep leaves no file: an interrupt while the session is
+serialised comes before the file exists, and an interrupt that stops
+the keep (where it cannot be held back) gives the one line that says
+the session is lost.  The case of two real interrupts, the second held
+back, is tested through the command line (\cref{sec:sessions-recover}).
+
+<<test functions>>=
+class TestInterruptedKeep:
+  """An interrupted keep leaves no empty kept file (#316)."""
+
+  def test_no_file_before_the_text_is_ready(self, tmp_path, monkeypatch):
+    import scholar.review as review
+    path = TestSaveWhenTheLockIsHeld._make(tmp_path, monkeypatch)
+    monkeypatch.setattr(review, "session_file_data",
+                        Mock(side_effect=KeyboardInterrupt))
+    with pytest.raises(KeyboardInterrupt):
+      keep_unsaved_session(load_session("held"), path)
+    assert unsaved_session_files() == []
+
+  def test_a_stopped_keep_is_said_in_one_line(self, tmp_path, monkeypatch):
+    import scholar.review as review
+    from scholar.utils import LockNotTaken
+    path = TestSaveWhenTheLockIsHeld._make(tmp_path, monkeypatch)
+    monkeypatch.setattr(review, "keep_unsaved_session",
+                        Mock(side_effect=KeyboardInterrupt))
+    refusal = refused_save(load_session("held"), path, LockNotTaken(
+      path, "still locked after 1 s", held=True, lock_file=path))
+    assert refusal.unsaved is None and refusal.interrupted
+    assert "interrupted while it was being kept" in str(refusal)
+    assert "its changes are lost" in str(refusal)
+    assert "\n" not in str(refusal)
+    assert unsaved_session_files() == []
+
+  def test_an_interrupt_is_held_back(self):
+    import os
+    import signal
+    import time
+    held = InterruptHeldBack()
+    with held:
+      os.kill(os.getpid(), signal.SIGINT)
+      time.sleep(0.05)
+    assert held.arrived
+@
+
+[[sessions recover --discard]] deletes a kept file and nothing else: a
+session file, a file named like a kept one that does not read as one, a
+kept file's content under another name, and a missing file are
+refused, and the file stays.
+
+<<test functions>>=
+class TestDiscardKeptFile:
+  """discard_unsaved_session deletes only kept files (#316)."""
+
+  def test_a_kept_file_is_deleted(self, tmp_path, monkeypatch):
+    path = TestSaveWhenTheLockIsHeld._make(tmp_path, monkeypatch)
+    kept = keep_unsaved_session(load_session("held"), path)
+    assert discard_unsaved_session(kept.name) == kept
+    assert not kept.exists() and path.exists()
+
+  def test_anything_else_stays(self, tmp_path, monkeypatch):
+    path = TestSaveWhenTheLockIsHeld._make(tmp_path, monkeypatch)
+    fake = path.with_name(f"held.json{UNSAVED_MARK}20261123T0-x")
+    fake.write_text('{"query": "q"}')
+    renamed = path.with_name("renamed-kept-file")
+    renamed.write_text(
+      keep_unsaved_session(load_session("held"), path).read_text())
+    for target in (path, fake, renamed,
+                   path.with_name("gone.json.unsaved-x")):
+      with pytest.raises(SessionFileError):
+        discard_unsaved_session(target)
+    assert path.exists() and fake.exists() and renamed.exists()
 @
 
 A lock file that cannot be opened is no other process's doing.  With

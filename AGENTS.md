@@ -2598,7 +2598,18 @@ context (#107). `review.save_session` now:
   file's own name begins with, written in the sessions directory;
   restores baseline and keys, saves through `save_session` (same
   merge, under the lock) and deletes FILE; refused again: FILE stays,
-  the new copy is removed. `reconcile_session` and
+  the new copy is removed. `--discard` deletes a kept file
+  (`discard_unsaved_session`: name has `.json.unsaved-` and
+  `read_kept_file` accepts it; else exit 2); every refused save leaves
+  one full copy, never removed automatically. Crafted kept files
+  (deep nesting -> `RecursionError`, non-string `baseline_keys`) are
+  one-line refusals. The keep serialises first and creates the file
+  only to write it (an interrupted keep leaves no file), and holds
+  back SIGINT while keeping (`InterruptHeldBack`, main thread only;
+  the command then exits 130); an interrupt that still stops it gives
+  "... could not be kept ..., so its changes are lost". SIGTERM is no
+  interrupt: `decide`/TUI end at once without a kept file (143), only
+  `enrich` turns it into one. `reconcile_session` and
   `keep_copy_before_run` take `session_lock` too (hint
   `NOTHING_CHANGED_HINT`; refused: `lock_refusal`, `SessionNotSaved`
   with no kept file, "run the command again"). `scholar enrich` stops
