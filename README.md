@@ -300,15 +300,15 @@ scripts, and scholar stops there.
 ### Basic Search
 
 ```bash
-# Search with default providers (Semantic Scholar, OpenAlex, DBLP)
+# Search with default providers (Semantic Scholar, OpenAlex, DBLP);
+# without -l every result is fetched (a notice on stderr when that is many)
 scholar search "differential privacy"
 
-# Limit results per provider (default: 1000)
+# Limit results per provider
 scholar search "blockchain" -l 50
-
-# Unlimited results per provider
-scholar search "blockchain" -l 0
 ```
+
+`scholar syntax` lists what a search without a limit costs per provider.
 
 ### Systematic Review Workflow
 
