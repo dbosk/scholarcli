@@ -57,6 +57,14 @@ INCLUDE_MAKEFILES=../makefiles
 include ${INCLUDE_MAKEFILES}/noweb.mk
 include check.mk
 
+# The document uses biblatex with biber.  When the .bbl is missing,
+# latexmk (run with -use-make) asks make for it, and the shared tex.mk
+# offers two pattern rules: the first, from the .aux, runs bibtexu, which
+# finds no \bibdata in a biblatex .aux and fails (#311).  This explicit
+# rule wins over both and runs biber on the .bcf.
+${TEX_OUTDIR}/scholar.bbl: ${TEX_OUTDIR}/scholar.bcf
+	${BIBLIOGRAPHY.bcf}
+
 clean:
 	${RM} ${DOC}
 	${RM} noweb_lexer.py
