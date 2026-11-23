@@ -216,7 +216,9 @@ it from the first page it reads: OpenAlex's [[meta.count]], DBLP's
 Xplore's [[total_records]], HAL's [[numFound]], Scopus's
 [[opensearch:totalResults]] and arXiv's feed total.  Each is read where
 the provider already reads it to stop paging, so no field is newly
-assumed.  A provider that filters records after fetching them (arXiv's
+assumed.  The same place announces it to a listening command line
+([[first_total_known]], \cref{sec:first-total}), the moment it is
+first known.  A provider that filters records after fetching them (arXiv's
 year filter) reports none, because the service's total counts records
 the filter removes.
 
@@ -357,6 +359,96 @@ def cache_answer(provider, key, papers) -> None:
         total=getattr(provider, "last_total", None),
         total_estimated=getattr(provider, "last_total_estimated", False),
     )
+@
+
+\subsection{Hearing of the total while paging}
+\label{sec:first-total}
+
+A search without a limit fetches every page the service has, and the
+command line searches without one by default
+(\url{https://github.com/dbosk/scholar/issues/301}).  For most queries
+that is a few hundred records, but a broad query can match hundreds of
+thousands, which takes long and spends quota.  The user should hear of
+it while it happens, not when the search is over: by then nothing can
+be changed.  The total ([[last_total]], \cref{sec:reported-total})
+arrives with the first page for every provider that reports one, so
+that is the moment to say it.
+
+The policy (when a total is large, what to print, whether the user
+asked for everything) belongs to the command line; the providers only
+know the moment.  So the providers announce the total to whoever
+listens, and the command line listens.  [[first_total_known]] is the
+announcement, called once per fetched answer where the provider reads
+the first page's total; [[listening_for_totals]] installs a listener
+for the duration of a search.  The listener sits in a
+[[contextvars.ContextVar]] rather than a module global, so that it is
+restored however the search ends and a listener can never outlive the
+search it was installed for.  Without a listener (the TUI, [[rq]] with
+a limit, library callers) the announcement does nothing.  A cached
+answer announces nothing: it is fetched already, so there is nothing
+left to warn about.  A value that is no count (a [[bool]], [[None]])
+is not passed on, as [[provider_total]] does not read one either.
+
+<<provider protocol>>=
+_TOTAL_LISTENER: contextvars.ContextVar = contextvars.ContextVar(
+    "scholar_total_listener", default=None
+)
+
+
+@contextlib.contextmanager
+def listening_for_totals(listener):
+    """Call `listener(name, total, estimated)` when a search hears its total.
+
+    `listener` None installs nothing, so a caller can pass it
+    conditionally.
+    """
+    token = _TOTAL_LISTENER.set(listener)
+    try:
+        yield
+    finally:
+        _TOTAL_LISTENER.reset(token)
+
+
+def first_total_known(name: str, total, estimated: bool = False) -> None:
+    """Tell the current listener, if any, the total of a search's first page."""
+    listener = _TOTAL_LISTENER.get()
+    if (listener is not None and isinstance(total, int)
+            and not isinstance(total, bool)):
+        listener(name, total, estimated)
+<<imports>>=
+import contextlib
+import contextvars
+@
+
+Let's verify that the announcement reaches a listener only while it is
+installed, and only with a count:
+
+<<test functions>>=
+class TestFirstTotalKnown:
+  """first_total_known reaches the listener of the current search only."""
+
+  def test_listener_hears_the_total(self):
+    heard = []
+    with listening_for_totals(lambda *a: heard.append(a)):
+      first_total_known("openalex", 25_000)
+      first_total_known("s2", 18_149, True)
+    assert heard == [("openalex", 25_000, False), ("s2", 18_149, True)]
+
+  def test_nothing_is_heard_outside_or_without_a_listener(self):
+    heard = []
+    with listening_for_totals(lambda *a: heard.append(a)):
+      pass
+    first_total_known("openalex", 25_000)
+    with listening_for_totals(None):
+      first_total_known("openalex", 25_000)
+    assert heard == []
+
+  def test_no_count_is_not_passed_on(self):
+    heard = []
+    with listening_for_totals(lambda *a: heard.append(a)):
+      first_total_known("dblp", None)
+      first_total_known("dblp", True)
+    assert heard == []
 @
 
 \subsection{The outcome of a DOI lookup}
@@ -3265,6 +3357,10 @@ the views show beside the count, as for the relevance search's
 ceiling.
 The answer is cached like the ceiling's, since it is what the search
 gives every time, and the reason is derived again on a cache hit.
+The first page's total is announced ([[first_total_known]],
+\cref{sec:first-total}), marked as an estimate like
+[[last_total_estimated]]; the first page is the request without a
+[[token]], since every later one carries the token of the page before.
 
 The fields are those of the relevance search.
 The issue found that the bulk search refuses the field [[tldr]]; the
@@ -3302,6 +3398,8 @@ def _search_bulk(
             response.raise_for_status()
             data = response.json()
             total = s2_total(data)
+            if "token" not in params:
+                first_total_known(self.name, total, True)
             page = data.get("data") or []
             papers.extend(self._convert_paper(p) for p in page)
             logger.info(
@@ -5667,6 +5765,7 @@ while True:
     if self.last_total is None:
         count = (getattr(page, "meta", None) or {}).get("count")
         self.last_total = count if isinstance(count, int) else None
+        first_total_known(self.name, self.last_total)
     for work in page:
         all_papers.append(self._convert_work(work))
         if len(all_papers) >= limit:
@@ -9296,6 +9395,7 @@ def _fetch_pages(
         if offset == 0:
             # `_parse_total` reads an absent @total as 0: unknown then
             self.last_total = total if total or not hits else None
+            first_total_known(self.name, self.last_total)
         if not hits:
             # No more results available
             break
@@ -10531,6 +10631,7 @@ def _search_starter(
             total = metadata.get("total", 0)
             if self.last_total is None and "total" in metadata:
                 self.last_total = total
+                first_total_known(self.name, total)
             if len(all_papers) >= total:
                 break
 
@@ -10616,6 +10717,7 @@ def _search_expanded(
             total = query_result.get("RecordsFound", 0)
             if self.last_total is None and "RecordsFound" in query_result:
                 self.last_total = total
+                first_total_known(self.name, total)
             if first_record > total:
                 break
 
@@ -12584,6 +12686,7 @@ def _search_uncached(
             total = data.get("total_records", 0)
             if self.last_total is None and "total_records" in data:
                 self.last_total = total
+                first_total_known(self.name, total)
             if start_record > total:
                 break
 
@@ -13476,6 +13579,8 @@ class PacedArxivClient(arxiv.Client):
             total = getattr(getattr(feed, "header", None),
                             "total_results", None)
             self.last_total = total if isinstance(total, int) else None
+            if _try_index == 0:
+                first_total_known("arxiv", self.last_total)
         return feed
 
     def results(self, search, offset=0):
@@ -15504,6 +15609,7 @@ def _fetch_pages(
         if start == 0 and isinstance(total, int):
             # an absent numFound reads as 0: unknown when docs came
             self.last_total = total if total or not docs else None
+            first_total_known(self.name, self.last_total)
         if not docs:
             break
 
@@ -16499,6 +16605,7 @@ class ScopusProvider:
                 total = int(declared or 0)
                 if declared is not None and self.last_total is None:
                     self.last_total = total
+                    first_total_known(self.name, total)
                 entries = scopus_result_entries(results)
                 if (declared is not None and total == 0) or not entries:
                     break
@@ -18067,6 +18174,135 @@ class TestReportedTotals:
     provider.search("total, years", limit=1,
                     filters=SearchFilters(year="2020"))
     assert provider.last_total is None
+@
+
+Each of them also announces the total at its first page
+([[first_total_known]], \cref{sec:first-total}), once, before the next
+page is asked for: that is what lets the command line warn while a
+search without a limit is still running.  The tests search without a
+limit through two pages and note, at the announcement, how many
+requests had been sent.  The responses are those of the tests above,
+as two pages; Semantic Scholar's are the recorded bulk pages.  Web of
+Science's Expanded tier reads its total like the Starter tier and is
+not repeated here.
+
+<<test functions>>=
+class TestFirstTotalAnnounced:
+  """Every provider announces its total at the first page (#301)."""
+
+  @staticmethod
+  def _json(data):
+    response = Mock(status_code=200, ok=True, headers={})
+    response.json.return_value = data
+    response.raise_for_status = Mock()
+    return response
+
+  def _heard(self, provider, pages, query="total"):
+    """Search without a limit; return what was heard and when."""
+    heard = []
+    with patch("requests.get") as get:
+      get.side_effect = [self._json(p) for p in pages]
+      with listening_for_totals(
+        lambda *a: heard.append((*a, get.call_count))
+      ):
+        provider.search(query, limit=UNLIMITED_PROVIDER_LIMIT)
+    return heard
+
+  <<first total announced test methods>>
+<<first total announced test methods>>=
+def test_openalex(self):
+  provider = OpenAlexProvider(api_key=None)
+  served = []
+
+  class Page(list):
+    meta = {"count": 2}
+
+  def pages(per_page):
+    for work in ("W1", "W2"):
+      served.append(work)
+      yield Page([{"id": work}])
+
+  heard = []
+  with patch("pyalex.Works") as works:
+    works.return_value.search.return_value.paginate = pages
+    with listening_for_totals(lambda *a: heard.append((*a, len(served)))):
+      provider.search("total query", limit=UNLIMITED_PROVIDER_LIMIT)
+  assert heard == [("openalex", 2, False, 1)]
+
+def test_dblp(self):
+  def page(title):
+    return {"result": {"hits": {
+      "@total": "2", "hit": [{"info": {"title": title}}],
+    }}}
+  empty = {"result": {"hits": {"@total": "2", "hit": []}}}
+  heard = self._heard(DBLPProvider(), [page("A"), page("B"), empty])
+  assert heard == [("dblp", 2, False, 1)]
+
+def test_wos_starter(self):
+  provider = WebOfScienceProvider(
+    starter_api_key="test_key", expanded_api_key=None
+  )
+  def page(title):
+    return {"metadata": {"total": 2}, "hits": [{"title": title}]}
+  heard = self._heard(provider, [page("A"), page("B")])
+  assert heard == [("wos", 2, False, 1)]
+
+def test_ieee(self):
+  def page(title):
+    return {"total_records": 2, "articles": [
+      {"title": title, "authors": {"authors": []}},
+    ]}
+  heard = self._heard(
+    IEEEXploreProvider(api_key="test_key"), [page("A"), page("B")]
+  )
+  assert heard == [("ieee", 2, False, 1)]
+
+def test_hal(self):
+  def page(title):
+    return {"response": {"numFound": 2, "docs": [{"title_s": [title]}]}}
+  empty = {"response": {"numFound": 2, "docs": []}}
+  with patch("scholar.providers.HAL_PAGE_SIZE", 1):
+    heard = self._heard(HALProvider(), [page("A"), page("B"), empty])
+  assert heard == [("hal", 2, False, 1)]
+
+def test_scopus(self, monkeypatch):
+  monkeypatch.setenv("SCOPUS_VIEW", "standard")
+  def page(title):
+    return {"search-results": {
+      "opensearch:totalResults": "2",
+      "entry": [{"@_fa": "true", "dc:title": title}],
+    }}
+  empty = {"search-results": {"opensearch:totalResults": "2"}}
+  heard = self._heard(
+    ScopusProvider(api_key="test_key"), [page("A"), page("B"), empty]
+  )
+  assert heard == [("scopus", 2, False, 1)]
+
+def test_arxiv_first_page_only(self, monkeypatch):
+  from types import SimpleNamespace
+  client = ArxivProvider()._client
+  feed = SimpleNamespace(header=SimpleNamespace(total_results=77))
+  monkeypatch.setattr(
+    arxiv.Client, "_Client__try_parse_feed",
+    lambda self, url, first_page, try_index: feed,
+  )
+  heard = []
+  with listening_for_totals(lambda *a: heard.append(a)):
+    client._parse_feed("https://export.arxiv.org/x")
+    client._parse_feed("https://export.arxiv.org/x", first_page=False)
+    client._parse_feed("https://export.arxiv.org/x", _try_index=1)
+  assert heard == [("arxiv", 77, False)]
+
+def test_s2_bulk(self, monkeypatch):
+  sent = _replay_s2(
+    monkeypatch, [S2_BULK_PAGE_1, {**S2_BULK_PAGE_2, "token": None}]
+  )
+  provider = SemanticScholarProvider(api_key=None)
+  heard = []
+  with listening_for_totals(lambda *a: heard.append((*a, len(sent)))):
+    provider.search("plain words", limit=UNLIMITED_PROVIDER_LIMIT)
+  assert len(sent) == 2
+  assert heard == [("s2", 4903, True, 1)]
 @
 
 A cached answer must come back with the time it was fetched and the
