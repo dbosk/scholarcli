@@ -2565,12 +2565,79 @@ context (#107). `review.save_session` now:
 - **locks**: the re-read, merge and replace run under
   `utils.file_lock` (`filelock`: `flock` on POSIX, `LockFileEx` on
   Windows) on a hidden sidecar `.<name>.json.lock`, so two processes
-  saving at once take turns. Held for milliseconds only, never from
-  load to save; after `LOCK_TIMEOUT` (10 s) it warns and writes
-  unlocked. Notes writers (`save_note`, `delete_note`, `get_note`,
-  `import_notes`, `migrate_paper_id`) take the notes file's lock via
-  `_holding_notes_lock`. Same machine only: no help across
-  machines on a shared directory.
+  saving at once take turns. Held for the merge and write only, never
+  from load to save. A session save NEVER writes unlocked (#316,
+  review.nw `sec:session-lock`): `session_lock(path, hint)` =
+  `file_lock(..., required=True, timeout=SESSION_LOCK_TIMEOUT (300 s),
+  notice_after=SESSION_LOCK_NOTICE (= LOCK_TIMEOUT, 10 s),
+  notice_every=SESSION_LOCK_REPEAT (60 s), notice_hint=...)`: WARNING
+  lines naming the file, time waited and left, and that Ctrl-C stops
+  the wait. `utils.LockNotTaken(path, reason, held=, lock_file=)`:
+  `held` True = another holder (timeout), False = the lock file cannot
+  be opened/created (`OSError`, "cannot open the lock file X: ...").
+  `save_session` takes the lock apart from the merge (`ExitStack`); on
+  `LockNotTaken` or `KeyboardInterrupt` during the wait,
+  `refused_save` keeps the session as `<name>.json.unsaved-<UTC
+  time>-<random>` (`keep_unsaved_session`, mkstemp) unless the
+  directory is not writable (`os.access`; then no attempt, said in the
+  line), and raises `SessionNotSaved(path, unsaved, reason, cause=
+  held|lock-file|interrupted, keep_error=)`; `cli.main()` prints it as
+  one unwrapped line, no traceback, exit 1 (130 when interrupted).
+  Kept file = `session_file_data(session)` + `UNSAVED_KEY`
+  `"scholar_unsaved"`: `{"target": "<name>.json", "baseline":
+  baseline_data(...) | null, "baseline_keys": [...]}`. The baseline is
+  plain JSON (NO pickle: a pickled baseline ran code on recover, review
+  of #317): `SessionBaseline` fields by name, values through a tagged
+  codec (`baseline_value_data`/`baseline_value`: one-key objects
+  `tuple`, `list`, `frozenset`, `dict` as pairs, `enum` [name, value]
+  from `BASELINE_ENUMS` = DecisionStatus, ReviewSource; leaves str,
+  int, float, bool, null); `baseline_from_data` checks tags, field
+  names and types, else `ValueError` -> `SessionFileError`.
+  `scholar sessions recover FILE` (`recover_unsaved_session`) accepts
+  only a `target` that is a plain non-hidden `<name>.json` the kept
+  file's own name begins with, written in the sessions directory;
+  restores baseline and keys, saves through `save_session` (same
+  merge, under the lock) and deletes FILE; refused again: FILE stays,
+  the new copy is removed. `--discard` deletes a kept file
+  (`discard_unsaved_session`: name has `.json.unsaved-` and
+  `read_kept_file` accepts it; else exit 2); every refused save leaves
+  one full copy, never removed automatically. Crafted kept files
+  (deep nesting -> `RecursionError`, non-string `baseline_keys`) are
+  one-line refusals. The keep serialises first and creates the file
+  only to write it (an interrupted keep leaves no file), and holds
+  back SIGINT while keeping (`InterruptHeldBack`, main thread only;
+  the command then exits 130); an interrupt that still stops it gives
+  "... could not be kept ..., so its changes are lost". SIGTERM is no
+  interrupt: `decide`/TUI end at once without a kept file (143), only
+  `enrich` turns it into one. `reconcile_session` and
+  `keep_copy_before_run` take `session_lock` too (hint
+  `NOTHING_CHANGED_HINT`; refused: `lock_refusal`, `SessionNotSaved`
+  with no kept file, "run the command again"). `scholar enrich` stops
+  at a refused chunk save ("Stopped: saved K of N ...", exit 1 or 130;
+  earlier chunks saved, the chunk in the kept file); the TUI's exit
+  save raises through `run_review`/`sessions resume` to `main`; a
+  refused `search -n` / `llm synthesize` prints nothing of its work
+  (both save first; results in the kept file and the caches).
+  `sessions list` warns about kept files (`unsaved_session_files`).
+  Other `file_lock` users still write unlocked after their timeout:
+  notes (`_holding_notes_lock`, 10 s; #319) and caches
+  (`CACHE_LOCK_TIMEOUT`, 60 s). Notes writers (`save_note`,
+  `delete_note`, `get_note`, `import_notes`, `migrate_paper_id`) take
+  the notes file's lock via `_holding_notes_lock`. Same machine only:
+  no help across machines on a shared directory.
+- **cost** (#316, review.nw `sec:save-cost`/`sec:pairing-cost`): a
+  save is linear in the decisions. `pair_with_file` groups the
+  baseline's keys by paper id once (`base_keys_by_id`; it used to scan
+  every baseline key per paper id: 94 s at 30,000 decisions with five
+  links each), and `save_session` runs under
+  `paused_garbage_collection()` (gc off, then restored as it was).
+  Measured after a load, invented session, 5 links per decision, under
+  other jobs' load: 5,000 / 10,000 / 30,000 decisions 1.2 / 2.9 /
+  8.1 s (before 4.1 / 15.5 / 172 s). The gc pause at 30,000: 12.3 s
+  without it vs 7.7-8.4 s with it (ours); 13.3/18.8 vs 8.5/12.6 s
+  (reviewer's), 2.6 vs 1.7-2.1 s at 5,000. Tests keep the old pairing
+  as `reference_pair_with_file` (test_review.py; do not change it) and
+  compare on the #228 scenarios and 400 seeded random cases.
 - **writes atomically**: `utils.atomic_write_text` (temp file in the
   same directory, fsync, `os.replace`), keeping the previous file as
   `<name>.json.bak` (one generation).
