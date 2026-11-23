@@ -2605,6 +2605,72 @@ case-insensitive byte search for the id in each file (every decision
 stores `paper_id`; an arXiv DOI also matches its bare arXiv id) and
 decodes only those; non-ASCII/`"`/`\` fragments decode every file.
 
+### `search -f csv` rows (#300)
+
+`search -f csv` is tab-separated, written by Python's `csv` module
+(`csv.writer(sys.stdout, delimiter="\t", lineterminator="\n")`, default
+quote mark `"` and `QUOTE_MINIMAL`); read it with
+`csv.reader(f, delimiter="\t")` (cli.nw `sec:search-csv-rows`). The `#`
+lines and blank lines are printed as before; only the header and paper
+rows go through the writer. A row whose fields hold no tab, line break
+or quote mark is byte-identical to the old f-string output (tested);
+**behaviour change**: a field holding a quote mark, a tab or a line
+break is now quoted, its quote marks doubled (in the tests' invented
+sample, 3 of 20 titles, the ones with a quote mark). Before, a tab or
+line break split the cell or row. `clean_metadata_text` keeps tabs and
+line breaks (and decodes `&#9;`/`&#10;` into them), so ingest cleaning
+does not prevent them. Reading (cli.nw `sec:search-csv-comments`, in
+the `--format` help): the output is blocks of `#` lines, a blank
+line, the header, the paper rows, a blank line; parse it whole with
+`csv.reader(f, delimiter="\t")`, rows up to the first empty row are
+comments, then the header, then papers up to the next empty row. Never
+drop lines starting with `#` before parsing (a quoted title can hold
+`\n#...`, a title can begin with `#`). `csv_comment` turns tab,
+CR and LF in every `#` line into spaces (a query `x<TAB>"y` or
+`a<LF>"b` used to open a quoted field that swallowed every row);
+quote marks stay, since a comment row is one field beginning with `#`
+(tested with `"a b"`, several blocks, `# Results:`/`# Search:`
+errors with line breaks).
+
+### Spreadsheet-safe CSV (`--spreadsheet-safe`, #285)
+
+`sessions export -f csv|all --spreadsheet-safe` and `search -f csv
+--spreadsheet-safe` (review.nw `sec:spreadsheet-safe`) write each cell
+that begins with a character of `SPREADSHEET_FORMULA_STARTS` (`=
++ - @`, tab, CR, LF, full-width U+FF1D U+FF0B U+FF0D U+FF20: OWASP's
+CSV-injection list, read 2026-11-20 at
+https://owasp.org/www-community/attacks/CSV_Injection, no more and no
+fewer), or with `'` itself, with one `'` in front
+(`spreadsheet_safe_cell`). The page's tab prefix was not taken: the
+same page lists tab as a trigger. The page wraps and prefixes *every*
+field; prefixing only trigger cells and leaving quoting to
+`csv.writer`'s minimal rule is scholar's choice (exact undo, other
+cells unchanged for scripts; quoting every field changed nothing in
+LibreOffice, comma import). Numeric columns (`CSV_NUMERIC_COLUMNS` =
+`year`, `llm_confidence`; `SpreadsheetSafeWriter` finds them by header
+name, so a new column is text; search's year likewise) go through
+`spreadsheet_safe_number`: left alone only for an int, a float or a
+string `float()` reads that equals its `strip()` (`"\t5"` is text), else treated as text (a session can hold
+`"year": "=1+2"`; `Paper.from_dict` keeps it). Undo: drop the first
+character of every cell, in any column, that begins with `'` (exact: a
+leading `'` is doubled, and a number left alone never begins with
+`'`). `#` lines and headers are unchanged. In `search` the prefix is
+put on the cell before `csv.writer` writes it, so a cell beginning with
+a tab or line break stays one quoted cell (tested; LibreOffice read it
+as one text cell, the old unquoted row as a formula). Off by default
+and byte-identical without it (checked against e7dc5f5): scripts read
+the raw file. To make it the default, set
+`cli.SPREADSHEET_SAFE_DEFAULT = True` (the flag has
+`--no-spreadsheet-safe`; `None` = not given). With another format it is
+refused (exit 2; search: not csv/auto, before searching; export: not
+csv/all, before loading). Limits, also in both helps: it protects only
+a reader that uses the file's own separator (comma for the export, tab
+for search; a semicolon import of the safe export gave the same
+formulas as the raw one for a field holding `a;=1+2`); LibreOffice
+shows the `'` as part of the text; Excel may drop the prefix on save
+and reopen (the page). LibreOffice 26.2.6.3, tried 2026-11-20; Excel
+not tried. Not covered: `sessions check -f csv`, the screen sheet.
+
 ### LaTeX Output: Standalone, Fragment, Audit Table
 
 `review.py` owns the shared LaTeX pieces: the escapers (`escape_latex`,
