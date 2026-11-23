@@ -3814,6 +3814,41 @@ alphabetically). An untangled checkout mounts nothing instead of failing.
   `doc/Makefile`, and an `\input` in `doc/scholar.tex`. The parametrised
   test in `cli.nw` then loads it with pytorial's parser.
 
+### The methods part of the documentation (#310, #311)
+
+`doc/scholar.pdf` has a part after the Tutorials, "The methods behind
+the defaults" (`doc/methods/methods.tex`, plain LaTeX, no code):
+`procedure.tex` (the procedure, each step with its command and a
+`\cref` to its grounds), `measured.tex` (our own measurements of
+2026-11-23, anonymised; the scripts read private sessions and are not
+published), `search.tex` (the literature search of 2026-11-23, sessions
+`screenlit-q1..q4`, one agent screener), one backing chapter per claim
+(`stopping.tex`, `abbreviated.tex`, `databases.tex`,
+`llm-screening.tex`, known items in `reporting.tex`). Wording rules
+(#252): nothing from memory; our measurements are "these cases"; a tier
+is not a stopping rule; negatives as "none among N screened of M; a
+sample of n held none (interval)". `doc/methods/tables/` is generated
+from copies of the sessions (query lists and matrices with
+`hits_label`, audit tables by `generate_audit_table --bearing-only`
+with `--cited-from doc/bibliography.bib`); regenerate, do not hand-edit.
+A query matrix is a whole `tabular` in its file: an `\input` inside a
+tabular followed by `\bottomrule` fails ("Misplaced \noalign").
+- `doc/bibliography.bib`: the review's 51 entries with provenance
+  blocks (check with backing-claims' `check_provenance.py --quotes`);
+  `\printbibliography` is in `scholar.tex`'s backmatter. The preamble
+  loads `longtable` and `array` for the audit tables.
+- #311: latexmk `-use-make` asks make for a missing `.bbl`, and tex.mk's
+  `.aux` rule (bibtexu) came first; `doc/Makefile` has an explicit
+  `ltxobj/scholar.bbl: ltxobj/scholar.bcf` rule running biber. The
+  pdfTeX warning `name{noweb.}` came from noweb.sty itself: page ranges
+  in "used in" lists (`342--46`) reach `\@nwhyperpagenum` with an empty
+  label; the preamble leaves such a range unlinked.
+- `TestMethodsPartSources` (cli.nw, after the woven-document guard)
+  runs the unsettable-character check over `doc/methods/**/*.tex` and
+  the non-comment lines of `doc/bibliography.bib` (comments hold the
+  verbatim quotes, which biber never passes on).
+- In `\texttt` (Bera Mono, T1) `--` sets as one dash: write `-{}-`.
+
 ## Testing
 
 ```bash
