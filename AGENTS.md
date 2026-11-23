@@ -2489,6 +2489,13 @@ screeners)} over records screened twice, `screen_sample` (the one
   before the files are moved (the other order could leave a screened
   sheet whose draw is never recordable); a failure after the save says
   the draw's id is recorded and points to `sessions tier-sample`.
+  A refused save (#317, `SessionNotSaved`, also from the pre-run copy)
+  is re-raised for `main()`'s one line: staging discarded (no sheet, no
+  tier file), nothing claims a recorded draw; the kept
+  `.json.unsaved-*` file holds `tier_samples` (via `session_file_data`),
+  so `sessions recover` adds the draw, sheetless (`sessions tier-sample`
+  lists its papers). Tested with a real lock holder started after the
+  pre-run copy.
   `--dry-run` draws in memory, prints no id, writes nothing. `BASE-tier.json`
   adds `rest_sample` (the record minus `rule`). Exit 2 before loading:
   `--rest-sample` without `--pending`, without a tier option, without
