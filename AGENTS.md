@@ -2833,7 +2833,28 @@ store file and both ids and skips it (raising would discard the
 caller's enrichment run or search append), raising only on write
 errors. `notes export` also writes atomically (no `.bak`).
 `sessions export` stages all its files with `utils.staged_outputs` and
-moves them into place only if every format succeeded (#83).
+moves them into place only if every format succeeded (#83). The moves
+are a transaction (#320, utils.nw `sec:staged-outputs`,
+`place_staged_files`): every target is checked first
+(`output_target_problem`: a directory there, an unwritable directory,
+the sticky-bit rule of rename(2)); then each existing target is moved
+aside into `.scholar-replaced-*` before the new file goes in, and a
+failure part-way undoes the moves (old file back, new file without a
+predecessor removed). Removals (`staged_outputs(dir, remove=[names])`,
+the screen sheet's stale `BASE-tier.json`) are moves aside in the same
+transaction, made after every file is in place. A failure raises
+`OutputsNotPlaced` (`new`/`old`/`missing`/`not_written`, `kept`,
+`rolled_back`, `changed`); `cli.export_failure_text` words the message
+from it: "no files were written or changed" (with "and was rolled
+back" when files had moved) only when `not changed`, else "Export
+failed part-way and could not be rolled back" plus one line per kind
+naming where an earlier version is kept (that directory is then left).
+The rest-sample export says "None of the exported files was written or
+changed" and "the screen sheet was not written" unless a restore
+failed. Limits (in the prose): several renames are not one atomic step;
+between the move aside and the move in the name holds no file; a killed
+process undoes nothing (replaced files stay in `.scholar-replaced-*`);
+the check is a forecast (`os.access` caveats), the undo is the guard.
 `sessions list` warns on stderr about sessions with records but no
 decisions and no context (`needs_check` in the JSON). The paper registry
 is process-global, so tests that load sessions should use unique DOIs or

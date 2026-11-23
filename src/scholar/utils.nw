@@ -1284,6 +1284,7 @@ class TestAtomicWriteText:
 @
 
 \subsection{Several files, all or nothing}
+\label{sec:staged-outputs}
 
 An export that writes a [[.csv]], a [[.tex]] and a [[.bib]] must not leave
 some of them new and some old.  Renaming several files can never be one
@@ -1292,9 +1293,9 @@ content (where bugs and bad data strike), happen before anything
 is touched.  [[staged_outputs]] hands the caller an empty staging directory
 inside the target directory.  The caller's generators write their files
 there under their final names.  Only when the block finishes without an
-exception are the files synced and renamed into the target directory, one
-[[os.replace]] each.  If the block raises, the staging directory and
-everything in it is removed and the target directory is exactly as before.
+exception are the files moved into the target directory.  If the block
+raises, the staging directory and everything in it is removed and the
+target directory is exactly as before.
 
 The staging directory sits inside the target directory for the same reason
 the temporary file does: the renames stay on one file system.  Generators
@@ -1303,36 +1304,445 @@ writes [[<stem>.bib]] next to [[<stem>.tex]]) keep working unchanged, and
 any reference one file makes to another uses the bare file name, which is
 the same in both places.
 
+The moves themselves can fail too.  A directory where a file should go
+was the case seen (\url{https://github.com/dbosk/scholar/issues/320}): the
+first files of the export were renamed into place, the next rename
+failed, and the export was left half new, which is what staging was for
+to prevent.  So the last step is a small transaction of its own, in
+three parts.
+\begin{description}
+\item[Check every target first] Before anything is moved, each target
+  is checked for the reasons a rename refuses that can be seen in
+  advance (\cref{sec:staged-outputs-check}).  A failure here moves
+  nothing.
+\item[Keep what is replaced] Each existing target is first moved aside
+  into a hidden directory beside the staging, [[.scholar-replaced-*]],
+  and only then is the new file moved in.  When a move fails part-way
+  (a race with another program, a full disk), the moves made so far are
+  undone, latest first: the old file is moved back over the new one, a
+  new file that replaced nothing is removed.  The old files are deleted
+  only when every move has succeeded.
+\item[Say what is left] Only when undoing fails as well are the files
+  left mixed, and then the error says, per file, whether it holds the
+  new version, the earlier one or none, and where an earlier version
+  that could not be put back is kept: the directory of replaced files
+  is not removed in that case.
+\end{description}
+A caller may also ask for files to be removed, such as an earlier
+export's file that the new one makes misleading.  A removal is part of
+the same transaction: it is a move aside like the others, made after
+every new file is in place, and undone with them.
+
+What this guarantees rests on [[os.replace]], whose documentation says
+that a successful rename is atomic (a POSIX requirement), that it
+replaces an existing file silently \enquote{if the user has permission},
+raises [[OSError]] for a non-empty directory, and \enquote{may fail if
+src and dst are on different filesystems}
+(\url{https://docs.python.org/3/library/os.html#os.replace}, read
+2026-11-23).  Every rename here stays inside the target directory, so on
+one file system.  What a file system cannot give is atomicity across
+several names: between moving an old file aside and moving the new one
+in, the name holds no file for a moment, and a reader at that instant
+finds none (rename(2) promises that a single replacing rename leaves no
+such moment, \url{https://man7.org/linux/man-pages/man2/rename.2.html};
+two renames cannot).  The session file avoids the gap by copying instead
+(\cref{sec:atomic-write}), because other processes read it all the time;
+an export's files are read by a person or a \LaTeX{} run started after
+the export, so the gap is accepted for the sake of a restore that is a
+rename too.  And if the process is killed between the moves, nothing
+undoes them: the files moved so far stay, and the replaced ones stay in
+the [[.scholar-replaced-*]] directory, whose files keep their names.
+
 <<utils functions>>=
+from collections.abc import Iterable
+
+STAGING_PREFIX = ".scholar-staging-"
+KEPT_PREFIX = ".scholar-replaced-"
+
+
 @contextmanager
-def staged_outputs(directory: str | os.PathLike) -> Iterator[Path]:
+def staged_outputs(
+    directory: str | os.PathLike, remove: Iterable[str] = ()
+) -> Iterator[Path]:
     """Stage files and move them into `directory` only if all succeed.
 
     Yields a fresh staging directory inside `directory`. Write every
     output there under its final file name. When the block completes,
-    each staged file is synced and renamed into `directory`; when it
+    each staged file is moved into `directory` and each file named in
+    `remove` is removed from it, all or nothing as far as the file
+    system allows: on a failure part-way the moves are undone, and
+    `OutputsNotPlaced` says what each file holds. When the block
     raises, the staged files are discarded and `directory` is untouched.
     """
     directory = Path(directory)
     staging = Path(
-        tempfile.mkdtemp(dir=directory, prefix=".scholar-staging-")
+        tempfile.mkdtemp(dir=directory, prefix=STAGING_PREFIX)
     )
     try:
         yield staging
         staged = sorted(p for p in staging.iterdir() if p.is_file())
-        for path in staged:
-            with open(path, "rb") as f:
-                os.fsync(f.fileno())
-        for path in staged:
-            os.replace(path, directory / path.name)
-        _fsync_directory(directory)
+        place_staged_files(directory, staged, remove)
     finally:
         shutil.rmtree(staging, ignore_errors=True)
 @
 
-We check both outcomes: on success the files land under their own names and
-replace older ones; on failure the older files stay and no staging
-directory is left behind.
+[[place_staged_files]] is the transaction.  It works on two lists, the
+targets of the staged files and the files to remove, and records before
+moving anything whether each target held a file, which the error needs
+to tell an earlier version from no file at all.  A removal of a file
+that is not there is nothing to do, and a removal of a name a staged
+file replaces anyway is already done by that move.  The staged files
+are synced before the first move, as [[atomic_write_bytes]] syncs its
+temporary file, so that no rename can become durable before the data it
+points to.
+
+<<utils functions>>=
+def place_staged_files(
+    directory: Path, staged: list[Path], remove: Iterable[str] = ()
+) -> None:
+    """Move each of `staged` into `directory` under its own name and
+    remove the files named in `remove`, all or nothing as far as the
+    file system allows. Raises `OutputsNotPlaced` on failure.
+    """
+    targets = [directory / path.name for path in staged]
+    names = {path.name for path in staged}
+    removals = [
+        directory / name for name in remove
+        if name not in names and os.path.lexists(directory / name)
+    ]
+    every_target = targets + removals
+    existed = {target: os.path.lexists(target) for target in every_target}
+    placement = _Placement(directory)
+    <<check every target before moving anything>>
+    try:
+        for path in staged:
+            with open(path, "rb") as f:
+                os.fsync(f.fileno())
+    except OSError as error:
+        raise placement.failure(
+            _failure_reason(error), every_target, existed
+        ) from error
+    <<move every file, undoing all moves on a failure>>
+    placement.commit()
+
+
+def _failure_reason(error: BaseException) -> str:
+    """The exception as one line: its class and its message."""
+    return f"{type(error).__name__}: {error}"
+@
+
+A failure while moving is first undone, then reported.  An interrupt
+(Ctrl-C) is undone the same way but passes on as itself, since the
+caller handles it as an interrupt; if undoing it failed, a warning says
+what is left, because nothing else would.
+
+<<move every file, undoing all moves on a failure>>=
+try:
+    for source, target in zip(staged, targets):
+        placement.put(source, target)
+    for target in removals:
+        placement.take_away(target)
+except BaseException as error:
+    moved = placement.moved()
+    undone = placement.roll_back()
+    failure = placement.failure(
+        _failure_reason(error), every_target, existed,
+        rolled_back=moved and undone,
+    )
+    if not isinstance(error, Exception):
+        if failure.changed:
+            logging.getLogger(__name__).warning("%s", failure)
+        raise
+    raise failure from error
+@
+
+\paragraph{The error.}
+[[OutputsNotPlaced]] carries the outcome per target, in four lists, so
+that a caller can word its own message from what happened instead of
+from what it hoped.  [[changed]] is the one question most callers ask:
+whether any target differs from before the call.  A target that held no
+file before and holds none now has not changed, so it is listed
+apart, as not written, rather than as missing.
+
+<<utils functions>>=
+class OutputsNotPlaced(Exception):
+    """Staged outputs that could not all be moved into place.
+
+    `new` lists the targets that now hold the staged file, `old` those
+    that hold what they held before, `missing` those that held a file
+    before and hold none now, and `not_written` those that held no file
+    before and still hold none. `kept` maps a target to where its
+    earlier version is kept when it could not be put back. `rolled_back`
+    is true when files had been moved and every move was undone.
+    """
+
+    def __init__(
+        self, reason: str, *, new=(), old=(), missing=(),
+        not_written=(), kept=None, rolled_back: bool = False,
+    ):
+        super().__init__(reason)
+        self.reason = reason
+        self.new = list(new)
+        self.old = list(old)
+        self.missing = list(missing)
+        self.not_written = list(not_written)
+        self.kept = dict(kept or {})
+        self.rolled_back = rolled_back
+
+    @property
+    def changed(self) -> bool:
+        """Whether any target differs from what it was before."""
+        return bool(self.new or self.missing)
+
+    def file_lines(self) -> list[str]:
+        """Say which target holds what, one line per kind there is."""
+
+        def names(targets):
+            return ", ".join(
+                f"{target} (earlier version kept as {self.kept[target]})"
+                if target in self.kept else str(target)
+                for target in targets
+            )
+
+        kinds = (
+            ("Holding the new version", self.new),
+            ("Holding the earlier version", self.old),
+            ("Missing", self.missing),
+            ("Not written", self.not_written),
+        )
+        return [f"{label}: {names(targets)}"
+                for label, targets in kinds if targets]
+
+    def __str__(self) -> str:
+        if self.changed:
+            return "; ".join([self.reason, *self.file_lines()])
+        if self.rolled_back:
+            return f"{self.reason} (every file moved was put back)"
+        return self.reason
+@
+
+\paragraph{Moving with a way back.}
+[[_Placement]] makes the moves and remembers each one, so that it can
+undo them and say afterwards where each target stands.  The directory of
+replaced files is made only when a target exists, so an export into an
+empty directory creates none.  A replaced file keeps its own name in it;
+the names are unique, being names in one directory.  Undoing goes
+latest first, so a target is always put back to the state before its
+own move, and it goes on past a step that fails, so that one stubborn
+file does not keep the others from being restored.
+
+<<utils functions>>=
+@dataclass
+class _Move:
+    """One target of a placement and how far its move got."""
+
+    target: Path
+    existed: bool
+    aside: Path | None = None
+    placed: bool = False
+
+
+class _Placement:
+    """Moves files into `directory`, keeping what they replace."""
+
+    def __init__(self, directory: Path):
+        self.directory = directory
+        self.kept: Path | None = None
+        self.moves: list[_Move] = []
+
+    <<placement methods>>
+@
+
+Putting a file in place is two renames: the old file aside, the new one
+in.  Taking a file away is the first of them alone.  A file to take away
+that has gone meanwhile is what was wanted, so it ends that step
+without error.
+
+<<placement methods>>=
+def put(self, source: Path, target: Path) -> None:
+    """Move `source` to `target`, setting an existing target aside."""
+    move = _Move(target, existed=os.path.lexists(target))
+    self.moves.append(move)
+    if move.existed:
+        self._set_aside(move)
+    os.replace(source, target)
+    move.placed = True
+
+def take_away(self, target: Path) -> None:
+    """Set `target` aside, to be deleted once everything succeeded."""
+    move = _Move(target, existed=True)
+    self.moves.append(move)
+    try:
+        self._set_aside(move)
+    except FileNotFoundError:
+        if os.path.lexists(target):
+            raise
+
+def _set_aside(self, move: _Move) -> None:
+    if self.kept is None:
+        self.kept = Path(
+            tempfile.mkdtemp(dir=self.directory, prefix=KEPT_PREFIX)
+        )
+    aside = self.kept / move.target.name
+    os.replace(move.target, aside)
+    move.aside = aside
+
+def moved(self) -> bool:
+    """Whether any file has been moved yet."""
+    return any(move.placed or move.aside for move in self.moves)
+@
+
+[[roll_back]] puts an earlier version back with one rename, over the
+new file if that was moved in, which is atomic for that name; a new file
+that replaced nothing is removed.  Each failure is logged with its
+reason, which the error's lists do not carry.  When everything was put
+back, the directory of replaced files is empty and goes too.
+
+<<placement methods>>=
+def roll_back(self) -> bool:
+    """Undo every move, latest first; whether all were undone."""
+    undone = True
+    for move in reversed(self.moves):
+        try:
+            if move.aside is not None:
+                os.replace(move.aside, move.target)
+                move.aside = None
+            elif move.placed:
+                os.unlink(move.target)
+            move.placed = False
+        except OSError as error:
+            undone = False
+            logging.getLogger(__name__).warning(
+                "Could not restore %s: %s", move.target, error
+            )
+    if undone:
+        self._drop_kept()
+    return undone
+
+def commit(self) -> None:
+    """Make the moves durable and delete the replaced files."""
+    _fsync_directory(self.directory)
+    self._drop_kept()
+
+def _drop_kept(self) -> None:
+    if self.kept is None:
+        return
+    try:
+        shutil.rmtree(self.kept)
+    except OSError as error:
+        logging.getLogger(__name__).warning(
+            "Could not remove %s, which holds replaced files: %s",
+            self.kept, error,
+        )
+@
+
+The error is built from the moves: a target moved in holds the new
+version, one set aside and not moved in holds none, and one never
+touched (or put back) holds what it held before, a file or nothing.
+
+<<placement methods>>=
+def failure(
+    self, reason: str, targets: list[Path], existed: dict,
+    rolled_back: bool = False,
+) -> OutputsNotPlaced:
+    """An `OutputsNotPlaced` saying where each of `targets` stands."""
+    moves = {move.target: move for move in self.moves}
+    lists = {"new": [], "old": [], "missing": [], "not_written": []}
+    kept = {}
+    for target in targets:
+        move = moves.get(target)
+        if move is not None and move.aside is not None:
+            kept[target] = move.aside
+        if move is not None and move.placed:
+            lists["new"].append(target)
+        elif move is not None and move.aside is not None:
+            lists["missing"].append(target)
+        elif existed[target]:
+            lists["old"].append(target)
+        else:
+            lists["not_written"].append(target)
+    return OutputsNotPlaced(
+        reason, kept=kept, rolled_back=rolled_back, **lists
+    )
+@
+
+\paragraph{Checking the targets.}
+\label{sec:staged-outputs-check}
+Most refusals of a rename can be seen before it is tried, and a refusal
+seen then costs nothing to undo.  [[output_target_problem]] looks for
+three, from the errors rename(2) lists
+(\url{https://man7.org/linux/man-pages/man2/rename.2.html}, read
+2026-11-23): a directory at the target (EISDIR; [[os.replace]] also
+refuses a non-empty one, as quoted above), a directory without write
+permission (EACCES), and the sticky-bit rule (EPERM): in a directory
+with the sticky bit set, as [[/tmp]] usually is, only the owner of a
+file or of the directory may replace or remove it.  Privileged processes
+are exempt from that rule; Linux grants the exemption by the
+[[CAP_FOWNER]] capability, which this check approximates by the root
+user.
+
+The checks are a forecast, not a guarantee.  [[os.access]] tests the
+real user, not the effective one, unless asked (and the platform
+supports it), and its documentation warns that \enquote{I/O operations
+may fail even when [[access()]] indicates that they would succeed},
+for network file systems in particular, and that the state can change
+between the check and the use
+(\url{https://docs.python.org/3/library/os.html#os.access}, read
+2026-11-23).  That is why the moves are still undone on a failure: the
+check only makes the undoing rarer.
+
+<<check every target before moving anything>>=
+problems = [
+    problem for target in every_target
+    if (problem := output_target_problem(target)) is not None
+]
+if problems:
+    raise placement.failure("; ".join(problems), every_target, existed)
+<<utils functions>>=
+import stat
+
+
+def output_target_problem(target: Path) -> str | None:
+    """Why a rename to (or of) `target` would be refused, or `None`."""
+    try:
+        status = os.lstat(target)
+    except FileNotFoundError:
+        status = None
+    except OSError as error:
+        return f"{target}: {error.strerror or error}"
+    if status is not None and stat.S_ISDIR(status.st_mode):
+        return f"{target} is a directory"
+    directory = target.parent
+    if not os.access(
+        directory, os.W_OK | os.X_OK,
+        effective_ids=os.access in os.supports_effective_ids,
+    ):
+        return f"{directory} is not writable"
+    geteuid = getattr(os, "geteuid", None)
+    if status is not None and geteuid is not None and sticky_refuses(
+        os.stat(directory), status, geteuid()
+    ):
+        return (f"{target} belongs to another user in a directory with "
+                "the sticky bit set")
+    return None
+
+
+def sticky_refuses(
+    directory_status: os.stat_result, file_status: os.stat_result,
+    euid: int,
+) -> bool:
+    """Whether the sticky-bit rule forbids user `euid` to rename the file."""
+    return (
+        bool(directory_status.st_mode & stat.S_ISVTX)
+        and euid != 0
+        and euid not in (file_status.st_uid, directory_status.st_uid)
+    )
+@
+
+\paragraph{Tests.}
+The first two tests are the original contract: on success the files
+land under their own names and replace older ones; when the block
+raises, the older files stay and no staging directory is left behind.
 
 <<test functions>>=
 class TestStagedOutputs:
@@ -1368,6 +1778,187 @@ class TestStagedOutputs:
         assert sorted(p.name for p in out_dir.iterdir()) == [
             "r.csv", "r.tex",
         ]
+@
+
+The moves are tested on real files in a temporary directory, three
+outputs [[a.csv]], [[b.tex]] and [[c.txt]] (moved in that order) over
+an earlier set.  The provoked failure of
+\url{https://github.com/dbosk/scholar/issues/320}, a directory at the
+second target, must be found by the check, so that nothing moves.  A
+failure the check cannot foresee is injected through [[os.replace]]
+(the only way to make a rename fail on demand, whatever the file
+system): the rename of the first or of the last staged file, and, to
+reach the last part of the transaction, the rename that would put a
+replaced file back.  A staged file's rename has a source in the staging
+directory, a restore one in the directory of replaced files, which is
+how the injected failures tell them apart.  Every test compares the
+directory's whole content, hidden files included, so that a leftover
+staging or replaced-files directory fails it too.
+
+<<test functions>>=
+class TestStagedOutputMoves:
+    """The moves of staged_outputs are all or nothing (#320)."""
+
+    @pytest.fixture
+    def out_dir(self, tmp_path):
+        out = tmp_path / "out"
+        out.mkdir()
+        return out
+
+    <<staged output moves test methods>>
+@
+
+<<staged output moves test methods>>=
+NAMES = ("a.csv", "b.tex", "c.txt")
+
+def _content(self, out_dir):
+    """Every entry of `out_dir`: file bytes, or "dir" for a directory."""
+    return {
+        p.name: "dir" if p.is_dir() else p.read_bytes()
+        for p in out_dir.iterdir()
+    }
+
+def _export(self, out_dir, remove=()):
+    with staged_outputs(out_dir, remove=remove) as staging:
+        for name in self.NAMES:
+            (staging / name).write_text(f"new {name}")
+
+def _fail_on(self, monkeypatch, failing):
+    """Make `os.replace` raise for the renames `failing` picks."""
+    import scholar.utils as utils
+
+    real_replace = os.replace
+
+    def replace(source, target):
+        if failing(Path(source), Path(target)):
+            raise OSError(28, "No space left on device")
+        return real_replace(source, target)
+
+    monkeypatch.setattr(utils.os, "replace", replace)
+
+def test_a_directory_at_the_second_target_moves_nothing(self, out_dir):
+    for name in ("a.csv", "c.txt"):
+        (out_dir / name).write_text(f"old {name}")
+    (out_dir / "b.tex").mkdir()
+    before = self._content(out_dir)
+    with pytest.raises(OutputsNotPlaced) as caught:
+        self._export(out_dir)
+    assert self._content(out_dir) == before
+    assert not caught.value.changed
+    assert not caught.value.rolled_back
+    assert caught.value.old == [out_dir / name for name in self.NAMES]
+    assert "b.tex is a directory" in str(caught.value)
+
+@pytest.mark.parametrize("failing_name", ["a.csv", "c.txt"])
+def test_a_failed_move_is_rolled_back(
+    self, out_dir, monkeypatch, failing_name,
+):
+    for name in self.NAMES:
+        (out_dir / name).write_text(f"old {name}")
+    before = self._content(out_dir)
+    self._fail_on(monkeypatch, lambda source, target: (
+        STAGING_PREFIX in str(source) and target.name == failing_name
+    ))
+    with pytest.raises(OutputsNotPlaced) as caught:
+        self._export(out_dir)
+    assert self._content(out_dir) == before
+    assert not caught.value.changed
+    assert caught.value.rolled_back
+    assert "No space left on device" in str(caught.value)
+
+def test_a_new_file_that_replaced_nothing_is_removed(
+    self, out_dir, monkeypatch,
+):
+    (out_dir / "c.txt").write_text("old c.txt")
+    self._fail_on(monkeypatch, lambda source, target: (
+        STAGING_PREFIX in str(source) and target.name == "c.txt"
+    ))
+    with pytest.raises(OutputsNotPlaced) as caught:
+        self._export(out_dir)
+    assert self._content(out_dir) == {"c.txt": b"old c.txt"}
+    assert caught.value.not_written == [out_dir / "a.csv",
+                                        out_dir / "b.tex"]
+
+def test_an_existing_set_is_replaced_without_leftovers(self, out_dir):
+    for name in self.NAMES:
+        (out_dir / name).write_text(f"old {name}")
+    self._export(out_dir)
+    assert self._content(out_dir) == {
+        name: f"new {name}".encode() for name in self.NAMES
+    }
+
+def test_a_failed_restore_says_where_each_file_stands(
+    self, out_dir, monkeypatch,
+):
+    for name in ("a.csv", "b.tex", "c.txt"):
+        (out_dir / name).write_text(f"old {name}")
+    self._fail_on(monkeypatch, lambda source, target: (
+        STAGING_PREFIX in str(source) and target.name == "c.txt"
+        or KEPT_PREFIX in str(source)
+        and target.name in ("a.csv", "c.txt")
+    ))
+    with pytest.raises(OutputsNotPlaced) as caught:
+        self._export(out_dir)
+    failure = caught.value
+    assert failure.changed and not failure.rolled_back
+    assert failure.new == [out_dir / "a.csv"]
+    assert failure.old == [out_dir / "b.tex"]
+    assert failure.missing == [out_dir / "c.txt"]
+    assert failure.kept[out_dir / "a.csv"].read_text() == "old a.csv"
+    assert failure.kept[out_dir / "c.txt"].read_text() == "old c.txt"
+    assert (out_dir / "a.csv").read_text() == "new a.csv"
+    assert not (out_dir / "c.txt").exists()
+    assert failure.file_lines() == [
+        f"Holding the new version: {out_dir / 'a.csv'} (earlier version "
+        f"kept as {failure.kept[out_dir / 'a.csv']})",
+        f"Holding the earlier version: {out_dir / 'b.tex'}",
+        f"Missing: {out_dir / 'c.txt'} (earlier version kept as "
+        f"{failure.kept[out_dir / 'c.txt']})",
+    ]
+@
+
+A removal belongs to the same transaction: it happens when the files
+are in place, and a failure undoes it with them, here a failure of the
+removal itself, the last step there is.
+
+<<staged output moves test methods>>=
+def test_a_removal_happens_with_the_moves(self, out_dir):
+    (out_dir / "stale.json").write_text("old counts")
+    self._export(out_dir, remove=["stale.json", "absent.json"])
+    assert set(self._content(out_dir)) == set(self.NAMES)
+
+def test_a_failed_removal_undoes_the_moves(self, out_dir, monkeypatch):
+    (out_dir / "a.csv").write_text("old a.csv")
+    (out_dir / "stale.json").write_text("old counts")
+    before = self._content(out_dir)
+    self._fail_on(monkeypatch, lambda source, target: (
+        source.name == "stale.json" and KEPT_PREFIX in str(target)
+    ))
+    with pytest.raises(OutputsNotPlaced) as caught:
+        self._export(out_dir, remove=["stale.json"])
+    assert self._content(out_dir) == before
+    assert caught.value.rolled_back
+@
+
+The sticky-bit rule is tested on its own, with the status of a file and
+of a directory built by hand: a test cannot make a file owned by another
+user without privileges.
+
+<<staged output moves test methods>>=
+def test_the_sticky_bit_rule(self):
+    import stat
+
+    def status(mode, uid):
+        return os.stat_result((mode, 0, 0, 1, uid, 0, 0, 0, 0, 0))
+
+    sticky_dir = status(stat.S_IFDIR | 0o1777, 0)
+    plain_dir = status(stat.S_IFDIR | 0o777, 0)
+    theirs = status(stat.S_IFREG | 0o644, 2000)
+    mine = status(stat.S_IFREG | 0o644, 1000)
+    assert sticky_refuses(sticky_dir, theirs, 1000)
+    assert not sticky_refuses(sticky_dir, mine, 1000)
+    assert not sticky_refuses(plain_dir, theirs, 1000)
+    assert not sticky_refuses(sticky_dir, theirs, 0)
 @
 
 \subsection{One writer at a time: [[file_lock]]}
