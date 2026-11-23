@@ -81,6 +81,7 @@ from .scholar import doi_copy_index, doi_copy_of, foldable_copy
 from .scholar import get_registry, isolated_registry
 from .scholar import hits_label, provider_outcome, result_outcome
 from .scholar import provider_via, result_via
+from .scholar import provider_order, result_order, ANSWER_ORDERS
 from .scholar import count_label, provider_total, result_total
 from .scholar import search_provider, parts_returning, provider_fetch
 from .scholar import result_dates
@@ -104,6 +105,9 @@ __all__ = [
     "provider_outcome",
     "provider_via",
     "result_via",
+    "provider_order",
+    "result_order",
+    "ANSWER_ORDERS",
     "applied_filters",
     "filter_flags",
     "without_search_in",
@@ -2591,6 +2595,7 @@ class SearchResult:
     error: str | None = None
     retries: int = 0
     via: str | None = None
+    order: str | None = None
     <<search result total>>
     <<search result dates>>
     <<search result parts>>
@@ -2690,6 +2695,137 @@ class TestProviderVia:
         assert (s2.via, openalex.via) == ("bulk", None)
         assert s2.merge(openalex).via == "s2: bulk"
         assert s2.deduplicate().via == "bulk"
+@
+
+\paragraph{How the answer was ordered.}
+\label{sec:search-result-order}
+A limited search keeps the head of the provider's list, so which
+records it holds depends on the order the provider sorted them in:
+the first hundred of a relevance ranking are the hundred best matches,
+the first hundred of a newest-first list are merely the latest.
+Scopus and Web of Science returned their lists newest first until
+they were asked otherwise
+(\url{https://github.com/dbosk/scholarcli/issues/303}, measured on
+twelve cached queries on 2026-11-23: every Scopus list in
+non-increasing year order, Web of Science's mostly so, 89\,\%), and in
+one review a limit of 40 then hid an older review that spoke against
+the hypothesis.
+So a result records the order of its answer in [[order]], one of
+[[ANSWER_ORDERS]]:
+\begin{description}
+\item[ [[relevance]] ] best match first, as the provider ranks it;
+\item[ [[date]] ] newest first;
+\item[ [[citations]] ] most cited first;
+\item[ [[unknown]] ] no order that a place in the list could be read
+  against: none asked for and none documented, or one that ranks
+  nothing (Semantic Scholar's bulk search without a limit returns
+  paper ids in ascending order; a merged list joins two answers).
+\end{description}
+[[None]] means not recorded: a provider that does not report it, or a
+result from before it was recorded.
+Each provider states the order \emph{it asks for} (the providers
+chapter gives the documentation for each, \cref{sec:answer-orders}),
+in an optional attribute [[last_order]] read like [[last_via]]: a
+value outside the vocabulary, a missing attribute or a [[Mock]] reads
+as [[None]], never as a claim.
+Which place a record had in an ordered answer, and selecting a first
+tier by it, builds on this field
+(\url{https://github.com/dbosk/scholarcli/issues/302}).
+
+<<constants>>=
+ORDER_RELEVANCE = "relevance"
+ORDER_DATE = "date"
+ORDER_CITATIONS = "citations"
+ORDER_UNKNOWN = "unknown"
+ANSWER_ORDERS = (ORDER_RELEVANCE, ORDER_DATE, ORDER_CITATIONS, ORDER_UNKNOWN)
+<<functions>>=
+def provider_order(provider) -> str | None:
+    """Return the order of the provider's last answer, if it says.
+
+    Reads the optional `last_order` attribute; anything but one of
+    `ANSWER_ORDERS` reads as `None`, not recorded.
+    """
+    return _read_order(provider, "last_order")
+
+
+def result_order(result) -> str | None:
+    """Return the order recorded on a `SearchResult`-like object."""
+    return _read_order(result, "order")
+
+
+def _read_order(obj, attr: str) -> str | None:
+    """Read an answer order, ignoring values outside the vocabulary."""
+    order = getattr(obj, attr, None)
+    return order if isinstance(order, str) and order in ANSWER_ORDERS \
+        else None
+@
+
+Let's verify that the order is read defensively, reaches the result
+through [[Search.execute]], survives deduplication, and becomes
+[[unknown]] in a merge (the merge is explained below).
+
+<<test functions>>=
+class TestProviderOrder:
+    """provider_order reads last_order defensively."""
+
+    def test_reads_the_vocabulary_only(self):
+        assert provider_order(Mock(last_order="relevance")) == "relevance"
+        assert provider_order(Mock(last_order="date")) == "date"
+        assert provider_order(Mock(last_order="newest")) is None
+        assert provider_order(Mock()) is None
+        assert result_order(Mock(order="citations")) == "citations"
+        assert result_order(Mock()) is None
+
+    def test_execute_records_it(self, monkeypatch):
+        """The order reaches the result and survives deduplication."""
+        from scholar import providers
+
+        ranked = Mock(last_error=None, last_retries=0,
+                      last_order="relevance")
+        ranked.name = "scopus"
+        ranked.search.return_value = []
+        silent = Mock(last_error=None, last_retries=0)
+        silent.name = "plain"
+        silent.search.return_value = []
+        monkeypatch.setattr(
+            providers, "PROVIDERS", {"scopus": ranked, "plain": silent}
+        )
+
+        scopus, plain = Search("q").execute(providers=["scopus", "plain"])
+
+        assert (scopus.order, plain.order) == ("relevance", None)
+        assert scopus.deduplicate().order == "relevance"
+        assert scopus.merge(scopus).order == "unknown"
+        assert plain.merge(plain).order is None
+
+    def test_only_an_answer_has_an_order(self, monkeypatch):
+        """A failed or skipped search records none; a partial one does."""
+        from scholar import providers, ratelimit
+
+        failed = Mock(last_error="HTTP 500", last_retries=0,
+                      last_order="relevance")
+        failed.name = "failed"
+        failed.search.return_value = []
+        partial = Mock(last_error="HTTP 500", last_retries=0,
+                       last_order="relevance")
+        partial.name = "partial"
+        partial.search.return_value = [Paper(title="T", authors=["A"])]
+        skipped = Mock(last_order="relevance")
+        skipped.name = "skipped"
+        monkeypatch.setattr(providers, "PROVIDERS", {
+            "failed": failed, "partial": partial, "skipped": skipped,
+        })
+        ratelimit.get_limiter("skipped").record_limit_hit(
+            reason="daily quota spent", exhausted_daily=True
+        )
+
+        results = Search("q").execute(
+            providers=["failed", "partial", "skipped"]
+        )
+
+        assert [(r.provider, r.order) for r in results] == [
+            ("failed", None), ("partial", "relevance"), ("skipped", None),
+        ]
 @
 
 \subsubsection{A failure is not zero hits}
@@ -3778,6 +3914,13 @@ lists several, joined by a comma) and so already carries the prefixes.
 Retries add up, since each was a request someone waited for.
 The endpoint that answered ([[via]], \cref{sec:search-result-via})
 is kept the same way as the error, prefixed with its provider.
+The order of the answer ([[order]], \cref{sec:search-result-order})
+cannot be kept that way: the merged list is the two answers joined and
+deduplicated, which is no provider's ranking, even when both were
+ranked by relevance.  So it is [[unknown]] once
+either input recorded an order, and [[None]] when neither did.  The
+order of each provider's own answer stays with the parts the merge
+keeps, and those are what a session records.
 
 <<functions>>=
 def _merged_filters(a: dict | None, b: dict | None) -> dict | None:
@@ -3836,6 +3979,9 @@ def merge(self, other: "SearchResult") -> "SearchResult":
         via="; ".join(
             v for v in (self._labelled_via(), other._labelled_via()) if v
         ) or None,
+        order=(
+            ORDER_UNKNOWN if self.order or other.order else None
+        ),
         parts=parts,
         found_in=parts_returning(deduped, parts),
     )
@@ -4407,8 +4553,16 @@ alone, so the call before the search already gives the answer (and the
 only one for a skipped search); the second call matters for a provider
 that notes its routing while searching, which is read when no limit
 is passed.
-The endpoint that answered ([[via]], \cref{sec:search-result-via}) is
+The endpoint that answered ([[via]], \cref{sec:search-result-via}) and
+the order of the answer ([[order]], \cref{sec:search-result-order}) are
 read with the outcome.
+An order belongs to an answer, so a search that failed outright (an
+error and no papers) records none, as a skipped one does, and as
+Semantic Scholar's refused search does; without this rule a provider
+that declares its order would record \enquote{failed \dots{} order:
+relevance} for a list it never received.  An incomplete answer, an
+error with papers, keeps its order: the papers it has are the head of
+that ordered list.
 
 <<functions>>=
 def search_provider(
@@ -4452,6 +4606,8 @@ def search_provider(
     result.papers = provider.search(query, limit=limit, filters=filters)
     result.error, result.retries = provider_outcome(provider)
     result.via = provider_via(provider)
+    if result.papers or not result.error:
+        result.order = provider_order(provider)
     applied = applied_filters(provider, query, filters, limit)
     result.filters = applied.as_dict() if applied else None
     result.total, result.total_estimated = provider_total(provider)
