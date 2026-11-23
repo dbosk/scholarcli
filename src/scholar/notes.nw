@@ -110,6 +110,9 @@ from pathlib import Path
 from typing import Any
 import functools
 import hashlib
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 import json
 import os
 import tempfile
@@ -799,7 +802,8 @@ Readers take no lock.  A write replaces the file in one rename, so a
 reader sees the old file or the new one, never a part; locking a read
 would only make a stuck writer stop every command that shows a note.
 [[get_note]] is a reader that sometimes writes (it moves a note to a
-paper's new DOI id, below), and it takes the lock for that move alone.
+paper's new DOI id, below); it takes the lock for that move alone, and
+only when the lock is free at once.
 
 <<notes constants>>=
 NOTES_LOCK_TIMEOUT = 30  # seconds a notes write waits for its lock
@@ -838,12 +842,27 @@ def _holding_notes_lock(function):
     Raises `NotesNotLocked`, before `function` runs, if the lock is not
     taken within `NOTES_LOCK_TIMEOUT` seconds or cannot be opened.
     """
+    return _with_notes_lock(function, wait=True)
+
+
+def _if_notes_lock_free(function):
+    """Run `function` under the notes file's lock if it is free now.
+
+    Raises `NotesNotLocked` at once, without a wait or a notice, if
+    another holder has it.
+    """
+    return _with_notes_lock(function, wait=False)
+
+
+def _with_notes_lock(function, wait: bool):
     @functools.wraps(function)
     def locked(*args, **kwargs):
         try:
             with file_lock(
-                get_data_dir() / NOTES_FILE, timeout=NOTES_LOCK_TIMEOUT,
-                required=True, notice_after=NOTES_LOCK_NOTICE,
+                get_data_dir() / NOTES_FILE,
+                timeout=NOTES_LOCK_TIMEOUT if wait else 0,
+                required=True,
+                notice_after=NOTES_LOCK_NOTICE if wait else None,
             ):
                 return function(*args, **kwargs)
         except LockNotTaken as error:
@@ -858,9 +877,10 @@ holds it until the test closes its standard input.  The waits are
 shortened to fractions of a second.  A refused write must leave the
 notes file byte for byte as it was, raise [[NotesNotLocked]] with one
 line, and say once that it waits; deletion (of one note or all),
-import and the decision stores are refused alike; a read still reads, a legacy note included,
-which stays where it is; and a lock file that cannot be opened gets
-its own words.
+import and the decision stores are refused alike; a read still reads,
+at once, a legacy note included, which stays where it is until a read
+finds the lock free; and a lock file that cannot be opened gets its
+own words.
 
 <<test functions>>=
 import contextlib
@@ -952,18 +972,26 @@ class TestNotesLockRefused:
                     write()
         assert self.stores() == before
 
-    def test_a_read_moves_nothing_while_refused(self, notes_file, caplog):
+    def test_a_read_neither_waits_nor_moves_while_held(
+        self, notes_file, monkeypatch
+    ):
+        import time
+        import scholar.notes as notes
+
+        monkeypatch.setattr(notes, "NOTES_LOCK_TIMEOUT", 5)
         bare = Paper(title="Old", authors=["Ada Lovelace"])
         save_note(bare, "Under the hash.")
         with_doi = Paper(title="Old", authors=["Ada Lovelace"],
                          doi="10.1/gained")
         before = self.stores()
         with notes_lock_held_elsewhere():
-            note = get_note(with_doi)
-        assert note.note == "Under the hash."
-        assert note.paper_id == "doi:10.1/gained"
+            for _ in range(2):
+                started = time.monotonic()
+                note = get_note(with_doi)
+                assert time.monotonic() - started < 0.5
+                assert note.note == "Under the hash."
+                assert note.paper_id == "doi:10.1/gained"
         assert self.stores() == before
-        assert f"The note stays under {bare.id} for now." in caplog.text
         assert get_note(with_doi).note == "Under the hash."
         invalidate_notes_cache()
         assert {n.paper_id for n in list_papers_with_notes()} == {
@@ -1033,10 +1061,17 @@ def test_concurrent_note_saves_keep_both(tmp_path, monkeypatch):
 the paper's legacy hash id (a paper that has gained a DOI since), it
 moves the note to the DOI id, and that move is a write: it takes the
 lock and reads the file again under it, since another process may have
-changed the notes since the unlocked read.  A refused move is no reason
-to fail the read: the note is returned all the same and stays where it
-is, under the legacy id, where every lookup still finds it, and the
-next lookup that gets the lock moves it.
+changed the notes since the unlocked read.  But it takes the lock only
+if the lock is free at that moment ([[_if_notes_lock_free]]), without
+waiting.  A reader must not be stopped by a writer, and this one is
+called on the TUI's main thread whenever a paper's details are shown: a
+wait of [[NOTES_LOCK_TIMEOUT]] there froze the screen on every view of
+such a paper while another process held the lock.  A move that finds
+the lock taken is simply not made: the note is returned all the same
+and stays where it is, under the legacy id, where every lookup still
+finds it, and a later read that finds the lock free moves it.  Nothing
+is logged for it, since it is no failure and would repeat on every
+read.
 
 <<paper notes functions>>=
 def get_note(paper: Any) -> PaperNote | None:
@@ -1044,8 +1079,8 @@ def get_note(paper: Any) -> PaperNote | None:
     Get the note for a paper, if one exists.
 
     A note stored under the paper's legacy hash id is moved to its DOI
-    id, under the notes lock; if the lock is refused, the note is
-    returned unmoved and a warning is logged.
+    id, under the notes lock if it is free; if it is not, the note is
+    returned unmoved, without waiting.
 
     Args:
         paper: A Paper object.
@@ -1070,9 +1105,7 @@ def get_note(paper: Any) -> PaperNote | None:
         return None
     try:
         return _move_legacy_note(paper, legacy_id)
-    except NotesNotLocked as error:
-        logger.warning("%s The note stays under %s for now.",
-                       error, legacy_id)
+    except NotesNotLocked:
         return _note_under(paper, paper_id, legacy_note)
 
 
@@ -1087,7 +1120,7 @@ def _note_under(paper: Any, paper_id: str, note: PaperNote) -> PaperNote:
     )
 
 
-@_holding_notes_lock
+@_if_notes_lock_free
 def _move_legacy_note(paper: Any, legacy_id: str) -> PaperNote | None:
     """Move `paper`'s note from `legacy_id` to its own id; return it."""
     paper_id = get_paper_id(paper)
@@ -1846,7 +1879,94 @@ are read only for a search without a session file
 (\cref{sec:notes-search-decisions}), and a session holds the paper
 under its new id.
 
+\paragraph{Nothing to move, no wait.}
+A refused lock costs its wait, [[NOTES_LOCK_TIMEOUT]], and an append
+or an enrichment run can rename many papers, most of them without a
+note or a decision record: a first version waited for the lock before
+every rename, so three renames with the lock held cost a minute and a
+half and six log lines.  Two rules keep the cost to one wait.
+\begin{description}
+\item[Look before locking] Whether the old id has anything to move is
+  read without the lock ([[_records_under]]): writes replace a file in
+  one rename, so the look sees a whole file, and if the old id is in
+  neither store there is nothing to move and nothing to lock.  A file
+  that cannot be read counts as possibly holding records, so that the
+  locked path names it in its warning as before.  A record written
+  under the old id between the look and a later write is the same race
+  as a note saved under an old id after the rename, which
+  [[move_stranded_notes]] repairs.
+\item[One wait per run] A caller that renames several papers in one
+  run holds a [[moving_records]] batch.  After the first refusal in the
+  batch, later moves are not tried: they are left at once, and when the
+  batch ends one WARNING names every pair left and says to run
+  [[sessions reconcile]].  A call outside a batch is a batch of its own,
+  warned about at once.  The batch lives in a context variable, so the
+  TUI's enrichment thread and the main thread do not share one.
+\end{description}
+
 <<search decisions functions>>=
+@dataclass
+class MoveBatch:
+    """The record moves of one run: the first refusal and what it left."""
+    refused: "NotesNotLocked | None" = None
+    left: list[tuple[str, str]] = field(default_factory=list)
+
+
+_MOVE_BATCH: ContextVar[MoveBatch | None] = ContextVar(
+    "notes_move_batch", default=None
+)
+
+
+@contextmanager
+def moving_records() -> Iterator[MoveBatch]:
+    """Group the `migrate_paper_id` calls of one run.
+
+    After the first refused lock, later moves are left without a wait;
+    on leaving, one warning names every pair left. Nested uses join the
+    outer batch.
+    """
+    outer = _MOVE_BATCH.get()
+    if outer is not None:
+        yield outer
+        return
+    batch = MoveBatch()
+    token = _MOVE_BATCH.set(batch)
+    try:
+        yield batch
+    finally:
+        _MOVE_BATCH.reset(token)
+        if batch.left:
+            _warn_moves_left(batch.refused, batch.left)
+
+
+def _warn_moves_left(error: "NotesNotLocked",
+                     left: list[tuple[str, str]]) -> None:
+    pairs = ", ".join(f"{old} -> {new}" for old, new in left)
+    logger.warning(
+        "%s The note and decision records of %d renamed paper(s) were "
+        "not moved: %s; the session records the renames, and `scholar "
+        "sessions reconcile` on it moves the notes once the lock is "
+        "free.",
+        error, len(left), pairs,
+    )
+
+
+def _records_under(old_id: str) -> bool:
+    """Whether the stores may hold records under `old_id` (no lock)."""
+    try:
+        if old_id in _load_all_notes():
+            return True
+    except NotesFileError:
+        return True
+    for decision_file in get_decisions_dir().glob("*.json"):
+        try:
+            if old_id in read_search_decisions_file(decision_file).decisions:
+                return True
+        except NotesFileError:
+            return True
+    return False
+
+
 def migrate_paper_id(old_id: str, new_id: str) -> bool:
     """Move any note and search decisions from `old_id` to `new_id`.
 
@@ -1855,20 +1975,25 @@ def migrate_paper_id(old_id: str, new_id: str) -> bool:
     already present under `new_id` are kept and the old ones dropped.
     A notes or decisions file that cannot be read is left untouched
     and named in a warning; a failed write raises `NotesFileError`.
-    If the notes lock is not taken, nothing is moved, a warning says
-    so, and the result is False.
+    Nothing to move: True without taking the lock. If the notes lock
+    is not taken, or was refused earlier in the `moving_records` batch,
+    nothing is moved, a warning says so (once per batch), and the
+    result is False.
     """
-    if old_id == new_id:
+    if old_id == new_id or not _records_under(old_id):
         return True
+    batch = _MOVE_BATCH.get()
+    if batch is not None and batch.refused is not None:
+        batch.left.append((old_id, new_id))
+        return False
     try:
         _move_records(old_id, new_id)
     except NotesNotLocked as error:
-        logger.warning(
-            "%s The note and decision records of %s were not moved to "
-            "%s; the session records the rename, and `scholar sessions "
-            "reconcile` on it moves the note once the lock is free.",
-            error, old_id, new_id,
-        )
+        if batch is None:
+            _warn_moves_left(error, [(old_id, new_id)])
+        else:
+            batch.refused = error
+            batch.left.append((old_id, new_id))
         return False
     return True
 

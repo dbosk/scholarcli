@@ -164,6 +164,7 @@ are now provided by the [[review]] module.
 
 <<tui imports>>=
 from datetime import datetime
+import shlex
 from pathlib import Path
 
 from textual.app import App, ComposeResult
@@ -694,9 +695,15 @@ class AbstractScreen(Screen[None]):
             if enriched.id != paper.id:
                 from scholar.notes import get_paper_id, migrate_paper_id
                 try:
-                    migrate_paper_id(
+                    if not migrate_paper_id(
                         get_paper_id(paper), get_paper_id(enriched)
-                    )
+                    ):
+                        app.call_from_thread(
+                            app.notify,
+                            notes_left_message(app.session, paper),
+                            severity="warning", markup=False,
+                            timeout=NOTES_ERROR_TIMEOUT,
+                        )
                 except NotesFileError as error:
                     app.call_from_thread(
                         app.notify, notes_unavailable_message(error),
@@ -2838,13 +2845,18 @@ without them:
   (\cref{sec:abstract-screen}).  [[migrate_paper_id]] reports an
   unreadable file itself and only raises when a write fails; the thread
   turns that into the same notification instead of dying with a
-  traceback over the screen.  A refused notes lock it reports only in
-  a warning and moves nothing (\cref{sec:notes-migrate-paper-id}); the
+  traceback over the screen.  A refused notes lock moves nothing and
+  makes [[migrate_paper_id]] return [[False]]
+  (\cref{sec:notes-migrate-paper-id}); its warning goes to the log,
+  which the TUI does not show, so the thread shows a notification
+  instead ([[notes_left_message]]) that says the note stayed under the
+  old id and names the [[sessions reconcile]] command that moves it,
+  as a failed note edit names the file that kept its text.  The
   adoption itself is recorded in the session as a rename when the
   enriched paper replaces the decision's ([[record_rename]],
   \cref{sec:session-renames}), on the main thread like every other
   change to the session, so the samples drawn before it still find the
-  paper and [[sessions reconcile]] can move the note later.
+  paper and that reconcile knows where the note belongs.
 \end{description}
 The message names the file and its [[.bak]], like the CLI's.
 A write refused because another process holds the notes file's lock
@@ -2873,6 +2885,18 @@ def notes_unavailable_message(error: NotesFileError) -> str:
         f"{error}\n{kept}"
         "Notes are unavailable until the file is repaired or its previous "
         f"version is restored from {backup_path(error.path)}."
+    )
+
+
+def notes_left_message(session: ReviewSession, paper: Paper) -> str:
+    """Return how the TUI reports a note left under a renamed paper's id."""
+    from scholar.review import session_argument
+
+    return (
+        f"The note of {get_paper_id(paper)} was not moved to the adopted "
+        "preprint: another scholar process holds the notes lock. Once it "
+        "is free, run: scholar sessions reconcile "
+        f"{shlex.quote(session_argument(session))}"
     )
 
 
@@ -3140,6 +3164,87 @@ class TestEnrichmentRename:
         assert session.renamed == {
             "doi:10.5555/tui-pub": "doi:10.48550/tui-pre"}
         assert session.tier_samples[0].papers == ["doi:10.48550/tui-pre"]
+@
+
+When another process holds the notes lock, the note stays under the
+published DOI and the TUI says so, naming the command that moves it.
+The lock is held by a real other process; the wait is cut short.
+
+<<test functions>>=
+class TestEnrichmentRenameRefusedLock:
+    """A note the lock kept back is announced in the TUI (#319)."""
+
+    def test_the_reconcile_hint_is_shown(self, tmp_path, monkeypatch):
+        import asyncio
+        import subprocess
+        import sys
+        from dataclasses import replace
+        import scholar.notes as notes
+        from scholar.utils import lock_path
+
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        monkeypatch.setattr(notes, "NOTES_LOCK_TIMEOUT", 0.3)
+        notes.invalidate_notes_cache()
+        published = Paper(title="A Published Version", authors=["A B"],
+                          doi="10.5555/tui-held")
+        notes.save_note(published, "Read the published version.")
+        before = (notes.get_data_dir() / notes.NOTES_FILE).read_bytes()
+        session = ReviewSession(
+            query="q", providers=["openalex"], timestamp=datetime.now(),
+            name="tui-held",
+            decisions=[ReviewDecision(paper=published, provider="openalex")],
+        )
+        monkeypatch.setattr(
+            "scholar.enrich.enrich_paper",
+            lambda paper, **kwargs: replace(
+                paper, doi="10.48550/tui-held-pre",
+                published_versions=[{"doi": paper.doi,
+                                     "relation": "preprint-of"}],
+            ),
+        )
+        app = PaperReviewApp(session)
+        notices = []
+        show = app.notify
+
+        def record(message, **kwargs):
+            notices.append((message, kwargs.get("severity")))
+            show(message, **kwargs)
+
+        app.notify = record
+
+        async def drive():
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                await pilot.press("enter", "e")
+                for _ in range(100):
+                    await pilot.pause(0.05)
+                    if session.renamed:
+                        break
+
+        holder = subprocess.Popen(
+            [sys.executable, "-c",
+             "import sys\n"
+             "from filelock import FileLock\n"
+             "lock = FileLock(sys.argv[1])\n"
+             "lock.acquire()\n"
+             "print('held', flush=True)\n"
+             "sys.stdin.read()\n",
+             str(lock_path(notes.get_data_dir() / notes.NOTES_FILE))],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+        )
+        try:
+            assert holder.stdout.readline().strip() == "held"
+            asyncio.run(drive())
+        finally:
+            holder.stdin.close()
+            holder.wait(10)
+        assert session.renamed == {
+            "doi:10.5555/tui-held": "doi:10.48550/tui-held-pre"}
+        assert (notes.get_data_dir() / notes.NOTES_FILE).read_bytes() \
+            == before
+        [message] = [m for m, severity in notices if severity == "warning"]
+        assert "doi:10.5555/tui-held" in message
+        assert message.endswith("scholar sessions reconcile tui-held")
 @
 
 \subsection{Search Filters Action}

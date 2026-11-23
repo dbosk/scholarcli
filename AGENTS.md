@@ -1379,7 +1379,13 @@ or a stale process's write-back, keeps its sample entry).
 the end of every merge, so old files' samples are repointed once a
 rename record names the id; renames before #319 left no record and
 stay "not found". A stale process still writes a renamed paper back
-under its old id (no tombstone drop for renames; pre-existing).
+under its old id (no tombstone drop for renames; pre-existing, #327);
+two processes renaming one paper two ways (adoption vs append) leave
+both decisions, the map entry of the last saver, and the sample on
+the adopted id in both orders (pinned by real-subprocess tests).
+`settle_rename_cycles` (after the merge's union) drops the entry of a
+pair `a -> b`, `b -> a` that leads away from the held id, so a rename
+back leaves no cycle on disk.
 Checked: the pipx build 1.29 loads a file with `renamed` and drops
 it on save (decisions kept).
 Nothing unreconciled is silent: `foldable_copies` (counted with the
@@ -2507,9 +2513,9 @@ screeners)} over records screened twice, `screen_sample` (the one
   in order, `census`) in `ReviewSession.tier_samples`: saved only when
   non-empty, old files load [], concurrent merge adds the file's draws
   by `sample_id` (real-subprocess race with a decide, both orders),
-  ids repointed by `repoint_paper_ids` (folds and renames; the
-  version-link lookup of `drawn_decisions` is gone, #319: one
-  mechanism, `current_paper_id`). An older Scholar drops the
+  ids repointed by `repoint_paper_ids` (folds and renames, #319; the
+  version-link lookup of `drawn_decisions` stays only as a fallback).
+  An older Scholar drops the
   list on save (read from its loader/serialiser, which know only their
   keys). This export SAVES the session (help says so): inside the
   staging, after `keep_copy_before_run(session, "pre-rest-sample")`,
@@ -2530,8 +2536,10 @@ screeners)} over records screened twice, `screen_sample` (the one
   Counting (`tier_sample_counts`, review.nw, no llm_review import so
   `sessions show` stays light): drawn ids looked up through
   `drawn_decisions` (`current_paper_id`: fold tombstones and renames,
-  #319); a paper renamed before renames were recorded, or gone, is
-  `not_found`. Screened = the first decided decision
+  #319; then, only for an id no decision holds, a version-link DOI
+  exactly one paper names: an adoption by a build without rename
+  records); any other paper renamed before renames were recorded, or
+  gone, is `not_found`. Screened = the first decided decision
   under the id (anyone). `tier_sample_verdict(d, uses_categories)`
   (one function for counts, show, table, JSON, sentence): a discard
   with a version note (`AUDIT_VERSION_NOTES`) or a record criterion
@@ -2749,17 +2757,27 @@ context (#107). `review.save_session` now:
   `save_search_decisions`, `get_previous_decision`,
   `clear_all_decisions`, the move inside `get_note`
   (`_move_legacy_note`) and `migrate_paper_id` (`_move_records`).
-  Readers take no lock (atomic replace); `get_note` reads unlocked and,
-  if the move is refused, returns the legacy note unmoved with a
-  WARNING. `main()` prints `NotesNotLocked` as its one line without
+  Readers take no lock (atomic replace); `get_note` reads unlocked and
+  moves a legacy note only if the lock is free at once
+  (`_if_notes_lock_free`, timeout 0, no notice, nothing logged), else
+  returns it unmoved: the TUI's detail screen never waits. `main()` prints `NotesNotLocked` as its one line without
   the `.bak` repair advice (exit 1); the TUI's
   `notes_unavailable_message` likewise, the typed note kept in
   `unsaved-note-*.md` (`edit_note_in_editor` catches any
-  `NotesFileError`). `migrate_paper_id` catches it, moves nothing,
-  WARNs (notes file, both ids, "`scholar sessions reconcile` on it
-  moves the note once the lock is free") and returns False (True
-  otherwise); `move_stranded_notes` reads `renamed` as well as
-  `folded`. Caches deliberately keep writing unlocked after
+  `NotesFileError`). `migrate_paper_id` first looks without the lock
+  (`_records_under`; an unreadable store counts as holding records) and
+  returns True at once when the old id has nothing to move; otherwise
+  it catches `NotesNotLocked`, moves nothing and returns False. Within
+  a `moving_records()` batch (a `ContextVar`; nested uses join the
+  outer; the append's conversion, the whole `enrich` run,
+  `move_stranded_notes`) the first refusal is remembered, later moves
+  are left without a wait, and ONE warning at the batch's end names
+  every `old -> new` pair and `scholar sessions reconcile`; outside a
+  batch the warning comes at once (TUI: plus a notification,
+  `notes_left_message`, naming the reconcile command). Measured with
+  the real 30 s timeout and a lock holder: an append with three
+  noted homonym renames took one wait (was 90 s), none noted no wait.
+  `move_stranded_notes` reads `renamed` as well as `folded`. Caches deliberately keep writing unlocked after
   `CACHE_LOCK_TIMEOUT` (60 s): atomic and merged, entries refetchable,
   and a refusal at exit would lose this process's entries for certain
   (cache.nw prose). Same machine only: no help across machines on a
