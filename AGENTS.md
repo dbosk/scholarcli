@@ -2860,21 +2860,35 @@ then still keeps every export from removing or overwriting on undo a
 file it did not place, so the worst case is files of two exports mixed
 (as before #320), never a deleted file (tested with two cache dirs).
 The undo removes
-or overwrites a placed file only while it still is that file
-(`file_identity` = lstat `st_dev`/`st_ino` of the staged file before
-its rename); otherwise it leaves it and lists it in `others` ("Replaced
-by another program meanwhile"). SIGTERM is an interrupt during the
-moves (`utils.sigterm_as_keyboard_interrupt`, moved here from cli.nw;
-`enrich` imports it), so it is rolled back like Ctrl-C. A replaced
-file's mode is kept (`shutil.copymode` onto the staged file). Each
-export holds `file_lock(staging / "staging")`, lock file
-`.staging.lock` INSIDE the staging directory (never moved, removed
-with the directory, success or failure); the directory lock alone
-cannot tell a killed export's staging from a live export still writing,
-so under the directory lock `leftover_directories` finds
-`.scholar-replaced-*` (always left over) and `.scholar-staging-*` whose
-lock is free (`staging_left_over`) and logs one WARNING each
-(`leftover_warning`), deleting nothing. A failure raises
+or overwrites a placed file only while it still is that file:
+`file_identity` = lstat `(st_dev, st_ino, st_size, st_mtime_ns)` of the
+staged file just before its rename (after `copymode`, which changes
+ctime, not mtime; a rename keeps all four). Any write, a delete and
+re-create (ext4 reuses inode numbers) and a mere touch (safe side)
+count as another program's file: left in place, earlier version kept,
+listed in `others` ("Replaced by another program meanwhile"). NOT
+detected: a writer that restores size and mtime exactly; little to
+compare on a file system without inode numbers and with coarse times.
+SIGTERM is an interrupt during the moves
+(`utils.sigterm_as_keyboard_interrupt`, moved here from cli.nw;
+`enrich` imports it), so it is rolled back like Ctrl-C; an interrupt
+during the moves passes on as `MovesInterrupted` (a
+`KeyboardInterrupt` with `.failure`), and the export prints one line
+for Ctrl-C and SIGTERM alike ("Export stopped by an interrupt and was
+rolled back: no files were written or changed.", or the lists when a
+restore failed) and exits 130. A replaced file's mode is kept
+(`shutil.copymode` onto the staged file). Each export holds
+`file_lock(staging / "staging")` (`.staging.lock` INSIDE the staging
+directory) and, while its moves run, `file_lock(kept / "replaced")`
+(`.replaced.lock` inside the `.scholar-replaced-*` directory); both go
+with their directory and stay, unlocked, in a directory a killed
+export (or a failed restore) leaves. Under the directory lock
+`leftover_directories` reports each `.scholar-replaced-*` and
+`.scholar-staging-*` whose own lock is free (`left_over`), so a live
+export of another cache directory is never reported; one WARNING each
+(`leftover_warning`; the replaced-files one says it holds the versions
+from before the unfinished export and that the files in the directory
+are the latest finished export's), deleting nothing. A failure raises
 `OutputsNotPlaced` (`new`/`old`/`missing`/`not_written`/`others`, `kept`,
 `rolled_back`, `changed`); `cli.export_failure_text` words the message
 from it: "no files were written or changed" (with "and was rolled
