@@ -3510,7 +3510,7 @@ originals: list = []
 processed: list = []
 lookup_outcomes: list = []
 crossref_failures: Counter = Counter()
-adopted_any = False
+records_moved = False
 pre_run_copy = (
     keep_copy_before_run(session_data, "pre-enrich") if selected else None
 )
@@ -3566,7 +3566,10 @@ overwrite the original.
 The copy covers the session file only: an adoption also moves the notes
 and decision records to the new id ([[migrate_paper_id]]), so the report
 adds a line saying that restoring does not undo that, when the run
-adopted a preprint.
+adopted a preprint and the move was made ([[records_moved]]).  A move
+the notes lock refused moved nothing, so the line would be false; the
+warning that names the notes left for [[sessions reconcile]] then
+stands alone.
 The final report and the interrupt message both name it, with the path
 written out so that it can be pasted into a [[cp]] command.
 
@@ -3577,7 +3580,7 @@ if pre_run_copy is not None:
         f"{escape(str(pre_run_copy))}[/dim]",
         soft_wrap=True,
     )
-    if adopted_any:
+    if records_moved:
         console.print(
             "[dim]Restoring it does not undo the notes and decision "
             "records moved to the adopted ids.[/dim]"
@@ -3754,9 +3757,9 @@ adoption, and one warning at the end names every note left to
 for orig, new in zip(before, after):
     if get_paper_id(orig) == get_paper_id(new):
         continue
-    migrate_paper_id(get_paper_id(orig), get_paper_id(new))
+    if migrate_paper_id(get_paper_id(orig), get_paper_id(new)):
+        records_moved = True
     record_rename(session_data, get_paper_id(orig), get_paper_id(new))
-    adopted_any = True
     console.print(
         f"[cyan]Adopted preprint {new.doi} for "
         f"\N{LEFT DOUBLE QUOTATION MARK}{escape(new.title_preview())}"
@@ -4774,6 +4777,92 @@ class TestEnrichCommand:
         mock_migrate.assert_called_once_with(
             "doi:10.1/bare", "doi:10.48550/arxiv.2401.1"
         )
+@
+
+The line about restoring follows the move: printed when the adoption
+moved the records, not when another process held the notes lock and
+nothing moved, where only the warning naming the notes left for
+[[sessions reconcile]] is given.  The lock is held by a real other
+process, the wait cut short.
+
+<<test functions>>=
+class TestEnrichRestoreLine:
+    """The restore line is printed only after a move (#319)."""
+
+    LINE = "Restoring it does not undo"
+
+    def _save(self, tmp_path, monkeypatch):
+        from scholar import Paper
+        from scholar.notes import save_note
+        from scholar.review import (
+            DecisionStatus, ReviewDecision, ReviewSession, save_session,
+        )
+
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        published = Paper(title="A Published Version",
+                          authors=["Ada Lovelace"], doi="10.5555/restore")
+        save_session(ReviewSession(
+            query="q", providers=["openalex"],
+            timestamp=datetime(2026, 11, 23), name="restore-line",
+            decisions=[ReviewDecision(paper=published, provider="openalex",
+                                      status=DecisionStatus.PENDING)],
+        ))
+        save_note(published, "Read the published version.")
+
+    def _enrich(self):
+        from dataclasses import replace
+
+        def adopt(papers, **kwargs):
+            return [replace(p, doi="10.48550/restore",
+                            published_versions=[{
+                                "doi": p.doi, "relation": "preprint-of"}])
+                    for p in papers]
+
+        with patch("scholar.enrich.enrich_papers", side_effect=adopt), \
+                patch("scholar.crossref.annotate_papers",
+                      side_effect=lambda papers, progress_callback=None:
+                      list(papers)):
+            return runner.invoke(app, ["enrich", "restore-line"])
+
+    def test_printed_after_a_move(self, tmp_path, monkeypatch):
+        self._save(tmp_path, monkeypatch)
+        result = self._enrich()
+        assert result.exit_code == 0, result.output
+        assert self.LINE in result.output
+
+    def test_not_printed_when_the_lock_kept_the_note(
+        self, tmp_path, monkeypatch
+    ):
+        import subprocess
+        import sys
+        import scholar.notes as notes
+        from scholar.utils import lock_path
+
+        monkeypatch.setattr(notes, "NOTES_LOCK_TIMEOUT", 0.3)
+        self._save(tmp_path, monkeypatch)
+        holder = subprocess.Popen(
+            [sys.executable, "-c",
+             "import sys\n"
+             "from filelock import FileLock\n"
+             "lock = FileLock(sys.argv[1])\n"
+             "lock.acquire()\n"
+             "print('held', flush=True)\n"
+             "sys.stdin.read()\n",
+             str(lock_path(notes.get_data_dir() / notes.NOTES_FILE))],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+        )
+        try:
+            assert holder.stdout.readline().strip() == "held"
+            result = self._enrich()
+        finally:
+            holder.stdin.close()
+            holder.wait(10)
+        assert result.exit_code == 0, result.output
+        assert self.LINE not in result.output
+        assert "Adopted preprint 10.48550/restore" in result.output
+        warning = " ".join(result.output.split())
+        assert "doi:10.5555/restore -> doi:10.48550/restore" in warning
+        assert "scholar sessions reconcile" in warning
 @
 
 Enrichment of a large session takes hours, and it saves the session it
