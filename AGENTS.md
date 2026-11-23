@@ -695,10 +695,14 @@ lookups (`get_paper_by_doi`, `get_preprint_locations`,
 Keys in messages (#159): `network.redact_secrets(text)` hides the
 values of `api_key`/`apikey`/`api-key`/`key` URL parameters and
 `mailto`/`email` (personal data, #160, #259), in any case, and (#306)
-the header/mapping forms `x-api-key`/`api-key`/`api_key`/`apikey`/
-`authorization` followed by `:` or `=` and a bare or quoted value
-(scheme word Bearer/Basic/Token kept: `SECRET_HEADER`) and any
-`Bearer <token>` (`BEARER_TOKEN`). `check_provider` applies it to every health message; the
+the URL parameters `access_token`/`token`, the header/mapping forms
+`api-key`/`api_key`/`apikey` (also with `x-` or `x-<vendor>-`, e.g.
+`x-goog-api-key`)/`authorization` followed by `:` or `=` and a bare or
+quoted value (scheme word Bearer/Basic/Token kept: `SECRET_HEADER`) and
+any `Bearer <token>` (`BEARER_TOKEN`); in those two forms a value
+counts only if it holds a digit or has >= `MIN_BARE_SECRET_CHARS` (16)
+characters, so prose ("api_key: API key", "a bearer token") stays.
+Idempotent: `[redacted]` is never redacted again. `check_provider` applies it to every health message; the
 OpenAlex and IEEE (`apikey` in the URL) error logs use it. The OpenAlex
 `/works` probe sends the key as `Authorization: Bearer` (documented,
 as pyalex does); `/rate-limit` keeps the `api_key` parameter (the only
