@@ -2464,6 +2464,58 @@ screeners)} over records screened twice, `screen_sample` (the one
   per decision (`link_places_data`, ranked links only, key absent
   otherwise). CSV: `best_rank`, `providers_count` (databases) after `provider`
   (both in `CSV_NUMERIC_COLUMNS`).
+- **Sample of the rest** (#315, cli.nw `sec:rest-sample-sheet`,
+  `sec:sessions-tier-sample`; review.nw `sec:tier-sample-record`;
+  llm_review.nw `sec:tier-sample`): `sessions export S -f screen-sheet
+  --pending <tier options> --rest-sample N --seed S [--batch-size B]
+  [--dry-run]` lists instead of the tier a draw of N of the pending
+  papers the tier leaves out (`outside_tier`; one per paper id, so no
+  decided and no tier paper), drawn by `llm sample`'s draw:
+  `llm_review.smallest_keys(sorted ids, random.Random(seed), N)` (the
+  key step of `draw_llm_sample`, now shared; `test_golden_draw` and the
+  tier test's golden draw for seed 315 pin it), listed in key order;
+  rest <= N -> all of it, `census` True; an empty rest is a ValueError
+  (export exit 1). `draw_tier_sample` records a `review.TierSample`
+  (`sample_id` `<drawn_at>/rest/seed=S/<12 uuid4 hex>`, `drawn_at` UTC,
+  `seed`, `size`, `rule` = `TierRule.data()`, `rest`, `rest_digest` =
+  sha256 of the sorted ids joined by newlines [:16], `papers` drawn ids
+  in order, `census`) in `ReviewSession.tier_samples`: saved only when
+  non-empty, old files load [], concurrent merge adds the file's draws
+  by `sample_id` (real-subprocess race with a decide, both orders),
+  ids repointed by `repoint_folded_ids`. An older Scholar drops the
+  list on save (read from its loader/serialiser, which know only their
+  keys). This export SAVES the session (help says so): inside the
+  staging, after `keep_copy_before_run(session, "pre-rest-sample")`;
+  `--dry-run` draws in memory, prints, writes nothing. `BASE-tier.json`
+  adds `rest_sample` (the record minus `rule`). Exit 2 before loading:
+  `--rest-sample` without `--pending`, without a tier option, without
+  `--seed`, N < 1, another format; `--seed`/`--dry-run` alone.
+  Counting (`tier_sample_counts`, review.nw, no llm_review import so
+  `sessions show` stays light): drawn ids looked up through
+  `drawn_decisions` (fold tombstones, then a version-link DOI exactly
+  one paper holds: a preprint adoption); a homonym/surname rename or a
+  gone paper is `not_found`. Screened = a decision under the id is
+  decided (anyone); bearing = `check_bucket(d) == CHECK_BEARING` (the
+  audit table's rule). `sessions show`: one `tier_sample_line` per draw
+  after the tier line, JSON `tier_samples` (record + counts), both only
+  with draws. `sessions tier-sample S [--report] [-f table|json]`
+  (read-only): per draw counts and rule flags (`tier_rule_flags`),
+  unscreened ids; `--report` adds `TierSampleReport` rate and
+  `modified_wilson_interval(bearing, screened)` and
+  `tier_sample_sentence` ("Of the M pending records outside the first
+  tier, a random sample of N (seed S) was screened; k bore on the
+  question (r%; 95% modified Wilson interval a% to b%" + for k = 0 ": a
+  sample in which none bore does not show that none of the rest
+  does)"). Unlike `llm sample --report` (which shows the interval of
+  the reviewed part with a caveat), rate and interval are WITHHELD
+  (`withheld_reason`) while any drawn paper is unscreened or not found;
+  a complete census gets its rate, no interval. LaTeX report: after the
+  search parameters, a sub-heading "Records outside the screening tier"
+  and one sentence per draw (`build_tier_sample_latex`, nothing
+  without draws). Audit caption unchanged. `llm classify S
+  --tier-sample ID` classifies the draw's still-pending papers
+  (`candidates=`); exit 2 with `--second-screen`, `--top`,
+  `--min-providers` or an unknown id; exit 1 when none is pending.
 
 ### Session Arguments
 
@@ -3317,6 +3369,11 @@ moved five places, `paper_id` stays last): empty when unset,
   Nothing is withheld or retried for it. Later checks (`sessions show`,
   report) see only title and abstract (see Headless Review Sessions).
   Answers without a valid `paper_index` are skipped (never index 0).
+- **Sample of a tier's rest (#315).** `llm classify S --tier-sample ID`
+  classifies the pending papers of a `TierSample` (see Screening tier
+  in Headless Review Sessions); `sessions tier-sample S --report` gives
+  the bearing rate with the same `modified_wilson_interval`, withheld
+  while the draw is not fully screened.
 - **First tier (#302, cli.nw `sec:llm-classify-tier`).** `llm classify
   S --top K --min-providers N` classifies only the pending papers of
   `screening_tier` (either condition), printing `tier_lines`; passed as
