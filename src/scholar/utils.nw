@@ -1385,27 +1385,39 @@ def staged_outputs(
         tempfile.mkdtemp(dir=directory, prefix=STAGING_PREFIX)
     )
     try:
-        with file_lock(staging):
+        with file_lock(staging / STAGING_LOCK_NAME):
             try:
                 yield staging
                 staged = sorted(
-                    p for p in staging.iterdir() if p.is_file()
+                    p for p in staging.iterdir()
+                    if p.is_file() and p.name != staging_lock_file_name()
                 )
                 place_staged_files(directory, staged, remove, staging)
             finally:
                 shutil.rmtree(staging, ignore_errors=True)
     finally:
-        lock_path(staging).unlink(missing_ok=True)
+        shutil.rmtree(staging, ignore_errors=True)
 @
 
 The export holds a lock on its own staging directory from start to
 end, so that another export can tell a staging directory in use from
-one a killed export left (\cref{sec:staged-outputs-leftovers}).  The
-lock is let go only after the directory is gone; its lock file,
-[[.<staging name>.lock]] beside it, is removed then, which is safe here
-although it is not for a lock that guards a file: whoever takes the
-lock of a removed staging directory finds no directory and leaves it
-alone.
+one a killed export left (\cref{sec:staged-outputs-leftovers}).  Its
+lock file, [[.staging.lock]], lies inside the staging directory, so it
+goes with that directory, after a success as after a failure, and never
+appears among the outputs; it is the one file of the staging directory
+that is not moved.  The directory is removed while the lock is still
+held, so no other export can find it unlocked and still there; where
+the system cannot delete a file that is open (Windows), the second
+removal after the lock is let go takes what is left.
+
+<<utils functions>>=
+STAGING_LOCK_NAME = "staging"
+
+
+def staging_lock_file_name() -> str:
+    """The name of the lock file inside a staging directory."""
+    return lock_path(Path(STAGING_LOCK_NAME)).name
+@
 
 [[place_staged_files]] is the transaction.  It takes the directory's
 lock first and holds it to the end (\cref{sec:staged-outputs-lock}).
@@ -1815,29 +1827,83 @@ undo (a reviewer of \url{https://github.com/dbosk/scholar/pull/324}
 forced this with threads).  Two defences close it.
 
 The first is a lock on the directory, held from the leftover check
-through the last move: [[file_lock]] (\cref{sec:file-lock}) on
-[[.scholar-outputs.lock]] in the target directory, [[required]], so that
-it is never skipped.  The moves take milliseconds, so a wait of
-[[PLACING_LOCK_TIMEOUT]] seconds without the lock means that another
-export is stuck in its moves, and the export fails with one line, having
-moved nothing; it can simply be run again.  The lock file stays in the
-directory, as a session's lock file does, since removing a lock file
-that others may be waiting on would let two of them hold the lock at
-once.  The lock only coordinates exports that take it, on one machine
-(\cref{sec:file-lock} says why).
+through the last move: [[file_lock]] (\cref{sec:file-lock}),
+[[required]], so that it is never skipped while it can be taken.  The
+moves take milliseconds, so a wait of [[PLACING_LOCK_TIMEOUT]] seconds
+without the lock means that another export is stuck in its moves, and
+the export fails with one line, having moved nothing; it can simply be
+run again.
+
+The lock file does not lie in the output directory.  A lock file must
+outlive its use (removing one that others may be waiting on would let
+two of them hold the lock at once), and output directories are often a
+paper's repository, where a file of scholar's own would stay as clutter
+nobody asked for.  So it lies in scholar's cache directory
+([[get_cache_dir]], \cref{cache-module}, which honours
+[[SCHOLAR_CACHE_DIR]]), in [[locks/]], named after the first
+[[PLACING_LOCK_DIGITS]] hexadecimal digits of the SHA-256 of the output
+directory's resolved path: [[locks/.export-<digits>.lock]]
+([[file_lock]] gives every lock file a leading dot).  [[scholar cache
+clear]] deletes only the [[*.pkl]] files at the top of the cache
+directory and [[cache info]] counts only those, so neither touches
+[[locks/]].
+
+The price is the reach of the lock: it excludes only exports that use
+the same cache directory.  Two processes with different cache
+directories, as agents that set [[SCHOLAR_CACHE_DIR]] apart have, can
+move files into one directory at once.  The second defence below still
+holds then: no export removes or overwrites, while undoing, a file it
+did not place, so the worst case is the one before the lock, the files
+of two exports mixed, never a file deleted.  The same holds when the
+cache directory cannot be written: the export goes on without the lock
+and says so in one warning, since an export must not fail for want of
+a cache.
 
 <<utils functions>>=
 from contextlib import ExitStack
 
-PLACING_LOCK_NAME = "scholar-outputs"
+PLACING_LOCKS_SUBDIR = "locks"
+PLACING_LOCK_DIGITS = 16
 PLACING_LOCK_TIMEOUT = 5  # seconds; the moves take milliseconds
 
 
-def placing_lock(directory: Path):
-    """The lock under which files are moved into `directory`."""
-    return file_lock(
-        directory / PLACING_LOCK_NAME, timeout=PLACING_LOCK_TIMEOUT,
-        required=True,
+def placing_lock_path(directory: Path) -> Path:
+    """The path whose `file_lock` guards the moves into `directory`."""
+    from scholar.cache import get_cache_dir
+
+    locks = get_cache_dir() / PLACING_LOCKS_SUBDIR
+    locks.mkdir(exist_ok=True)
+    digest = hashlib.sha256(str(Path(directory).resolve()).encode())
+    return locks / f"export-{digest.hexdigest()[:PLACING_LOCK_DIGITS]}"
+
+
+@contextmanager
+def placing_lock(directory: Path) -> Iterator[None]:
+    """Hold the lock under which files are moved into `directory`.
+
+    Raises `LockNotTaken` when another holder keeps it; goes on without
+    it, with a warning, when the cache directory cannot hold the lock.
+    """
+    with ExitStack() as stack:
+        try:
+            stack.enter_context(file_lock(
+                placing_lock_path(directory),
+                timeout=PLACING_LOCK_TIMEOUT, required=True,
+            ))
+        except LockNotTaken as error:
+            if error.held:
+                raise
+            _warn_moving_unlocked(directory, error.reason)
+        except OSError as error:
+            _warn_moving_unlocked(directory, error)
+        yield
+
+
+def _warn_moving_unlocked(directory: Path, reason) -> None:
+    logging.getLogger(__name__).warning(
+        "Moving the files into %s without a lock (%s): an export into "
+        "the same directory at the same time is not excluded, but no "
+        "file another export placed is removed", directory, reason,
     )
 <<take the directory's lock, or fail moving nothing>>=
 lock = ExitStack()
@@ -1846,8 +1912,6 @@ try:
 except LockNotTaken as error:
     problem = (
         f"another export is moving files into {directory} ({error.reason})"
-        if error.held else
-        f"cannot lock {directory} for the moves ({error.reason})"
     )
     raise OutputsNotPlaced(
         problem,
@@ -1905,7 +1969,7 @@ files cannot undo the moves.  It leaves, in the target directory, the
 files moved so far, a [[.scholar-replaced-*]] directory holding the
 earlier versions of the files it had replaced or moved aside, under
 their own names, and its [[.scholar-staging-*]] directory holding the
-new files it had not moved yet.  To put the earlier export back, move
+new files it had not moved yet (and its lock file, [[.staging.lock]]).  To put the earlier export back, move
 the files of the replaced-files directory back into the directory, over
 the new ones, and delete both hidden directories.
 
@@ -1915,11 +1979,20 @@ says that they are there, one warning per directory.  It looks while it
 holds the directory's lock, so a replaced-files directory it finds
 belongs to no running export, since one exists only during the moves.
 A staging directory exists for a whole export, which the lock does not
-cover; so every export holds a lock on its own staging directory while
-it runs ([[staged_outputs]] above), and one whose lock can be taken at
-once is left over.  When the lock is taken and the directory has just
-been removed by its export, the lock file this check made is removed
-too.
+cover, and the directory lock alone cannot tell a staging directory a
+killed export left from one of an export that is still writing its
+files and has not reached its moves: both exist, unlocked by the
+directory lock, with files in them, and neither age nor content tells
+them apart.  So every export holds a lock on its own staging directory
+while it runs ([[staged_outputs]] above), and one whose lock can be
+taken at once is left over.  The lock file is inside the staging
+directory: when the directory is gone, the check cannot create the file
+and counts the directory as gone, not left over.  A staging directory a
+killed export of an older scholar left has no lock file; the check
+creates one inside it, which stays there with the files.  An export
+caught between creating its staging directory and taking its lock, a
+few instructions, is reported as left over by mistake; the warning
+deletes nothing, so the cost is a wrong line.
 
 <<warn about what an export that did not finish left>>=
 for leftover in leftover_directories(directory, own_staging):
@@ -1947,11 +2020,9 @@ def leftover_directories(
 def staging_left_over(staging: Path) -> bool:
     """Whether no running export holds the staging directory `staging`."""
     try:
-        with file_lock(staging, timeout=0, required=True):
-            if staging.exists():
-                return True
-            lock_path(staging).unlink(missing_ok=True)
-            return False
+        with file_lock(staging / STAGING_LOCK_NAME, timeout=0,
+                       required=True):
+            return True
     except LockNotTaken:
         return False
 
@@ -2050,7 +2121,7 @@ class TestStagedOutputs:
         assert (out_dir / "r.csv").read_text() == "new csv"
         assert (out_dir / "r.tex").read_text() == "new tex"
         assert sorted(p.name for p in out_dir.iterdir()) == [
-            ".scholar-outputs.lock", "r.csv", "r.tex",
+            "r.csv", "r.tex",
         ]
 
     def test_failure_leaves_existing_files_untouched(self, out_dir):
@@ -2099,11 +2170,10 @@ class TestStagedOutputMoves:
 NAMES = ("a.csv", "b.tex", "c.txt")
 
 def _content(self, out_dir):
-    """Every entry of `out_dir`: file bytes, or "dir" for a directory;
-    the directory's lock file, which stays by design, left out."""
+    """Every entry of `out_dir`: file bytes, or "dir" for a directory."""
     return {
         p.name: "dir" if p.is_dir() else p.read_bytes()
-        for p in out_dir.iterdir() if p.name != ".scholar-outputs.lock"
+        for p in out_dir.iterdir()
     }
 
 def _export(self, out_dir, remove=()):
@@ -2255,9 +2325,13 @@ at once, a real subprocess killed with SIGKILL in the middle of its
 moves, and a real SIGTERM.  The interleaving of the two exports is forced
 with events at the renames, through the same [[os.replace]] seam as
 above; each wait has a time limit, so a test that goes wrong fails
-instead of hanging.  The race of the reviewer needs the lock out of the
-way, which the seam [[placing_lock]] allows; with the real lock the
-second export must move nothing.
+instead of hanging.  The race of the reviewer is run as it happens when
+the lock cannot reach: the two exports use different cache directories
+(each thread gets its own from [[get_cache_dir]]), so each takes a lock
+of its own, and the identity check alone must keep [[a.csv]]; with one
+cache directory the second export must move nothing.  An export whose
+cache directory cannot be made (its path is a file) goes on and says
+so.
 
 <<test functions>>=
 class TestStagedOutputSafety:
@@ -2314,17 +2388,21 @@ def test_a_rename_keeps_the_file_identity(self, out_dir):
     os.replace(source, out_dir / "placed")
     assert file_identity(out_dir / "placed") == identity
 
-def test_without_the_lock_an_undo_leaves_another_export_s_file(
-    self, out_dir, monkeypatch,
+def test_with_two_cache_directories_no_file_is_deleted(
+    self, out_dir, tmp_path, monkeypatch,
 ):
-    import contextlib
     import threading
-    import scholar.utils as utils
+    import scholar.cache as cache
 
     for name in ("a.csv", "b.tex"):
         (out_dir / name).write_text(f"old {name}")
-    monkeypatch.setattr(utils, "placing_lock",
-                        lambda directory: contextlib.nullcontext())
+
+    def cache_dir_of_thread():
+        path = tmp_path / f"cache-{threading.current_thread().name}"
+        path.mkdir(exist_ok=True)
+        return path
+
+    monkeypatch.setattr(cache, "get_cache_dir", cache_dir_of_thread)
     a_aside, b_placed, a_placed, b_done = (threading.Event()
                                            for _ in range(4))
 
@@ -2363,6 +2441,8 @@ def test_without_the_lock_an_undo_leaves_another_export_s_file(
     assert outcome["A"] is None
     assert self._content(out_dir) == {"a.csv": b"A a.csv",
                                       "b.tex": b"A b.tex"}
+    assert {p.name for p in (tmp_path / "cache-A" / "locks").iterdir()} \
+        == {p.name for p in (tmp_path / "cache-B" / "locks").iterdir()}
     failure = outcome["B"]
     assert isinstance(failure, OutputsNotPlaced)
     assert failure.others == [out_dir / "a.csv"]
@@ -2407,6 +2487,34 @@ def test_with_the_lock_a_second_export_moves_nothing(
     assert f"another export is moving files into {out_dir}" in str(failure)
     assert self._content(out_dir) == {"a.csv": b"A a.csv",
                                       "b.tex": b"A b.tex"}
+
+def test_the_lock_lies_in_the_cache_directory(self, out_dir):
+    from scholar.cache import get_cache_dir
+
+    outcome = {}
+    self._export(out_dir, "A", outcome)
+    assert outcome["A"] is None
+    assert self._content(out_dir) == {"a.csv": b"A a.csv",
+                                      "b.tex": b"A b.tex"}
+    lock_file = lock_path(placing_lock_path(out_dir))
+    assert lock_file.parent == get_cache_dir() / "locks"
+    assert lock_file.exists()
+
+def test_without_a_cache_directory_the_export_goes_on(
+    self, out_dir, tmp_path, monkeypatch, caplog,
+):
+    not_a_directory = tmp_path / "cache-file"
+    not_a_directory.write_text("")
+    monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(not_a_directory))
+    outcome = {}
+    self._export(out_dir, "A", outcome)
+    assert outcome["A"] is None
+    assert self._content(out_dir) == {"a.csv": b"A a.csv",
+                                      "b.tex": b"A b.tex"}
+    [warning] = [r.getMessage() for r in caplog.records
+                 if r.levelname == "WARNING"]
+    assert warning.startswith(f"Moving the files into {out_dir} without "
+                              "a lock")
 @
 
 A killed export is a real one: a child process that kills itself with
@@ -2458,14 +2566,15 @@ def test_a_killed_export_is_reported_by_the_next(
     assert not (out_dir / "b.tex").exists()
     assert {p.name: p.read_text() for p in kept.iterdir()} == {
         "a.csv": "old a.csv", "b.tex": "old b.tex"}
-    assert {p.name for p in staging.iterdir()} == {"b.tex", "c.txt"}
+    assert {p.name for p in staging.iterdir()} == {
+        "b.tex", "c.txt", ".staging.lock"}
 
     live = out_dir / f"{STAGING_PREFIX}live"
     live.mkdir()
     holding, release = threading.Event(), threading.Event()
 
     def hold():
-        with file_lock(live):
+        with file_lock(live / STAGING_LOCK_NAME):
             holding.set()
             release.wait(30)
 

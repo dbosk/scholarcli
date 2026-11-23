@@ -2843,12 +2843,23 @@ failure part-way undoes the moves (old file back, new file without a
 predecessor removed). Removals (`staged_outputs(dir, remove=[names])`,
 the screen sheet's stale `BASE-tier.json`) are moves aside in the same
 transaction, made after every file is in place. The moves run under
-`placing_lock(dir)` = `file_lock(dir / "scholar-outputs",
-timeout=PLACING_LOCK_TIMEOUT (5 s), required=True)`; the lock file
-`.scholar-outputs.lock` stays in the output directory (by design, as
-session lock files do); a refused lock fails the export with one line
-("another export is moving files into DIR"), moving nothing (#320
-review: without it two exports could delete a file). The undo removes
+`placing_lock(dir)`: `file_lock` (required, `PLACING_LOCK_TIMEOUT` 5 s)
+on `<cache dir>/locks/.export-<16 hex of sha256(resolved dir)>.lock`
+(`placing_lock_path`, via `cache.get_cache_dir`, so
+`SCHOLAR_CACHE_DIR` applies; `locks/` made on demand; `cache
+clear`/`cache info` look only at top-level `*.pkl`, tested). Nothing
+of the lock lies in the output directory (exports go into paper
+repositories). A lock another export holds fails the export with one
+line ("another export is moving files into DIR"), moving nothing; a
+cache directory that cannot hold the lock (`OSError`, or a lock file
+that cannot be made) gives one WARNING ("Moving the files into DIR
+without a lock ...") and the export goes on. Limit: processes with
+different cache directories (agents with their own
+`SCHOLAR_CACHE_DIR`) do not exclude each other; the identity check
+then still keeps every export from removing or overwriting on undo a
+file it did not place, so the worst case is files of two exports mixed
+(as before #320), never a deleted file (tested with two cache dirs).
+The undo removes
 or overwrites a placed file only while it still is that file
 (`file_identity` = lstat `st_dev`/`st_ino` of the staged file before
 its rename); otherwise it leaves it and lists it in `others` ("Replaced
@@ -2856,8 +2867,11 @@ by another program meanwhile"). SIGTERM is an interrupt during the
 moves (`utils.sigterm_as_keyboard_interrupt`, moved here from cli.nw;
 `enrich` imports it), so it is rolled back like Ctrl-C. A replaced
 file's mode is kept (`shutil.copymode` onto the staged file). Each
-export holds `file_lock(staging)` (lock file beside it, removed at the
-end); under the directory lock `leftover_directories` finds
+export holds `file_lock(staging / "staging")`, lock file
+`.staging.lock` INSIDE the staging directory (never moved, removed
+with the directory, success or failure); the directory lock alone
+cannot tell a killed export's staging from a live export still writing,
+so under the directory lock `leftover_directories` finds
 `.scholar-replaced-*` (always left over) and `.scholar-staging-*` whose
 lock is free (`staging_left_over`) and logs one WARNING each
 (`leftover_warning`), deleting nothing. A failure raises
