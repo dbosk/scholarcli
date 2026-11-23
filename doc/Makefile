@@ -35,7 +35,7 @@ all: ${DOC}
 # `make check` builds the PDF and checks the build (check.mk); what it
 # accepts: src/scholar/cli.nw, sec:woven-document.
 CHECK_JOB=	scholar
-CHECK_SOURCES=	scholar.tex preamble.tex ${SRC_TEX} ${METHODS_TEX}
+CHECK_SOURCES=	scholar.tex preamble.tex ${SRC_TEX} ${METHODS_TEX} bibliography.bib
 
 scholar.pdf: scholar.tex preamble.tex
 scholar.pdf: ${SRC_TEX}
