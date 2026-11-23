@@ -3263,22 +3263,40 @@ fixture has a quoted query, a `[`-row, `ĸ`, `CO₂`, a ligature. About
   `%20` stays and the DOIs `10.5555/a%7Db` (written `a%257Db`) and
   `10.5555/a}b` (written `a%7Db`) stay two papers (table
   `tab:bibtex-verbatim-escapes`; inversion tested on a generated set
-  with every code after 0 to 3 `%25`). Other provenance fields carry no
+  with every code after 0 to 3 `%25`). The `%25` rule is for the DOI
+  and the ID line only (`exact=`): the `url` field keeps round 2's
+  encoding, so a URL's own `%7B` stays and its link is unchanged
+  (checked with `pdfinfo -url`). Old `.bib` files (DOI holding the text
+  `%7D`): `prov import` keeps the DOI as written when the block's `ID`
+  is that DOI's id (`<<keep the DOI as written when the recorded id
+  names it>>`); `--cited-from` tries the decoded DOI, then the DOI as
+  written for entries not matched by DOI (`_cited_bib_papers` returns
+  `as_written_dois`), naming those on stderr. Other provenance fields carry no
   line break (placeholders, dates, fields parsed line by line), except
   FOUND-VIA's query (#323, left open: a shell command). Text fields (`bibtex_text_value`): tab
   and line breaks -> space, other C0 dropped (biber 2.21 core-dumps on
   a NUL); then `escape_bibtex` (review.nw `sec:latex-titles`): a value
   with a backslash is read as LaTeX by pylatexenc (declared dependency
-  since #304; bibtexparser 2 depends on it) and, when safe, written as
-  its Unicode text. Only command nodes are decoded (`LatexWalker` nodes:
-  macros with their arguments, math; groups kept with their braces and
-  read inside; other text, `~`, `--`, quotes kept as written); a bare
-  `%` becomes `\%` before parsing (no comment). Safe = parses with
-  `tolerant_parsing=False`, every backslash starts a macro the
-  converter knows (`get_macro_spec`), no comment inside a command, no
-  environment, non-empty text (`latex_text_pieces`). Added through
-  `add_context_category`: font switches `\em \it \bf ...` (discard) and
-  `\texttt`-like commands (`%s`). `\{`/`\}` decode to `LatexBrace` ->
+  since #304; bibtexparser 2 depends on it) and written as its Unicode
+  text only if every command is on the allow-list: accents
+  (`LATEX_ACCENTS`, not `\d \b \t`), letters (`LATEX_LETTERS`), font
+  commands and switches, escaped specials, `\textendash
+  \textemdash \ ` (`LATEX_TEXT_ALLOWED`), and inside math only the
+  decoder's one-character no-argument symbol macros plus the math
+  alphabets (`_math_allowed`). Anything else (`\cite \url \href
+  \footnote \ref \input`, environments, unknown) -> literal. Also
+  required: strict parse, every backslash starts an allowed macro, at
+  most `LATEX_DECODE_MAX_CHARS` 4000 characters (longest real title
+  2042) and `LATEX_DECODE_MAX_DEPTH` 8, every decoded character
+  settable (`_settable`: Latin in T1 or mapped by the escaper; math
+  alphanumerics U+1D400-1D7FF NFKC-folded), non-empty, and no exception
+  (any `Exception` -> literal; `\href` raised IndexError, deep nesting
+  RecursionError). Only command nodes are decoded; a math span without
+  a command (`$x^2$`) stays as written. `^` is now escaped
+  (`\textasciicircum{}`; outside math it stopped pdfLaTeX, checked on
+  main; `escape_latex` always escaped it). Fuzz in the suite: every
+  macro the decoder knows x 10 shapes, seeded, 5 s cap. `\{`/`\}`
+  decode to `LatexBrace` ->
   `\textbraceleft{}`/`\textbraceright{}`. Anything else: every backslash
   -> `\textbackslash{}` (`BIBTEX_SPECIALS`), a still-escaped `\{`/`\}`
   -> brace commands. Printed (main / every backslash escaped / now):

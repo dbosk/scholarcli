@@ -11450,15 +11450,18 @@ def _bib_author_forms(entry) -> tuple[list[str], list[str]]:
     return given_first, surname_first
 
 
-def _cited_bib_papers(paths: list[Path]) -> tuple[list, list[str], int]:
+def _cited_bib_papers(
+    paths: list[Path],
+) -> tuple[list, list[str], int, dict]:
     """Read the `.bib` files as `(key, readings, edition)` tuples.
 
     `readings` are the entry's papers: authors given name first, and
     surname first when that names another surname; `edition` is the
     entry's `edition` field as written, or None.  Also returns the
-    keys of entries with neither title nor DOI, which are skipped, and
-    the number of blocks that could not be parsed.  An entry with the
-    same key and work in two files is read once.
+    keys of entries with neither title nor DOI, which are skipped, the
+    number of blocks that could not be parsed, and, by the entry's
+    index, the entry read with its DOI as written when decoding changed
+    it.  An entry with the same key and work in two files is read once.
     """
     from dataclasses import replace
 
@@ -11468,6 +11471,7 @@ def _cited_bib_papers(paths: list[Path]) -> tuple[list, list[str], int]:
     from scholar.scholar import Paper
 
     entries: list = []
+    as_written_dois: dict = {}
     skipped: list[str] = []
     failed = 0
     seen: set = set()
@@ -11487,9 +11491,8 @@ def _cited_bib_papers(paths: list[Path]) -> tuple[list, list[str], int]:
         failed += len(raw.failed_blocks)
         for entry, written in zip(decoded.entries, raw.entries):
             title = " ".join(str(_bib_value(entry, "title") or "").split())
-            doi = read_bibtex_verbatim(
-                str(_bib_value(written, "doi") or "").strip()
-            ) or None
+            written_doi = str(_bib_value(written, "doi") or "").strip()
+            doi = read_bibtex_verbatim(written_doi) or None
             if not title and not doi:
                 skipped.append(entry.key)
                 continue
@@ -11504,8 +11507,12 @@ def _cited_bib_papers(paths: list[Path]) -> tuple[list, list[str], int]:
             if audit_work_key(as_written) != audit_work_key(paper):
                 readings.append(as_written)
             edition = " ".join(str(_bib_value(entry, "edition") or "").split())
+            if doi and written_doi != doi:
+                as_written_dois[len(entries)] = (entry.key, [
+                    replace(reading, doi=written_doi) for reading in readings
+                ], edition or None)
             entries.append((entry.key, readings, edition or None))
-    return entries, skipped, failed
+    return entries, skipped, failed, as_written_dois
 
 
 def _match_cited_bibs(paths: list[Path], session) -> list:
@@ -11514,8 +11521,9 @@ def _match_cited_bibs(paths: list[Path], session) -> list:
         CHECK_BY_DOI, CHECK_BY_LOOSE_TITLE, match_cited_entries,
     )
 
-    entries, skipped, failed = _cited_bib_papers(paths)
+    entries, skipped, failed, as_written_dois = _cited_bib_papers(paths)
     cited = match_cited_entries(entries, session)
+    <<match an older bib's DOI as written>>
     by_doi = sum(1 for e in cited if e.matched_by == CHECK_BY_DOI)
     loose = [e for e in cited if e.matched_by == CHECK_BY_LOOSE_TITLE]
     by_title = sum(
@@ -11542,6 +11550,32 @@ def _match_cited_bibs(paths: list[Path], session) -> list:
             "files; their entries are not matched.[/yellow]"
         )
     return cited
+@
+
+A [[.bib]] that an earlier Scholar wrote holds a DOI as the paper had
+it, and one that held the text of an encoder's code,
+[[10.5555/q%7Dr]], reads back decoded as [[10.5555/q}r]]
+(\cref{sec:bibtex-field-values} in the review module).
+Without the [[ID]] line of a provenance block there is nothing to tell
+which was meant, so the decoded DOI is tried first, the way every
+newer [[.bib]] is written, and the DOI as written second, only for an
+entry the first did not match by its DOI; such matches are named on
+the standard error, so the author knows the older reading was used.
+
+<<match an older bib's DOI as written>>=
+older = []
+for index, entry in as_written_dois.items():
+    if cited[index].matched_by == CHECK_BY_DOI:
+        continue
+    second = match_cited_entries([entry], session)[0]
+    if second.matched_by == CHECK_BY_DOI:
+        cited[index] = second
+        older.append(entry[0])
+if older:
+    Console(stderr=True).print(
+        f"Matched by the DOI as written (a .bib from an older Scholar): "
+        f"{escape(', '.join(older))}"
+    )
 @
 
 An entry found only once edition and chapter number were set aside
@@ -31644,6 +31678,71 @@ class TestAwkwardDoiReadsBack:
     assert exported.exit_code == 0, exported.output
     assert f"% ID: {bibtex_verbatim_value(paper.id)}\n% CLAIM: odd" \
       in exported.stdout
+
+  OLD_DOI = "10.5555/q%7Dr"
+
+  def test_an_older_bib_keeps_its_note_where_it_was(
+    self, tmp_path, monkeypatch
+  ):
+    from scholar import Paper
+    from scholar.notes import get_note
+
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+    paper = Paper(title="Old file", authors=["Dahl, Di"], year=2020,
+                  doi=self.OLD_DOI)
+    bib = tmp_path / "old.bib"
+    bib.write_text(
+      "% === provenance: dahl2020 ===\n"
+      f"% ID: {paper.id}\n"
+      "% CLAIM: written by an older version\n"
+      "@article{dahl2020,\n"
+      "  title = {Old file},\n"
+      "  author = {Dahl, Di},\n"
+      "  year = {2020},\n"
+      f"  doi = {{{self.OLD_DOI}}},\n"
+      "}\n"
+    )
+    result = runner.invoke(app, ["prov", "import", str(bib)])
+    assert result.exit_code == 0, result.output
+    note = get_note(paper)
+    assert note is not None
+    assert "CLAIM: written by an older version" in note.note
+    assert get_note(Paper(title="Old file", authors=["Dahl, Di"],
+                          doi="10.5555/q}r")) is None
+
+  def test_cited_from_tries_an_older_bibs_doi_as_written(
+    self, tmp_path, monkeypatch
+  ):
+    from datetime import datetime
+    from scholar import review
+    from scholar.scholar import Paper
+
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+    session = review.ReviewSession(
+      query="q", providers=["openalex"], timestamp=datetime(2026, 1, 1),
+      name="older",
+    )
+    session.decisions = [review.ReviewDecision(
+      paper=Paper(title="Stored title", authors=["Di Dahl"], year=2020,
+                  doi=self.OLD_DOI),
+      provider="openalex", status=review.DecisionStatus.KEPT, tags=["ml"],
+    )]
+    review.save_session(session)
+    bib = tmp_path / "old.bib"
+    bib.write_text(
+      "@article{dahl2020,\n  title = {Another title},\n"
+      f"  author = {{Dahl, Di}},\n  doi = {{{self.OLD_DOI}}},\n}}\n"
+    )
+    result = runner.invoke(
+      app, ["sessions", "export", "older", "-f", "table", "--cited-from",
+            str(bib), "-o", str(tmp_path / "tab")],
+    )
+    assert result.exit_code == 0, result.output
+    stderr = " ".join(result.stderr.split())
+    assert "1 entries, 1 matched by DOI" in stderr
+    assert "Matched by the DOI as written (a .bib from an older " \
+      "Scholar): dahl2020" in stderr
+    assert r"\emph{cited}: ml" in (tmp_path / "tab.tex").read_text()
 @
 
 A title in \LaTeX{} is now written as its text, [[Caf\'e]] as
@@ -32699,6 +32798,7 @@ def _paper_from_entry(
         year=year,
         doi=read_bibtex_verbatim(fields.get("doi") or "") or None,
     )
+    <<keep the DOI as written when the recorded id names it>>
     if paper.doi:
         <<warn when the recorded id is not the entry's DOI>>
         return paper
@@ -32739,6 +32839,22 @@ if paper_id and paper_id != paper.id:
         "%s: provenance block records %s, the entry's DOI is %s; "
         "using the DOI", fields.get("title", ""), paper_id, paper.id,
     )
+@
+
+A [[.bib]] written before the DOI was encoded holds it as the paper had
+it, and a DOI that held the text of one of the encoder's codes,
+[[10.5555/q%7Dr]], now reads back as [[10.5555/q}r]], another paper.
+Its block's [[ID]] line, written then from the paper, tells the two
+apart: when the recorded id is that of the DOI as written and not that
+of the decoded one, the DOI as written is the paper's, and the note
+goes where the earlier version filed it.
+
+<<keep the DOI as written when the recorded id names it>>=
+written_doi = (fields.get("doi") or "").strip()
+if paper_id and written_doi and paper_id != paper.id:
+    as_written = dataclasses.replace(paper, doi=written_doi)
+    if as_written.id == paper_id:
+        paper = as_written
 @
 
 Without a DOI the recorded id is the best we know, but it can be stale
@@ -33855,7 +33971,7 @@ class TestUnescapeNonLatinSeparator:
         assert "scholarnonlatinsep" in entry
         bib = tmp_path / "cited.bib"
         bib.write_text(entry + "\n", encoding="utf-8")
-        entries, _, unparsable = _cited_bib_papers([bib])
+        entries, _, unparsable, _ = _cited_bib_papers([bib])
         assert unparsable == 0
         [(key, [read], _edition)] = entries
         assert (key, read.title) == ("smith2024", title)
