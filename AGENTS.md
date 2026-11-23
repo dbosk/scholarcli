@@ -2544,8 +2544,18 @@ break is now quoted, its quote marks doubled (in the tests' invented
 sample, 3 of 20 titles, the ones with a quote mark). Before, a tab or
 line break split the cell or row. `clean_metadata_text` keeps tabs and
 line breaks (and decodes `&#9;`/`&#10;` into them), so ingest cleaning
-does not prevent them. Known gap, not fixed: a query holding a line
-break breaks its `# Query:` line (the `#` lines stay as they were).
+does not prevent them. Reading (cli.nw `sec:search-csv-comments`, in
+the `--format` help): the output is blocks of `#` lines, a blank
+line, the header, the paper rows, a blank line; parse it whole with
+`csv.reader(f, delimiter="\t")`, rows up to the first empty row are
+comments, then the header, then papers up to the next empty row. Never
+drop lines starting with `#` before parsing (a quoted title can hold
+`\n#...`, a title can begin with `#`). `csv_comment` turns tab,
+CR and LF in every `#` line into spaces (a query `x<TAB>"y` or
+`a<LF>"b` used to open a quoted field that swallowed every row);
+quote marks stay, since a comment row is one field beginning with `#`
+(tested with `"a b"`, several blocks, `# Results:`/`# Search:`
+errors with line breaks).
 
 ### Spreadsheet-safe CSV (`--spreadsheet-safe`, #285)
 
@@ -2565,7 +2575,7 @@ LibreOffice, comma import). Numeric columns (`CSV_NUMERIC_COLUMNS` =
 `year`, `llm_confidence`; `SpreadsheetSafeWriter` finds them by header
 name, so a new column is text; search's year likewise) go through
 `spreadsheet_safe_number`: left alone only for an int, a float or a
-string `float()` reads, else treated as text (a session can hold
+string `float()` reads that equals its `strip()` (`"\t5"` is text), else treated as text (a session can hold
 `"year": "=1+2"`; `Paper.from_dict` keeps it). Undo: drop the first
 character of every cell, in any column, that begins with `'` (exact: a
 leading `'` is doubled, and a number left alone never begins with
