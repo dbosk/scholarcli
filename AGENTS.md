@@ -867,24 +867,28 @@ identity of every outgoing request:
   downloads through the tunnel).
 - **Identifiers in URL paths** (#304): never paste a DOI or id into a
   URL; a `#` cut it at the fragment, a `?` started a query. Query
-  strings go to `requests`/the client as a mapping. S2:
-  `providers.s2_paper_url(paper_id, relation=None)` = `quote(paper_id,
-  safe="/:")` (the swagger's examples `DOI:10.18653/v1/N18-3011`
-  unchanged), used by the DOI lookup, citations/references and
-  `pdf.resolve_doi_s2`. doi.org: `pdf.doi_resolver_url(doi)` per the
-  DOI Handbook 2025 sec. 4.7 (prefix and suffix quoted apart, safe
-  `!$&'()*+;=:@`, so a slash inside the suffix is `%2F`); the PDF
-  cache key `get_cached_doi_pdf_path` stays unencoded (never
-  requested; changing it would orphan imports). Already encoded, left
-  as they were: Crossref and Unpaywall (`quote(doi, safe='')`; Crossref's
-  docs disagree on the slash, the `%2F` form is answered), OpenAlex
-  (pyalex `quote_plus`s the whole `https://doi.org/...`; a space
-  becomes `+`, whether OpenAlex reads that as a space is unchecked),
-  Europe PMC, IEEE, WoS, Scopus (query parameters), arXiv (library).
-  Tests: conftest's `request_targets` (loopback stand-in for named
-  hosts, rewrites in `HTTPAdapter.send`, keeps raw request targets;
-  `paths()`/`queries()` decode) and `awkward_doi`
-  (`10.5555/a#b?c%d e<f>g`).
+  strings go to `requests`/the client as a mapping. One encoder,
+  `network.quote_identifier` (network.nw `sec:identifier-in-path`):
+  encodes `# ? %`, space, C0/DEL, non-ASCII, `< > " { } | \ ^`, the
+  backtick and `[ ]`; keeps `/ : @ ! $ & ' ( ) * + , ; =` literal. Rule:
+  an identifier that worked before goes out exactly as before (DOI
+  Handbook 4.7 would encode an inner slash, Crossref says not to;
+  scholar always sent it literal). Used by
+  `providers.s2_paper_url(paper_id, relation=None)` (DOI lookup,
+  citations/references, `pdf.resolve_doi_s2`) and
+  `pdf.doi_resolver_url(doi)`. `pdf.extract_doi` decodes a pasted
+  doi.org URL once (`...CO;2-%23` was sent as `%2523`); a raw DOI is
+  never decoded. The PDF cache key `get_cached_doi_pdf_path` stays
+  unencoded (never requested). Already encoded, left as they were:
+  Crossref and Unpaywall (`quote(doi, safe='')`, the `%2F` form is
+  answered), OpenAlex (pyalex `quote_plus`s the whole
+  `https://doi.org/...`; a space becomes `+`, unchecked whether
+  OpenAlex reads it as a space), Europe PMC, IEEE, WoS, Scopus (query
+  parameters), arXiv (library). Tests: conftest's `request_targets`
+  (loopback stand-in for named hosts, rewrites in `HTTPAdapter.send`,
+  keeps raw request targets; `paths()`/`queries()` decode),
+  `awkward_doi` (`10.5555/a#b?c%d e<f>g`), and request lines pinned to
+  what the code before #304 sent (`TestDoiInRequestPaths`).
 
 ### PDF Cache and `scholar pdf import` (#296)
 
@@ -3077,15 +3081,25 @@ fixture has a quoted query, a `[`-row, `ĸ`, `CO₂`, a ligature. About
   layout, field order and DOI (verbatim in biblatex) are unchanged.
   Every field of both writers (`format_bibtex_entry`, the search
   formatter's `_format_paper`) goes through `review.bibtex_field(name,
-  value)` (#304, review.nw `sec:bibtex-field-values`): `doi`/`url`
-  (`BIBTEX_VERBATIM_FIELDS`) written as given except an unpaired brace
-  (`unpaired_braces`, counted as BibTeX does, backslash or not) or a
-  line break, percent-encoded (`%7B %7D %0D %0A`); other fields
-  `escape_bibtex` then an unpaired brace -> `\textbraceleft{}` /
-  `\textbraceright{}` (a backslash escaping it goes with it), a final
-  odd backslash -> `\textbackslash{}`. Paired braces stay. Ordinary
-  values byte-identical (checked on 6,594 papers of two copied real
-  sessions). Keys need nothing (`cite_key_base` is letters/digits).
+  value)` (#304, review.nw `sec:bibtex-field-values`). `doi`/`url`
+  (`BIBTEX_VERBATIM_FIELDS`, `bibtex_verbatim_value`): as given except
+  an unpaired brace (`unpaired_braces`, counted as biber counts), a
+  backslash before a brace or at the end, and C0 controls, which are
+  percent-encoded (`%7B %7D %5C %00`..`%1F`); `read_bibtex_verbatim`
+  is the exact inverse and is applied to the DOI by both readers
+  (`_cited_bib_papers` for `--cited-from`, `_paper_from_entry` for
+  `prov import`). Blind spot, accepted: a value already holding one of
+  those escapes as text reads back decoded (escaping every `%` would
+  change every URL with a `%`). Text fields (`bibtex_text_value`): tab
+  and line breaks -> space, other C0 dropped (biber 2.21 core-dumps on
+  a NUL); an escaped `\{`/`\}` -> `\textbraceleft{}`/`\textbraceright{}`;
+  then `escape_bibtex`, which now writes every backslash of the text as
+  `\textbackslash{}` (`BIBTEX_SPECIALS`; a title `x\y` stopped pdfLaTeX
+  on main); then an unpaired brace -> the same commands. No output
+  value holds a backslash before a brace or at its end (bibtexparser
+  then loses the entry, biber does not). Paired braces stay. 3 of 6,594
+  papers of two copied real sessions write differently (2 titles with
+  a backslash, 1 with a control character); keys never change.
   bibtexparser 2.1's writer was tried and not used: it encloses values
   unchecked and doubles braces on a second write. Biber counts `\{`
   as a brace, so there is no BibTeX escape for an unpaired one.
