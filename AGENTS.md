@@ -2431,10 +2431,13 @@ screeners)} over records screened twice, `screen_sample` (the one
   (`relevance_place`; a date-ordered first place never selects; a
   semantic answer holds <= 50, so K >= 50 takes it whole, on purpose);
   `min_providers` = distinct DATABASES of current, non-merged linked
-  records (`returning_databases`; database = `ratelimit.quota_group` of
-  the registered provider of that name, `provider_database`, else the
-  name: openalex, its source-pinned servers and openalex-semantic are
-  one); `provider` = a link to a current
+  records (`returning_databases`; database = `provider_database(name)`
+  = `review.PROVIDER_DATABASES.get(name, name)`, a static map so that
+  `sessions show` and the CSV never import `scholar.providers` (a child
+  interpreter test checks show text/JSON and CSV; a test keeps the map
+  equal to `ratelimit.quota_group` of the registered providers):
+  openalex, its source-pinned servers and openalex-semantic are one);
+  `provider` = a link to a current
   non-merged record of P whose query holds T (casefold). Records via
   `LinkedRecords` (current only; key None resolved as `search_record`).
   `TierSelection` counts: `met` (overlapping), `only`, `several`,
@@ -2449,7 +2452,9 @@ screeners)} over records screened twice, `screen_sample` (the one
   `--batch-size` (batch ids follow the tier). Without the options the
   sheet is unchanged (tested), except that a stale `BASE-tier.json` of
   the same base is removed after the staged files are in place (a
-  failed export removes nothing). Exit 2 before loading: another format,
+  failed export removes nothing), and only when it is a JSON object
+  with every key of `cli.TIER_FILE_KEYS` (`is_tier_file`); any other
+  file is left with a warning. Exit 2 before loading: another format,
   K/N < 1, `--query-like` without `--provider` or empty; after loading:
   a `--provider` no current non-merged record has. `sessions show`:
   `tier_overview_line` (`TIER_SHOW_TOP` = 100, `TIER_SHOW_PROVIDERS` =
