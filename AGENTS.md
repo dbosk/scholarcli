@@ -3813,6 +3813,29 @@ alphabetically). An untangled checkout mounts nothing instead of failing.
   dependency lines), `TUTORIAL_FILES` in `cli.nw`, `SRC_TEX` in
   `doc/Makefile`, and an `\input` in `doc/scholar.tex`. The parametrised
   test in `cli.nw` then loads it with pytorial's parser.
+- **Lessons** (in order): first-search, reviewing-in-the-tui,
+  enrich-verify-export, `tiered-search` (#310: two wordings into one
+  session, `sessions show`, `-f screen-sheet --pending` with and without
+  `--top 3`, `--rest-sample 2 --seed 7`, `sessions tier-sample --report`
+  before and after the sample is decided), llm-synthesis,
+  scholar-with-an-agent. Every keyless provider that answers (OpenAlex,
+  arXiv, HAL) records `order: relevance`, so tiered-search poses the
+  unranked contrast (IEEE's `order: unknown`) as a question. Pytorial's
+  plain-string patterns collapse white space (Rich's line wrapping is
+  harmless); regex patterns do not, so multi-word regex anchors use
+  `\s+`. Tried live once (2026-11-23, two keyless OpenAlex requests).
+- **Help pointers** (#310): `search`, `sessions export` and `llm
+  classify` end their description with the lesson (`scholar tutorial
+  run tiered-search`) and "Searching and screening" in doc/scholar.pdf
+  (`TestHelpPointsToTheMethod`).
+- **README** (#310): one section per kind of work.
+  `TestReadmeCommands` (cli.nw, after the tutorial tests) parses every
+  `scholar` command of its code blocks with the command line's own
+  parser (`make_context` down the groups, as Click's `Group.invoke`;
+  Typer carries its own copy of Click, `typer._click`, so the test
+  catches `typer.TyperException` with exit code 2, not
+  `click.UsageError`), in a temp dir where the `.tsv`/`.bib` files a
+  line names exist; nothing runs. A README command line must parse.
 
 ## Testing
 
