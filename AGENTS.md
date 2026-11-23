@@ -307,7 +307,8 @@ OpenAlex pages of 200 against the metered budget.
   and `OPENALEX_PAGE_SIZE` (200, also the OpenAlex paging size).
 - Tutorials keep `-l 5` on every practice search, and every search
   step's required pattern has the lookahead
-  `(?=.*\s(?:-l|--limit)[\s=]+[1-9])`, so a learner who drops it fails
+  `scholar\s+search(?=.*\s(?:-l\s*|--limit[\s=]+)[1-9])\s+...` (accepts
+  `-l5`, `--limit=5` and the limit first), so a learner who drops it fails
   the step. `test_tutorial_searches_carry_a_limit` (any line running
   `scholar search`/`rq`, wherever on the line) and
   `test_tutorial_search_steps_require_the_limit` (each search pattern
