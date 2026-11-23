@@ -3244,13 +3244,47 @@ searched again.
 `llm classify` tells the model to use only the session's existing
 themes and motivations; `parse_llm_response(allowed_tags=…)` maps tags
 case-insensitively onto that vocabulary, drops the rest with a warning
-(`LLMDecision.dropped_tags`), and `classify_papers_with_llm` retries the
-batch once with the vocabulary spelled out when a paper would be left
-without tags. A session without tags imposes nothing unless
+(`LLMDecision.dropped_tags`), and `classify_papers_with_llm` asks once
+more, with the vocabulary spelled out, about a paper that would be left
+without tags (see "Retry and run tally" below). A session without tags
+imposes nothing unless
 `llm classify --tag` (the `vocabulary=` argument) seeds it; with
 `--allow-new-tags` (`allow_new_tags=`) the prompt asks the model to
 prefer the vocabulary and new tags are not dropped. The `llm`
 module is looked up via `globals()` so tests can substitute a fake model.
+
+**Retry and run tally (#306, llm_review.nw `sec:retry-one-paper`,
+`sec:papers-last`, `sec:classifier-run-cost`; cli.nw
+`sec:llm-classify-run-cost`).** The retry no longer re-sends the
+batch: only papers whose first answer needs it (`_needs_retry(decision,
+allowed)`: `problem` set, or all tags dropped) are asked again, each
+in a request of its own, built by `build_classification_prompt` for
+that paper alone (same fixed parts) + `_retry_reminder`; the others
+keep their first answer, in place (paper found by id among those not
+yet asked again). Still unusable → withheld as before; a retry with no
+JSON keeps the first answer (withheld) instead of ending the run. This
+covers `llm classify`, `--second-screen` and `rq` (all go through
+`classify_papers_with_llm`). Stand-in models in tests must answer per
+paper (by title: `TitleAnsweringModel` in llm_review.nw), not per
+position, since a retried paper is `[Paper 0]` of its own request.
+**Prompt order**: every fixed part (context, categories, themes,
+motivations, examples, `CLASSIFICATION_INSTRUCTIONS`) first, then
+`## Papers to Classify` and the papers, then `PROMPT_CLOSING_LINE`;
+the retry reminder follows the paper. This changed the prompt, so
+`llm_prompt_version` differs for every run since #306; stored versions
+are not rewritten. **Tally**: `RequestTally.ask(model, prompt)` counts
+requests and sums `response.usage()` (llm 0.38 `Usage.input/.output`,
+`None` unless the plugin called `set_usage`; a response without
+`usage` reports none). `LLMBatchResult` gained `requests`, `retried`
+(paper ids asked again), `usage_reported` (requests with a count);
+`prompt_tokens`/`completion_tokens` are now the run's sums (before,
+they read `response.prompt_tokens`, an attribute llm 0.38's responses
+do not have, so they were None). `run_cost_line(batch, withheld_as)` → "Requests:
+1 batch + 2 single retries; left pending: 1; tokens: 300 in, 30 out"
+(" (reported for k of n requests)" when partial; "tokens: not reported
+by the model" when none); `cli.print_run_cost` prints it last in `llm
+classify` and `rq`, and in the second screen with "no screening
+stored". Nothing is stored in the session; no price is computed.
 
 **Unknown model (#284).** Every model lookup (`classify_papers_with_llm`,
 `second_screen_with_llm`, `generate_literature_synthesis`,
@@ -3371,8 +3405,8 @@ moved five places, `paper_id` stays last): empty when unset,
 - **No invented values.** `parse_llm_response` returns one entry per
   paper; an unusable answer (no answer, decision not kept/discarded, a
   discard without tags, confidence missing/non-numeric/outside [0, 1])
-  gets `LLMDecision.answer_problem`, triggers the single retry, and is
-  then withheld with the category-rule ones (`LLMDecision.problem`);
+  gets `LLMDecision.answer_problem`, triggers the paper's single retry
+  (on its own, #306), and is then withheld with the category-rule ones (`LLMDecision.problem`);
   `llm classify` and `rq` list them (`print_withheld_papers`) under
   "Left pending, no usable answer".
 - **Quotes in the reasons (#256).** `llm classify` (not `rq`) ends
@@ -3413,7 +3447,8 @@ moved five places, `paper_id` stays last): empty when unset,
   `sample_id` (that band) or a banded draw's group id (`sample_group`,
   all bands; each screening stores its band's id); sampled papers
   `reset_since_draw` are skipped and counted. Session order, `-n` per
-  run (one request + the one retry, as classify); decisions with a
+  run (one batch request + one per paper asked again, as classify);
+  decisions with a
   counted screening of identity `("llm", model, True)`
   (`has_second_screen_by`) are skipped unless `--rescreen`; copies under
   one id are shown once and all screened. `classify_papers_with_llm(...,
