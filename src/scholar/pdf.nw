@@ -107,6 +107,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 
@@ -565,11 +566,14 @@ said why---while a remembered cooldown lasts.
 We take the limiter from the registered provider rather than by name,
 so that it carries the provider's declared rate even when no search has
 run in this process yet.
+For the same reason the URL comes from the provider module's
+[[s2_paper_url]], which percent-encodes the DOI
+(\cref{sec:s2-paper-path} in the providers module).
+This module used to fill in a template of its own,
+[[.../paper/DOI:{doi}]], so a DOI holding a [[#]] asked about whatever
+came before it.
 
 <<doi resolution functions>>=
-S2_PAPER_API = "https://api.semanticscholar.org/graph/v1/paper/DOI:{doi}"
-
-
 def resolve_doi_s2(
     doi: str,
     progress_callback: Callable[[str], None] | None = None,
@@ -589,9 +593,11 @@ def resolve_doi_s2(
         progress_callback(f"Checking Semantic Scholar for {doi}...")
     
     try:
+        from scholar.providers import s2_paper_url
+
         limiter = _s2_limiter()
         limiter.acquire()
-        url = S2_PAPER_API.format(doi=doi)
+        url = s2_paper_url(f"DOI:{doi}")
         response = network.get(
             url,
             params={"fields": "openAccessPdf"},
@@ -678,8 +684,42 @@ We read a bounded prefix of the page.
 The meta tags sit in the head, and an unbounded read of an arbitrary
 URL is not something a fallback should do.
 
+\label{sec:doi-resolver-url}
+The DOI goes into the path of the resolver's URL, and pasted in as it
+is, a [[#]] in it ends the path and a [[?]] starts a query
+(\url{https://github.com/dbosk/scholar/issues/304}).
+The DOI Handbook says how the resolver wants it written (DOI Handbook,
+September 2025, section 4.7 \enquote{Percent-encoding}, and 4.4.4
+\enquote{HTTP proxy form},
+\url{https://www.doi.org/doi-handbook/DOIHandbook_2025.pdf}, read
+2026-11-23): prefix and suffix are percent-encoded each on its own,
+every byte of their UTF-8 except letters, digits and
+[[-._~!$&'()*+;=:@]], and joined by one [[/]]; the proxy decodes the
+name before it resolves it.
+So a slash \emph{inside} the suffix is encoded too, [[%2F]], and only
+the one between prefix and suffix stays.
+The Handbook's example is [[10.1000/456#789]], written
+[[10.1000/456%23789]].
+[[urllib.parse.quote]] does the encoding, with the Handbook's list as
+the characters it leaves alone; the split at the first slash is the
+only part of our own.
+The PDF cache keeps its key, [[DOI_RESOLVER_URL]] plus the normalised
+DOI unencoded (\cref{sec:pdf-import-key}): that string is never requested,
+and changing it would lose every PDF imported under it.
+
 <<pdf constants>>=
 DOI_RESOLVER_URL = "https://doi.org/"
+DOI_NAME_SAFE = "!$&'()*+;=:@"
+<<doi resolution functions>>=
+def doi_resolver_url(doi: str) -> str:
+    """Return the doi.org URL of `doi`, percent-encoded as the DOI
+    Handbook prescribes (prefix and suffix encoded each on its own)."""
+    prefix, slash, suffix = doi.partition("/")
+    parts = [prefix, suffix] if slash else [prefix]
+    return DOI_RESOLVER_URL + "/".join(
+        urllib.parse.quote(part, safe=DOI_NAME_SAFE) for part in parts
+    )
+<<pdf constants>>=
 LANDING_PAGE_BYTES = 512 * 1024
 CITATION_PDF_URL = re.compile(
     r"""<meta\s+[^>]*?
@@ -704,7 +744,7 @@ def resolve_doi_landing(
     response = None
     try:
         response = network.get(
-            DOI_RESOLVER_URL + doi,
+            doi_resolver_url(doi),
             headers={"Accept": "text/html,application/pdf"},
             timeout=30,
             stream=True,
@@ -726,6 +766,48 @@ def resolve_doi_landing(
     if not match:
         return None
     return html.unescape(match.group(1) or match.group(2))
+@
+
+Let's verify that both resolvers that put the DOI into a path send it
+whole.
+The [[request_targets]] fixture (\cref{sec:request-targets} in the
+cache module) stands in for the two hosts and keeps what arrives, after
+[[requests]] and [[urllib3]] have written the request; the DOI holds a
+[[#]], a [[?]], a [[%]], a space and [[<>]].
+The Handbook's own example pins the resolver's form, and a second
+slash in the suffix must be encoded where the first is not.
+
+<<test functions>>=
+class TestDoiInRequestPaths:
+    """The PDF resolvers percent-encode the DOI in the request path."""
+
+    def test_semantic_scholar_gets_the_whole_doi(
+        self, request_targets, awkward_doi
+    ):
+        request_targets.serve("api.semanticscholar.org")
+        assert resolve_doi_s2(awkward_doi) is None
+        assert request_targets.paths() == [
+            f"/graph/v1/paper/DOI:{awkward_doi}"
+        ]
+        assert set(request_targets.queries()[0]) == {"fields"}
+
+    def test_the_resolver_gets_the_whole_doi(
+        self, request_targets, awkward_doi
+    ):
+        request_targets.serve("doi.org")
+        assert resolve_doi_landing(awkward_doi) is None
+        assert request_targets.paths() == [f"/{awkward_doi}"]
+        assert request_targets.queries() == [{}]
+
+    def test_the_handbook_example(self):
+        assert doi_resolver_url("10.1000/456#789") \
+            == "https://doi.org/10.1000/456%23789"
+
+    def test_only_the_first_slash_stays(self):
+        assert doi_resolver_url("10.18653/v1/N18-3011") \
+            == "https://doi.org/10.18653/v1%2FN18-3011"
+        assert doi_resolver_url("10.1000/a(b);c:d") \
+            == "https://doi.org/10.1000/a(b);c:d"
 @
 
 \subsection{Combined DOI Resolution}
