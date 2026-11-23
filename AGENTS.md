@@ -2508,7 +2508,8 @@ screeners)} over records screened twice, `screen_sample` (the one
   (rate withheld); without categories every keep bears, whoever kept
   it. NOT the audit table's cited rule (`check_bucket`), which ignored
   unreviewed keeps (review of #318: 0 of 60 vs 5 of 60). Deciders =
-  `decision_source_items` over the screened drawn decisions, named in
+  `decision_source_items` over the screened drawn decisions, zero rows
+  dropped at the call (JSON too; the function is unchanged), named in
   every output ("by human: 5; agent, unreviewed: 55"), never a reason
   to withhold. `sessions show`: one `tier_sample_line` per draw
   (`tier_sample_counts_text`) after the tier line, JSON `tier_samples`
