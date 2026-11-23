@@ -78,6 +78,7 @@ implementation section they verify.
 
 <<test [[review.py]]>>=
 """Tests for the review module."""
+import contextlib
 import pytest
 from datetime import datetime
 from pathlib import Path
@@ -120,6 +121,7 @@ from scholar.notes import (
     get_paper_id, get_query_hash, get_data_dir,
     load_search_decisions,
     migrate_paper_id,
+    moving_records,
     ReviewDecisionRecord,
 )
 
@@ -5962,8 +5964,9 @@ samples of machine decisions, so a concurrent save adds the draws only
 the file has, by [[sample_id]] (\cref{sec:session-integrity}); the id
 ends in random digits for the reason given for [[LLMSample]] ids
 (\cref{sec:tier-sample} in the LLM review module).  The paper ids are
-repointed when copies are folded, as those of the review samples are
-([[repoint_folded_ids]], \cref{sec:session-copies}).
+repointed when copies are folded or a paper is renamed, as those of
+the review samples are ([[repoint_paper_ids]],
+\cref{sec:session-renames}).
 
 <<load the samples of a tier's rest>>=
 session.tier_samples = [
@@ -5983,18 +5986,22 @@ for sample in on_disk.tier_samples:
 @
 
 \paragraph{What a draw shows so far.}
-A drawn paper is looked up by its id.  Its id may have moved since: a
-fold repoints the stored id, but a paper whose preprint was adopted
-([[scholar enrich]], \cref{preprint-module}) is held under the
-preprint's DOI, with the DOI it was drawn under among its version
-links.  So an id no decision holds is looked up among the version links
-([[version_link_dois]]) and taken when exactly one paper names it.  A
-paper renamed for another reason (a DBLP homonym number or a Scopus
-name written surname first, dropped from a DOI-less id at an append,
-\cref{sec:review-renamed-authors}) keeps no trace of its old id and is
-counted as not found, as is a paper no longer in the session.  The
-report says how many and counts them neither as screened nor as
-unscreened.
+A drawn paper is looked up by its id.  Its id may have moved since:
+a fold or a rename (an adopted preprint, a DBLP homonym number or a
+name written surname first dropped from a DOI-less id) repoints the
+stored id, and [[drawn_decisions]] follows both maps itself as well
+([[current_paper_id]], \cref{sec:session-renames}), for a session
+whose ids were not repointed yet.  The rename record is the mechanism;
+the version links ([[version_link_dois]]) remain a fallback for one
+case it cannot know: a preprint adopted by a Scholar that kept no
+rename record (between #318 and #319, or an older build saving the
+file in between), whose adopted paper still names the DOI it was
+drawn under.  The fallback is asked only when no decision holds the
+id the maps give, and it is taken only when exactly one paper names
+the link.  Any other paper renamed without a record keeps no trace of
+its old id and is counted as not found, as is a paper no longer in the
+session.  The report says
+how many and counts them neither as screened nor as unscreened.
 
 A drawn paper is \emph{screened} when a decision under its id is kept
 or discarded, by anyone.  Copies of one paper under one id are one
@@ -6125,20 +6132,22 @@ def drawn_decisions(
 ) -> dict[str, list[ReviewDecision]]:
     """The decisions each drawn paper id names now ([] when none).
 
-    Follows the fold tombstones, then a version link that exactly one
+    Follows the fold tombstones and the renames (`current_paper_id`),
+    then, for an id no decision holds, a version link that exactly one
     paper of the session holds.
     """
     by_id: dict[str, list[ReviewDecision]] = {}
     for decision in session.decisions:
         by_id.setdefault(get_paper_id(decision.paper), []).append(decision)
+    held = set(by_id)
     linked: dict[str, set[str]] = {}
-    for paper_id, held in by_id.items():
-        for link in version_link_dois(held[0].paper):
+    for paper_id, decisions in by_id.items():
+        for link in version_link_dois(decisions[0].paper):
             linked.setdefault(link, set()).add(paper_id)
     found = {}
     for drawn in paper_ids:
-        paper_id = resolve_folded_id(session.folded, drawn)
-        if paper_id not in by_id and len(linked.get(paper_id, ())) == 1:
+        paper_id = current_paper_id(session, drawn, held)
+        if paper_id not in held and len(linked.get(paper_id, ())) == 1:
             paper_id = next(iter(linked[paper_id]))
         found[drawn] = by_id.get(paper_id, [])
     return found
@@ -6331,8 +6340,9 @@ another process meanwhile is kept.  Then the counts: a drawn paper is
 screened once decided, by a model too; it bears when a human keeps it
 under a theme or a classifier keeps it as supporting the claim, not
 when it is discarded with a bearing category or kept as adjacent; a
-paper whose preprint was adopted is found by its version link, and a
-paper gone is not found.
+paper whose preprint was adopted is found through the rename record,
+or without one through its version link, and a paper gone is not
+found.
 
 <<test functions>>=
 class TestTierSampleRecord:
@@ -6519,6 +6529,47 @@ def test_copies_decided_apart_are_undetermined(self):
                                 self._sample(["doi:10.5555/rest-1"]))
     assert (counts.screened, counts.bearing, counts.judged) == (1, 0, 0)
     assert counts.copies_apart == ["doi:10.5555/rest-1"]
+@
+
+An adopted paper is found through the rename record, or, adopted by a
+build that kept none, through its version link, but only when exactly
+one paper names the link.
+
+<<tier sample record test methods>>=
+def test_an_adoption_without_a_record_is_found_by_its_link(self):
+  """A preprint adopted by a build without rename records (#319)."""
+  def adopted(n, linked):
+    decision = self._decision(n, DecisionStatus.KEPT, ["supports-claim"])
+    decision.paper = Paper(
+      title=f"Rest {n}", authors=["Ada Lovelace"],
+      doi=f"10.48550/pre-{n}",
+      published_versions=[{"doi": f"10.5555/{linked}",
+                           "relation": "preprint-of"}],
+    )
+    return decision
+
+  session = ReviewSession(query="q", providers=["openalex"],
+                          timestamp=datetime(2026, 11, 23),
+                          decisions=[adopted(1, "pub"),
+                                     adopted(2, "twice"),
+                                     adopted(3, "twice")])
+  counts = tier_sample_counts(session, self._sample(
+    ["doi:10.5555/pub", "doi:10.5555/twice"]))
+  assert counts.screened == 1 and counts.bearing == 1
+  assert counts.not_found == ["doi:10.5555/twice"]
+
+def test_a_rename_record_finds_the_adopted_paper(self):
+  adopted = self._decision(6, DecisionStatus.KEPT, ["qualifies-claim"])
+  adopted.paper = Paper(title="Rest 6", authors=["Ada Lovelace"],
+                        doi="10.48550/rest-6")
+  session = ReviewSession(query="q", providers=["openalex"],
+                          timestamp=datetime(2026, 11, 23),
+                          decisions=[adopted],
+                          renamed={"doi:10.5555/rest-6":
+                                   "doi:10.48550/rest-6"})
+  counts = tier_sample_counts(session,
+                              self._sample(["doi:10.5555/rest-6"]))
+  assert counts.screened == 1 and counts.not_found == []
 @
 
 A fold moves a DOI-less copy into its DOI copy; the drawn id then names
@@ -7538,6 +7589,8 @@ class ReviewSession:
     tier_samples: list[TierSample] = field(default_factory=list)
     # Tombstones of folded copies: folded-away id -> id folded into
     folded: dict[str, str] = field(default_factory=dict)
+    # Renamed papers: old id -> the id the session now holds it under
+    renamed: dict[str, str] = field(default_factory=dict)
     # Internal cache for computed properties (not persisted)
     _cache: dict = field(default_factory=dict, repr=False, compare=False)
     # State as loaded or last saved, for merging on save (not persisted)
@@ -8422,6 +8475,7 @@ def create_review_session(
             session._baseline = previous_session._baseline
             session._loaded_from = previous_session._loaded_from
         session.folded = dict(previous_session.folded)
+        session.renamed = dict(previous_session.renamed)
 
     # Build search records (query, provider, filters, limit, outcome),
     # one per provider search, also inside a merged result
@@ -8462,7 +8516,8 @@ def create_review_session(
     <<restore papers not in current results>>
     
     # Convert search results to review decisions, merging with previous
-    <<convert search results to decisions>>
+    with moving_records():
+        <<convert search results to decisions>>
     <<point links at the records that replaced theirs>>
     supersede_merged_records(session)
     <<take the session as built as the baseline>>
@@ -10388,6 +10443,7 @@ for result in results:
             )
             decision_lookup.pop(old_id, None)
             decision_lookup[paper_id] = renamed
+            record_rename(session, old_id, paper_id)
             for link in links:
                 renamed.record_link(link)
             continue
@@ -10416,6 +10472,7 @@ for result in results:
             replaced.paper = merge_version_of(paper, replaced.paper)
             decision_lookup[paper_id] = replaced
             provenance_lookup[old_id] = replaced
+            record_rename(session, old_id, paper_id)
             for link in links:
                 replaced.record_link(link)
             continue
@@ -11496,7 +11553,7 @@ def reconcile_copies(session: ReviewSession) -> list[tuple[str, str]]:
             noted.add(doi_id)
         removed.add(id(absorbed))
     session.decisions = [d for d in session.decisions if id(d) not in removed]
-    repoint_folded_ids(session)
+    repoint_paper_ids(session)
     session._invalidate_cache()
     return folds
 @
@@ -11568,7 +11625,11 @@ note, whose new id has none, gets it moved.  So a reconcile can be run
 again to repair what its notes step left undone: a note write that
 failed after the session was saved, or a note that a process which had
 loaded the session before the reconcile saved under the old id
-afterwards.  When both ids have a note the old one stays, as
+afterwards.  The renamed ids (\cref{sec:session-renames}) are read
+the same way, so a reconcile also moves the note of a paper renamed
+while another process held the notes lock: [[migrate_paper_id]] then
+moved nothing and said to run it (\cref{sec:notes-migrate-paper-id}
+in the notes chapter).  When both ids have a note the old one stays, as
 [[migrate_paper_id]] would otherwise drop it, and it is still found:
 [[has_note]] looks a DOI paper's note up under its legacy hash id too.
 A note whose old id the session still holds stays where it is: that
@@ -11608,23 +11669,26 @@ def reconcile_session(
 
 
 def move_stranded_notes(session: ReviewSession) -> list[tuple[str, str]]:
-    """Move notes left under folded-away ids to their new id.
+    """Move notes left under folded-away or renamed ids to their new id.
 
     Only when the new id has no note and the session no longer holds a
-    decision under the old id. Returns the moves made.
+    decision under the old id. Returns the moves made; a move the notes
+    lock refused is not made (`migrate_paper_id` warns) and not listed.
     """
-    if not session.folded:
+    if not session.folded and not session.renamed:
         return []
     noted = {note.paper_id for note in list_papers_with_notes()}
     held = {get_paper_id(d.paper) for d in session.decisions}
     moves = []
-    for old_id in session.folded:
-        new_id = resolve_folded_id(session.folded, old_id)
-        if old_id in noted and new_id not in noted and old_id not in held:
-            migrate_paper_id(old_id, new_id)
-            noted.discard(old_id)
-            noted.add(new_id)
-            moves.append((old_id, new_id))
+    with moving_records():
+        for old_id in {**session.renamed, **session.folded}:
+            new_id = current_paper_id(session, old_id, held)
+            if (old_id in noted and new_id not in noted
+                    and old_id not in held
+                    and migrate_paper_id(old_id, new_id)):
+                noted.discard(old_id)
+                noted.add(new_id)
+                moves.append((old_id, new_id))
     return moves
 @
 
@@ -11685,7 +11749,7 @@ copy, and is noted in the target's [[same_id_copies]] instead, as a
 namesake of a held paper is.  Paper ids stored elsewhere in the session---the source
 papers of a snowballing round, the drawn papers of an LLM review
 sample or of a sample of a tier's rest---are repointed to the new id
-([[repoint_folded_ids]]), so that
+([[repoint_paper_ids]], \cref{sec:session-renames}), so that
 they still name a decision of the session.  A chain of folds (an id
 folded into one that was later folded again) is followed to its end,
 with a guard against a cycle that a hand-edited file could contain.
@@ -11698,28 +11762,6 @@ def resolve_folded_id(folded: dict[str, str], paper_id: str) -> str:
         paper_id = folded[paper_id]
         seen.add(paper_id)
     return paper_id
-
-
-def repoint_folded_ids(session: ReviewSession) -> None:
-    """Repoint stored paper ids of folded-away copies to their target."""
-    if not session.folded:
-        return
-    for snowball_round in session.snowball_rounds:
-        snowball_round.source_papers = [
-            resolve_folded_id(session.folded, paper_id)
-            for paper_id in snowball_round.source_papers
-        ]
-    for sample in session.llm_samples:
-        for paper in sample.papers:
-            if paper.get("paper_id"):
-                paper["paper_id"] = resolve_folded_id(
-                    session.folded, paper["paper_id"]
-                )
-    for draw in session.tier_samples:
-        draw.papers = [
-            resolve_folded_id(session.folded, paper_id)
-            for paper_id in draw.papers
-        ]
 
 
 def apply_tombstones(
@@ -11787,6 +11829,629 @@ for link in decision.found_by:
 for copy in decision.same_id_copies:
     target.add_same_id_copy(copy)
 target.provider = united_providers(target.provider, decision.provider)
+@
+
+\paragraph{Renames.}
+\label{sec:session-renames}
+A fold is not the only way a paper changes its id.  A paper is
+\emph{renamed} when the session goes on holding it, with its decision,
+under another id: at an append, when a DBLP homonym number or a name
+written surname first is dropped from a DOI-less id
+(\cref{sec:review-renamed-authors,sec:review-surname-first}) and when a
+paper whose preprint was adopted elsewhere arrives and its published
+entry takes the preprint's identity; and when [[scholar enrich]] or the
+TUI adopts a preprint (\cref{preprint-module}).  A DOI-less decision
+met by its DOI copy is no rename: the append keeps it and adds the DOI
+copy beside it, and only [[sessions reconcile]] folds the two
+(above), which repoints the stored ids as every fold does.  Paper
+ids stored elsewhere in the session then named nothing: the papers of
+an LLM review sample and of a sample of a tier's rest, drawn before the
+rename, counted as \enquote{not found}
+(\url{https://github.com/dbosk/scholarcli/issues/319}).  The tier
+sample looked such a paper up through its version links, which an
+adoption leaves and the other renames do not.
+
+Every rename is therefore recorded in the session, in one place:
+[[renamed]], a map from the old id to the new one, saved as
+[[renamed]] when it holds any, united with the file's on every save
+and carried over by an append, exactly as [[folded]] is.  Whoever reads
+a stored paper id asks [[current_paper_id]], which follows both maps.
+It is a map of its own, not more entries in [[folded]], because a
+tombstone means more than \enquote{this id is now that one}, and the
+extra meaning is wrong for a rename.  [[apply_tombstones]] would be
+safe: a rename leaves no copy under the old id, so a copy found there
+is one a stale process brought back.  But an append routes a returned
+paper of a folded-away id to the folded-into decision only if
+[[plausibly_same_work]] allows it, and notes it as a namesake
+otherwise.  A published version returning after its preprint was
+adopted can be years younger than the preprint, so as a tombstone the
+adoption would turn the returning published version into a namesake,
+where the append now folds it into the adopted entry by its version
+link (above).  Folding is the business of [[sessions reconcile]]; a
+rename only follows a paper that is already one decision.
+
+The note and decision records follow a rename through
+[[migrate_paper_id]] (\cref{sec:notes-migrate-paper-id} in the notes
+chapter); an append's conversion is one [[moving_records]] batch, so
+with the notes lock held by another process it waits once, not once
+per rename, and one warning names the notes left for
+[[sessions reconcile]], which finds them through this record.
+
+[[record_rename]] records one rename and repoints the stored ids at
+once; [[repoint_paper_ids]] does the repointing for both maps, for the
+snowball rounds' source papers and both kinds of sample, and runs again
+whenever the session is read from a file and after every merge with
+the file on save.  It looks at the decisions only when something is
+stored to repoint: an append builds its session without the samples,
+which come in from the file at the save, so the renames of a large
+append cost no pass over the decisions each.  So a sample drawn in another process, merged in at
+a save, or stored in a file written before this record existed, is
+repointed as soon as a rename record names its paper's old id.  A
+rename made before this record existed left no trace (except the
+version link of an adoption, which is no rename record); its drawn
+paper stays \enquote{not found} in [[llm sample --report]] and in the
+tier sample's counts, as before.
+
+A stored id that some decision of the session still holds is not
+repointed, though a map names it.  That decision is the one the sample
+drew: a copy a stale process kept apart beside its fold
+(\cref{sec:session-copies}), or a paper that a later search brought
+back under the old id after the rename.  Repointing it would make the
+sample report another decision than the one drawn.
+
+A chain of renames and folds (a paper renamed, then folded; an id
+folded into one renamed later) is followed to its end through both
+maps, with the same guard against a cycle as [[resolve_folded_id]].
+Where both maps name one id (possible only when a later search brought
+a paper back under it), the fold is followed, as before renames were
+recorded.
+
+A paper can be renamed back: [[a]] to [[b]], then [[b]] to [[a]].
+[[record_rename]] then drops the entry it undoes, so a session keeps
+[[b]] to [[a]] only.  The merge with the file on save unites the maps,
+though, and the file may still hold the older [[a]] to [[b]], which
+would make a cycle of two entries; each process that saved one of them
+had it right when it saved.  After the union, [[settle_rename_cycles]]
+keeps of such a pair the entry that leads to the id a decision holds
+and drops the other; if a decision holds both ids or neither, the pair
+stays, and [[current_paper_id]]'s guard ends the walk.  Longer cycles
+cannot arise from renames, which always lead to the id just given.
+
+<<review session functions>>=
+def current_paper_id(
+    session: ReviewSession, paper_id: str, held: set[str] | None = None
+) -> str:
+    """The id under which `session` now holds the paper stored as `paper_id`.
+
+    Follows the fold tombstones (`folded`) and the renames (`renamed`)
+    to the end of the chain. An id in `held` (the ids of the session's
+    decisions, computed when not given) is its own current id.
+    """
+    if held is None:
+        held = {get_paper_id(d.paper) for d in session.decisions}
+    seen = {paper_id}
+    while paper_id not in held:
+        following = session.folded.get(paper_id) or session.renamed.get(
+            paper_id
+        )
+        if following is None or following in seen:
+            break
+        paper_id = following
+        seen.add(paper_id)
+    return paper_id
+
+
+def settle_rename_cycles(session: ReviewSession) -> None:
+    """Drop the entry of a rename pair `a -> b`, `b -> a` that leads away
+    from the id a decision of `session` holds."""
+    held = {get_paper_id(d.paper) for d in session.decisions}
+    for old_id, new_id in list(session.renamed.items()):
+        if session.renamed.get(new_id) != old_id:
+            continue
+        if old_id in held and new_id not in held:
+            del session.renamed[old_id]
+
+
+def record_rename(session: ReviewSession, old_id: str, new_id: str) -> None:
+    """Record that `session` now holds the paper `old_id` as `new_id`.
+
+    Repoints the paper ids stored in the session (`repoint_paper_ids`).
+    """
+    if old_id == new_id:
+        return
+    if session.renamed.get(new_id) == old_id:
+        del session.renamed[new_id]
+    session.renamed[old_id] = new_id
+    repoint_paper_ids(session)
+
+
+def repoint_paper_ids(session: ReviewSession) -> None:
+    """Repoint stored paper ids of folded-away or renamed papers.
+
+    The source papers of the snowball rounds and the drawn papers of
+    both kinds of sample; an id a decision still holds stays.
+    """
+    if not session.folded and not session.renamed:
+        return
+    if not (session.snowball_rounds or session.llm_samples
+            or session.tier_samples):
+        return
+    held = {get_paper_id(d.paper) for d in session.decisions}
+    for snowball_round in session.snowball_rounds:
+        snowball_round.source_papers = [
+            current_paper_id(session, paper_id, held)
+            for paper_id in snowball_round.source_papers
+        ]
+    for sample in session.llm_samples:
+        for paper in sample.papers:
+            if paper.get("paper_id"):
+                paper["paper_id"] = current_paper_id(
+                    session, paper["paper_id"], held
+                )
+    for draw in session.tier_samples:
+        draw.papers = [
+            current_paper_id(session, paper_id, held)
+            for paper_id in draw.papers
+        ]
+@
+
+The tests start with the resolution itself: a rename, a rename then a
+fold, a cycle a hand-edited file could hold, an id a decision still
+holds, and a rename back.  Then a file: a session that never renamed
+anything is saved without the key, as before, and a file without it
+loads with no renames; a file whose sample still names an old id the
+file's renames know is repointed as it is read.
+
+<<test functions>>=
+class TestSessionRenames:
+  """Renames are recorded and followed by the stored ids (#319)."""
+
+  <<session rename test methods>>
+
+<<session rename test methods>>=
+@staticmethod
+def _session(*ids):
+  return ReviewSession(
+    query="q", providers=["dblp"], timestamp=datetime(2026, 11, 23),
+    decisions=[ReviewDecision(paper=Paper(title=f"T {n}", authors=["A"],
+                                          doi=f"10.5555/{n}"),
+                              provider="dblp") for n in ids],
+  )
+
+def test_the_chain_is_followed(self):
+  session = self._session("c")
+  session.renamed = {"hash:a": "hash:b", "hash:x": "hash:y",
+                     "hash:y": "hash:x"}
+  session.folded = {"hash:b": "doi:10.5555/c"}
+  assert current_paper_id(session, "hash:a") == "doi:10.5555/c"
+  assert current_paper_id(session, "hash:x") in {"hash:x", "hash:y"}
+  assert current_paper_id(session, "hash:other") == "hash:other"
+
+def test_a_held_id_is_its_own(self):
+  session = self._session("old", "new")
+  session.renamed = {"doi:10.5555/old": "doi:10.5555/new"}
+  assert current_paper_id(session, "doi:10.5555/old") == "doi:10.5555/old"
+
+def test_a_rename_back_leaves_no_cycle(self):
+  session = self._session()
+  record_rename(session, "hash:a", "hash:b")
+  record_rename(session, "hash:b", "hash:a")
+  assert session.renamed == {"hash:b": "hash:a"}
+
+def test_a_rename_back_leaves_no_cycle_on_disk(self):
+  import json
+  from scholar.review import _get_sessions_dir
+  from scholar.scholar import isolated_registry
+
+  first = Paper(title="Back", authors=["Wei Wang 0001"], year=2021)
+  second = Paper(title="Back", authors=["Wei Wang"], year=2021)
+  session = ReviewSession(
+    query="q", providers=["dblp"], timestamp=datetime(2026, 11, 23),
+    name="rename-back",
+    decisions=[ReviewDecision(paper=first, provider="dblp")])
+  save_session(session)
+  with isolated_registry():
+    session = load_session("rename-back")
+    session.decisions[0].paper = second
+    record_rename(session, first.id, second.id)
+    save_session(session)
+  with isolated_registry():
+    session = load_session("rename-back")
+    assert session.renamed == {first.id: second.id}
+    session.decisions[0].paper = first
+    record_rename(session, second.id, first.id)
+    save_session(session)
+  path = _get_sessions_dir() / "rename-back.json"
+  assert json.loads(path.read_text())["renamed"] == {second.id: first.id}
+  with isolated_registry():
+    session = load_session("rename-back")
+    assert current_paper_id(session, second.id) == first.id
+    assert current_paper_id(session, first.id) == first.id
+
+def test_record_rename_repoints_both_samples(self):
+  session = self._session("new")
+  session.llm_samples.append(LLMSample(
+    sample_id="s", seed=1, drawn_at="2026-11-23T10:00:00+00:00",
+    criteria={}, sessions=["q"], population=1, population_digest="d",
+    size=1, papers=[{"paper_id": "hash:old", "status": "discarded",
+                     "source": "llm", "confidence": 0.9}],
+  ))
+  session.tier_samples.append(TierSample(
+    sample_id="r", drawn_at="2026-11-23T10:00:00+00:00", seed=1, size=1,
+    rule={}, rest=1, rest_digest="d", papers=["hash:old"],
+  ))
+  record_rename(session, "hash:old", "doi:10.5555/new")
+  assert session.llm_samples[0].papers[0]["paper_id"] == "doi:10.5555/new"
+  assert session.tier_samples[0].papers == ["doi:10.5555/new"]
+
+def test_files_without_renames(self):
+  import json
+  from scholar.review import _get_sessions_dir
+
+  session = self._session("new")
+  session.name = "no-renames"
+  save_session(session)
+  path = _get_sessions_dir() / "no-renames.json"
+  assert "renamed" not in json.loads(path.read_text())
+  assert load_session("no-renames").renamed == {}
+
+def test_a_stored_sample_is_repointed_when_read(self):
+  import json
+  from scholar.review import _get_sessions_dir
+  from scholar.scholar import isolated_registry
+
+  session = self._session("new")
+  session.name = "read-renames"
+  save_session(session)
+  path = _get_sessions_dir() / "read-renames.json"
+  data = json.loads(path.read_text())
+  data["renamed"] = {"hash:old": "doi:10.5555/new"}
+  data["tier_samples"] = [TierSample(
+    sample_id="r", drawn_at="2026-11-23T10:00:00+00:00", seed=1, size=1,
+    rule={}, rest=1, rest_digest="d", papers=["hash:old"],
+  ).to_dict()]
+  path.write_text(json.dumps(data))
+  with isolated_registry():
+    loaded = load_session("read-renames")
+  assert loaded.renamed == {"hash:old": "doi:10.5555/new"}
+  assert loaded.tier_samples[0].papers == ["doi:10.5555/new"]
+@
+
+The record is united on every save, like the tombstones.  Two real
+processes race: one appends a search that drops a homonym number, one
+draws a sample of the tier's rest under the old id, and each saves
+while the other has loaded the session before it.  In both orders the
+file keeps the rename, and the sample finds the paper.  Where the
+renaming process saves last, its merge brings the sample in and
+repoints it.  Where the sampling process saves last, it still holds the
+paper's decision under the old id, which a stale process writes back
+(as a stale process writes back a copy folded away while it held it,
+\cref{sec:session-copies}); the sample then names that decision, which
+a decision holds, so it is not repointed and is found all the same.
+The two decisions the file then holds for one paper are a known gap,
+not repaired here
+(\url{https://github.com/dbosk/scholarcli/issues/327}): renames have
+no tombstone drop of the untouched stale copy.
+
+<<session rename test methods>>=
+RACE = "rename-race"
+OLD = Paper(title="Homonyms in Records", authors=["Wei Wang 0001"],
+            year=2021)
+NEW = Paper(title="Homonyms in Records", authors=["Wei Wang"], year=2021)
+RENAME = """
+  from scholar import Paper, SearchResult
+  from scholar.review import create_review_session, save_session
+  paper = Paper(title="Homonyms in Records", authors=["Wei Wang"],
+                year=2021)
+  session = create_review_session([SearchResult(
+    query="q", provider="dblp", timestamp="t", papers=[paper])],
+    "q", "rename-race")
+  WAIT
+  save_session(session)
+"""
+DRAW = """
+  from scholar.review import TierSample, load_session, save_session
+  session = load_session("rename-race")
+  WAIT
+  session.tier_samples.append(TierSample(
+    sample_id="r", drawn_at="2026-11-23T10:00:00+00:00", seed=1, size=1,
+    rule={}, rest=1, rest_digest="d",
+    papers=[session.decisions[0].paper.id]))
+  save_session(session)
+"""
+WAIT = 'import sys; print("loaded", flush=True); sys.stdin.readline()'
+
+def _race(self, stale, other):
+  """`stale` loads and waits; `other` runs whole; then `stale` saves."""
+  import json
+  import subprocess
+  import sys
+  import textwrap
+  from scholar.review import _get_sessions_dir
+  from scholar.scholar import isolated_registry
+
+  with isolated_registry():
+    save_session(ReviewSession(
+      query="q", providers=["dblp"], timestamp=datetime(2026, 11, 23),
+      name=self.RACE, decisions=[ReviewDecision(
+        paper=self.OLD, provider="dblp", status=DecisionStatus.DISCARDED,
+        tags=["off-topic-false-hit"], source=ReviewSource.LLM_UNREVIEWED,
+      )],
+    ))
+  code = {
+    wait: textwrap.dedent(template).replace("WAIT",
+                                            self.WAIT if wait else "")
+    for template, wait in ((stale, True), (other, False))
+  }
+  first = subprocess.Popen(
+    [sys.executable, "-c", code[True]],
+    stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+  )
+  try:
+    assert first.stdout.readline().strip() == "loaded"
+    subprocess.run([sys.executable, "-c", code[False]], check=True,
+                   timeout=120)
+    first.communicate("go\n", timeout=120)
+  finally:
+    if first.poll() is None:
+      first.kill()
+  assert first.returncode == 0
+  data = json.loads((_get_sessions_dir() / f"{self.RACE}.json").read_text())
+  assert data["renamed"] == {self.OLD.id: self.NEW.id}
+  with isolated_registry():
+    session = load_session(self.RACE)
+  held = {d.paper.id for d in session.decisions}
+  [draw] = session.tier_samples
+  assert draw.papers[0] in held
+  return draw.papers[0], held
+
+def test_the_renaming_process_saves_last(self):
+  drawn, held = self._race(self.RENAME, self.DRAW)
+  assert drawn == self.NEW.id and held == {self.NEW.id}
+
+def test_the_sampling_process_saves_last(self):
+  drawn, held = self._race(self.DRAW, self.RENAME)
+  assert drawn == self.OLD.id and held == {self.OLD.id, self.NEW.id}
+@
+
+Two processes can also rename one paper two ways: one adopts a
+preprint for it (as [[scholar enrich]] does, through
+[[record_rename]]), while the other's append drops the homonym number
+from its id.  Each loaded the session before the other saved.  The
+saved file then holds the rename of the process that saved last (the
+union lets our entry win, as for every map entry), and both decisions:
+the renamed one of each process, since each process's merge pairs only
+copies under one id and the two new ids differ.  So one paper is held
+twice, under the adopted DOI and under the plain hash, which is the
+gap of a stale process writing back a renamed paper
+(\url{https://github.com/dbosk/scholarcli/issues/327}).  Neither
+decision is lost, and the sample drawn before both names an id a
+decision holds, in both orders the adopted one: the adopting process
+repoints the sample it holds, and the appending process never holds
+the sample (an append builds its session without samples, which come
+in from the file at its save) and so takes the file's sample as it
+is, whose id a decision holds and is therefore not repointed.  The
+sample thus does not always follow the map's entry; it follows the
+first process that repointed it and saved.  The map keeps one entry per old
+id, so when the appending process saves last, the adoption's entry,
+from the old id to the adopted DOI, is not in the file at all: the
+adopted decision is then held under an id no rename leads to.  The
+sample is unaffected (it names that id, which a decision holds), and
+the lost entry is part of the same gap
+(\url{https://github.com/dbosk/scholarcli/issues/327}).
+
+<<session rename test methods>>=
+ADOPT = """
+  from scholar import Paper
+  from scholar.review import load_session, record_rename, save_session
+  session = load_session("rename-race")
+  WAIT
+  decision = session.decisions[0]
+  old_id = decision.paper.id
+  decision.paper = Paper(
+    title="Homonyms in Records", authors=["Wei Wang"], year=2021,
+    doi="10.48550/race-pre",
+    published_versions=[{"doi": "10.5555/race-pub",
+                         "relation": "preprint-of"}])
+  record_rename(session, old_id, decision.paper.id)
+  save_session(session)
+"""
+ADOPTED = "doi:10.48550/race-pre"
+
+def _rename_race(self, stale, other):
+  """Both processes rename the drawn paper; return the saved file's
+  renames, the held ids and the id the sample names."""
+  import json
+  import subprocess
+  import sys
+  import textwrap
+  from scholar.review import _get_sessions_dir
+  from scholar.scholar import isolated_registry
+
+  with isolated_registry():
+    save_session(ReviewSession(
+      query="q", providers=["dblp"], timestamp=datetime(2026, 11, 23),
+      name=self.RACE, decisions=[ReviewDecision(
+        paper=self.OLD, provider="dblp", status=DecisionStatus.DISCARDED,
+        tags=["off-topic-false-hit"], source=ReviewSource.LLM_UNREVIEWED,
+      )],
+      tier_samples=[TierSample(
+        sample_id="r", drawn_at="2026-11-23T10:00:00+00:00", seed=1,
+        size=1, rule={}, rest=1, rest_digest="d", papers=[self.OLD.id])],
+    ))
+  code = {
+    wait: textwrap.dedent(template).replace("WAIT",
+                                            self.WAIT if wait else "")
+    for template, wait in ((stale, True), (other, False))
+  }
+  first = subprocess.Popen(
+    [sys.executable, "-c", code[True]],
+    stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+  )
+  try:
+    assert first.stdout.readline().strip() == "loaded"
+    subprocess.run([sys.executable, "-c", code[False]], check=True,
+                   timeout=120)
+    first.communicate("go\n", timeout=120)
+  finally:
+    if first.poll() is None:
+      first.kill()
+  assert first.returncode == 0
+  data = json.loads((_get_sessions_dir() / f"{self.RACE}.json").read_text())
+  with isolated_registry():
+    session = load_session(self.RACE)
+  decided = sorted((d.paper.id, d.status.value) for d in session.decisions)
+  [draw] = session.tier_samples
+  return data["renamed"], decided, draw.papers[0]
+
+def test_the_adopting_process_saves_last(self):
+  renamed, decided, drawn = self._rename_race(self.ADOPT, self.RENAME)
+  assert renamed == {self.OLD.id: self.ADOPTED}
+  assert decided == sorted([(self.ADOPTED, "discarded"),
+                            (self.NEW.id, "discarded")])
+  assert drawn == self.ADOPTED
+
+def test_the_appending_process_saves_last(self):
+  renamed, decided, drawn = self._rename_race(self.RENAME, self.ADOPT)
+  assert renamed == {self.OLD.id: self.NEW.id}
+  assert decided == sorted([(self.ADOPTED, "discarded"),
+                            (self.NEW.id, "discarded")])
+  assert drawn == self.ADOPTED
+@
+
+A note that the lock kept from following its paper is moved by
+[[sessions reconcile]]: the append renames the paper while another
+process holds the notes lock, so the note stays under the old id and
+the warning says to reconcile; once the lock is free, the reconcile
+moves it, because the session recorded the rename.  The lock is held by
+a real other process, as in the notes chapter's tests.
+
+<<session rename test methods>>=
+@staticmethod
+@contextlib.contextmanager
+def _notes_lock_held_elsewhere():
+  """Hold the notes file's lock in another process during the block."""
+  import subprocess
+  import sys
+  from scholar.notes import NOTES_FILE, get_data_dir
+  from scholar.utils import lock_path
+
+  holder = subprocess.Popen(
+    [sys.executable, "-c",
+     "import sys\n"
+     "from filelock import FileLock\n"
+     "lock = FileLock(sys.argv[1])\n"
+     "lock.acquire()\n"
+     "print('held', flush=True)\n"
+     "sys.stdin.read()\n",
+     str(lock_path(get_data_dir() / NOTES_FILE))],
+    stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+  )
+  try:
+    assert holder.stdout.readline().strip() == "held"
+    yield
+  finally:
+    holder.stdin.close()
+    holder.wait(10)
+
+def test_reconcile_moves_a_note_the_lock_kept_back(self, monkeypatch,
+                                                    caplog):
+  import scholar.notes as notes
+  from scholar import SearchResult
+  from scholar.notes import get_note, save_note
+  from scholar.scholar import isolated_registry
+
+  monkeypatch.setattr(notes, "NOTES_LOCK_TIMEOUT", 0.3)
+  save_session(ReviewSession(
+    query="q", providers=["dblp"], timestamp=datetime(2026, 11, 23),
+    name="note-race", decisions=[ReviewDecision(
+      paper=self.OLD, provider="dblp")],
+  ))
+  save_note(self.OLD, "Read the numbered copy.")
+  with self._notes_lock_held_elsewhere():
+    with isolated_registry():
+      save_session(create_review_session([SearchResult(
+        query="q", provider="dblp", timestamp="t", papers=[self.NEW])],
+        "q", "note-race"))
+  assert "scholar sessions reconcile" in caplog.text
+  notes.invalidate_notes_cache()
+  assert get_note(self.OLD).note == "Read the numbered copy."
+  assert get_note(self.NEW) is None
+  reconcile_session("note-race")
+  notes.invalidate_notes_cache()
+  assert get_note(self.NEW).note == "Read the numbered copy."
+  assert get_note(self.OLD) is None
+@
+
+An append that renames several papers while the lock is held waits
+once at most: a rename with nothing to move takes no lock, and after
+the first refusal the other moves are left at once and named in one
+warning.  Three DBLP homonym renames are appended with the lock held
+by another process and the wait cut to a second: with no note, no
+wait; with one note among them, one wait; with a note on each, still
+one wait and one warning naming the three pairs.
+
+<<session rename test methods>>=
+@staticmethod
+def _numbered(n):
+  return (Paper(title=f"Numbered {n}", authors=["Wei Wang 0001"],
+                year=2021),
+          Paper(title=f"Numbered {n}", authors=["Wei Wang"], year=2021))
+
+def _append_three_renames(self, name, noted, monkeypatch, caplog):
+  """Append the three renames with the lock held; return the time taken
+  and the warnings about moves left."""
+  import time
+  import scholar.notes as notes
+  from scholar import SearchResult
+  from scholar.notes import save_note
+  from scholar.scholar import isolated_registry
+
+  monkeypatch.setattr(notes, "NOTES_LOCK_TIMEOUT", 1.0)
+  pairs = [self._numbered(n) for n in range(3)]
+  save_session(ReviewSession(
+    query="q", providers=["dblp"], timestamp=datetime(2026, 11, 23),
+    name=name, decisions=[ReviewDecision(paper=old, provider="dblp")
+                          for old, _ in pairs],
+  ))
+  for old, _ in pairs[:noted]:
+    save_note(old, f"About {old.title}.")
+  caplog.clear()
+  with self._notes_lock_held_elsewhere():
+    with isolated_registry():
+      started = time.monotonic()
+      session = create_review_session([SearchResult(
+        query="q", provider="dblp", timestamp="t",
+        papers=[new for _, new in pairs])], "q", name)
+      took = time.monotonic() - started
+  assert session.renamed == {old.id: new.id for old, new in pairs}
+  warnings = [r.getMessage() for r in caplog.records
+              if "were not moved" in r.getMessage()]
+  return took, warnings, pairs
+
+def test_renames_with_nothing_to_move_do_not_wait(self, monkeypatch,
+                                                  caplog):
+  took, warnings, _ = self._append_three_renames(
+    "three-none", 0, monkeypatch, caplog)
+  assert took < 0.8 and warnings == []
+
+def test_one_note_costs_one_wait(self, monkeypatch, caplog):
+  took, warnings, pairs = self._append_three_renames(
+    "three-one", 1, monkeypatch, caplog)
+  assert 1.0 <= took < 1.8
+  [warning] = warnings
+  assert pairs[0][0].id in warning and pairs[1][0].id not in warning
+
+def test_three_notes_cost_one_wait_and_one_warning(self, monkeypatch,
+                                                   caplog):
+  took, warnings, pairs = self._append_three_renames(
+    "three-all", 3, monkeypatch, caplog)
+  assert 1.0 <= took < 1.8
+  [warning] = warnings
+  assert "3 renamed paper(s)" in warning
+  for old, new in pairs:
+    assert f"{old.id} -> {new.id}" in warning
+  assert "scholar sessions reconcile" in warning
 @
 
 \paragraph{What is left for the user.}
@@ -13623,6 +14288,7 @@ def read_session_file(
         <<load the LLM review samples>>
         <<load the samples of a tier's rest>>
         session.folded = dict(data.get("folded") or {})
+        session.renamed = dict(data.get("renamed") or {})
 
         stored: dict[str, Paper] = {}
         for dec_data in data["decisions"]:
@@ -13677,6 +14343,7 @@ def read_session_file(
                 )
             )
         
+        repoint_paper_ids(session)
         logger.info("Loaded session with %d papers", len(session.decisions))
     except (json.JSONDecodeError, KeyError, OSError, ValueError,
             TypeError) as e:
@@ -13810,6 +14477,7 @@ data = {
     <<serialise the LLM review samples>>
     <<serialise the samples of a tier's rest>>
     **({"folded": session.folded} if session.folded else {}),
+    **({"renamed": session.renamed} if session.renamed else {}),
     "decisions": [
         {
             "paper_id": get_paper_id(d.paper),
@@ -14890,6 +15558,8 @@ def merge_concurrent_changes(
             theirs.paper = paper_filled_from(held, theirs.paper)
         session.decisions.append(theirs)
     session.folded = {**on_disk.folded, **session.folded}
+    session.renamed = {**on_disk.renamed, **session.renamed}
+    settle_rename_cycles(session)
     apply_tombstones(session, base, paired)
 
     <<merge research context from disk>>
@@ -14917,7 +15587,7 @@ def merge_concurrent_changes(
     <<merge the LLM review samples from disk>>
     <<merge the samples of a tier's rest from disk>>
     supersede_merged_records(session)
-    repoint_folded_ids(session)
+    repoint_paper_ids(session)
 
     session._invalidate_cache()
 @
