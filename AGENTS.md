@@ -3285,6 +3285,12 @@ do not have, so they were None). `run_cost_line(batch, withheld_as)` → "Reques
 by the model" when none); `cli.print_run_cost` prints it last in `llm
 classify` and `rq`, and in the second screen with "no screening
 stored". Nothing is stored in the session; no price is computed.
+Dry runs (`llm classify --dry-run`, also with `--second-screen`) print
+the prompt through `cli.print_dry_run_prompt`: a Rich `Text`,
+`soft_wrap=True`, no highlighter, so the output is the prompt's exact
+characters (before, Rich markup ate `[abstract truncated]` and any
+tag-like brackets in titles, and lines were wrapped). `llm synthesize
+--dry-run` still prints through markup (not changed here).
 
 **Unknown model (#284).** Every model lookup (`classify_papers_with_llm`,
 `second_screen_with_llm`, `generate_literature_synthesis`,
