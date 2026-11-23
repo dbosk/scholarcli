@@ -3504,19 +3504,20 @@ and the outcomes of their lookups in [[lookup_outcomes]]
 from collections import Counter
 
 from rich.progress import Progress
-from scholar.notes import get_paper_id, migrate_paper_id
+from scholar.notes import get_paper_id, migrate_paper_id, moving_records
 from scholar.review import SessionNotSaved, keep_copy_before_run
 
 originals: list = []
 processed: list = []
 lookup_outcomes: list = []
 crossref_failures: Counter = Counter()
-adopted_any = False
+records_moved = False
 pre_run_copy = (
     keep_copy_before_run(session_data, "pre-enrich") if selected else None
 )
 try:
-    with sigterm_as_keyboard_interrupt(), Progress() as progress:
+    with sigterm_as_keyboard_interrupt(), Progress() as progress, \
+            moving_records():
         task = progress.add_task("[cyan]Enriching...", total=len(selected))
         for start in range(0, len(selected), ENRICH_SAVE_EVERY):
             chunk = selected[start:start + ENRICH_SAVE_EVERY]
@@ -3566,7 +3567,10 @@ overwrite the original.
 The copy covers the session file only: an adoption also moves the notes
 and decision records to the new id ([[migrate_paper_id]]), so the report
 adds a line saying that restoring does not undo that, when the run
-adopted a preprint.
+adopted a preprint and the move was made ([[records_moved]]).  A move
+the notes lock refused moved nothing, so the line would be false; the
+warning that names the notes left for [[sessions reconcile]] then
+stands alone.
 The final report and the interrupt message both name it, with the path
 written out so that it can be pasted into a [[cp]] command.
 
@@ -3577,7 +3581,7 @@ if pre_run_copy is not None:
         f"{escape(str(pre_run_copy))}[/dim]",
         soft_wrap=True,
     )
-    if adopted_any:
+    if records_moved:
         console.print(
             "[dim]Restoring it does not undo the notes and decision "
             "records moved to the adopted ids.[/dim]"
@@ -3592,7 +3596,7 @@ the old id are moved by the time the session names the new one.
 <<enrich, check and save one chunk>>=
 from scholar.enrich import enrich_papers
 from scholar.crossref import annotate_papers, noting_failures
-from scholar.review import save_session
+from scholar.review import record_rename, save_session
 
 before = [decision.paper for decision in chunk]
 judged = [not hand_given_abstract(d) for d in chunk]
@@ -3738,16 +3742,25 @@ keyed by that identity, so records saved under the published DOI would
 be orphaned.  Adoption is detectable by comparing ids across the
 enrichment: [[enrich_paper]] is the only enrichment step that can
 change [[Paper.id]].  For each adoption we migrate the persistent
-stores ([[migrate_paper_id]], \cref{notes-module}) and tell the user
-what was swapped, naming both DOIs so the substitution is transparent
-in the terminal transcript, not only in the session file.
+stores ([[migrate_paper_id]], \cref{notes-module}), record the rename
+in the session, so that the samples drawn before it still find the
+paper and a note the notes lock kept from moving is moved later
+([[record_rename]], \cref{sec:session-renames} in the review chapter),
+and tell the user what was swapped, naming both DOIs so the
+substitution is transparent in the terminal transcript, not only in
+the session file.  The whole run is one [[moving_records]] batch
+(\cref{sec:notes-migrate-paper-id} in the notes chapter): if another
+process holds the notes lock, the run waits for it once, not once per
+adoption, and one warning at the end names every note left to
+[[sessions reconcile]].
 
 <<record preprint adoptions during enrich>>=
 for orig, new in zip(before, after):
     if get_paper_id(orig) == get_paper_id(new):
         continue
-    migrate_paper_id(get_paper_id(orig), get_paper_id(new))
-    adopted_any = True
+    if migrate_paper_id(get_paper_id(orig), get_paper_id(new)):
+        records_moved = True
+    record_rename(session_data, get_paper_id(orig), get_paper_id(new))
     console.print(
         f"[cyan]Adopted preprint {new.doi} for "
         f"\N{LEFT DOUBLE QUOTATION MARK}{escape(new.title_preview())}"
@@ -4765,6 +4778,92 @@ class TestEnrichCommand:
         mock_migrate.assert_called_once_with(
             "doi:10.1/bare", "doi:10.48550/arxiv.2401.1"
         )
+@
+
+The line about restoring follows the move: printed when the adoption
+moved the records, not when another process held the notes lock and
+nothing moved, where only the warning naming the notes left for
+[[sessions reconcile]] is given.  The lock is held by a real other
+process, the wait cut short.
+
+<<test functions>>=
+class TestEnrichRestoreLine:
+    """The restore line is printed only after a move (#319)."""
+
+    LINE = "Restoring it does not undo"
+
+    def _save(self, tmp_path, monkeypatch):
+        from scholar import Paper
+        from scholar.notes import save_note
+        from scholar.review import (
+            DecisionStatus, ReviewDecision, ReviewSession, save_session,
+        )
+
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        published = Paper(title="A Published Version",
+                          authors=["Ada Lovelace"], doi="10.5555/restore")
+        save_session(ReviewSession(
+            query="q", providers=["openalex"],
+            timestamp=datetime(2026, 11, 23), name="restore-line",
+            decisions=[ReviewDecision(paper=published, provider="openalex",
+                                      status=DecisionStatus.PENDING)],
+        ))
+        save_note(published, "Read the published version.")
+
+    def _enrich(self):
+        from dataclasses import replace
+
+        def adopt(papers, **kwargs):
+            return [replace(p, doi="10.48550/restore",
+                            published_versions=[{
+                                "doi": p.doi, "relation": "preprint-of"}])
+                    for p in papers]
+
+        with patch("scholar.enrich.enrich_papers", side_effect=adopt), \
+                patch("scholar.crossref.annotate_papers",
+                      side_effect=lambda papers, progress_callback=None:
+                      list(papers)):
+            return runner.invoke(app, ["enrich", "restore-line"])
+
+    def test_printed_after_a_move(self, tmp_path, monkeypatch):
+        self._save(tmp_path, monkeypatch)
+        result = self._enrich()
+        assert result.exit_code == 0, result.output
+        assert self.LINE in result.output
+
+    def test_not_printed_when_the_lock_kept_the_note(
+        self, tmp_path, monkeypatch
+    ):
+        import subprocess
+        import sys
+        import scholar.notes as notes
+        from scholar.utils import lock_path
+
+        monkeypatch.setattr(notes, "NOTES_LOCK_TIMEOUT", 0.3)
+        self._save(tmp_path, monkeypatch)
+        holder = subprocess.Popen(
+            [sys.executable, "-c",
+             "import sys\n"
+             "from filelock import FileLock\n"
+             "lock = FileLock(sys.argv[1])\n"
+             "lock.acquire()\n"
+             "print('held', flush=True)\n"
+             "sys.stdin.read()\n",
+             str(lock_path(notes.get_data_dir() / notes.NOTES_FILE))],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+        )
+        try:
+            assert holder.stdout.readline().strip() == "held"
+            result = self._enrich()
+        finally:
+            holder.stdin.close()
+            holder.wait(10)
+        assert result.exit_code == 0, result.output
+        assert self.LINE not in result.output
+        assert "Adopted preprint 10.48550/restore" in result.output
+        warning = " ".join(result.output.split())
+        assert "doi:10.5555/restore -> doi:10.48550/restore" in warning
+        assert "scholar sessions reconcile" in warning
 @
 
 Enrichment of a large session takes hours, and it saves the session it
@@ -8013,8 +8112,11 @@ def notes_import(
 @
 
 [[notes clear]] deletes the file that the notes module reads, so it
-takes the name from the same constant, [[NOTES_FILE]], rather than
-spelling it out a second time where a rename would silently miss it.
+leaves the deleting to that module, [[delete_all_notes]], which takes
+the name from the same constant, [[NOTES_FILE]], rather than spelling
+it out a second time where a rename would silently miss it, and
+deletes under the notes file's lock (\cref{sec:notes-lock} in the
+notes chapter).
 
 <<notes command>>=
 @notes_app.command("clear")
@@ -8032,9 +8134,7 @@ def notes_clear(
 
     Requires --force flag to confirm deletion.
     """
-    from scholar.notes import (
-        NOTES_FILE, get_data_dir, list_papers_with_notes,
-    )
+    from scholar.notes import delete_all_notes, list_papers_with_notes
 
     console = Console()
     notes = list_papers_with_notes()
@@ -8048,12 +8148,8 @@ def notes_clear(
         console.print("[yellow]Use --force to confirm.[/yellow]")
         raise typer.Exit(1)
 
-    # Delete the notes file
-    notes_file = get_data_dir() / NOTES_FILE
-    if notes_file.exists():
-        notes_file.unlink()
-
-    console.print(f"[green]Deleted {len(notes)} note(s).[/green]")
+    deleted = delete_all_notes()
+    console.print(f"[green]Deleted {deleted} note(s).[/green]")
 @
 
 The test renames the file through the constant, so a clear that spelt
@@ -13833,6 +13929,125 @@ def test_without_draws_and_unknown(self, tmp_path, monkeypatch):
   assert json.loads(self._show("-f", "json").output) == []
   missing = runner.invoke(app, ["sessions", "tier-sample", "no-such"])
   assert missing.exit_code == 1
+@
+
+A sample keeps finding a paper renamed after the draw
+(\cref{sec:session-renames} in the review chapter).  The test draws
+both kinds of sample through the commands that report them, before
+each kind of rename: an append that drops a DBLP homonym number,
+reorders a name written surname first, and brings the adopted preprint
+of a published entry; and [[scholar enrich]] adopting a preprint, with
+the enrichment stood in for as the adoption test above does (the
+lookups would need the network).  After the rename, [[llm sample
+--report]] and [[sessions tier-sample --report]] find every drawn
+paper.  The papers are unreviewed classifier discards, so that [[llm
+sample]] can draw them; the tier sample is stored directly, since only
+its ids matter here.
+
+<<sessions tier sample test methods>>=
+def _renamed_session(self, tmp_path, monkeypatch, papers):
+  from scholar.review import (
+    DecisionStatus, ReviewDecision, ReviewSession, ReviewSource,
+    TierSample, load_session, save_session,
+  )
+
+  monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+  save_session(ReviewSession(
+    query="q", providers=["dblp"], timestamp=datetime(2026, 11, 23),
+    name="renames",
+    decisions=[ReviewDecision(
+      paper=paper, provider="dblp", status=DecisionStatus.DISCARDED,
+      tags=["off-topic-false-hit"], source=ReviewSource.LLM_UNREVIEWED,
+      llm_confidence=0.95,
+    ) for paper in papers],
+  ))
+  drawn = runner.invoke(app, ["llm", "sample", "renames", "--discarded",
+                              "-n", str(len(papers)), "--seed", "319"])
+  assert drawn.exit_code == 0, drawn.output
+  session = load_session("renames")
+  session.tier_samples.append(TierSample(
+    sample_id="rest-319", drawn_at="2026-11-23T10:00:00+00:00", seed=319,
+    size=len(papers), rule={"top": 1}, rest=len(papers),
+    rest_digest="0123abcd", papers=[paper.id for paper in papers],
+  ))
+  save_session(session)
+
+def _assert_all_found(self, count):
+  reported = runner.invoke(app, ["llm", "sample", "renames", "--report",
+                                 "-f", "json"])
+  assert reported.exit_code == 0, reported.output
+  [report] = json.loads(reported.output)
+  assert report["not_found"] == 0
+  assert len(report["unreviewed"]) == count
+  tier = runner.invoke(app, ["sessions", "tier-sample", "renames",
+                             "--report", "-f", "json"])
+  assert tier.exit_code == 0, tier.output
+  [draw] = json.loads(tier.output)
+  assert draw["not_found"] == [] and draw["screened"] == count
+
+def test_an_append_renames_after_the_draw(self, tmp_path, monkeypatch):
+  from scholar import Paper, SearchResult
+  from scholar.review import create_review_session, load_session, save_session
+  from scholar.scholar import isolated_registry
+
+  numbered = Paper(title="Homonyms in Records", authors=["Wei Wang 0001"],
+                   year=2021)
+  backwards = Paper(title="Names Written Backwards", authors=["Fares E."],
+                    year=2021)
+  published = Paper(title="A Published Version", authors=["Ada Lovelace"],
+                    year=2022, doi="10.5555/rename-pub")
+  self._renamed_session(tmp_path, monkeypatch,
+                        [numbered, backwards, published])
+  returned = [
+    Paper(title="Homonyms in Records", authors=["Wei Wang"], year=2021),
+    Paper(title="Names Written Backwards", authors=["E. Fares"],
+          year=2021),
+    Paper(title="A Published Version", authors=["Ada Lovelace"],
+          year=2019, doi="10.48550/rename-pre",
+          published_versions=[{"doi": "10.5555/rename-pub",
+                               "relation": "preprint-of"}]),
+  ]
+  with isolated_registry():
+    save_session(create_review_session([SearchResult(
+      query="q", provider="dblp", timestamp="t", papers=returned,
+    )], "q", "renames"))
+  with isolated_registry():
+    session = load_session("renames")
+    assert session.renamed == {
+      old.id: new.id for old, new in zip(
+        [numbered, backwards, published], returned)
+    }
+    assert {d.paper.id for d in session.decisions} == {
+      paper.id for paper in returned}
+    self._assert_all_found(3)
+
+def test_enrich_adopts_after_the_draw(self, tmp_path, monkeypatch):
+  from dataclasses import replace
+  from unittest.mock import patch
+  from scholar import Paper
+  from scholar.review import load_session
+  from scholar.scholar import isolated_registry
+
+  published = Paper(title="A Published Version", authors=["Ada Lovelace"],
+                    year=2022, doi="10.5555/enrich-pub")
+  self._renamed_session(tmp_path, monkeypatch, [published])
+
+  def adopt(papers, **kwargs):
+    return [replace(p, doi="10.48550/enrich-pre",
+                    published_versions=[{"doi": p.doi,
+                                         "relation": "preprint-of"}])
+            for p in papers]
+
+  with patch("scholar.enrich.enrich_papers", side_effect=adopt), patch(
+    "scholar.crossref.annotate_papers",
+    side_effect=lambda papers, progress_callback=None: list(papers),
+  ):
+    enriched = runner.invoke(app, ["enrich", "renames"])
+  assert enriched.exit_code == 0, enriched.output
+  with isolated_registry():
+    assert load_session("renames").renamed == {
+      "doi:10.5555/enrich-pub": "doi:10.48550/enrich-pre"}
+    self._assert_all_found(1)
 @
 
 \paragraph{The draws in [[sessions show]].}
@@ -34168,6 +34383,12 @@ with an empty store and overwriting the file
 (\url{https://github.com/dbosk/scholar/issues/114}).  Rather than catch it
 in every command, we catch it once here and turn it into one line that
 names the file and points to its [[.bak]], with exit code~1.
+A notes write that could not take the notes file's lock raises
+[[NotesNotLocked]], a [[NotesFileError]] of its own
+(\cref{sec:notes-lock} in the notes chapter): the file is not broken,
+so the advice to repair it or restore the [[.bak]] would mislead.  It
+is printed as the one line it is, like a refused session save below,
+also with exit code~1.
 
 A save of a session that cannot take the session file's lock in time
 raises [[SessionNotSaved]] (\cref{sec:session-lock} in the review
@@ -34197,11 +34418,14 @@ and the prose the model wrote is in the synthesis cache, which
 <<main entry point>>=
 def main() -> None:
     """Main entry point for the Scholar CLI."""
-    from scholar.notes import NotesFileError
+    from scholar.notes import NotesFileError, NotesNotLocked
     from scholar.utils import backup_path
 
     try:
         app()
+    except NotesNotLocked as error:
+        print_session_not_saved(error)
+        sys.exit(1)
     except NotesFileError as error:
         Console(stderr=True).print(
             f"[red]{escape(str(error))}[/red]\n"
@@ -34245,6 +34469,56 @@ def test_main_reports_unreadable_notes_file(tmp_path, monkeypatch, capsys):
     assert "Cannot read notes file" in " ".join(err.split())
     assert "paper_notes.json.bak" in "".join(err.split())
     assert notes_file.read_text() == '{"doi:10.1/x": '
+@
+
+A refused notes lock is one line, without the advice to repair a file
+that is not broken, and the note given on the command line is not
+written:
+
+<<test functions>>=
+def test_main_reports_a_refused_notes_lock(tmp_path, monkeypatch, capsys):
+    """main() prints NotesNotLocked as its one line, exit code 1 (#319)."""
+    import json
+    import threading
+    import scholar.notes as notes
+    from scholar.notes import NOTES_FILE, get_data_dir, invalidate_notes_cache
+    from scholar.utils import file_lock
+
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(notes, "NOTES_LOCK_TIMEOUT", 0.2)
+    invalidate_notes_cache()
+    notes_file = get_data_dir() / NOTES_FILE
+    notes_file.write_text("{}")
+    holding, release = threading.Event(), threading.Event()
+
+    def holder():
+        with file_lock(notes_file):
+            holding.set()
+            release.wait(10)
+
+    thread = threading.Thread(target=holder)
+    thread.start()
+    holding.wait(10)
+    now = datetime.now()
+    note = notes.PaperNote(paper_id="doi:10.1/x", title="T", note="Mine.",
+                           created_at=now, updated_at=now)
+    export = tmp_path / "export.json"
+    export.write_text(json.dumps({"notes": {note.paper_id: note.to_dict()}}))
+    monkeypatch.setattr(sys, "argv", ["scholar", "notes", "import",
+                                      str(export)])
+    try:
+        with pytest.raises(SystemExit) as exit_info:
+            main()
+    finally:
+        release.set()
+        thread.join(10)
+    assert exit_info.value.code == 1
+    err = capsys.readouterr().err
+    assert err.count("\n") == 1
+    assert "is locked by another scholar process" in err
+    assert "no note or decision record was written" in err
+    assert ".bak" not in err
+    assert notes_file.read_text() == "{}"
 @
 
 \subsection{Testing the CLI application}
