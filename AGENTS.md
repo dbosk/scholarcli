@@ -873,6 +873,30 @@ identity of every outgoing request:
   on request; skipped with `--offline`).
 - Not done: per-provider proxy selection (e.g. only Scopus and PDF
   downloads through the tunnel).
+- **Identifiers in URL paths** (#304): never paste a DOI or id into a
+  URL; a `#` cut it at the fragment, a `?` started a query. Query
+  strings go to `requests`/the client as a mapping. One encoder,
+  `network.quote_identifier` (network.nw `sec:identifier-in-path`):
+  encodes `# ? %`, space, C0/DEL, non-ASCII, `< > " { } | \ ^`, the
+  backtick and `[ ]`; keeps `/ : @ ! $ & ' ( ) * + , ; =` literal. Rule:
+  an identifier that worked before goes out exactly as before (DOI
+  Handbook 4.7 would encode an inner slash, Crossref says not to;
+  scholar always sent it literal). Used by
+  `providers.s2_paper_url(paper_id, relation=None)` (DOI lookup,
+  citations/references, `pdf.resolve_doi_s2`) and
+  `pdf.doi_resolver_url(doi)`. `pdf.extract_doi` decodes a pasted
+  doi.org URL once (`...CO;2-%23` was sent as `%2523`); a raw DOI is
+  never decoded. The PDF cache key `get_cached_doi_pdf_path` stays
+  unencoded (never requested). Already encoded, left as they were:
+  Crossref and Unpaywall (`quote(doi, safe='')`, the `%2F` form is
+  answered), OpenAlex (pyalex `quote_plus`s the whole
+  `https://doi.org/...`; a space becomes `+`, unchecked whether
+  OpenAlex reads it as a space), Europe PMC, IEEE, WoS, Scopus (query
+  parameters), arXiv (library). Tests: conftest's `request_targets`
+  (loopback stand-in for named hosts, rewrites in `HTTPAdapter.send`,
+  keeps raw request targets; `paths()`/`queries()` decode),
+  `awkward_doi` (`10.5555/a#b?c%d e<f>g`), and request lines pinned to
+  what the code before #304 sent (`TestDoiInRequestPaths`).
 
 ### PDF Cache and `scholar pdf import` (#296)
 
@@ -3306,6 +3330,76 @@ fixture has a quoted query, a `[`-row, `ĸ`, `CO₂`, a ligature. About
   and journal go through `escape_bibtex` like the export's `.bib`
   (#230; before, raw `& % $ # _` and symbols stopped pdfLaTeX); the
   layout, field order and DOI (verbatim in biblatex) are unchanged.
+  Every field of both writers (`format_bibtex_entry`, the search
+  formatter's `_format_paper`) goes through `review.bibtex_field(name,
+  value)` (#304, review.nw `sec:bibtex-field-values`). `doi`/`url`
+  (`BIBTEX_VERBATIM_FIELDS`, `bibtex_verbatim_value`): as given except
+  an unpaired brace (`unpaired_braces`, counted as biber counts), a
+  backslash before a brace or at the end, and C0 controls, which are
+  percent-encoded (`%7B %7D %5C %00`..`%1F`); `read_bibtex_verbatim`
+  is the exact inverse and is applied to the DOI by both readers
+  (`_cited_bib_papers` for `--cited-from`, `_paper_from_entry` for
+  `prov import`) and to the `% ID:` line (`bibtex+prov` and `prov
+  export` write it encoded, `_recorded_id` decodes; a line break in a
+  DOI split the line and lost the entry). Exactly invertible: a `%`
+  followed by zero or more `25` and then a writer code (`7B 7D 5C
+  00`..`1F`, `BIBTEX_BEFORE_CODE`) is written `%25`; the reader decodes
+  a code and such a `%25` (`BIBTEX_VERBATIM_ESCAPE`), nothing else, so
+  `%20` stays and the DOIs `10.5555/a%7Db` (written `a%257Db`) and
+  `10.5555/a}b` (written `a%7Db`) stay two papers (table
+  `tab:bibtex-verbatim-escapes`; inversion tested on a generated set
+  with every code after 0 to 3 `%25`). The `%25` rule is for the DOI
+  and the ID line only (`exact=`): the `url` field keeps round 2's
+  encoding, so a URL's own `%7B` stays and its link is unchanged
+  (checked with `pdfinfo -url`). Old `.bib` files (DOI holding the text
+  `%7D`): `prov import` keeps the DOI as written when the block's `ID`
+  is that DOI's id (`<<keep the DOI as written when the recorded id
+  names it>>`); `--cited-from` tries the decoded DOI, then the DOI as
+  written for entries not matched by DOI (`_cited_bib_papers` returns
+  `as_written_dois`), naming those on stderr. Other provenance fields carry no
+  line break (placeholders, dates, fields parsed line by line), except
+  FOUND-VIA's query (#323, left open: a shell command). Text fields (`bibtex_text_value`): tab
+  and line breaks -> space, other C0 dropped (biber 2.21 core-dumps on
+  a NUL); then `escape_bibtex` (review.nw `sec:latex-titles`): a value
+  with a backslash is read as LaTeX by pylatexenc (declared dependency
+  since #304; bibtexparser 2 depends on it) and written as its Unicode
+  text only if every command is on the allow-list: accents
+  (`LATEX_ACCENTS`, not `\d \b \t`), letters (`LATEX_LETTERS`), font
+  commands and switches, escaped specials, `\textendash
+  \textemdash \ ` (`LATEX_TEXT_ALLOWED`), and inside math only the
+  decoder's one-character no-argument symbol macros plus the math
+  alphabets (`_math_allowed`). Anything else (`\cite \url \href
+  \footnote \ref \input`, environments, unknown) -> literal. Also
+  required: strict parse, every backslash starts an allowed macro, at
+  most `LATEX_DECODE_MAX_CHARS` 4000 characters (longest real title
+  2042) and `LATEX_DECODE_MAX_DEPTH` 8, every decoded character
+  settable (`_settable`: Latin in T1 or mapped by the escaper; math
+  alphanumerics U+1D400-1D7FF NFKC-folded), non-empty, and no exception
+  (any `Exception` -> literal; `\href` raised IndexError, deep nesting
+  RecursionError). Only command nodes are decoded; a math span without
+  a command (`$x^2$`) stays as written. `^` is now escaped
+  (`\textasciicircum{}`; outside math it stopped pdfLaTeX, checked on
+  main; `escape_latex` always escaped it). Fuzz in the suite: every
+  macro the decoder knows x 10 shapes, seeded, 5 s cap. `\{`/`\}`
+  decode to `LatexBrace` ->
+  `\textbraceleft{}`/`\textbraceright{}`. Anything else: every backslash
+  -> `\textbackslash{}` (`BIBTEX_SPECIALS`), a still-escaped `\{`/`\}`
+  -> brace commands. Printed (main / every backslash escaped / now):
+  `Caf\'e` Café / Caf\'e / Café; `The \textit{wolf}` The *wolf* / The
+  \textitwolf / The wolf; `{\em x}` *x* / \em x / x; `$\alpha$-stable`
+  stops / $\alpha$-stable / α-stable; `x\y`, `C:\dir\new` stop / literal
+  / literal (table `tab:latex-titles`). The report's `escape_latex`
+  still prints titles as stored; ingest-time cleaning is #329. Values
+  without a backslash never reach the parser (byte-identical). Then an
+  unpaired brace -> the same commands. No output
+  value holds a backslash before a brace or at its end (bibtexparser
+  then loses the entry, biber does not). Paired braces stay. 3 of 6,594
+  papers of two copied real sessions write differently (2 titles with
+  a backslash, 1 with a control character); keys never change.
+  bibtexparser 2.1's writer was tried and not used: it encloses values
+  unchecked and doubles braces on a second write. Biber counts `\{`
+  as a brace, so there is no BibTeX escape for an unpaired one.
+  `TestAwkwardBibCompiles` (latex marker) compiles such a report.
   `prov import/export`
   match entries by `Paper.id`, never by key, so old `.bib` files still
   round-trip.
