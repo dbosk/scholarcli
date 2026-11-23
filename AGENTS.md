@@ -3779,12 +3779,37 @@ U+2028, U+FEFF and the like in code chunks as Python escapes
 most non-Latin tests already did; name them in the prose if the reader
 needs to know. The full build is `make -C doc check
 LATEXFLAGS="-shell-escape -interaction=nonstopmode"` (between 7 and
-26 minutes on the machines tried, longer under load; 2471 pages):
-`check` fails unless `ltxobj/scholar.log` and the PDF exist and the
-log is newer than every source, and on `^! `, "There were
-undefined", "Label(s) may have changed" or "Rerun to get" in the
-log; the shared rule fails on none of these reliably; the root `doc/scholar.pdf` target (used by
-`publish-github`) runs it.
+26 minutes on the machines tried, longer under load; 2692 pages at
+6b9d135). `check` lives in `doc/check.mk` (included by `doc/Makefile`,
+`CHECK_JOB`/`CHECK_SOURCES`; it sets `PDFLATEX` with latexmk
+`$max_repeat=10`, the book needs 7 runs from clean) and
+`doc/check-settled.py`. It builds the PDF in a sub-make whose status
+it ignores (the shared rule fails on nothing reliably), then fails
+unless log and PDF exist and the log is newer than every source, on
+an error (`^! `) or "There were undefined". When the log only says
+the references did not settle ("Label(s) may have changed", "Rerun
+to get"), the script runs pdflatex (`-8bit ${LATEXFLAGS} -recorder
+-output-directory=ltxobj`) up to 3 more times, digesting the files
+latexmk watches (the engine rule's sources in `.fdb_latexmk` inside
+the output dir, `(generated)` outputs excluded); state after run k ==
+state after k-2 != k-1 is a **two-state flip**: it passes with the
+warning "the references alternate between two states and cannot
+settle" and the labels whose page/sub-page letter differs (<= 20, a
+count, noweb chunk labels named by their chunk), remembered in
+`ltxobj/scholar.flip` so a re-run repeats the warning; anything else
+fails ("did not settle ... not a two-state flip"). Why the book can
+flip: noweb's used-in/continued-in lists (`\@pagesl`, kept in noweb's
+form) fold pages into ranges, so their length depends on the page
+breaks (at e7833a7 it flipped from clean, at 6b9d135 it settled). In a
+flipping region a list's page or letter may be off by one; rebuild
+after the next text change or live with the warning. latexmk itself
+has only `$max_repeat` and `$failure_cmd` (any failure). didactic's
+`\@didactic@keep@pa/pp` records change one run after the layout
+settles (read from `didactic.sty`, not traced further).
+`TestDocumentCheck` (latex marker, ~20 s) builds a flipping, a
+settling and an undefined-reference document with `check.mk`. The
+root `doc/scholar.pdf` target (used by `publish-github`) runs
+`check`.
 `doc/Makefile`'s rules for `../src/scholar/%.tex` name the `.nw`, so a
 changed source is re-woven (before, a stale woven chapter was used).
 `doc/preamble.tex` redefines noweb's `\@subpageref` to always print

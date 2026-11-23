@@ -28,30 +28,11 @@ SRC_TEX+=	../src/scholar/tutorials/scholar-with-an-agent.tex
 
 all: ${DOC}
 
-# A LaTeX error does not reliably fail the build: the shared rule ignores
-# the exit status of its first latexmk run (even 127, no latexmk at all)
-# and its rerun loop ends in a successful `break`.  This target fails
-# unless the PDF and the log exist and the log is newer than every
-# source, and when that log holds an error, an undefined reference or
-# cross-references that did not settle (#279).  latexmk's own "Maximum
-# runs of pdflatex reached" goes to the terminal, not to the log; the
-# log lines it reacts to are what we find.  Run it non-interactively:
-#   make check LATEXFLAGS="-shell-escape -interaction=nonstopmode"
-CHECK_LOG=	${TEX_OUTDIR}/scholar.log
-CHECK_PATTERNS=	-e '^! ' -e 'There were undefined' \
-		-e 'Label(s) may have changed' -e 'Rerun to get'
-
-check: scholar.pdf
-	@for f in ${CHECK_LOG} ${TEX_OUTDIR}/scholar.pdf scholar.pdf; do \
-	  [ -e $$f ] || { echo "check: $$f is missing; the build did not run" >&2; \
-	                  exit 1; }; \
-	done
-	@for f in scholar.tex preamble.tex ${SRC_TEX}; do \
-	  [ ${CHECK_LOG} -nt $$f ] || { \
-	    echo "check: ${CHECK_LOG} is older than $$f; the build did not run" >&2; \
-	    exit 1; }; \
-	done
-	@! grep -n -A3 ${CHECK_PATTERNS} ${CHECK_LOG}
+# `make check` builds the PDF and checks the build: see check.mk and
+# check-settled.py, which also tell a two-state flip (references that
+# alternate between two layouts and cannot settle) from a failure.
+CHECK_JOB=	scholar
+CHECK_SOURCES=	scholar.tex preamble.tex ${SRC_TEX}
 
 scholar.pdf: scholar.tex preamble.tex
 scholar.pdf: ${SRC_TEX}
@@ -73,16 +54,9 @@ scholar.pdf: noweb_lexer.py
 ../src/scholar/%.tex: ../src/scholar/%.nw
 	${MAKE} -C ../src/scholar $(notdir $@)
 
-# latexmk stops after 5 pdflatex runs by default.  From a clean
-# ltxobj/ this document needs 7 before its .aux stops changing (the
-# didactic package's page records settle last), so latexmk gave up with
-# "Maximum runs" and `check` failed until pdflatex was run by hand
-# (#279).  10 leaves room.  The shared tex.mk sets PDFLATEX with ?=, so
-# this wins and LATEXFLAGS from the command line still applies.
-PDFLATEX=	latexmk -pdf -use-make -8bit -e '$$max_repeat=10'
-
 INCLUDE_MAKEFILES=../makefiles
 include ${INCLUDE_MAKEFILES}/noweb.mk
+include check.mk
 
 clean:
 	${RM} ${DOC}
