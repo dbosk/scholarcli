@@ -11909,6 +11909,7 @@ from scholar.utils import staged_outputs
 out_base = Path(output)
 files_created = []
 tex_path = Path(f"{output}.tex")
+rest_draw_saved = None
 try:
     with staged_outputs(out_base.parent) as staging:
         staged = staging / out_base.name
@@ -11948,10 +11949,13 @@ try:
         <<write the screen sheet>>
 except Exception as error:
     logger.debug("Export of %s failed", name, exc_info=True)
-    console.print(
-        f"[red]Export failed, no files were written or changed: "
-        f"{escape(type(error).__name__)}: {escape(str(error))}[/red]"
-    )
+    if rest_draw_saved is not None:
+        <<say that the draw is recorded although the export failed>>
+    else:
+        console.print(
+            f"[red]Export failed, no files were written or changed: "
+            f"{escape(type(error).__name__)}: {escape(str(error))}[/red]"
+        )
     raise typer.Exit(1)
 @
 
@@ -13180,14 +13184,16 @@ def rest_sample_data(draw) -> dict:
     return {"rest_sample": data}
 
 
-def rest_draw_line(draw) -> str:
-    """Say what was drawn and that the session records it."""
+def rest_draw_line(draw, recorded: bool = True) -> str:
+    """Say what was drawn; by its id only when the draw is `recorded`."""
     taken = (f"all {len(draw.papers)} (a census)" if draw.census
              else f"{len(draw.papers)}")
-    return (
-        f"Sample of the rest {draw.sample_id}: {taken} of the {draw.rest} "
-        f"pending papers outside the tier, seed {draw.seed}."
-    )
+    what = (f"{taken} of the {draw.rest} pending papers outside the tier, "
+            f"seed {draw.seed}")
+    if recorded:
+        return f"Sample of the rest {draw.sample_id}: {what}."
+    return (f"Would draw {what}; the sample's id is assigned when the "
+            "draw is recorded.")
 <<draw the sheet from the rest of the tier>>=
 sheet_tier, rest_draw, sheet_decisions = draw_rest_sample(
     session, sheet_decisions, tier_rule, rest_sample, rest_seed
@@ -13198,14 +13204,44 @@ if format_type == "screen-sheet" and rest_draw is not None:
 
     keep_copy_before_run(session, "pre-rest-sample")
     save_session(session)
+    rest_draw_saved = rest_draw
 <<print the screen sheet's tier>>=
 if rest_draw is not None:
     console.print(escape(rest_draw_line(rest_draw)), soft_wrap=True)
     console.print("The draw is recorded in the session.")
 @
 
+The session is saved inside the staging, before the staged files are
+moved into place, so a failure of that move leaves a recorded draw
+without its sheet.  The other order, the files first and the session
+last, would leave a sheet whose draw a failed save did not record; its
+papers would be screened from it and so stop being pending, and the
+same seed would then draw other papers, so that sample could never be
+recorded.  A recorded draw without a sheet loses nothing: [[sessions
+tier-sample]] lists its papers and [[llm classify --tier-sample]] takes
+them.  So the export saves first, and once it has saved, a failure says
+so: the draw's id, that it is recorded, that the sheet may not have been
+written, and where its papers are listed.  (The files moved before the
+failure stay where they are; the staging moves them one by one.)
+
+<<say that the draw is recorded although the export failed>>=
+console.print(
+    f"[red]Export failed after the draw was recorded: "
+    f"{escape(type(error).__name__)}: {escape(str(error))}[/red]\n"
+    f"The draw {escape(rest_draw_saved.sample_id)} is recorded in the "
+    "session, but the screen sheet may not have been written; "
+    f"`scholar sessions tier-sample {escape(shlex.quote(name))}` lists "
+    "its papers.",
+    soft_wrap=True,
+)
+@
+
 The dry run draws before the staging, prints what a real run would
 print and returns; the session is not saved, so the draw is forgotten.
+It prints no id: a real run draws the same papers but records them
+under an id of its own (\cref{sec:tier-sample} in the LLM review module
+says why an id ends in random digits), and an id printed here would
+name no draw.
 A real run with the same seed draws the same papers, as long as the
 pending papers and the tier are the same.
 
@@ -13223,7 +13259,8 @@ if rest_sample is not None and dry_run:
         raise typer.Exit(1)
     for tier_line in tier_lines(dry_tier, "pending papers"):
         console.print(escape(tier_line), soft_wrap=True)
-    console.print(escape(rest_draw_line(dry_draw)), soft_wrap=True)
+    console.print(escape(rest_draw_line(dry_draw, recorded=False)),
+                  soft_wrap=True)
     console.print(
         f"Would write {len(dry_decisions)} paper(s) to the screen sheet "
         "and record the draw in the session; nothing written."
@@ -13354,8 +13391,34 @@ def test_a_dry_run_writes_nothing(self, tmp_path, monkeypatch):
                         "--dry-run")
   assert result.exit_code == 0, result.output
   assert "nothing written" in result.output
+  assert "Sample of the rest" not in result.output
+  assert "assigned when the draw is recorded" in result.output
   assert path.read_bytes() == before
   assert not list(tmp_path.glob("rest*"))
+
+def test_a_failure_after_the_save_says_the_draw_is_recorded(
+  self, tmp_path, monkeypatch,
+):
+  import os
+
+  self._save(tmp_path, monkeypatch)
+  real_replace = os.replace
+
+  def failing_move(source, target, *args, **kwargs):
+    if ".scholar-staging-" in str(source):
+      raise OSError("no space left on the device")
+    return real_replace(source, target, *args, **kwargs)
+
+  with monkeypatch.context() as patched:
+    patched.setattr(os, "replace", failing_move)
+    result = self._export(tmp_path, "--rest-sample", "3", "--seed", "315")
+  assert result.exit_code == 1
+  [draw] = self._session().tier_samples
+  text = " ".join(result.output.split())
+  assert "no files were written or changed" not in text
+  assert f"The draw {draw.sample_id} is recorded in the session" in text
+  assert "scholar sessions tier-sample rest-sheet" in text
+  assert not (tmp_path / "rest.tsv").exists()
 
 def test_without_the_option_the_session_is_not_written(
   self, tmp_path, monkeypatch,
@@ -13463,7 +13526,9 @@ def sessions_tier_sample(
     end says how far the share may reach. Read-only; exits 0.
     """
     from scholar.llm_review import tier_sample_report, tier_sample_sentence
-    from scholar.review import tier_sample_counts, tier_sample_data
+    from scholar.review import (
+        tier_sample_counts, tier_sample_counts_text, tier_sample_data,
+    )
 
     if output_format not in ("table", "json"):
         Console().print(
@@ -13475,9 +13540,10 @@ def sessions_tier_sample(
     if session is None:
         Console().print(f"[red]Session not found: {escape(name)}[/red]")
         raise typer.Exit(1)
-    rows = []
+    rows, counts_texts = [], []
     for draw in session.tier_samples:
         counts = tier_sample_counts(session, draw)
+        counts_texts.append(tier_sample_counts_text(counts))
         data = tier_sample_data(draw, counts)
         if report:
             <<add the rate of a draw to its data>>
@@ -13507,7 +13573,7 @@ console = Console()
 if not rows:
     console.print("No samples of a tier's rest are recorded in this "
                   "session.")
-for data in rows:
+for data, counts_text in zip(rows, counts_texts):
     console.print(f"[bold]Sample of the rest {escape(data['sample_id'])}"
                   "[/bold]", soft_wrap=True)
     console.print(
@@ -13515,9 +13581,7 @@ for data in rows:
         f"{escape(tier_rule_flags(data['rule']))}: "
         f"{len(data['papers'])}{' (a census)' if data['census'] else ''} "
         f"of {data['rest']} pending papers outside the tier; "
-        f"{data['screened']} screened, {data['bearing']} bearing"
-        + (f", {len(data['not_found'])} not found"
-           if data["not_found"] else ""),
+        f"{escape(counts_text)}",
         soft_wrap=True, highlight=False,
     )
     if report:
@@ -13588,16 +13652,19 @@ def test_listed_then_reported(self, tmp_path, monkeypatch):
   data = json.loads(self._show("--report", "-f", "json").output)[0]
   assert (data["screened"], data["rate"], data["interval"]) == (2, None,
                                                                 None)
-  assert data["withheld"] == "1 of the 3 drawn are not yet screened"
+  assert data["withheld"] == "1 of the 3 drawn is not yet screened"
+  assert data["deciders"] == {"human": 2}
   self._decide(draw.papers[2:], "keep", "supports-claim")
   data = json.loads(self._show("--report", "-f", "json").output)[0]
   assert (data["screened"], data["bearing"]) == (3, 1)
   assert data["rate"] == pytest.approx(1 / 3)
   assert data["interval"] == pytest.approx(
     list(modified_wilson_interval(1, 3)))
-  assert data["sentence"].startswith(
-    "Of the 5 pending records outside the first tier, a random sample "
-    "of 3 (seed 315) was screened; 1 bore on the question (33.3%;")
+  assert data["sentence"].startswith("Of the 5 records pending on ")
+  assert ("outside the first tier (a place at most 1 in the answer of a "
+          "current search ordered by relevance), a random sample of 3 "
+          "(seed 315) was screened (by human: 3); 1 bore on the question "
+          "(33.3%;") in data["sentence"]
   report = self._show("--report")
   assert "95% modified Wilson interval" in " ".join(report.output.split())
 

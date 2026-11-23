@@ -2485,8 +2485,11 @@ screeners)} over records screened twice, `screen_sample` (the one
   ids repointed by `repoint_folded_ids`. An older Scholar drops the
   list on save (read from its loader/serialiser, which know only their
   keys). This export SAVES the session (help says so): inside the
-  staging, after `keep_copy_before_run(session, "pre-rest-sample")`;
-  `--dry-run` draws in memory, prints, writes nothing. `BASE-tier.json`
+  staging, after `keep_copy_before_run(session, "pre-rest-sample")`,
+  before the files are moved (the other order could leave a screened
+  sheet whose draw is never recordable); a failure after the save says
+  the draw's id is recorded and points to `sessions tier-sample`.
+  `--dry-run` draws in memory, prints no id, writes nothing. `BASE-tier.json`
   adds `rest_sample` (the record minus `rule`). Exit 2 before loading:
   `--rest-sample` without `--pending`, without a tier option, without
   `--seed`, N < 1, another format; `--seed`/`--dry-run` alone.
@@ -2494,21 +2497,39 @@ screeners)} over records screened twice, `screen_sample` (the one
   `sessions show` stays light): drawn ids looked up through
   `drawn_decisions` (fold tombstones, then a version-link DOI exactly
   one paper holds: a preprint adoption); a homonym/surname rename or a
-  gone paper is `not_found`. Screened = a decision under the id is
-  decided (anyone); bearing = `check_bucket(d) == CHECK_BEARING` (the
-  audit table's rule). `sessions show`: one `tier_sample_line` per draw
-  after the tier line, JSON `tier_samples` (record + counts), both only
-  with draws. `sessions tier-sample S [--report] [-f table|json]`
-  (read-only): per draw counts and rule flags (`tier_rule_flags`),
-  unscreened ids; `--report` adds `TierSampleReport` rate and
-  `modified_wilson_interval(bearing, screened)` and
-  `tier_sample_sentence` ("Of the M pending records outside the first
-  tier, a random sample of N (seed S) was screened; k bore on the
-  question (r%; 95% modified Wilson interval a% to b%" + for k = 0 ": a
-  sample in which none bore does not show that none of the rest
-  does)"). Unlike `llm sample --report` (which shows the interval of
-  the reviewed part with a caveat), rate and interval are WITHHELD
-  (`withheld_reason`) while any drawn paper is unscreened or not found;
+  gone paper is `not_found`. Screened = the first decided decision
+  under the id (anyone). `tier_sample_verdict(d, uses_categories)`
+  (one function for counts, show, table, JSON, sentence): a discard
+  with a version note (`AUDIT_VERSION_NOTES`) or a record criterion
+  (`AUDIT_RECORD_CRITERIA`) is EXCLUDED (counted by reason, out of the
+  denominator `judged`); any other discard does not bear; in a session
+  using categories (any tag in `AUDIT_CATEGORIES`) a keep bears iff its
+  category is of bearing order, a keep without one is UNDETERMINED
+  (rate withheld); without categories every keep bears, whoever kept
+  it. NOT the audit table's cited rule (`check_bucket`), which ignored
+  unreviewed keeps (review of #318: 0 of 60 vs 5 of 60). Deciders =
+  `decision_source_items` over the screened drawn decisions, named in
+  every output ("by human: 5; agent, unreviewed: 55"), never a reason
+  to withhold. `sessions show`: one `tier_sample_line` per draw
+  (`tier_sample_counts_text`) after the tier line, JSON `tier_samples`
+  (record + screened, deciders, bearing, judged, excluded,
+  undetermined, unscreened, not_found), both only with draws.
+  `sessions tier-sample S [--report] [-f table|json]` (read-only): per
+  draw counts and rule flags (`tier_rule_flags`), unscreened ids;
+  `--report` adds rate = bearing/judged,
+  `modified_wilson_interval(bearing, judged)` and `tier_sample_sentence`
+  ("Of the 300 records pending on <draw date> outside the first tier
+  (<`tier_rule_words`: the stored rule's own `meaning` with values put
+  in>), a random sample of 60 (seed 7) was screened (by human: 5;
+  agent, unreviewed: 55)[; k drawn records were excluded without a
+  judgement of the work (no-abstract: k), so the rate is over the other
+  n]; 3 bore on the question (5.0%; 95% modified Wilson interval 1.4%
+  to 13.7%[: a sample in which none bore does not show that none of the
+  rest does])."; a census: "every one was screened (...), a census
+  since ..., so the count is exact"). Unlike `llm sample --report`,
+  rate and interval are WITHHELD (`withheld_reason`, number agreement
+  via `llm_review.counted`) while any drawn paper is unscreened, not
+  found or undetermined, or when every screened one was excluded;
   a complete census gets its rate, no interval. LaTeX report: after the
   search parameters, a sub-heading "Records outside the screening tier"
   and one sentence per draw (`build_tier_sample_latex`, nothing
