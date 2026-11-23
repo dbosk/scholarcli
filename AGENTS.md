@@ -1488,7 +1488,11 @@ alone or narrowing like `--source`) selects decisions by
 note (a reset clears it). `stored_batch_check` → also
 `StoredBatchCheck.batches` (`stored_batches`: rows with a batch id per
 (what, kind, name, batch), `batch_findings` whole, confidence included,
-one-reason runs NOT pooled); `check-batches` lists them ("Stored
+one-reason runs NOT pooled; `stored_batch_findings`: a batch whose rows
+all share one reason over >= `SHARED_REASON_MIN_RECORDS` works gets one
+`one-reason` note "one reason for all N records of batch X: a rule given
+with --reason, or the same reason on every line", no flat finding;
+fewer works: nothing); `check-batches` lists them ("Stored
 batches …: N, …; k with findings", `BATCH_CONFIDENCE_NOTE` on a flat
 one: a `-c` for a whole run looks the same), JSON `batches`. The
 installed pre-#292 pipx build (no screenings) drops `agent_batch` and
@@ -2283,7 +2287,12 @@ screeners)} over records screened twice, `screen_sample` (the one
   `\n`, no comment line). Digest =
   first `SHEET_DIGEST_CHARS` = 8 hex of SHA-256 of [session file name,
   size, ids] (`screen_sheet_batches`): stable for one selection and
-  size. Without the option the output is unchanged.
+  size. Without the option the output is unchanged. `--pending`
+  (#292, cli.nw `sec:first-screen-sheet`, `pending_sheet_decisions`)
+  lists the pending papers instead (first screen; one per paper id,
+  same columns), exit 2 before loading with `--sample`/`--undecided-by`
+  or another format; its batch ids differ from a decided sheet's
+  because the id lists differ.
   Prints "N paper(s) on the screen sheet." and no machine-review
   table. `all` stays csv + latex.
 
