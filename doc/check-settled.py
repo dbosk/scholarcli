@@ -41,7 +41,7 @@ def log_failure(text):
     """Return why the log shows a failed build, or None."""
     errors = [line for line in text.splitlines() if line.startswith("! ")]
     if errors:
-        return "LaTeX error: " + errors[0][2:]
+        return errors[0]
     if "There were undefined" in text:
         return "undefined references or citations"
     if missing := PYTHONTEX_MISSING.search(text):
