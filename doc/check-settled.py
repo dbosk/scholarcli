@@ -1,34 +1,15 @@
 #!/usr/bin/env python3
-"""Check a LaTeX build's log, and tell a two-state flip from a failure.
+"""Check what a LaTeX build left; pass a two-state flip with a warning.
 
-Usage: check-settled.py JOB OUTDIR ENGINE [ARG ...]
+Usage: check-settled.py --status N --sources "F ..." JOB OUTDIR ENGINE ...
 
-Called by `make check` (check.mk) after latexmk has run.  The log of the
-last run decides:
-
-- an error (a line starting with "! ") or an undefined reference fails;
-- a log without "Label(s) may have changed" or "Rerun to get" passes;
-- otherwise the files that feed back into the next run did not become
-  stable within latexmk's run limit.  We then run ENGINE (the engine
-  command line latexmk uses) up to three more times, keeping a digest of
-  those files after each run.  When the state after run k equals the
-  state after run k-2 and differs from run k-1, the document alternates
-  between two layouts and cannot settle: we print one named warning that
-  lists the labels whose page or sub-page letter differs and pass.
-  Anything else fails.
-
-The files that feed back are the ones latexmk itself watches: the
-sources of the engine's rule in JOB.fdb_latexmk that lie in OUTDIR (for
-the scholar document: the .aux, .toc, .out, .run.xml, .unq, PythonTeX's
-.pytxmcr/.pytxpyg and minted's cached highlights).  A flip found once is
-remembered in JOB.flip (both states' digests), so running the check
-again on the same build repeats the warning without new runs.
-
-latexmk has no option for this: it offers $max_repeat (how many runs
-before it gives up) and $failure_cmd (a command run after any failed
-compilation, whatever the cause), but nothing that compares the states
-of earlier runs.
+Called by `make check` (check.mk) after the build: N is the build rule's
+exit status, ENGINE the engine command line for extra runs.  What it
+accepts and why is described in the documentation, chapter on the
+command-line interface, section "Keeping the woven document buildable"
+(src/scholar/cli.nw, sec:woven-document).
 """
+import argparse
 import hashlib
 import json
 import re
@@ -38,12 +19,18 @@ from pathlib import Path
 
 MORE_RUNS = 3
 SHOWN = 20
-UNDEFINED = "There were undefined"
 UNSETTLED = ("Label(s) may have changed", "Rerun to get")
+PYTHONTEX_MISSING = re.compile(
+    r"Package PythonTeX Warning: (Missing|Non-existent) [a-z ]*content"
+    r"|Run PythonTeX to create it")
 FLIP_WARNING = ("the references alternate between two states and cannot "
                 "settle")
 NEWLABEL = re.compile(r"^\\newlabel\{(.+?)\}\{\{(.*?)\}\{(.*?)\}")
 NEWSUBLABEL = re.compile(r"^\\newsublabel\{(.+?)\}\{\{.*?\}\{(.*?)\}\}")
+
+
+def fail(job, reason):
+    sys.exit(f"check: {job} failed: {reason}")
 
 
 def read_log(log):
@@ -55,8 +42,10 @@ def log_failure(text):
     errors = [line for line in text.splitlines() if line.startswith("! ")]
     if errors:
         return "LaTeX error: " + errors[0][2:]
-    if UNDEFINED in text:
+    if "There were undefined" in text:
         return "undefined references or citations"
+    if missing := PYTHONTEX_MISSING.search(text):
+        return f"PythonTeX output is missing ({missing.group(0)})"
     return None
 
 
@@ -124,17 +113,11 @@ def chunk_names(keys, sources):
     return names
 
 
-def differences(one, other, job, outdir):
+def differences(one, other, sources):
     keys = sorted(k for k in one.keys() | other.keys()
                   if one.get(k) != other.get(k))
-    fdb = outdir / f"{job}.fdb_latexmk"
-    sources = []
-    if fdb.exists():
-        sources = [Path(line.split('"')[1]) for line in
-                   fdb.read_text(encoding="utf-8",
-                                 errors="replace").splitlines()
-                   if line.startswith('  "') and '.tex"' in line]
-    names = chunk_names(set(keys[:SHOWN]), sources)
+    names = chunk_names(set(keys[:SHOWN]),
+                        [s for s in sources if s.suffix == ".tex"])
     lines = []
     for key in keys[:SHOWN]:
         label = f"<<{names[key]}>> ({key})" if key in names else key
@@ -147,14 +130,9 @@ def differences(one, other, job, outdir):
     return lines
 
 
-def main(job, outdir, engine):
-    outdir = Path(outdir)
+def settle(job, outdir, engine, sources):
+    """Run the engine up to MORE_RUNS times; pass a two-state flip."""
     log, aux, flip = (outdir / f"{job}.{ext}" for ext in ("log", "aux", "flip"))
-    text = read_log(log)
-    if reason := log_failure(text):
-        sys.exit(f"check: {job} failed: {reason}")
-    if not unsettled(text):
-        return
     files = feedback_files(job, outdir)
     states = [snapshot(files, aux)]
     if flip.exists():
@@ -165,10 +143,13 @@ def main(job, outdir, engine):
     for run in range(1, MORE_RUNS + 1):
         print(f"check: the build did not settle; run {run} of {MORE_RUNS} "
               f"more: {' '.join(engine)}", file=sys.stderr)
-        subprocess.run(engine, stdout=subprocess.DEVNULL, check=False)
+        # No terminal: at an error the engine reads end of file and stops,
+        # instead of waiting unseen at its prompt.  Its log is the evidence.
+        subprocess.run(engine, stdin=subprocess.DEVNULL,
+                       stdout=subprocess.DEVNULL, check=False)
         text = read_log(log)
         if reason := log_failure(text):
-            sys.exit(f"check: {job} failed: {reason}")
+            fail(job, reason)
         if not unsettled(text):
             print(f"check: settled after {run} more run(s)", file=sys.stderr)
             flip.unlink(missing_ok=True)
@@ -179,7 +160,7 @@ def main(job, outdir, engine):
             warning = "\n".join(
                 [f"check: warning: {FLIP_WARNING}: {job} flips between two "
                  "layouts on every run; these differ between them:"]
-                + differences(states[run - 1][1], states[run][1], job, outdir)
+                + differences(states[run - 1][1], states[run][1], sources)
                 + ["check: passed with that warning (the PDF is the last "
                    "run's)"])
             flip.write_text(json.dumps({"states": [states[run - 1][0],
@@ -187,11 +168,37 @@ def main(job, outdir, engine):
                                         "warning": warning}))
             print(warning, file=sys.stderr)
             return
-    sys.exit(f"check: {job} did not settle after {MORE_RUNS} more runs, "
-             "and it is not a two-state flip")
+    fail(job, f"it did not settle after {MORE_RUNS} more runs, and it is "
+         "not a two-state flip")
+
+
+def main(argv):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--status", type=int, required=True)
+    parser.add_argument("--sources", default="")
+    parser.add_argument("job")
+    parser.add_argument("outdir", type=Path)
+    parser.add_argument("engine", nargs=argparse.REMAINDER)
+    args = parser.parse_args(argv)
+    job, outdir = args.job, args.outdir
+    sources = [Path(s) for s in args.sources.split()]
+    log, pdf = outdir / f"{job}.log", outdir / f"{job}.pdf"
+    if not log.exists():
+        fail(job, f"{log} is missing; the build did not run")
+    for source in sources:
+        if source.exists() and log.stat().st_mtime < source.stat().st_mtime:
+            fail(job, f"{log} is older than {source}; the build did not run")
+    text = read_log(log)
+    if reason := log_failure(text):
+        fail(job, reason)
+    if unsettled(text):
+        settle(job, outdir, args.engine, sources)
+    elif args.status != 0:
+        fail(job, f"the build rule ended with status {args.status} "
+             "(see its output above), and the log does not show why")
+    if not pdf.exists():
+        fail(job, f"{pdf} is missing")
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 4:
-        sys.exit(__doc__)
-    main(sys.argv[1], sys.argv[2], sys.argv[3:])
+    main(sys.argv[1:])

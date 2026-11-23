@@ -28,9 +28,8 @@ SRC_TEX+=	../src/scholar/tutorials/scholar-with-an-agent.tex
 
 all: ${DOC}
 
-# `make check` builds the PDF and checks the build: see check.mk and
-# check-settled.py, which also tell a two-state flip (references that
-# alternate between two layouts and cannot settle) from a failure.
+# `make check` builds the PDF and checks the build (check.mk); what it
+# accepts: src/scholar/cli.nw, sec:woven-document.
 CHECK_JOB=	scholar
 CHECK_SOURCES=	scholar.tex preamble.tex ${SRC_TEX}
 
