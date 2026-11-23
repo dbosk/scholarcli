@@ -221,7 +221,9 @@ class LLMBatchResult:
             and, when any answer was unusable, one retry
         retried: Ids of the papers asked again in the retry, because
             their first answer was unusable
-        usage_reported: How many of the requests reported a token count
+        input_reported: How many of the requests reported an input
+            token count
+        output_reported: How many reported an output token count
         prompt_version: Hash of the prompt template and run options
             (see `classification_prompt_version`)
         passages: The full-text passages shown to the model, by paper
@@ -238,7 +240,8 @@ class LLMBatchResult:
     passages: dict[str, list[str]] = field(default_factory=dict)
     requests: int = 0
     retried: list[str] = field(default_factory=list)
-    usage_reported: int = 0
+    input_reported: int = 0
+    output_reported: int = 0
 @
 
 
@@ -2252,7 +2255,8 @@ def classify_papers_with_llm(
         completion_tokens=requests.output_tokens,
         requests=requests.count,
         retried=retried,
-        usage_reported=requests.usage_reported,
+        input_reported=requests.input_reported,
+        output_reported=requests.output_reported,
         withheld=withheld,
         passages={
             decision.paper.id: [quote.text for quote in quotes]
@@ -2743,12 +2747,12 @@ as one paper's answer was unusable, and the second answer replaced the
 first for every paper.  A run of 2026-11-23 measured what that costs
 (\url{https://github.com/dbosk/scholarcli/issues/306}, 50 papers, one
 model): no paper was skipped at any batch size, every retry was for a
-first answer without a category tag, and one paper per request needed
-a retry on 13 of 50 requests.  So a retry is often about one paper of
-the batch, and re-sending a batch of fifty for it costs fifty papers'
-input; it can also change the other answers, which were usable, since
-the same measurement found about one verdict in ten unstable between
-runs.  Now the second request holds only the papers whose first answer
+first answer without a category tag, 13 of 50 single-paper requests
+needed a retry, and in batches of ten one batch in five needed one, in
+both of two rounds.  Re-sending a batch of fifty for a retry costs
+fifty papers' input, and it can change the other answers, which were
+usable: the same measurement found about one verdict in ten unstable
+between runs.  Now the second request holds only the papers whose first answer
 needs a retry, built by the same prompt builder for those papers, with
 the reminder after them.  A paper with a usable first answer keeps it,
 untouched.
@@ -2789,24 +2793,59 @@ if needing:
         len(needing),
     )
     <<choose the papers to ask again>>
+    answers = []
     try:
-        answers = parse(
-            requests.ask(model, prompt_for(
-                again, [paper_quotes[i] for i in shown] if paper_quotes
-                else None,
-            ) + _retry_reminder(allowed, categories)),
-            again,
-        )
-    except ValueError as error:
-        logger.warning("Retry unreadable, its papers stay withheld: %s",
-                       error)
-        answers = []
+        text = requests.ask(model, prompt_for(
+            again, [paper_quotes[i] for i in shown] if paper_quotes
+            else None,
+        ) + _retry_reminder(allowed, categories))
+    except Exception as error:
+        <<withhold the papers of a failed retry request>>
+    else:
+        try:
+            answers = parse(text, again)
+        except ValueError as error:
+            logger.warning("Retry unreadable, its papers stay withheld: %s",
+                           error)
     <<put each new answer in place of the first>>
 @
 
+A retry request can fail as any request can: the connection is
+refused, the service answers with an error, the model's plugin raises.
+The first answers it was meant to mend are then all the run has for
+those papers, so they are withheld as after an unreadable retry, and
+the batch's usable answers are applied as usual; a failure used to end
+the run with an exception and lose them all.  Each withheld paper's
+problem names the failure after its first answer's problem, worded by
+[[request_failure_reason]] (\cref{sec:request-failure-reason} in the
+network module), which leaves out the request's address and any key in
+it.  The exception is caught whatever its class, since each plugin
+raises its own, and only around the request: a fault in scholar's
+parsing is not a failed request.  The first request has no such
+fallback: when it fails, no paper has an answer, and its exception
+leaves [[classify_papers_with_llm]] as before (the command ends with
+it, and nothing is decided).
+
+<<withhold the papers of a failed retry request>>=
+from dataclasses import replace
+
+from scholar.network import request_failure_reason
+
+failure = f"retry request failed: {request_failure_reason(error)}"
+logger.warning("%s; its papers stay withheld", failure)
+for position in needing:
+    first = decisions[position]
+    decisions[position] = replace(
+        first, answer_problem=f"{first.problem}; {failure}"
+    )
+@
+
 The papers to ask again are found by the paper id of each first
-answer, among the batch's papers not yet chosen, so the second
-prompt shows them in the order of the first answers.
+answer, among the batch's papers not yet chosen, and shown in the
+order of the batch, which is the session's order: the second prompt
+then follows from the session and the list of papers asked again,
+whatever order the model answered in (an unanswered paper's entry
+comes after the answered ones, \cref{sec:llm-parse}).
 
 <<choose the papers to ask again>>=
 from scholar.notes import get_paper_id
@@ -2819,7 +2858,8 @@ for position in needing:
                  if get_paper_id(to_classify[i].paper) == paper_id)
     not_chosen.remove(index)
     shown.append(index)
-    retried.append(paper_id)
+shown.sort()
+retried.extend(get_paper_id(to_classify[i].paper) for i in shown)
 again = [to_classify[i] for i in shown]
 <<put each new answer in place of the first>>=
 open_positions = list(needing)
@@ -2834,14 +2874,19 @@ The prompt keeps its order: the fixed parts, then the papers, then the
 instructions (\cref{sec:prompt-construction}).  The same change first
 put the papers last, after the instructions, so that every request of a
 run would begin with the same text, as a provider's caching of a
-common prompt prefix needs.  The run against the real model above
-showed the cost of that order: the batch of fifty came back without a
-category tag on all fifty papers, and of five batches of ten, two came
-back without it on nine and on ten of their papers, where with the
-instructions after the papers the same batch of fifty had needed no
-retry and one batch of ten in five had needed one.  That was one run
-per shape, so it is no rate, but fifty of fifty is not noise, and the
-reorder bought nothing, since scholar asks for no caching.  So the
+common prompt prefix needs.  In the run against the real model above,
+with that order, the batch of fifty came back without a category tag
+on all fifty papers, and of five batches of ten, two
+came back without it on nine and on ten of their papers.  With the
+instructions after the papers, the same batch of fifty had needed no
+retry in the earlier measurement, and one batch of ten in five had
+needed one.  A second check on 2026-11-23, with this order restored
+and the one-request retry (the same 50 papers, the same model), gave:
+one batch of fifty, one request and no retry, 34\,898 input and
+6\,830 output tokens; five batches of ten, no retry in any, 39\,410
+input and 5\,845 output tokens in all; every paper answered.  Each
+shape was run once, so none of this is a rate.  The reorder bought
+nothing, since scholar asks for no caching.  So the
 papers stay between the fixed parts and the instructions until a
 provider's caching makes the reorder worth measuring again; the prompt
 version (\cref{sec:prompt-version}) is pinned by a test so that the
@@ -2975,10 +3020,16 @@ def test_three_bad_shapes(self, monkeypatch):
     assert "Available Motivations" not in first
     assert "Title: Near" in first and note not in first
     assert len(fake_model.prompts) == 2
+    from scholar.llm_review import _category_status_rule
+
     assert fake_model.shown[1] == ["New 0", "New 1"]
-    for retry in fake_model.prompts[1:]:
-        assert "exactly one of these category tags" in retry
-        assert note not in retry
+    assert "IMPORTANT: give every paper exactly one" not in first
+    retry = fake_model.prompts[1]
+    assert retry.rstrip().endswith(
+        _category_status_rule(set(AUDIT_CATEGORIES)))
+    assert "IMPORTANT: give every paper exactly one of these category " \
+        "tags" in retry
+    assert note not in retry
 
     by_title = {d.paper.title: d for d in session.decisions}
     title_of = {
@@ -3371,24 +3422,45 @@ the plugins installed with scholar, the package's own OpenAI models,
 [[llm-gpt4all]] does not, so its runs report no tokens.  Whether
 [[llm-azure]] and [[llm-github-copilot]] report usage depends on the
 classes they reuse and override, which we did not trace; the line
-says when a run's model reported nothing.  A request
-counts as reporting usage when either number is given, and the line
-says when only some requests did, since the sums then leave the others
-out.  A response without [[usage]] (an older package, or a stand-in
-in a test) reports none.  The batch result's [[prompt_tokens]] and
-[[completion_tokens]] hold the run's sums; they used to read
-attributes of those names from the last response, which the [[llm]]
-package's responses do not have, so they were always [[None]].
+says when a run's model reported nothing.  The batch result's
+[[prompt_tokens]] and [[completion_tokens]] hold the run's sums; they
+used to read attributes of those names from the last response, which
+the [[llm]] package's responses do not have, so they were always
+[[None]].
+
+The answers are what a run is for, and the token count is a side
+note, so nothing about the count may cost an answer.  A response
+without [[usage]] (an older package, or a stand-in in a test), a
+[[usage()]] that raises, and a count that is not a whole number all
+count as not reported.  Input and output are counted apart, each with
+the number of requests that reported it, because a plugin may report
+one and not the other, and a missing count printed as a sum would read
+as zero.  A request is counted when it is sent, so a request that
+fails counts too.
 
 <<llm review llm interaction>>=
+def token_count(value) -> int | None:
+    """Return `value` as a token count, or `None` when it is not one."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
 def response_usage(response) -> tuple[int | None, int | None]:
-    """Return the input and output tokens a response reports, if any."""
+    """Return the input and output tokens a response reports, if any.
+
+    A missing or failing `usage()` reports none.
+    """
     usage = getattr(response, "usage", None)
     if not callable(usage):
         return None, None
-    reported = usage()
-    return (getattr(reported, "input", None),
-            getattr(reported, "output", None))
+    try:
+        reported = usage()
+    except Exception as error:
+        logger.warning("Token usage not readable: %s", error)
+        return None, None
+    return (token_count(getattr(reported, "input", None)),
+            token_count(getattr(reported, "output", None)))
 
 
 @dataclass
@@ -3396,21 +3468,22 @@ class RequestTally:
     """The requests one classifier run sent and the tokens reported."""
 
     count: int = 0
-    usage_reported: int = 0
+    input_reported: int = 0
+    output_reported: int = 0
     input_tokens: int | None = None
     output_tokens: int | None = None
 
     def ask(self, model, prompt: str) -> str:
         """Send `prompt` to `model`, count it, and return the text."""
+        self.count += 1
         response = model.prompt(prompt)
         text = response.text()
-        self.count += 1
         tokens_in, tokens_out = response_usage(response)
-        if tokens_in is not None or tokens_out is not None:
-            self.usage_reported += 1
         if tokens_in is not None:
+            self.input_reported += 1
             self.input_tokens = (self.input_tokens or 0) + tokens_in
         if tokens_out is not None:
+            self.output_reported += 1
             self.output_tokens = (self.output_tokens or 0) + tokens_out
         return text
 @
@@ -3432,16 +3505,27 @@ def run_cost_line(
         requests += f" + 1 retry of {again} paper" + ("" if again == 1
                                                       else "s")
     parts = [requests, f"{withheld_as}: {len(batch.withheld)}"]
-    if batch.usage_reported:
-        tokens = (f"tokens: {batch.prompt_tokens or 0} in, "
-                  f"{batch.completion_tokens or 0} out")
-        if batch.usage_reported < batch.requests:
-            tokens += (f" (reported for {batch.usage_reported} of "
-                       f"{batch.requests} requests)")
-        parts.append(tokens)
+    if batch.input_reported or batch.output_reported:
+        parts.append("tokens: " + ", ".join([
+            _token_sum(batch.prompt_tokens, batch.input_reported,
+                       batch.requests, "in"),
+            _token_sum(batch.completion_tokens, batch.output_reported,
+                       batch.requests, "out"),
+        ]))
     else:
         parts.append("tokens: not reported by the model")
     return "; ".join(parts)
+
+
+def _token_sum(total: int | None, reported: int, requests: int,
+               direction: str) -> str:
+    """Say a token sum, or that none was reported, and over how much."""
+    if not reported:
+        return f"{direction} not reported"
+    text = f"{total} {direction}"
+    if reported < requests:
+        text += f" (reported for {reported} of {requests} requests)"
+    return text
 @
 
 Let's check the retry and the tally with a stand-in for the model.  It
@@ -3451,9 +3535,11 @@ returning a response with [[text]]), reached through the same
 answer does not depend on where in a request the paper is: that is the
 property of a real model the retry relies on, and a stub answering by
 position would hand a paper asked again the answer meant for the
-paper at its index in the batch
-of the batch.  Its responses report usage with the [[llm]] package's
-own [[Usage]] class.  The papers and answers are invented.
+paper at its index in the batch.  Its responses report usage with the
+[[llm]] package's own [[Usage]] class, or a usage given as a function
+(one that raises, say); a request can be made to fail, with the
+exception [[requests]] raises for a refused connection.  The papers and
+answers are invented.
 
 <<test functions>>=
 class TitleAnsweringModel:
@@ -3462,14 +3548,18 @@ class TitleAnsweringModel:
   `answers` maps a title to its answers, the n-th used the n-th time
   the paper is asked about (the last one again after that); `None`
   leaves the paper out, a string is sent as the whole response.
-  `shown` lists, per prompt, the titles it showed.
+  `shown` lists, per prompt, the titles it showed.  `usage` is the
+  (input, output) pair each response reports, `None` for an empty
+  `Usage`, or a function returning what `usage()` returns; the calls
+  numbered in `fail_on` (1 = the first) raise a refused connection.
   """
 
   model_id = "stub-model"
 
-  def __init__(self, answers, usage=(100, 10)):
+  def __init__(self, answers, usage=(100, 10), fail_on=()):
     self.answers = answers
     self.usage = usage
+    self.fail_on = fail_on
     self.prompts = []
     self.shown = []
     self.asked = {}
@@ -3477,9 +3567,13 @@ class TitleAnsweringModel:
   def prompt(self, prompt):
     import re
     from types import SimpleNamespace
+    import requests as http
     from llm.models import Usage
 
     self.prompts.append(prompt)
+    if len(self.prompts) in self.fail_on:
+      raise http.ConnectionError(
+        "refused: https://api.example.invalid/v1?api_key=SECRET-KEY")
     answers = []
     papers = re.findall(r"\[Paper (\d+)\]\nTitle: (.*)", prompt)
     self.shown.append([title for _, title in papers])
@@ -3498,6 +3592,8 @@ class TitleAnsweringModel:
         answers.append({"paper_index": int(index), **answer})
     else:
       text = json.dumps({"classifications": answers})
+    if callable(self.usage):
+      return SimpleNamespace(text=lambda: text, usage=self.usage)
     usage = (Usage(input=self.usage[0], output=self.usage[1])
              if self.usage else Usage())
     return SimpleNamespace(text=lambda: text, usage=lambda: usage)
@@ -3535,12 +3631,15 @@ def _session(self):
     ],
   )
 
-def _run(self, monkeypatch, answers, usage=(100, 10)):
-  model = TitleAnsweringModel(answers, usage).install(monkeypatch)
+VOCABULARY = {"t", "off"}
+
+def _run(self, monkeypatch, answers, usage=(100, 10), fail_on=(),
+         **options):
+  model = TitleAnsweringModel(answers, usage, fail_on).install(monkeypatch)
   session = self._session()
   result = classify_papers_with_llm(
     session, model_id="stub-model", enrich_missing=False,
-    require_examples=False,
+    require_examples=False, vocabulary=self.VOCABULARY, **options,
   )
   return session, model, result
 @
@@ -3548,7 +3647,8 @@ def _run(self, monkeypatch, answers, usage=(100, 10)):
 In a batch of five, the second paper gets an unreadable decision and
 the fourth no answer.  The run sends two requests: the batch, then one
 holding exactly those two papers, with the batch's text up to the
-papers and the reminder after the instructions.  The other three
+papers and the reminder after the instructions (the tests seed a
+vocabulary, so that the reminder has something to say).  The other three
 answers are the batch's, and the tally counts the two requests and
 their tokens.
 
@@ -3582,6 +3682,11 @@ def test_two_unusable_of_five_are_asked_again_together(self,
   fixed = first.split("## Papers to Classify")[0]
   assert second.split("## Papers to Classify")[0] == fixed
   assert second.index("Title: Delta Heaps") < second.index("## Instructions")
+  from scholar.llm_review import _retry_reminder
+
+  reminder = _retry_reminder(self.VOCABULARY, None)
+  assert "IMPORTANT" in reminder and reminder not in first
+  assert second.endswith(reminder)
   answers = self._by_title(session, result.decisions)
   for title in ("Alpha Loops", "Gamma Queues", "Epsilon Trees"):
     assert (answers[title].status, answers[title].tags,
@@ -3593,8 +3698,9 @@ def test_two_unusable_of_five_are_asked_again_together(self,
   assert result.withheld == []
   assert result.retried == self._ids(session, "Beta Stacks",
                                      "Delta Heaps")
-  assert (result.requests, result.usage_reported, result.prompt_tokens,
-          result.completion_tokens) == (2, 2, 200, 20)
+  assert (result.requests, result.input_reported, result.output_reported,
+          result.prompt_tokens, result.completion_tokens) \
+    == (2, 2, 2, 200, 20)
   assert run_cost_line(result) == ("Requests: 1 batch + 1 retry of 2 "
                                    "papers; left pending: 0; tokens: "
                                    "200 in, 20 out")
@@ -3649,7 +3755,7 @@ def test_an_unreadable_retry_loses_no_other_answer(self, monkeypatch):
     "Beta Stacks": [None, "No JSON here."],
     "Delta Heaps": [self.MAYBE],
   })
-  assert model.shown == [self.TITLES, ["Delta Heaps", "Beta Stacks"]]
+  assert model.shown == [self.TITLES, ["Beta Stacks", "Delta Heaps"]]
   assert [d.problem for d in result.withheld] \
     == ["invalid decision 'maybe'", "no answer for this paper"]
   assert len(result.decisions) == 3
@@ -3658,27 +3764,115 @@ def test_an_unreadable_retry_loses_no_other_answer(self, monkeypatch):
 @
 
 A model whose responses report no tokens gives no sums, and the line
-says so; when only some requests reported them, the line says how many.
+says so; a usage that cannot be read (here [[usage()]] raises) counts
+as not reported and loses no answer; a count given for one direction
+only is not printed as a zero for the other; and when only some
+requests reported a count, the line says how many did, so that a
+partial sum is not read as the run's total.
 
 <<retry only the unusable test methods>>=
 def test_tokens_not_reported(self, monkeypatch):
   session, model, result = self._run(monkeypatch, {}, usage=None)
   assert (result.prompt_tokens, result.completion_tokens,
-          result.usage_reported) == (None, None, 0)
+          result.input_reported, result.output_reported) \
+    == (None, None, 0, 0)
   assert run_cost_line(result).endswith(
     "; tokens: not reported by the model")
+
+def test_a_failing_usage_is_not_reported(self, monkeypatch):
+  def broken():
+    raise RuntimeError("usage not available")
+
+  session, model, result = self._run(monkeypatch, {}, usage=broken)
+  assert len(result.decisions) == 5 and result.withheld == []
+  assert (result.requests, result.input_reported,
+          result.output_reported) == (1, 0, 0)
+  assert run_cost_line(result).endswith(
+    "; tokens: not reported by the model")
+
+def test_input_only_says_output_not_reported(self, monkeypatch):
+  from llm.models import Usage
+
+  session, model, result = self._run(
+    monkeypatch, {}, usage=lambda: Usage(input=120))
+  assert (result.prompt_tokens, result.completion_tokens) == (120, None)
+  assert run_cost_line(result).endswith(
+    "; tokens: 120 in, out not reported")
+
+def test_mixed_reports_say_how_many_requests_reported(self,
+                                                      monkeypatch):
+  from llm.models import Usage
+
+  reports = iter([Usage(input=300, output=30), None])
+  session, model, result = self._run(
+    monkeypatch, {"Beta Stacks": [None]},
+    usage=lambda: next(reports))
+  assert (result.requests, result.input_reported,
+          result.output_reported) == (2, 1, 1)
+  assert run_cost_line(result).endswith(
+    "; tokens: 300 in (reported for 1 of 2 requests), 30 out "
+    "(reported for 1 of 2 requests)")
 
 def test_tokens_reported_for_some_requests(self):
   batch = LLMBatchResult(
     decisions=[], model_id="m", timestamp="t", prompt_tokens=250,
-    completion_tokens=40, requests=2, usage_reported=1,
-    retried=["doi:a"],
+    completion_tokens=None, requests=2, input_reported=1,
+    output_reported=0, retried=["doi:a"],
     withheld=[LLMDecision("doi:a", "", [], None, "")],
   )
   assert run_cost_line(batch, withheld_as="no screening stored") == (
     "Requests: 1 batch + 1 retry of 1 paper; no screening stored: 1; "
-    "tokens: 250 in, 40 out (reported for 1 of 2 requests)"
+    "tokens: 250 in (reported for 1 of 2 requests), out not reported"
   )
+@
+
+A request that fails in the retry withholds only the papers it asked
+about, with the reason, and the batch's usable answers are applied;
+the run line counts the failed request.  The reason names the failure
+without the request's address or key.  A request that fails in the
+first place is no retry: the exception leaves
+[[classify_papers_with_llm]] as it always has, and nothing is decided.
+
+<<retry only the unusable test methods>>=
+def test_a_failed_retry_request_loses_no_other_answer(self, monkeypatch):
+  session, model, result = self._run(
+    monkeypatch, {"Beta Stacks": [self.MAYBE]}, fail_on=(2,))
+  assert model.shown == [self.TITLES]
+  assert len(model.prompts) == 2
+  assert [d.problem for d in result.withheld] == [
+    "invalid decision 'maybe'; retry request failed: connection failed "
+    "(ConnectionError)"
+  ]
+  assert "SECRET" not in result.withheld[0].problem
+  assert (result.requests, result.input_reported) == (2, 1)
+  apply_llm_decisions(session, result)
+  assert [d.status for d in session.decisions].count(
+    DecisionStatus.KEPT) == 4
+  assert run_cost_line(result).startswith(
+    "Requests: 1 batch + 1 retry of 1 paper; left pending: 1; ")
+
+def test_a_failed_first_request_ends_the_run(self, monkeypatch):
+  import requests as http
+
+  with pytest.raises(http.ConnectionError):
+    self._run(monkeypatch, {}, fail_on=(1,))
+
+def test_a_retry_under_candidates_asks_only_candidates(self,
+                                                      monkeypatch):
+  model = TitleAnsweringModel({
+    "Beta Stacks": [self.MAYBE], "Delta Heaps": [None],
+  }).install(monkeypatch)
+  session = self._session()
+  chosen = [session.decisions[1], session.decisions[3]]
+  result = classify_papers_with_llm(
+    session, model_id="stub-model", enrich_missing=False,
+    require_examples=False, vocabulary=self.VOCABULARY,
+    candidates=chosen,
+  )
+  assert model.shown == [["Beta Stacks", "Delta Heaps"],
+                         ["Beta Stacks", "Delta Heaps"]]
+  assert result.retried == self._ids(session, "Beta Stacks",
+                                     "Delta Heaps")
 @
 
 \subsection{Gathering Full-text Support}
@@ -8462,6 +8656,9 @@ def test_a_withheld_answer_stores_nothing(self, monkeypatch):
                                   enrich_missing=False)
   assert len(model.prompts) == 2
   assert "Compiler Course Design" not in model.prompts[1]
+  important = "IMPORTANT: give every paper exactly one of these category"
+  assert important not in model.prompts[0]
+  assert important in model.prompts[1]
   assert (result.batch.requests, len(result.batch.retried)) == (2, 1)
   assert run_cost_line(result.batch, "no screening stored").startswith(
     "Requests: 1 batch + 1 retry of 1 paper; no screening stored: 1; ")

@@ -3350,33 +3350,45 @@ retry no longer re-sends the batch: ONE second request holds only the
 papers whose first answer needs it (`_needs_retry(decision, allowed)`:
 `problem` set, or all tags dropped), built by
 `build_classification_prompt` for those papers (same fixed parts) +
-`_retry_reminder`; each answer replaces its paper's first answer in
-place (matched by paper id, in first-answer order); the others are
-untouched. No third pass: still unusable -> withheld; a retry with no
-JSON withholds its papers instead of ending the run. Covers `llm
-classify`, `--second-screen` and `rq`. A first version (one request
+`_retry_reminder` (at the end); papers shown in batch (session) order;
+each answer replaces its paper's first answer in place (matched by
+paper id); the others are untouched. No third pass: still unusable ->
+withheld; a retry with no JSON withholds its papers; a retry REQUEST
+that raises (any exception, caught around `RequestTally.ask` only)
+withholds its papers with problem "<first problem>; retry request
+failed: <`network.request_failure_reason`>" and the usable answers are
+applied. A failing FIRST request still raises out of
+`classify_papers_with_llm` (command ends with the exception, nothing
+decided). Covers `llm classify`, `--second-screen` and `rq`
+(`candidates=` too). A first version (one request
 per unusable paper, papers placed after the instructions) was run
 against anthropic/claude-sonnet-5-5 on 2026-11-23 (50 papers, one run
 per shape): papers-last made the model drop the category on 50 of 50
 (batch of 50) and on 9 and 10 of 10 (two of five batches of 10), and
 per-paper retries then cost the batch + 50 requests (138,101 tokens
-in). So the prompt order is main's (fixed parts, papers, instructions)
+in). A second check (main's order, one-request retry; same 50 papers,
+same model, 2026-11-23): batch of 50 one request, no retry, 34,898 in /
+6,830 out; five batches of 10 no retry, 39,410 / 5,845 in all. So the
+prompt order is main's (fixed parts, papers, instructions)
 and `TestPromptVersionPinned` pins `classification_prompt_version` to
 main's value `470bf32517e3861b` for its probe arguments: a prompt change
 must update the pin on purpose. Stand-in models in tests must answer
 per paper (by title: `TitleAnsweringModel` in llm_review.nw), not per
 position, since a retried paper gets a new index in the retry.
 **Tally**: `RequestTally.ask(model, prompt)` counts
-requests and sums `response.usage()` (llm 0.38 `Usage.input/.output`,
-`None` unless the plugin called `set_usage`; a response without
-`usage` reports none). `LLMBatchResult` gained `requests`, `retried`
-(paper ids asked again), `usage_reported` (requests with a count);
+each request when sent (a failed one too) and sums `response.usage()`
+(llm 0.38 `Usage.input/.output`, `None` unless the plugin called
+`set_usage`; no `usage`, a raising `usage()` or a non-count
+(`token_count`) = not reported, never an error). `LLMBatchResult`
+gained `requests`, `retried` (paper ids asked again),
+`input_reported`/`output_reported` (requests with that count);
 `prompt_tokens`/`completion_tokens` are now the run's sums (before,
 they read `response.prompt_tokens`, an attribute llm 0.38's responses
 do not have, so they were None). `run_cost_line(batch, withheld_as)` → "Requests:
 1 batch + 1 retry of 9 papers; left pending: 1; tokens: 300 in, 30 out"
-(" (reported for k of n requests)" when partial; "tokens: not reported
-by the model" when none); `cli.print_run_cost` prints it last in `llm
+(per direction: " (reported for k of n requests)" when partial, "out
+not reported" when none of that direction; "tokens: not reported by
+the model" when none at all); `cli.print_run_cost` prints it last in `llm
 classify` and `rq`, and in the second screen with "no screening
 stored". Nothing is stored in the session; no price is computed.
 Dry runs (`llm classify --dry-run`, also with `--second-screen`) print
