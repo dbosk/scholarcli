@@ -694,7 +694,15 @@ lookups (`get_paper_by_doi`, `get_preprint_locations`,
 
 Keys in messages (#159): `network.redact_secrets(text)` hides the
 values of `api_key`/`apikey`/`api-key`/`key` URL parameters and
-`mailto`/`email` (personal data, #160, #259), in any case. `check_provider` applies it to every health message; the
+`mailto`/`email` (personal data, #160, #259), in any case, and (#306)
+the URL parameters `access_token`/`token`, the header/mapping forms
+`api-key`/`api_key`/`apikey` (also with `x-` or `x-<vendor>-`, e.g.
+`x-goog-api-key`)/`authorization` followed by `:` or `=` and a bare or
+quoted value (scheme word Bearer/Basic/Token kept: `SECRET_HEADER`) and
+any `Bearer <token>` (`BEARER_TOKEN`); in those two forms a value
+counts only if it holds a digit or has >= `MIN_BARE_SECRET_CHARS` (16)
+characters, so prose ("api_key: API key", "a bearer token") stays.
+Idempotent: `[redacted]` is never redacted again. `check_provider` applies it to every health message; the
 OpenAlex and IEEE (`apikey` in the URL) error logs use it. The OpenAlex
 `/works` probe sends the key as `Authorization: Bearer` (documented,
 as pyalex does); `/rate-limit` keeps the `api_key` parameter (the only
@@ -3335,13 +3343,74 @@ searched again.
 `llm classify` tells the model to use only the session's existing
 themes and motivations; `parse_llm_response(allowed_tags=…)` maps tags
 case-insensitively onto that vocabulary, drops the rest with a warning
-(`LLMDecision.dropped_tags`), and `classify_papers_with_llm` retries the
-batch once with the vocabulary spelled out when a paper would be left
-without tags. A session without tags imposes nothing unless
+(`LLMDecision.dropped_tags`), and `classify_papers_with_llm` asks once
+more, with the vocabulary spelled out, about a paper that would be left
+without tags (see "Retry and run tally" below). A session without tags
+imposes nothing unless
 `llm classify --tag` (the `vocabulary=` argument) seeds it; with
 `--allow-new-tags` (`allow_new_tags=`) the prompt asks the model to
 prefer the vocabulary and new tags are not dropped. The `llm`
 module is looked up via `globals()` so tests can substitute a fake model.
+
+**Retry and run tally (#306, llm_review.nw `sec:retry-one-paper`,
+`sec:classifier-run-cost`; cli.nw `sec:llm-classify-run-cost`).** The
+retry no longer re-sends the batch: ONE second request holds only the
+papers whose first answer needs it (`_needs_retry(decision, allowed)`:
+`problem` set, or all tags dropped), built by
+`build_classification_prompt` for those papers (same fixed parts) +
+`_retry_reminder` (at the end); papers shown in batch (session) order;
+each answer replaces its paper's first answer in place (matched by
+paper id); the others are untouched. No third pass: still unusable ->
+withheld. The retry prompt is built before the `try`, which holds
+only `RequestTally.ask` (a fault in scholar's code propagates). A retry
+REQUEST that raises (any exception) or a retry with no JSON withholds
+EVERY paper asked again (`_withheld_after_retry`: problem = the non-empty
+parts of "<first problem or `NO_TAG_LEFT`>; retry request failed:
+<reason>" / "...; retry unreadable: <parse error>"; a paper whose tags
+were all dropped is withheld too, as main left it undecided when the
+run ended); the usable answers are applied. Reason via
+`retry_failure_reason`: `requests` exceptions through
+`network.request_failure_reason`, any other by class name only (plugin
+texts may hold a header with the key). A failing FIRST request still raises out of
+`classify_papers_with_llm` (command ends with the exception, nothing
+decided). Covers `llm classify`, `--second-screen` and `rq`
+(`candidates=` too). A first version (one request
+per unusable paper, papers placed after the instructions) was run
+against anthropic/claude-sonnet-5-5 on 2026-11-23 (50 papers, one run
+per shape): papers-last made the model drop the category on 50 of 50
+(batch of 50) and on 9 and 10 of 10 (two of five batches of 10), and
+per-paper retries then cost the batch + 50 requests (138,101 tokens
+in). A second check (main's order, one-request retry; same 50 papers,
+same model, 2026-11-23): batch of 50 one request, no retry, 34,898 in /
+6,830 out; five batches of 10 no retry, 39,410 / 5,845 in all. So the
+prompt order is main's (fixed parts, papers, instructions)
+and `TestPromptVersionPinned` pins `classification_prompt_version` to
+main's value `470bf32517e3861b` for its probe arguments: a prompt change
+must update the pin on purpose. Stand-in models in tests must answer
+per paper (by title: `TitleAnsweringModel` in llm_review.nw), not per
+position, since a retried paper gets a new index in the retry.
+**Tally**: `RequestTally.ask(model, prompt)` counts
+each request when sent (a failed one too) and sums `response.usage()`
+(llm 0.38 `Usage.input/.output`, `None` unless the plugin called
+`set_usage`; no `usage`, a raising `usage()` or a non-count
+(`token_count`) = not reported, never an error). `LLMBatchResult`
+gained `requests`, `retried` (paper ids asked again),
+`input_reported`/`output_reported` (requests with that count);
+`prompt_tokens`/`completion_tokens` are now the run's sums (before,
+they read `response.prompt_tokens`, an attribute llm 0.38's responses
+do not have, so they were None). `run_cost_line(batch, withheld_as)` → "Requests:
+1 batch + 1 retry of 9 papers; left pending: 1; tokens: 300 in, 30 out"
+(per direction: " (reported for k of n requests)" when partial, "out
+not reported" when none of that direction; "tokens: not reported by
+the model" when none at all); `cli.print_run_cost` prints it last in `llm
+classify` and `rq`, and in the second screen with "no screening
+stored". Nothing is stored in the session; no price is computed.
+Dry runs (`llm classify --dry-run`, also with `--second-screen`) print
+the prompt through `cli.print_dry_run_prompt`: a Rich `Text`,
+`soft_wrap=True`, no highlighter, so the output is the prompt's exact
+characters (before, Rich markup ate `[abstract truncated]` and any
+tag-like brackets in titles, and lines were wrapped). `llm synthesize
+--dry-run` still prints through markup (not changed here).
 
 **Unknown model (#284).** Every model lookup (`classify_papers_with_llm`,
 `second_screen_with_llm`, `generate_literature_synthesis`,
@@ -3462,8 +3531,8 @@ moved five places, `paper_id` stays last): empty when unset,
 - **No invented values.** `parse_llm_response` returns one entry per
   paper; an unusable answer (no answer, decision not kept/discarded, a
   discard without tags, confidence missing/non-numeric/outside [0, 1])
-  gets `LLMDecision.answer_problem`, triggers the single retry, and is
-  then withheld with the category-rule ones (`LLMDecision.problem`);
+  gets `LLMDecision.answer_problem`, puts the paper in the one retry
+  request (#306), and is then withheld with the category-rule ones (`LLMDecision.problem`);
   `llm classify` and `rq` list them (`print_withheld_papers`) under
   "Left pending, no usable answer".
 - **Quotes in the reasons (#256).** `llm classify` (not `rq`) ends
@@ -3509,7 +3578,8 @@ moved five places, `paper_id` stays last): empty when unset,
   `sample_id` (that band) or a banded draw's group id (`sample_group`,
   all bands; each screening stores its band's id); sampled papers
   `reset_since_draw` are skipped and counted. Session order, `-n` per
-  run (one request + the one retry, as classify); decisions with a
+  run (one batch request + at most one retry request, as classify);
+  decisions with a
   counted screening of identity `("llm", model, True)`
   (`has_second_screen_by`) are skipped unless `--rescreen`; copies under
   one id are shown once and all screened. `classify_papers_with_llm(...,

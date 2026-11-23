@@ -2636,6 +2636,7 @@ console.print(f"  Total papers: {stats['total']}")
 console.print(f"  Labeled by LLM: {len(updated)}")
 console.print(f"  Pending: {stats['pending']}")
 print_withheld_papers(console, session, batch.withheld)
+print_run_cost(console, batch)
 @
 
 \subsection{Resolving the research question}
@@ -27504,8 +27505,10 @@ def llm_classify(
     can go beyond the abstract.
 
     The tags already used in the session form the vocabulary the model must
-    stay within; tags it invents are dropped (with a warning) and the batch
-    is retried once. --tag adds tags to that vocabulary, so a fresh session
+    stay within; tags it invents are dropped (with a warning), and a paper
+    left without a usable answer is asked about once more, together with
+    the others that need it, in one request.
+    --tag adds tags to that vocabulary, so a fresh session
     can be constrained from the first batch; --allow-new-tags asks the model
     to prefer the vocabulary but lets it add tags when none fits.
 
@@ -27519,7 +27522,10 @@ def llm_classify(
     is filled in for the model.
 
     Each decision records the model, the time (UTC), a prompt version,
-    the model's reason and whether the abstract was truncated.
+    the model's reason and whether the abstract was truncated. The run
+    ends with one line counting its requests (the batch and the retry,
+    with its number of papers), the papers left pending and the tokens
+    the model reported.
 
     With --second-screen the model screens decided papers again, as a
     second screener: each answer is stored as a screening beside the
@@ -27600,8 +27606,7 @@ def llm_classify(
         )
 
         if dry_run:
-            console.print("[bold]Prompt (dry run):[/bold]")
-            console.print(result)
+            print_dry_run_prompt(console, result)
             return
 
         # Apply decisions
@@ -27620,6 +27625,7 @@ def llm_classify(
         <<report papers left pending by the classifier>>
         <<report reasons quoting words not in the record>>
         print_abstract_gap(updated, session, "decided", pending=False)
+        <<report what the classifier run asked and cost>>
 
     except ValueError as e:
         console.print(
@@ -28548,6 +28554,302 @@ class TestLLMClassifyWithheld:
 \subsection{Quotes in the classifier's reasons}
 \label{sec:llm-classify-quotes}
 
+\subsection{Showing the prompt of a dry run}
+\label{sec:llm-classify-dry-run}
+
+A dry run promises the prompt the model would be sent, but it used to
+print it through Rich's markup, so every bracketed word that looks like
+a style tag vanished: the classifier's own \enquote{[abstract
+truncated]} mark, a title holding \enquote{[bold]}, and a backslash
+before a bracket was taken as an escape.  The reader saw a prompt the
+model would never get.  The prompt is therefore printed as a
+[[Text]], which Rich does not parse for markup or emoji codes, without
+the highlighter, and with [[soft_wrap]] so that no line break is
+added: the output is the prompt's characters, as [[sessions show]]
+prints stored strings ([[print_show_line]]).  Only the heading
+above it is markup.  The ordinary dry run and the second screen's use
+it; [[rq]] has no dry run.
+
+<<llm command>>=
+def print_dry_run_prompt(console, prompt: str) -> None:
+    """Print a dry run's prompt exactly, never read as Rich markup."""
+    from rich.text import Text
+
+    console.print("[bold]Prompt (dry run):[/bold]")
+    console.print(Text(prompt), soft_wrap=True, highlight=False)
+@
+
+Let's check it with an invented paper whose title holds a style tag and
+a backslash before a bracket, and whose abstract is long enough to be
+cut, so the prompt carries the classifier's \enquote{[abstract
+truncated]} mark.  The output after the heading must be the prompt
+[[build_classification_prompt]] builds, character for character; the
+second screen's dry run is checked the same way, against
+[[second_screen_with_llm]]'s own dry run.
+
+<<test functions>>=
+class TestDryRunShowsThePromptExactly:
+  TITLE = "Loops [bold]x[/bold] and a path C:\\[dir] of [red]"
+
+  def _save(self, tmp_path, monkeypatch, decided):
+    from scholar.llm_review import MAX_ABSTRACT_CHARS
+    from scholar.review import (
+      DecisionStatus, ReviewDecision, ReviewSession, save_session,
+    )
+
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+    paper = Paper(title=self.TITLE, authors=["Ada Lovelace"],
+                  doi="10.5555/dry-run",
+                  abstract="Students traced loops. " * MAX_ABSTRACT_CHARS)
+    status = DecisionStatus.KEPT if decided else DecisionStatus.PENDING
+    save_session(ReviewSession(
+      query="q", providers=["p"], timestamp=datetime(2026, 11, 23),
+      name="dry", research_context="Do [i]novices[/i] misread loops?",
+      decisions=[ReviewDecision(paper=paper, provider="p", status=status,
+                                tags=["loops"] if decided else [])],
+    ))
+
+  def _shown(self, result):
+    assert result.exit_code == 0, result.output
+    heading = "Prompt (dry run):\n"
+    return result.output[result.output.index(heading) + len(heading):]
+
+  def test_the_ordinary_dry_run(self, tmp_path, monkeypatch):
+    from scholar.llm_review import TRUNCATION_MARK, classify_papers_with_llm
+    from scholar.review import load_session
+
+    self._save(tmp_path, monkeypatch, decided=False)
+    prompt = classify_papers_with_llm(
+      load_session("dry"), enrich_missing=False, dry_run=True,
+      require_examples=False,
+    )
+    assert self.TITLE in prompt and TRUNCATION_MARK in prompt
+    result = runner.invoke(app, ["llm", "classify", "dry", "--dry-run",
+                                 "--no-examples", "--no-enrich"])
+    assert self._shown(result) == prompt + "\n"
+
+  def test_the_second_screen_dry_run(self, tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    import scholar.llm_review as llm_review
+    from scholar.review import load_session
+
+    self._save(tmp_path, monkeypatch, decided=True)
+    model = SimpleNamespace(model_id="stub-model")
+    monkeypatch.setattr(llm_review, "llm",
+                        SimpleNamespace(get_model=lambda *_: model),
+                        raising=False)
+    prompt = llm_review.second_screen_with_llm(
+      load_session("dry"), over="all", dry_run=True, enrich_missing=False,
+    )
+    result = runner.invoke(app, ["llm", "classify", "dry",
+                                 "--second-screen", "--over", "all",
+                                 "--dry-run", "--no-enrich"])
+    assert self._shown(result) == prompt + "\n"
+@
+
+\subsection{What the classifier run asked and cost}
+\label{sec:llm-classify-run-cost}
+
+The classifier asks again, in one request, about the papers whose
+first answer was unusable (\cref{sec:retry-one-paper} in the LLM review
+module), and it tallies its requests and the tokens the model reported
+(\cref{sec:classifier-run-cost} there).  The run ends with that tally
+on one line, after everything else it reports, so that the cost of a
+batch size or a model can be read from the runs themselves rather than
+measured apart; the line is not stored in the session.  [[llm
+classify]], its second screen (where a withheld paper gets no
+screening rather than staying pending) and [[rq]], which classifies
+with the same function, all print it.  It is printed as plain text:
+it holds no stored string, but nothing in it is markup either.
+
+<<report what the classifier run asked and cost>>=
+print_run_cost(console, result)
+<<llm command>>=
+def print_run_cost(console, batch, withheld_as: str = "left pending"):
+    """Print the classifier run's requests, withheld papers and tokens."""
+    from scholar.llm_review import run_cost_line
+
+    console.print(run_cost_line(batch, withheld_as), soft_wrap=True,
+                  markup=False, highlight=False)
+@
+
+Let's run the three commands with a stand-in model reached through the
+seams the other tests use (the [[globals()]] seam of the classifier, or
+the [[llm]] module for [[rq]]); it answers each paper by its title, so
+that a paper asked about again gets its own answer, leaves out the
+paper titled \enquote{Second Paper} the first time it is asked about it,
+and reports invented token counts with the [[llm]] package's own
+[[Usage]].
+
+<<test functions>>=
+class TestClassifierRunCostLine:
+  """llm classify, its second screen and rq end with the run's tally."""
+
+  <<classifier run cost line test methods>>
+
+<<classifier run cost line test methods>>=
+@staticmethod
+def _model(model_id="stub-model"):
+  import re
+  from types import SimpleNamespace
+  from llm.models import Usage
+
+  class StubModel:
+    def __init__(self):
+      self.model_id = model_id
+      self.prompts = []
+      self.asked = {}
+
+    def prompt(self, prompt):
+      self.prompts.append(prompt)
+      if "Papers to Classify" not in prompt:
+        text = json.dumps({"queries": [{"provider": "fake",
+                                        "query": "rq query"}]})
+        return SimpleNamespace(text=lambda: text, usage=lambda: Usage())
+      answers = []
+      for index, title in re.findall(r"\[Paper (\d+)\]\nTitle: (.*)",
+                                     prompt):
+        self.asked[title] = self.asked.get(title, 0) + 1
+        if title == "Second Paper" and self.asked[title] == 1:
+          continue
+        answers.append({"paper_index": int(index), "decision": "kept",
+                        "tags": ["recursion"], "confidence": 0.8,
+                        "reasoning": "On recursion."})
+      text = json.dumps({"classifications": answers})
+      return SimpleNamespace(text=lambda: text,
+                             usage=lambda: Usage(input=200, output=20))
+
+  return StubModel()
+
+def _install(self, monkeypatch, model):
+  from types import SimpleNamespace
+  import scholar.llm_review as llm_review
+
+  monkeypatch.setattr(llm_review, "llm",
+                      SimpleNamespace(get_model=lambda *_: model),
+                      raising=False)
+
+def _papers(self):
+  return [
+    Paper(title=title, authors=["Ada Lovelace"], doi=f"10.5555/cost-{n}",
+          abstract="Students traced recursion as a loop.")
+    for n, title in enumerate(["First Paper", "Second Paper",
+                               "Third Paper"])
+  ]
+
+def _save(self, tmp_path, monkeypatch, decided=False):
+  from scholar.review import (
+    DecisionStatus, ReviewDecision, ReviewSession, save_session,
+  )
+
+  monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+  status = DecisionStatus.KEPT if decided else DecisionStatus.PENDING
+  save_session(ReviewSession(
+    query="q", providers=["p"], timestamp=datetime(2026, 11, 23),
+    name="run-cost", research_context="Do novices misread recursion?",
+    decisions=[
+      ReviewDecision(paper=p, provider="p", status=status,
+                     tags=["recursion"] if decided else [])
+      for p in self._papers()
+    ],
+  ))
+
+LINE = ("Requests: 1 batch + 1 retry of 1 paper; {}: 0; "
+        "tokens: 400 in, 40 out")
+
+def test_classify_ends_with_the_tally(self, tmp_path, monkeypatch):
+  from scholar.review import DecisionStatus, load_session
+
+  self._save(tmp_path, monkeypatch)
+  model = self._model()
+  self._install(monkeypatch, model)
+  result = runner.invoke(app, ["llm", "classify", "run-cost",
+                               "--no-examples", "--no-enrich"])
+  assert result.exit_code == 0, result.output
+  assert result.output.splitlines()[-1] == self.LINE.format("left pending")
+  assert len(model.prompts) == 2
+  assert [d.status for d in load_session("run-cost").decisions] \
+    == [DecisionStatus.KEPT] * 3
+
+def test_second_screen_ends_with_the_tally(self, tmp_path, monkeypatch):
+  self._save(tmp_path, monkeypatch, decided=True)
+  self._install(monkeypatch, self._model())
+  result = runner.invoke(app, ["llm", "classify", "run-cost",
+                               "--second-screen", "--over", "all",
+                               "--no-enrich"])
+  assert result.exit_code == 0, result.output
+  assert self.LINE.format("no screening stored") \
+    in result.output.splitlines()
+
+def test_rq_ends_with_the_tally(self, tmp_path, monkeypatch):
+  import sys
+  import types
+  from scholar import providers
+
+  monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+  provider = Mock()
+  provider.name = "fake"
+  provider.is_available.return_value = True
+  provider.search.return_value = self._papers()
+  monkeypatch.setattr(providers, "PROVIDERS", {"fake": provider})
+  model = self._model()
+  llm_mod = types.ModuleType("llm")
+  llm_mod.get_model = lambda model_id=None: model
+  monkeypatch.setitem(sys.modules, "llm", llm_mod)
+  result = runner.invoke(app, ["rq", "Do novices misread recursion?",
+                               "--provider", "fake", "--count", "3",
+                               "--no-enrich"])
+  assert result.exit_code == 0, result.output
+  assert result.output.splitlines()[-1] == self.LINE.format("left pending")
+  assert model.asked == {"First Paper": 1, "Second Paper": 2,
+                         "Third Paper": 1}
+@
+
+In a session whose papers carry tags, the retry [[rq]] sends ends with
+the reminder that spells out the vocabulary, as the classifier's own
+retry does: here [[rq]] appends to a saved session with one decided
+paper tagged \enquote{recursion}.
+
+<<classifier run cost line test methods>>=
+def test_the_rq_retry_ends_with_the_reminder(self, tmp_path,
+                                             monkeypatch):
+  import sys
+  import types
+  from scholar import providers
+  from scholar.llm_review import _retry_reminder
+  from scholar.review import (
+    DecisionStatus, ReviewDecision, ReviewSession, save_session,
+  )
+
+  monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+  save_session(ReviewSession(
+    query="Do novices misread recursion?", providers=["fake"],
+    timestamp=datetime(2026, 11, 23), name="rq-reminder",
+    decisions=[ReviewDecision(
+      paper=Paper(title="Tracing Tables", authors=["Ada Lovelace"],
+                  doi="10.5555/cost-kept", abstract="Tables of calls."),
+      provider="fake", status=DecisionStatus.KEPT, tags=["recursion"],
+    )],
+  ))
+  provider = Mock()
+  provider.name = "fake"
+  provider.is_available.return_value = True
+  provider.search.return_value = self._papers()
+  monkeypatch.setattr(providers, "PROVIDERS", {"fake": provider})
+  model = self._model()
+  llm_mod = types.ModuleType("llm")
+  llm_mod.get_model = lambda model_id=None: model
+  monkeypatch.setitem(sys.modules, "llm", llm_mod)
+  result = runner.invoke(app, ["rq", "Do novices misread recursion?",
+                               "--provider", "fake", "--count", "3",
+                               "--no-enrich", "-n", "rq-reminder"])
+  assert result.exit_code == 0, result.output
+  reminder = _retry_reminder({"recursion"}, None)
+  assert "IMPORTANT" in reminder
+  batch, retry = model.prompts[-2:]
+  assert reminder not in batch and retry.endswith(reminder)
+@
+
 The model gives a reason for each decision, stored as [[llm_reason]],
 and a reason that quotes the record is read as evidence.  A model can
 put its own paraphrase between quote marks, or words from another
@@ -28933,8 +29235,7 @@ except (ValueError, ImportError) as e:
     console.print(f"[red]Error: {escape(str(e))}[/red]", soft_wrap=True)
     raise typer.Exit(1)
 if dry_run:
-    console.print("[bold]Prompt (dry run):[/bold]")
-    console.print(screen)
+    print_dry_run_prompt(console, screen)
     return
 copy_path = None
 if screen.screened:
@@ -29003,6 +29304,7 @@ print_reason_quote_misses(
 )
 print_abstract_gap([d for d, _ in screen.screened], session, "screened",
                    pending=False)
+print_run_cost(console, screen.batch, "no screening stored")
 if copy_path is not None:
     console.print(f"[dim]Copy of the session before: {copy_path}[/dim]")
 @
@@ -29010,7 +29312,8 @@ if copy_path is not None:
 Let's run the command on a saved session of invented records, with a
 fake model through the [[globals()]] seam of the classifier tests: a
 discard the same model made, a keep a human made, and a pending paper.
-The saved file is compared before and after, so \enquote{no decision
+The fake answers each paper by its title, so a paper asked about again
+under another index gets its own answer.  The saved file is compared before and after, so \enquote{no decision
 was changed} means every saved field but the screenings.
 
 <<test functions>>=
@@ -29056,7 +29359,7 @@ def _make_session(self, tmp_path, monkeypatch):
     decisions=[machine, human, pending],
   ))
 
-def _fake(self, monkeypatch, bad_index=None):
+def _fake(self, monkeypatch, bad=None):
   import re
   from types import SimpleNamespace
   import scholar.llm_review as llm_review
@@ -29067,14 +29370,13 @@ def _fake(self, monkeypatch, bad_index=None):
 
     def prompt(self, prompt):
       FakeModel.prompts.append(prompt)
-      indices = sorted({int(i) for i in re.findall(r"\[Paper (\d+)\]",
-                                                   prompt)})
+      shown = re.findall(r"\[Paper (\d+)\]\nTitle: (.*)", prompt)
       text = json.dumps({"classifications": [
-        {"paper_index": i,
-         "decision": "maybe" if bad_index in (i, "all") else "kept",
+        {"paper_index": int(i),
+         "decision": "maybe" if bad in (title, "all") else "kept",
          "tags": ["recursion"], "confidence": 0.8,
          "reasoning": "On recursion."}
-        for i in indices
+        for i, title in shown
       ]})
       return SimpleNamespace(text=lambda: text)
 
@@ -29162,7 +29464,7 @@ def test_a_dry_run_and_a_withheld_answer_store_nothing(self, tmp_path,
                                                        monkeypatch):
   path = self._make_session(tmp_path, monkeypatch)
   saved = path.read_bytes()
-  prompts = self._fake(monkeypatch, bad_index=1)
+  prompts = self._fake(monkeypatch, bad="Recursion Misconceptions")
   result = self._classify("--second-screen", "--over", "all", "--dry-run",
                           "--no-enrich")
   assert result.exit_code == 0, result.output
@@ -29187,7 +29489,7 @@ session is kept: there is nothing to restore.
 def test_nothing_recorded_saves_nothing(self, tmp_path, monkeypatch):
   path = self._make_session(tmp_path, monkeypatch)
   saved = path.read_bytes()
-  self._fake(monkeypatch, bad_index="all")
+  self._fake(monkeypatch, bad="all")
   result = self._classify("--second-screen", "--over", "all",
                           "--no-enrich")
   assert result.exit_code == 0, result.output
