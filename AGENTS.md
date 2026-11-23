@@ -2464,6 +2464,97 @@ screeners)} over records screened twice, `screen_sample` (the one
   per decision (`link_places_data`, ranked links only, key absent
   otherwise). CSV: `best_rank`, `providers_count` (databases) after `provider`
   (both in `CSV_NUMERIC_COLUMNS`).
+- **Sample of the rest** (#315, cli.nw `sec:rest-sample-sheet`,
+  `sec:sessions-tier-sample`; review.nw `sec:tier-sample-record`;
+  llm_review.nw `sec:tier-sample`): `sessions export S -f screen-sheet
+  --pending <tier options> --rest-sample N --seed S [--batch-size B]
+  [--dry-run]` lists instead of the tier a draw of N of the pending
+  papers the tier leaves out (`outside_tier`; one per paper id, so no
+  decided and no tier paper), drawn by `llm sample`'s draw:
+  `llm_review.smallest_keys(sorted ids, random.Random(seed), N)` (the
+  key step of `draw_llm_sample`, now shared; `test_golden_draw` and the
+  tier test's golden draw for seed 315 pin it), listed in key order;
+  rest <= N -> all of it, `census` True; an empty rest is a ValueError
+  (export exit 1). `draw_tier_sample` records a `review.TierSample`
+  (`sample_id` `<drawn_at>/rest/seed=S/<12 uuid4 hex>`, `drawn_at` UTC,
+  `seed`, `size`, `rule` = `TierRule.data()`, `rest`, `rest_digest` =
+  sha256 of the sorted ids joined by newlines [:16], `papers` drawn ids
+  in order, `census`) in `ReviewSession.tier_samples`: saved only when
+  non-empty, old files load [], concurrent merge adds the file's draws
+  by `sample_id` (real-subprocess race with a decide, both orders),
+  ids repointed by `repoint_folded_ids`. An older Scholar drops the
+  list on save (read from its loader/serialiser, which know only their
+  keys). This export SAVES the session (help says so): inside the
+  staging, after `keep_copy_before_run(session, "pre-rest-sample")`,
+  before the files are moved (the other order could leave a screened
+  sheet whose draw is never recordable); a failure after the save says
+  the draw's id is recorded and points to `sessions tier-sample`.
+  A refused save (#317, `SessionNotSaved`, also from the pre-run copy)
+  is re-raised for `main()`'s one line: staging discarded (no sheet, no
+  tier file), nothing claims a recorded draw; the kept
+  `.json.unsaved-*` file holds `tier_samples` (via `session_file_data`),
+  so `sessions recover` adds the draw, sheetless (`sessions tier-sample`
+  lists its papers). Tested with a real lock holder started after the
+  pre-run copy.
+  `--dry-run` draws in memory, prints no id, writes nothing. `BASE-tier.json`
+  adds `rest_sample` (the record minus `rule`). Exit 2 before loading:
+  `--rest-sample` without `--pending`, without a tier option, without
+  `--seed`, N < 1, another format; `--seed`/`--dry-run` alone.
+  Counting (`tier_sample_counts`, review.nw, no llm_review import so
+  `sessions show` stays light): drawn ids looked up through
+  `drawn_decisions` (fold tombstones, then a version-link DOI exactly
+  one paper holds: a preprint adoption); a homonym/surname rename or a
+  gone paper is `not_found`. Screened = the first decided decision
+  under the id (anyone). `tier_sample_verdict(d, uses_categories)`
+  (one function for counts, show, table, JSON, sentence): a discard
+  with a version note (`AUDIT_VERSION_NOTES`) or a record criterion
+  (`AUDIT_RECORD_CRITERIA`) is EXCLUDED (counted by reason, out of the
+  denominator `judged`); any other discard does not bear; in a session
+  using categories (any tag in `AUDIT_CATEGORIES`) a keep bears iff its
+  category is of bearing order, a keep without one is UNDETERMINED
+  (rate withheld); without categories every keep bears, whoever kept
+  it. NOT the audit table's cited rule (`check_bucket`), which ignored
+  unreviewed keeps (review of #318: 0 of 60 vs 5 of 60). Deciders =
+  `decision_source_items` over the screened drawn decisions, zero rows
+  dropped at the call (JSON too; the function is unchanged), named in
+  every output ("by human: 5; agent, unreviewed: 55"), never a reason
+  to withhold. `sessions show`: one `tier_sample_line` per draw
+  (`tier_sample_counts_text`) after the tier line, JSON `tier_samples`
+  (record + screened, deciders, bearing, judged, excluded,
+  undetermined, unscreened, not_found), both only with draws.
+  `sessions tier-sample S [--report] [-f table|json]` (read-only): per
+  draw counts and rule flags (`tier_rule_flags`), unscreened ids;
+  `--report` adds rate = bearing/judged,
+  `modified_wilson_interval(bearing, judged)` and `tier_sample_sentence`
+  ("Of the 300 records pending on <draw date> outside the first tier
+  (<`tier_rule_words`: the stored rule's own `meaning` with values put
+  in>), a random sample of 60 (seed 7) was screened (by human: 5;
+  agent, unreviewed: 55)[; k drawn records were excluded without a
+  judgement of the work (no-abstract: k), so the rate is over the other
+  n]; 3 bore on the question (5.0%; 95% modified Wilson interval 1.4%
+  to 13.7%[: a sample in which none bore does not show that none of the
+  rest does])."; a census: "every one was screened (...), a census
+  since ..., so the count is exact"). Unlike `llm sample --report`,
+  rate and interval are WITHHELD (`withheld_reason`, number agreement
+  via `llm_review.counted`; the sentence then ends ". No rate is
+  given: <reason>.") while any drawn paper is unscreened, not found,
+  undetermined, or its decided copies give different verdicts
+  (`copies_apart`, ids named; whichever copy is first), or when every
+  screened one was excluded. A discard with a bearing category
+  (`audit_excluded`) counts as not bearing and is stated
+  (`discarded_bearing`: "k drawn record(s) was/were discarded although
+  categorised as bearing"). JSON adds `drawn`, `copies_apart`,
+  `discarded_bearing`. `tier_rule_words` fills values in through
+  `as_written` (a function replacement: `re.sub` would read `\d`, `\1`
+  as escapes) and `one_line` (line breaks/tabs -> space), also in
+  `tier_rule_flags`; one provider reads "of scopus", not "of one of";
+  a complete census gets its rate, no interval. LaTeX report: after the
+  search parameters, a sub-heading "Records outside the screening tier"
+  and one sentence per draw (`build_tier_sample_latex`, nothing
+  without draws). Audit caption unchanged. `llm classify S
+  --tier-sample ID` classifies the draw's still-pending papers
+  (`candidates=`); exit 2 with `--second-screen`, `--top`,
+  `--min-providers` or an unknown id; exit 1 when none is pending.
 
 ### Session Arguments
 
@@ -2565,12 +2656,79 @@ context (#107). `review.save_session` now:
 - **locks**: the re-read, merge and replace run under
   `utils.file_lock` (`filelock`: `flock` on POSIX, `LockFileEx` on
   Windows) on a hidden sidecar `.<name>.json.lock`, so two processes
-  saving at once take turns. Held for milliseconds only, never from
-  load to save; after `LOCK_TIMEOUT` (10 s) it warns and writes
-  unlocked. Notes writers (`save_note`, `delete_note`, `get_note`,
-  `import_notes`, `migrate_paper_id`) take the notes file's lock via
-  `_holding_notes_lock`. Same machine only: no help across
-  machines on a shared directory.
+  saving at once take turns. Held for the merge and write only, never
+  from load to save. A session save NEVER writes unlocked (#316,
+  review.nw `sec:session-lock`): `session_lock(path, hint)` =
+  `file_lock(..., required=True, timeout=SESSION_LOCK_TIMEOUT (300 s),
+  notice_after=SESSION_LOCK_NOTICE (= LOCK_TIMEOUT, 10 s),
+  notice_every=SESSION_LOCK_REPEAT (60 s), notice_hint=...)`: WARNING
+  lines naming the file, time waited and left, and that Ctrl-C stops
+  the wait. `utils.LockNotTaken(path, reason, held=, lock_file=)`:
+  `held` True = another holder (timeout), False = the lock file cannot
+  be opened/created (`OSError`, "cannot open the lock file X: ...").
+  `save_session` takes the lock apart from the merge (`ExitStack`); on
+  `LockNotTaken` or `KeyboardInterrupt` during the wait,
+  `refused_save` keeps the session as `<name>.json.unsaved-<UTC
+  time>-<random>` (`keep_unsaved_session`, mkstemp) unless the
+  directory is not writable (`os.access`; then no attempt, said in the
+  line), and raises `SessionNotSaved(path, unsaved, reason, cause=
+  held|lock-file|interrupted, keep_error=)`; `cli.main()` prints it as
+  one unwrapped line, no traceback, exit 1 (130 when interrupted).
+  Kept file = `session_file_data(session)` + `UNSAVED_KEY`
+  `"scholar_unsaved"`: `{"target": "<name>.json", "baseline":
+  baseline_data(...) | null, "baseline_keys": [...]}`. The baseline is
+  plain JSON (NO pickle: a pickled baseline ran code on recover, review
+  of #317): `SessionBaseline` fields by name, values through a tagged
+  codec (`baseline_value_data`/`baseline_value`: one-key objects
+  `tuple`, `list`, `frozenset`, `dict` as pairs, `enum` [name, value]
+  from `BASELINE_ENUMS` = DecisionStatus, ReviewSource; leaves str,
+  int, float, bool, null); `baseline_from_data` checks tags, field
+  names and types, else `ValueError` -> `SessionFileError`.
+  `scholar sessions recover FILE` (`recover_unsaved_session`) accepts
+  only a `target` that is a plain non-hidden `<name>.json` the kept
+  file's own name begins with, written in the sessions directory;
+  restores baseline and keys, saves through `save_session` (same
+  merge, under the lock) and deletes FILE; refused again: FILE stays,
+  the new copy is removed. `--discard` deletes a kept file
+  (`discard_unsaved_session`: name has `.json.unsaved-` and
+  `read_kept_file` accepts it; else exit 2); every refused save leaves
+  one full copy, never removed automatically. Crafted kept files
+  (deep nesting -> `RecursionError`, non-string `baseline_keys`) are
+  one-line refusals. The keep serialises first and creates the file
+  only to write it (an interrupted keep leaves no file), and holds
+  back SIGINT while keeping (`InterruptHeldBack`, main thread only;
+  the command then exits 130); an interrupt that still stops it gives
+  "... could not be kept ..., so its changes are lost". SIGTERM is no
+  interrupt: `decide`/TUI end at once without a kept file (143), only
+  `enrich` turns it into one. `reconcile_session` and
+  `keep_copy_before_run` take `session_lock` too (hint
+  `NOTHING_CHANGED_HINT`; refused: `lock_refusal`, `SessionNotSaved`
+  with no kept file, "run the command again"). `scholar enrich` stops
+  at a refused chunk save ("Stopped: saved K of N ...", exit 1 or 130;
+  earlier chunks saved, the chunk in the kept file); the TUI's exit
+  save raises through `run_review`/`sessions resume` to `main`; a
+  refused `search -n` / `llm synthesize` prints nothing of its work
+  (both save first; results in the kept file and the caches).
+  `sessions list` warns about kept files (`unsaved_session_files`).
+  Other `file_lock` users still write unlocked after their timeout:
+  notes (`_holding_notes_lock`, 10 s; #319) and caches
+  (`CACHE_LOCK_TIMEOUT`, 60 s). Notes writers (`save_note`,
+  `delete_note`, `get_note`, `import_notes`, `migrate_paper_id`) take
+  the notes file's lock via `_holding_notes_lock`. Same machine only:
+  no help across machines on a shared directory.
+- **cost** (#316, review.nw `sec:save-cost`/`sec:pairing-cost`): a
+  save is linear in the decisions. `pair_with_file` groups the
+  baseline's keys by paper id once (`base_keys_by_id`; it used to scan
+  every baseline key per paper id: 94 s at 30,000 decisions with five
+  links each), and `save_session` runs under
+  `paused_garbage_collection()` (gc off, then restored as it was).
+  Measured after a load, invented session, 5 links per decision, under
+  other jobs' load: 5,000 / 10,000 / 30,000 decisions 1.2 / 2.9 /
+  8.1 s (before 4.1 / 15.5 / 172 s). The gc pause at 30,000: 12.3 s
+  without it vs 7.7-8.4 s with it (ours); 13.3/18.8 vs 8.5/12.6 s
+  (reviewer's), 2.6 vs 1.7-2.1 s at 5,000. Tests keep the old pairing
+  as `reference_pair_with_file` (test_review.py; do not change it) and
+  compare on the #228 scenarios and 400 seeded random cases.
 - **writes atomically**: `utils.atomic_write_text` (temp file in the
   same directory, fsync, `os.replace`), keeping the previous file as
   `<name>.json.bak` (one generation).
@@ -3317,6 +3475,11 @@ moved five places, `paper_id` stays last): empty when unset,
   Nothing is withheld or retried for it. Later checks (`sessions show`,
   report) see only title and abstract (see Headless Review Sessions).
   Answers without a valid `paper_index` are skipped (never index 0).
+- **Sample of a tier's rest (#315).** `llm classify S --tier-sample ID`
+  classifies the pending papers of a `TierSample` (see Screening tier
+  in Headless Review Sessions); `sessions tier-sample S --report` gives
+  the bearing rate with the same `modified_wilson_interval`, withheld
+  while the draw is not fully screened.
 - **First tier (#302, cli.nw `sec:llm-classify-tier`).** `llm classify
   S --top K --min-providers N` classifies only the pending papers of
   `screening_tier` (either condition), printing `tier_lines`; passed as
