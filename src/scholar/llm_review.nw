@@ -196,8 +196,10 @@ class LLMDecision:
 
 \subsection{LLM Batch Result}
 
-An [[LLMBatchResult]] collects all decisions from a single LLM invocation,
-along with metadata about the model and timing.
+An [[LLMBatchResult]] collects all decisions from one run of the
+classifier, along with metadata about the model and timing, and what
+the run cost: the requests it made, the papers it asked about a second
+time and the tokens the model reported (\cref{sec:classifier-run-cost}).
 
 <<llm review data structures>>=
 @dataclass
@@ -209,11 +211,19 @@ class LLMBatchResult:
         decisions: List of individual paper decisions
         model_id: Identifier of the LLM model used
         timestamp: When the classification was performed
-        prompt_tokens: Optional token count for the prompt
-        completion_tokens: Optional token count for the response
+        prompt_tokens: Input tokens the model reported, summed over
+            the run's requests; `None` when no request reported any
+        completion_tokens: Output tokens, summed likewise
         withheld: Decisions not applied because the answer was
             unusable or broke the one-category rule even after the
             retry; their papers stay pending
+        requests: Requests sent to the model in the run: the batch
+            and, when any answer was unusable, one retry
+        retried: Ids of the papers asked again in the retry, because
+            their first answer was unusable
+        input_reported: How many of the requests reported an input
+            token count
+        output_reported: How many reported an output token count
         prompt_version: Hash of the prompt template and run options
             (see `classification_prompt_version`)
         passages: The full-text passages shown to the model, by paper
@@ -228,6 +238,10 @@ class LLMBatchResult:
     withheld: list[LLMDecision] = field(default_factory=list)
     prompt_version: str | None = None
     passages: dict[str, list[str]] = field(default_factory=dict)
+    requests: int = 0
+    retried: list[str] = field(default_factory=list)
+    input_reported: int = 0
+    output_reported: int = 0
 @
 
 
@@ -1624,6 +1638,27 @@ class TestPromptVersion:
                 != version, change
 @
 
+The version is pinned, too, so that the prompt cannot change unnoticed:
+a reordering of the prompt for issue~\#306 changed every answer's
+shape in a run against a real model (\cref{sec:retry-one-paper}), and
+nothing in the tests said that the prompt had changed.  The pinned
+value was computed from this module as it was before that issue (the
+main branch at the merge of pull request~\#317), tangled on its own,
+with the arguments below.  A deliberate change to the prompt changes
+the pin, together with a sentence here saying what changed and why.
+
+<<test functions>>=
+class TestPromptVersionPinned:
+  PINNED = "470bf32517e3861b"
+
+  def test_the_prompt_is_the_one_pinned(self):
+    assert classification_prompt_version(
+      research_context="Does the claim hold?",
+      vocabulary={"supports-claim"}, allow_new_tags=False,
+      examples="confirmed", use_fulltext=False, max_quotes=3, count=10,
+    ) == self.PINNED
+@
+
 
 \section{LLM Interaction}
 \label{sec:llm-interaction}
@@ -2031,6 +2066,8 @@ def classify_papers_with_llm(
     4. Optionally extracts full-text supporting passages
     5. Constructs a prompt with examples and papers to classify
     6. Invokes the LLM and parses the response
+    7. Asks again, in one request, about the papers whose first answer
+       was unusable; the others keep their first answer
 
     Args:
         session: The review session
@@ -2146,19 +2183,22 @@ def classify_papers_with_llm(
 
     <<sort the vocabulary into categories, notes and themes>>
 
-    # Build prompt
-    prompt = build_classification_prompt(
-        papers_to_classify=to_classify,
-        kept_examples=kept_examples,
-        discarded_examples=discarded_examples,
-        research_context=session.research_context,
-        available_themes=themes - set_apart,
-        available_motivations=motivations - set_apart,
-        paper_quotes=paper_quotes,
-        extra_tags=set(vocabulary or ()) - set_apart,
-        allow_new_tags=allow_new_tags,
-        category_tags=categories,
-    )
+    # Build prompt: the same fixed parts for the batch and every retry
+    def prompt_for(papers_shown, quotes_shown):
+        return build_classification_prompt(
+            papers_to_classify=papers_shown,
+            kept_examples=kept_examples,
+            discarded_examples=discarded_examples,
+            research_context=session.research_context,
+            available_themes=themes - set_apart,
+            available_motivations=motivations - set_apart,
+            paper_quotes=quotes_shown,
+            extra_tags=set(vocabulary or ()) - set_apart,
+            allow_new_tags=allow_new_tags,
+            category_tags=categories,
+        )
+
+    prompt = prompt_for(to_classify, paper_quotes)
 
     if dry_run:
         return prompt
@@ -2191,40 +2231,32 @@ def classify_papers_with_llm(
             f"  [{i}] {decision.paper.title[:50]}... ({abstract_status})"
         )
 
-    response = model.prompt(prompt)
-    response_text = response.text()
+    requests = RequestTally()
 
     # Parse response, keeping the model inside the vocabulary unless new
     # tags are welcome
     allowed = None if allow_new_tags else (known or None)
 
-    def parse(text: str) -> list[LLMDecision]:
+    def parse(text: str, papers_shown) -> list[LLMDecision]:
         return parse_llm_response(
-            text, to_classify, allowed_tags=allowed,
+            text, papers_shown, allowed_tags=allowed,
             excluded_tags=NOTE_TAGS, category_tags=categories,
         )
 
-    decisions = parse(response_text)
-    if _needs_retry(decisions, allowed):
-        logger.warning(
-            "Some papers were left without tags, without exactly one "
-            "category or with a category that does not fit the decision; "
-            "retrying once with the vocabulary spelled out"
-        )
-        response = model.prompt(
-            prompt + _retry_reminder(allowed, categories)
-        )
-        response_text = response.text()
-        decisions = parse(response_text)
-
+    decisions = parse(requests.ask(model, prompt), to_classify)
+    <<ask again, in one request, about the unusable answers>>
     <<withhold the decisions that cannot be applied>>
 
     return LLMBatchResult(
         decisions=decisions,
         model_id=model.model_id,
         timestamp=datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        prompt_tokens=getattr(response, "prompt_tokens", None),
-        completion_tokens=getattr(response, "completion_tokens", None),
+        prompt_tokens=requests.input_tokens,
+        completion_tokens=requests.output_tokens,
+        requests=requests.count,
+        retried=retried,
+        input_reported=requests.input_reported,
+        output_reported=requests.output_reported,
         withheld=withheld,
         passages={
             decision.paper.id: [quote.text for quote in quotes]
@@ -2362,9 +2394,11 @@ falls outside every count. The prompt already lists the vocabulary;
 now it also says to use nothing else, [[parse_llm_response]] maps each
 returned tag onto the vocabulary case-insensitively and drops what does
 not match (recording it in [[dropped_tags]] and warning), and when a
-paper would be left without any tag the batch is sent once more with
-the vocabulary spelled out, since a second attempt is cheaper than a
-paper that has to be tagged by hand. A session without tags yet
+paper would be left without any tag it is asked about once more, with
+the other papers that need it, the vocabulary spelled out
+(\cref{sec:retry-one-paper}),
+since a second attempt is cheaper than a paper that has to be tagged by
+hand. A session without tags yet
 imposes nothing, so the first round is free to propose themes---unless
 the caller seeds the vocabulary: [[vocabulary]] (the [[--tag]] option)
 adds tags that count as known from the first batch on, which is how a
@@ -2676,18 +2710,13 @@ def _check_one_category(
 
 A paper that breaks the rule goes through the same single retry as a
 paper left without tags, with the rule spelled out next to the
-vocabulary. The retry's answer replaces the first one for the whole
-batch, as it always has.
+vocabulary.
 
 <<llm review llm interaction>>=
-def _needs_retry(
-    decisions: list[LLMDecision], allowed: set[str] | None
-) -> bool:
+def _needs_retry(decision: LLMDecision, allowed: set[str] | None) -> bool:
     """Tell whether a paper lost all its tags or has no usable decision."""
-    return any(
-        (allowed and d.dropped_tags and not d.tags) or d.problem
-        for d in decisions
-    )
+    return bool((allowed and decision.dropped_tags and not decision.tags)
+                or decision.problem)
 
 
 def _retry_reminder(
@@ -2710,6 +2739,196 @@ def _retry_reminder(
         )
     return "\n\n" + "\n".join(lines)
 @
+
+\paragraph{Asking again about the unusable answers only.}
+\label{sec:retry-one-paper}
+The retry used to send the whole batch again, with the reminder, as soon
+as one paper's answer was unusable, and the second answer replaced the
+first for every paper.  A run of 2026-11-23 measured what that costs
+(\url{https://github.com/dbosk/scholarcli/issues/306}, 50 papers, one
+model): no paper was skipped at any batch size, every retry was for a
+first answer without a category tag, 13 of 50 single-paper requests
+needed a retry, and in batches of ten one batch in five needed one, in
+both of two rounds.  Re-sending a batch of fifty for a retry costs
+fifty papers' input, and it can change the other answers, which were
+usable: the same measurement found about one verdict in ten unstable
+between runs.  Now the second request holds only the papers whose first answer
+needs a retry, built by the same prompt builder for those papers, with
+the reminder after them.  A paper with a usable first answer keeps it,
+untouched.
+
+The second pass is one request, not one per paper.  A first version
+of this change asked about each paper in a request of its own, and a
+run against a real model on 2026-11-23 (the same 50 papers,
+[[anthropic/claude-sonnet-5-5]], one run per shape, so no rate) showed
+the cost when many answers of a batch are unusable: a batch of fifty
+whose fifty answers all lacked the category took the batch and fifty
+single requests, 138\,101 input and 15\,014 output tokens in all; a
+batch of ten took about 7\,000 to 9\,500 input tokens without a retry
+and about 26\,000 to 28\,000 with nine or ten single retries.  One
+request for all the papers asked again costs, for
+one unusable paper, a request of one paper, and for fifty, a request of
+fifty.  There is no third pass: a paper still unusable after it is
+withheld.
+
+Each answer stays tied to its paper.  The parser returns one decision
+per paper shown, so each answer of the second request is matched to a
+first answer by paper id, in the order of the first answers, which
+pairs two copies of one paper in a batch with one answer each.  It
+replaces that first answer in its place, so the decisions keep the
+order of the batch.  A second response with no JSON at all, which
+[[parse_llm_response]] raises for, withholds every paper asked again
+(below); it used to end the run and lose the batch's usable answers
+with it.  Every paper asked again is recorded in [[retried]], whatever
+came of it.
+
+<<ask again, in one request, about the unusable answers>>=
+retried: list[str] = []
+needing = [i for i, d in enumerate(decisions) if _needs_retry(d, allowed)]
+if needing:
+    logger.warning(
+        "%d paper(s) left without tags, without a usable answer or "
+        "without one category that fits the decision; asking again "
+        "about them in one request, with the vocabulary spelled out",
+        len(needing),
+    )
+    <<choose the papers to ask again>>
+    retry_prompt = prompt_for(
+        again, [paper_quotes[i] for i in shown] if paper_quotes else None,
+    ) + _retry_reminder(allowed, categories)
+    answers = []
+    failure = ""
+    try:
+        text = requests.ask(model, retry_prompt)
+    except Exception as error:
+        failure = f"retry request failed: {retry_failure_reason(error)}"
+    else:
+        try:
+            answers = parse(text, again)
+        except ValueError as error:
+            failure = f"retry unreadable: {error}"
+    if failure:
+        <<withhold the papers of a failed retry>>
+    <<put each new answer in place of the first>>
+@
+
+A retry request can fail as any request can: the connection is
+refused, the service answers with an error, the model's plugin raises.
+The exception is caught whatever its class, since each plugin raises
+its own, but only around the request: the retry's prompt is built
+before it, so a fault in scholar's own code (in building the prompt,
+say) still ends the run as a fault rather than passing for a failed
+request.  The first request has no
+such fallback: when it fails, no paper has an answer, and its
+exception leaves [[classify_papers_with_llm]] as before (the command
+ends with it, and nothing is decided).
+
+A failed or unreadable retry leaves the first answers it was meant to
+mend as all the run has for those papers, and every paper asked again
+is withheld, while the batch's usable answers are applied as usual.
+That includes a paper whose only defect was that every tag it got lay
+outside the vocabulary: its first answer has no [[problem]] of its
+own, but it is no usable answer either, a keep without the tags the
+run was meant to give.  On main such a paper got no decision when the
+retry failed (the run ended with the exception, and nothing was
+applied), so withholding it keeps what main did for it; applying it
+with no tag, as an earlier version of this change did after an
+unreadable retry, made the two kinds of failure treat it differently.
+Each withheld paper's problem names its first answer's defect and the
+retry's failure, the empty parts left out.
+
+The failure of a request is worded for the user and the session file,
+so it must not quote a key.  [[request_failure_reason]]
+(\cref{sec:request-failure-reason} in the network module) words the
+failures of [[requests]] itself, without their URLs; the model plugins
+raise exceptions of their own whose text may hold anything, a header
+with the key among it, so for those only the class is named
+([[retry_failure_reason]]), as [[request_failure_reason]] already does
+for the other [[requests]] exceptions for the same reason.
+
+<<withhold the papers of a failed retry>>=
+logger.warning("%s; its papers stay withheld", failure)
+for position in needing:
+    decisions[position] = _withheld_after_retry(decisions[position],
+                                                failure)
+<<llm review llm interaction>>=
+NO_TAG_LEFT = "no tag left inside the vocabulary"
+
+
+def _withheld_after_retry(first: LLMDecision, failure: str) -> LLMDecision:
+    """Return `first` withheld, naming its defect and the retry's failure."""
+    from dataclasses import replace
+
+    parts = [first.problem or NO_TAG_LEFT, failure]
+    return replace(first, answer_problem="; ".join(p for p in parts if p))
+
+
+def retry_failure_reason(error: Exception) -> str:
+    """Word a failed retry request without quoting a key.
+
+    A `requests` exception is worded by `request_failure_reason`; any
+    other is named by its class only.
+    """
+    from requests import RequestException
+
+    from scholar.network import request_failure_reason
+
+    if isinstance(error, RequestException):
+        return request_failure_reason(error)
+    return type(error).__name__
+@
+
+The papers to ask again are found by the paper id of each first
+answer, among the batch's papers not yet chosen, and shown in the
+order of the batch, which is the session's order: the second prompt
+then follows from the session and the list of papers asked again,
+whatever order the model answered in (an unanswered paper's entry
+comes after the answered ones, \cref{sec:llm-parse}).
+
+<<choose the papers to ask again>>=
+from scholar.notes import get_paper_id
+
+not_chosen = list(range(len(to_classify)))
+shown: list[int] = []
+for position in needing:
+    paper_id = decisions[position].paper_id
+    index = next(i for i in not_chosen
+                 if get_paper_id(to_classify[i].paper) == paper_id)
+    not_chosen.remove(index)
+    shown.append(index)
+shown.sort()
+retried.extend(get_paper_id(to_classify[i].paper) for i in shown)
+again = [to_classify[i] for i in shown]
+<<put each new answer in place of the first>>=
+open_positions = list(needing)
+for answer in answers:
+    position = next(p for p in open_positions
+                    if decisions[p].paper_id == answer.paper_id)
+    open_positions.remove(position)
+    decisions[position] = answer
+@
+
+The prompt keeps its order: the fixed parts, then the papers, then the
+instructions (\cref{sec:prompt-construction}).  The same change first
+put the papers last, after the instructions, so that every request of a
+run would begin with the same text, as a provider's caching of a
+common prompt prefix needs.  In the run against the real model above,
+with that order, the batch of fifty came back without a category tag
+on all fifty papers, and of five batches of ten, two
+came back without it on nine and on ten of their papers.  With the
+instructions after the papers, the same batch of fifty had needed no
+retry in the earlier measurement, and one batch of ten in five had
+needed one.  A second check on 2026-11-23, with this order restored
+and the one-request retry (the same 50 papers, the same model), gave:
+one batch of fifty, one request and no retry, 34\,898 input and
+6\,830 output tokens; five batches of ten, no retry in any, 39\,410
+input and 5\,845 output tokens in all; every paper answered.  Each
+shape was run once, so none of this is a rate.  The reorder bought
+nothing, since scholar asks for no caching.  So the
+papers stay between the fixed parts and the instructions until a
+provider's caching makes the reorder worth measuring again; the prompt
+version (\cref{sec:prompt-version}) is pinned by a test so that the
+prompt cannot change unnoticed.
 
 A paper that still has no single category after the retry gets no
 decision at all. Recording it anyway would put a row into the audit
@@ -2738,11 +2957,15 @@ if withheld:
 Let's check the three shapes from the issue in one batch. The session
 uses three categories, a theme and a note, and [[vocabulary]] seeds the
 fourth category (which the classifier would offer anyway). The model first answers with a theme only, with two
-categories, and with a category plus a copied note tag; on the retry it
-fixes the first paper but not the second. The note is never offered,
+categories, and with a category plus a copied note tag; asked again
+about the first two in one request, it fixes the first paper but not
+the second, and the third is not asked again. The note is never offered,
 not even on an example's tag line; it is dropped from the third paper,
 whose category stands; the first paper is classified; the second stays
-pending and is reported as withheld.
+pending and is reported as withheld.  The model is the stand-in that
+answers each paper by its title ([[TitleAnsweringModel]],
+\cref{sec:classifier-run-cost}), since a retry shows fewer papers than
+the batch, under other indices.
 
 <<test functions>>=
 class TestClassifierCategories:
@@ -2813,13 +3036,16 @@ def test_three_bad_shapes(self, monkeypatch):
     from scholar.notes import get_paper_id
 
     note = "duplicate-record-of-cited-source"
-    fake_model = self._fake_llm(monkeypatch, [
-        [["generality"], ["supports-claim", "qualifies-claim"],
-          ["Adjacent-Subtopic", note]],
-        [["supports-claim", "generality"],
-          ["supports-claim", "qualifies-claim"],
-          ["adjacent-subtopic", note]],
-    ])
+
+    def kept(*tags):
+        return {"decision": "kept", "tags": list(tags), "confidence": 0.8,
+                "reasoning": "r"}
+
+    fake_model = TitleAnsweringModel({
+        "New 0": [kept("generality"), kept("supports-claim", "generality")],
+        "New 1": [kept("supports-claim", "qualifies-claim")],
+        "New 2": [kept("Adjacent-Subtopic", note)],
+    }).install(monkeypatch)
     session = self._session()
     result = classify_papers_with_llm(
         session, model_id="fake", enrich_missing=False,
@@ -2832,8 +3058,16 @@ def test_three_bad_shapes(self, monkeypatch):
     assert "Available Motivations" not in first
     assert "Title: Near" in first and note not in first
     assert len(fake_model.prompts) == 2
-    assert "exactly one of these category tags" in fake_model.prompts[1]
-    assert note not in fake_model.prompts[1]
+    from scholar.llm_review import _category_status_rule
+
+    assert fake_model.shown[1] == ["New 0", "New 1"]
+    assert "IMPORTANT: give every paper exactly one" not in first
+    retry = fake_model.prompts[1]
+    assert retry.rstrip().endswith(
+        _category_status_rule(set(AUDIT_CATEGORIES)))
+    assert "IMPORTANT: give every paper exactly one of these category " \
+        "tags" in retry
+    assert note not in retry
 
     by_title = {d.paper.title: d for d in session.decisions}
     title_of = {
@@ -3020,7 +3254,9 @@ def _category_status_rule(categories: set[str] | None) -> str:
 @
 
 Let's check the parser on each pair, then a run in which the retry
-mends one contradiction and not the other.
+mends one contradiction and not the other (both asked again in one
+request, under new indices, so the stand-in answers by title,
+\cref{sec:classifier-run-cost}).
 
 <<test functions>>=
 class TestCategoryFitsStatus:
@@ -3086,42 +3322,15 @@ class TestCategoryFitsStatus:
     from scholar.llm_review import _category_status_rule
     from scholar.notes import get_paper_id
 
-    rounds = [
-      [("discarded", ["supports-claim"]), ("kept", ["off-topic-false-hit"])],
-      [("kept", ["supports-claim"]), ("kept", ["off-topic-false-hit"])],
-    ]
+    def answer(decision, tags):
+      return {"decision": decision, "tags": tags, "confidence": 0.8,
+              "reasoning": "r"}
 
-    class FakeResponse:
-      def __init__(self, text):
-        self._text = text
-
-      def text(self):
-        return self._text
-
-    class FakeModel:
-      model_id = "fake"
-
-      def __init__(self):
-        self.prompts = []
-
-      def prompt(self, prompt):
-        self.prompts.append(prompt)
-        answer = rounds[min(len(self.prompts), len(rounds)) - 1]
-        return FakeResponse(json.dumps({"classifications": [
-          {"paper_index": i, "decision": decision, "tags": tags,
-           "confidence": 0.8, "reasoning": "r"}
-          for i, (decision, tags) in enumerate(answer)
-        ]}))
-
-    fake_model = FakeModel()
-
-    class FakeLLMModule:
-      def get_model(self, _model_id=None):
-        return fake_model
-
-    import scholar.llm_review as llm_review
-
-    monkeypatch.setattr(llm_review, "llm", FakeLLMModule(), raising=False)
+    fake_model = TitleAnsweringModel({
+      "New 0": [answer("discarded", ["supports-claim"]),
+                answer("kept", ["supports-claim"])],
+      "New 1": [answer("kept", ["off-topic-false-hit"])],
+    }).install(monkeypatch)
     session = ReviewSession(
       query="q", providers=["p"], timestamp=datetime.now(),
       research_context="Does the claim hold?",
@@ -3137,7 +3346,7 @@ class TestCategoryFitsStatus:
     )
     assert len(fake_model.prompts) == 2
     rule = _category_status_rule(set(AUDIT_CATEGORIES))
-    assert rule in fake_model.prompts[0] and rule in fake_model.prompts[1]
+    assert all(rule in prompt for prompt in fake_model.prompts)
     title_of = {
       get_paper_id(d.paper): d.paper.title for d in session.decisions
     }
@@ -3224,6 +3433,556 @@ class TestCategoryFitsStatus:
       == [("kept", ["supports-claim"])]
 @
 
+
+\subsection{What a run asked and cost}
+\label{sec:classifier-run-cost}
+
+How often a model's answer needs a retry, and how many papers stay
+pending, used to be visible only in the warnings of one run, and the
+tokens a run used not at all.  The measurement behind the retry
+(\cref{sec:retry-one-paper}) had to count both by hand, and could not
+count tokens.  So the run keeps a tally of its requests: how many it
+sent, and the tokens the model reported for them.  The batch result
+carries the tally, the papers asked again ([[retried]]) and the
+withheld ones, and the commands print it in one line at the end.
+Nothing of it is stored in the session: the retry is not part of any
+verdict, and a decision's record (\cref{sec:llm-audit-fields} in the
+review module) stays as it was.  No price is computed; that depends on
+the provider's prices, which scholar does not know.
+
+Token counts come from the [[llm]] package, read in the source of the
+installed version~0.38 ([[llm/models.py]]): a response's [[usage()]]
+returns a [[Usage]] with [[input]] and [[output]] token counts, each
+[[None]] unless the model's plugin recorded it ([[set_usage]]).  Among
+the plugins installed with scholar, the package's own OpenAI models,
+[[llm-openai-plugin]], [[llm-anthropic]], [[llm-gemini]],
+[[llm-mistral]] and [[llm-openai-via-codex]] call [[set_usage]];
+[[llm-gpt4all]] does not, so its runs report no tokens.  Whether
+[[llm-azure]] and [[llm-github-copilot]] report usage depends on the
+classes they reuse and override, which we did not trace; the line
+says when a run's model reported nothing.  The batch result's
+[[prompt_tokens]] and [[completion_tokens]] hold the run's sums; they
+used to read attributes of those names from the last response, which
+the [[llm]] package's responses do not have, so they were always
+[[None]].
+
+The answers are what a run is for, and the token count is a side
+note, so nothing about the count may cost an answer.  A response
+without [[usage]] (an older package, or a stand-in in a test), a
+[[usage()]] that raises, and a count that is not a whole number all
+count as not reported.  Input and output are counted apart, each with
+the number of requests that reported it, because a plugin may report
+one and not the other, and a missing count printed as a sum would read
+as zero.  A request is counted when it is sent, so a request that
+fails counts too.
+
+<<llm review llm interaction>>=
+def token_count(value) -> int | None:
+    """Return `value` as a token count, or `None` when it is not one."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def response_usage(response) -> tuple[int | None, int | None]:
+    """Return the input and output tokens a response reports, if any.
+
+    A missing or failing `usage()` reports none.
+    """
+    usage = getattr(response, "usage", None)
+    if not callable(usage):
+        return None, None
+    try:
+        reported = usage()
+    except Exception as error:
+        logger.warning("Token usage not readable: %s", error)
+        return None, None
+    return (token_count(getattr(reported, "input", None)),
+            token_count(getattr(reported, "output", None)))
+
+
+@dataclass
+class RequestTally:
+    """The requests one classifier run sent and the tokens reported."""
+
+    count: int = 0
+    input_reported: int = 0
+    output_reported: int = 0
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+
+    def ask(self, model, prompt: str) -> str:
+        """Send `prompt` to `model`, count it, and return the text."""
+        self.count += 1
+        response = model.prompt(prompt)
+        text = response.text()
+        tokens_in, tokens_out = response_usage(response)
+        if tokens_in is not None:
+            self.input_reported += 1
+            self.input_tokens = (self.input_tokens or 0) + tokens_in
+        if tokens_out is not None:
+            self.output_reported += 1
+            self.output_tokens = (self.output_tokens or 0) + tokens_out
+        return text
+@
+
+The line names the batch and the retry apart, with the number of
+papers the retry carried, because that number is what the retry cost
+in input.  The papers withheld are
+named by what happened to them, which the caller says: an ordinary run
+leaves them pending, a second screen stores no screening for them.
+
+<<llm review llm interaction>>=
+def run_cost_line(
+    batch: LLMBatchResult, withheld_as: str = "left pending"
+) -> str:
+    """One line on the requests, withheld papers and tokens of a run."""
+    again = len(batch.retried)
+    requests = "Requests: 1 batch"
+    if again:
+        requests += f" + 1 retry of {again} paper" + ("" if again == 1
+                                                      else "s")
+    parts = [requests, f"{withheld_as}: {len(batch.withheld)}"]
+    if batch.input_reported or batch.output_reported:
+        parts.append("tokens: " + ", ".join([
+            _token_sum(batch.prompt_tokens, batch.input_reported,
+                       batch.requests, "in"),
+            _token_sum(batch.completion_tokens, batch.output_reported,
+                       batch.requests, "out"),
+        ]))
+    else:
+        parts.append("tokens: not reported by the model")
+    return "; ".join(parts)
+
+
+def _token_sum(total: int | None, reported: int, requests: int,
+               direction: str) -> str:
+    """Say a token sum, or that none was reported, and over how much."""
+    if not reported:
+        return f"{direction} not reported"
+    text = f"{total} {direction}"
+    if reported < requests:
+        text += f" (reported for {reported} of {requests} requests)"
+    return text
+@
+
+Let's check the retry and the tally with a stand-in for the model.  It
+is the stub the other classifier tests use (an object with [[prompt]]
+returning a response with [[text]]), reached through the same
+[[globals()]] seam, but it answers each paper by its title, so an
+answer does not depend on where in a request the paper is: that is the
+property of a real model the retry relies on, and a stub answering by
+position would hand a paper asked again the answer meant for the
+paper at its index in the batch.  Its responses report usage with the
+[[llm]] package's own [[Usage]] class, or a usage given as a function
+(one that raises, say); a request can be made to fail, with the
+exception [[requests]] raises for a refused connection.  The papers and
+answers are invented.
+
+<<test functions>>=
+class TitleAnsweringModel:
+  """Answers each paper of a prompt by its title, attempt by attempt.
+
+  `answers` maps a title to its answers, the n-th used the n-th time
+  the paper is asked about (the last one again after that); `None`
+  leaves the paper out, a string is sent as the whole response.
+  `shown` lists, per prompt, the titles it showed.  `usage` is the
+  (input, output) pair each response reports, `None` for an empty
+  `Usage`, or a function returning what `usage()` returns; the calls
+  numbered in `fail_on` (1 = the first) raise `failure`, by default a
+  refused connection.
+  """
+
+  model_id = "stub-model"
+
+  def __init__(self, answers, usage=(100, 10), fail_on=(), failure=None):
+    self.answers = answers
+    self.usage = usage
+    self.fail_on = fail_on
+    self.failure = failure
+    self.prompts = []
+    self.shown = []
+    self.asked = {}
+
+  def prompt(self, prompt):
+    import re
+    from types import SimpleNamespace
+    import requests as http
+    from llm.models import Usage
+
+    self.prompts.append(prompt)
+    if len(self.prompts) in self.fail_on:
+      raise self.failure or http.ConnectionError(
+        "refused: https://api.example.invalid/v1?api_key=SECRET-KEY")
+    answers = []
+    papers = re.findall(r"\[Paper (\d+)\]\nTitle: (.*)", prompt)
+    self.shown.append([title for _, title in papers])
+    for index, title in papers:
+      attempt = self.asked.get(title, 0)
+      self.asked[title] = attempt + 1
+      given = self.answers.get(title, [
+        {"decision": "kept", "tags": ["t"], "confidence": 0.8,
+         "reasoning": f"About {title}."},
+      ])
+      answer = given[min(attempt, len(given) - 1)]
+      if isinstance(answer, str):
+        text = answer
+        break
+      if answer is not None:
+        answers.append({"paper_index": int(index), **answer})
+    else:
+      text = json.dumps({"classifications": answers})
+    if callable(self.usage):
+      return SimpleNamespace(text=lambda: text, usage=self.usage)
+    usage = (Usage(input=self.usage[0], output=self.usage[1])
+             if self.usage else Usage())
+    return SimpleNamespace(text=lambda: text, usage=lambda: usage)
+
+  def install(self, monkeypatch):
+    from types import SimpleNamespace
+    import scholar.llm_review as llm_review
+
+    monkeypatch.setattr(llm_review, "llm",
+                        SimpleNamespace(get_model=lambda *_: self),
+                        raising=False)
+    return self
+
+
+class TestRetryOnlyTheUnusable:
+  """Only papers with an unusable first answer are asked again (#306)."""
+
+  <<retry only the unusable test methods>>
+
+<<retry only the unusable test methods>>=
+TITLES = ["Alpha Loops", "Beta Stacks", "Gamma Queues", "Delta Heaps",
+          "Epsilon Trees"]
+
+def _session(self):
+  return ReviewSession(
+    query="q", providers=["p"], timestamp=datetime(2026, 11, 23),
+    research_context="Do novices misread recursion?",
+    decisions=[
+      ReviewDecision(
+        paper=Paper(title=title, authors=["Ada Lovelace"],
+                    doi=f"10.5555/retry-{n}", abstract=f"On {title}."),
+        provider="p",
+      )
+      for n, title in enumerate(self.TITLES)
+    ],
+  )
+
+VOCABULARY = {"t", "off"}
+
+def _run(self, monkeypatch, answers, usage=(100, 10), fail_on=(),
+         failure=None, **options):
+  model = TitleAnsweringModel(answers, usage, fail_on,
+                              failure).install(monkeypatch)
+  session = self._session()
+  result = classify_papers_with_llm(
+    session, model_id="stub-model", enrich_missing=False,
+    require_examples=False, vocabulary=self.VOCABULARY, **options,
+  )
+  return session, model, result
+@
+
+In a batch of five, the second paper gets an unreadable decision and
+the fourth no answer.  The run sends two requests: the batch, then one
+holding exactly those two papers, with the batch's text up to the
+papers and the reminder after the instructions (the tests seed a
+vocabulary, so that the reminder has something to say).  The other three
+answers are the batch's, and the tally counts the two requests and
+their tokens.
+
+<<retry only the unusable test methods>>=
+def _by_title(self, session, decisions):
+  from scholar.notes import get_paper_id
+
+  title_of = {get_paper_id(d.paper): d.paper.title
+              for d in session.decisions}
+  return {title_of[d.paper_id]: d for d in decisions}
+
+def _ids(self, session, *titles):
+  from scholar.notes import get_paper_id
+
+  return [get_paper_id(d.paper) for d in session.decisions
+          if d.paper.title in titles]
+
+MAYBE = {"decision": "maybe", "tags": ["t"], "confidence": 0.5,
+         "reasoning": "?"}
+
+def test_two_unusable_of_five_are_asked_again_together(self,
+                                                       monkeypatch):
+  session, model, result = self._run(monkeypatch, {
+    "Beta Stacks": [self.MAYBE, {"decision": "discarded", "tags": ["off"],
+                                 "confidence": 0.9, "reasoning": "Off."}],
+    "Delta Heaps": [None, {"decision": "kept", "tags": ["t"],
+                           "confidence": 0.7, "reasoning": "Fits."}],
+  })
+  assert model.shown == [self.TITLES, ["Beta Stacks", "Delta Heaps"]]
+  first, second = model.prompts
+  fixed = first.split("## Papers to Classify")[0]
+  assert second.split("## Papers to Classify")[0] == fixed
+  assert second.index("Title: Delta Heaps") < second.index("## Instructions")
+  from scholar.llm_review import _retry_reminder
+
+  reminder = _retry_reminder(self.VOCABULARY, None)
+  assert "IMPORTANT" in reminder and reminder not in first
+  assert second.endswith(reminder)
+  answers = self._by_title(session, result.decisions)
+  for title in ("Alpha Loops", "Gamma Queues", "Epsilon Trees"):
+    assert (answers[title].status, answers[title].tags,
+            answers[title].confidence, answers[title].reasoning) \
+      == ("kept", ["t"], 0.8, f"About {title}.")
+  assert (answers["Beta Stacks"].status, answers["Beta Stacks"].tags) \
+    == ("discarded", ["off"])
+  assert answers["Delta Heaps"].reasoning == "Fits."
+  assert result.withheld == []
+  assert result.retried == self._ids(session, "Beta Stacks",
+                                     "Delta Heaps")
+  assert (result.requests, result.input_reported, result.output_reported,
+          result.prompt_tokens, result.completion_tokens) \
+    == (2, 2, 2, 200, 20)
+  assert run_cost_line(result) == ("Requests: 1 batch + 1 retry of 2 "
+                                   "papers; left pending: 0; tokens: "
+                                   "200 in, 20 out")
+@
+
+When every first answer is unusable, the second request holds every
+paper, and it is still one request.  A paper whose answer is unusable
+in the second request too is withheld and stays pending, as before,
+with no third request; a batch whose answers are all usable is one
+request; and a second response with no JSON leaves its papers withheld
+with their first answers' problems, while the others are applied.
+
+<<retry only the unusable test methods>>=
+def test_every_paper_unusable_is_one_retry(self, monkeypatch):
+  fine = {"decision": "kept", "tags": ["t"], "confidence": 0.8,
+          "reasoning": "Fine."}
+  session, model, result = self._run(
+    monkeypatch, {title: [self.MAYBE, fine] for title in self.TITLES})
+  assert model.shown == [self.TITLES, self.TITLES]
+  assert result.withheld == [] and len(result.decisions) == 5
+  assert all(d.reasoning == "Fine." for d in result.decisions)
+  assert run_cost_line(result).startswith(
+    "Requests: 1 batch + 1 retry of 5 papers; left pending: 0; ")
+
+def test_unusable_twice_is_withheld(self, monkeypatch):
+  session, model, result = self._run(monkeypatch, {
+    "Beta Stacks": [None, self.MAYBE],
+    "Delta Heaps": [None, {"decision": "kept", "tags": ["t"],
+                           "confidence": 0.7, "reasoning": "Fits."}],
+  })
+  assert model.shown == [self.TITLES, ["Beta Stacks", "Delta Heaps"]]
+  assert [d.problem for d in result.withheld] \
+    == ["invalid decision 'maybe'"]
+  assert len(result.decisions) == 4
+  apply_llm_decisions(session, result)
+  assert [d.status for d in session.decisions] == [
+    DecisionStatus.KEPT, DecisionStatus.PENDING, DecisionStatus.KEPT,
+    DecisionStatus.KEPT, DecisionStatus.KEPT,
+  ]
+  assert run_cost_line(result).startswith(
+    "Requests: 1 batch + 1 retry of 2 papers; left pending: 1; ")
+
+def test_usable_answers_are_one_request(self, monkeypatch):
+  session, model, result = self._run(monkeypatch, {})
+  assert len(model.prompts) == 1
+  assert (result.requests, result.retried, result.withheld) == (1, [], [])
+  assert run_cost_line(result) == ("Requests: 1 batch; left pending: 0; "
+                                   "tokens: 100 in, 10 out")
+
+def test_an_unreadable_retry_loses_no_other_answer(self, monkeypatch):
+  session, model, result = self._run(monkeypatch, {
+    "Beta Stacks": [None, "No JSON here."],
+    "Delta Heaps": [self.MAYBE],
+  })
+  assert model.shown == [self.TITLES, ["Beta Stacks", "Delta Heaps"]]
+  unreadable = "retry unreadable: No JSON found in LLM response"
+  assert [d.problem for d in result.withheld] == [
+    f"invalid decision 'maybe'; {unreadable}",
+    f"no answer for this paper; {unreadable}",
+  ]
+  assert len(result.decisions) == 3
+  assert run_cost_line(result).startswith(
+    "Requests: 1 batch + 1 retry of 2 papers; left pending: 2; ")
+@
+
+A model whose responses report no tokens gives no sums, and the line
+says so; a usage that cannot be read (here [[usage()]] raises) counts
+as not reported and loses no answer; a count given for one direction
+only is not printed as a zero for the other; and when only some
+requests reported a count, the line says how many did, so that a
+partial sum is not read as the run's total.
+
+<<retry only the unusable test methods>>=
+def test_tokens_not_reported(self, monkeypatch):
+  session, model, result = self._run(monkeypatch, {}, usage=None)
+  assert (result.prompt_tokens, result.completion_tokens,
+          result.input_reported, result.output_reported) \
+    == (None, None, 0, 0)
+  assert run_cost_line(result).endswith(
+    "; tokens: not reported by the model")
+
+def test_a_failing_usage_is_not_reported(self, monkeypatch):
+  def broken():
+    raise RuntimeError("usage not available")
+
+  session, model, result = self._run(monkeypatch, {}, usage=broken)
+  assert len(result.decisions) == 5 and result.withheld == []
+  assert (result.requests, result.input_reported,
+          result.output_reported) == (1, 0, 0)
+  assert run_cost_line(result).endswith(
+    "; tokens: not reported by the model")
+
+def test_input_only_says_output_not_reported(self, monkeypatch):
+  from llm.models import Usage
+
+  session, model, result = self._run(
+    monkeypatch, {}, usage=lambda: Usage(input=120))
+  assert (result.prompt_tokens, result.completion_tokens) == (120, None)
+  assert run_cost_line(result).endswith(
+    "; tokens: 120 in, out not reported")
+
+def test_mixed_reports_say_how_many_requests_reported(self,
+                                                      monkeypatch):
+  from llm.models import Usage
+
+  reports = iter([Usage(input=300, output=30), None])
+  session, model, result = self._run(
+    monkeypatch, {"Beta Stacks": [None]},
+    usage=lambda: next(reports))
+  assert (result.requests, result.input_reported,
+          result.output_reported) == (2, 1, 1)
+  assert run_cost_line(result).endswith(
+    "; tokens: 300 in (reported for 1 of 2 requests), 30 out "
+    "(reported for 1 of 2 requests)")
+
+def test_tokens_reported_for_some_requests(self):
+  batch = LLMBatchResult(
+    decisions=[], model_id="m", timestamp="t", prompt_tokens=250,
+    completion_tokens=None, requests=2, input_reported=1,
+    output_reported=0, retried=["doi:a"],
+    withheld=[LLMDecision("doi:a", "", [], None, "")],
+  )
+  assert run_cost_line(batch, withheld_as="no screening stored") == (
+    "Requests: 1 batch + 1 retry of 1 paper; no screening stored: 1; "
+    "tokens: 250 in (reported for 1 of 2 requests), out not reported"
+  )
+@
+
+A request that fails in the retry withholds only the papers it asked
+about, with the reason, and the batch's usable answers are applied;
+the run line counts the failed request.  The reason names the failure
+without the request's address or key.  A request that fails in the
+first place is no retry: the exception leaves
+[[classify_papers_with_llm]] as it always has, and nothing is decided.
+
+<<retry only the unusable test methods>>=
+def test_a_failed_retry_request_loses_no_other_answer(self, monkeypatch):
+  session, model, result = self._run(
+    monkeypatch, {"Beta Stacks": [self.MAYBE]}, fail_on=(2,))
+  assert model.shown == [self.TITLES]
+  assert len(model.prompts) == 2
+  assert [d.problem for d in result.withheld] == [
+    "invalid decision 'maybe'; retry request failed: connection failed "
+    "(ConnectionError)"
+  ]
+  assert "SECRET" not in result.withheld[0].problem
+  assert (result.requests, result.input_reported) == (2, 1)
+  apply_llm_decisions(session, result)
+  assert [d.status for d in session.decisions].count(
+    DecisionStatus.KEPT) == 4
+  assert run_cost_line(result).startswith(
+    "Requests: 1 batch + 1 retry of 1 paper; left pending: 1; ")
+
+def test_a_failed_retry_quotes_no_plugin_text(self, monkeypatch):
+  failure = RuntimeError(
+    "401 {'x-api-key': 'sk-ant-SECRET4', 'type': 'error'}")
+  session, model, result = self._run(
+    monkeypatch, {"Beta Stacks": [self.MAYBE]}, fail_on=(2,),
+    failure=failure)
+  assert [d.problem for d in result.withheld] == [
+    "invalid decision 'maybe'; retry request failed: RuntimeError"
+  ]
+
+def test_a_fault_building_the_retry_prompt_is_no_failed_request(
+  self, monkeypatch
+):
+  import scholar.llm_review as llm_review
+
+  real = llm_review.build_classification_prompt
+  calls = []
+
+  def builder(*args, **kwargs):
+    calls.append(1)
+    if len(calls) == 2:
+      raise TypeError("a fault in scholar's own code")
+    return real(*args, **kwargs)
+
+  monkeypatch.setattr(llm_review, "build_classification_prompt", builder)
+  with pytest.raises(TypeError):
+    self._run(monkeypatch, {"Beta Stacks": [self.MAYBE]})
+  assert len(calls) == 2
+@
+
+A paper whose every tag lay outside the vocabulary has no problem of
+its own, but it is asked again; when the retry fails or cannot be
+read, it is withheld like the others, its defect named.  After them
+come the values a usage may give that are no token count, and two
+tests that belong with the failed retry above: a failing first
+request, and a retry under [[candidates]].
+
+<<retry only the unusable test methods>>=
+OUTSIDE = {"decision": "kept", "tags": ["not-in-vocabulary"],
+           "confidence": 0.8, "reasoning": "Fits."}
+
+def test_tags_all_dropped_and_retry_request_failed(self, monkeypatch):
+  session, model, result = self._run(
+    monkeypatch, {"Beta Stacks": [self.OUTSIDE]}, fail_on=(2,))
+  assert model.shown == [self.TITLES]
+  assert [d.problem for d in result.withheld] == [
+    f"{NO_TAG_LEFT}; retry request failed: connection failed "
+    "(ConnectionError)"
+  ]
+  assert len(result.decisions) == 4
+
+def test_tags_all_dropped_and_retry_unreadable(self, monkeypatch):
+  session, model, result = self._run(
+    monkeypatch, {"Beta Stacks": [self.OUTSIDE, "No JSON here."]})
+  assert model.shown == [self.TITLES, ["Beta Stacks"]]
+  assert [d.problem for d in result.withheld] == [
+    f"{NO_TAG_LEFT}; retry unreadable: No JSON found in LLM response"
+  ]
+  assert len(result.decisions) == 4
+
+def test_what_is_no_token_count(self):
+  assert token_count(12) == 12 and token_count(0) == 0
+  for value in ("12", 3.5, True, -1, None):
+    assert token_count(value) is None, value
+
+def test_a_failed_first_request_ends_the_run(self, monkeypatch):
+  import requests as http
+
+  with pytest.raises(http.ConnectionError):
+    self._run(monkeypatch, {}, fail_on=(1,))
+
+def test_a_retry_under_candidates_asks_only_candidates(self,
+                                                      monkeypatch):
+  model = TitleAnsweringModel({
+    "Beta Stacks": [self.MAYBE], "Delta Heaps": [None],
+  }).install(monkeypatch)
+  session = self._session()
+  chosen = [session.decisions[1], session.decisions[3]]
+  result = classify_papers_with_llm(
+    session, model_id="stub-model", enrich_missing=False,
+    require_examples=False, vocabulary=self.VOCABULARY,
+    candidates=chosen,
+  )
+  assert model.shown == [["Beta Stacks", "Delta Heaps"],
+                         ["Beta Stacks", "Delta Heaps"]]
+  assert result.retried == self._ids(session, "Beta Stacks",
+                                     "Delta Heaps")
+@
 
 \subsection{Gathering Full-text Support}
 \label{sec:fulltext-classification}
@@ -3651,8 +4410,10 @@ Let's run the whole path once with a fake model, through the
 [[globals()]] seam the other classifier tests use: a batch of three
 where the model answers the first paper soundly (with a long abstract
 and a long reason), gives the second an unreadable decision on both
-attempts, and forgets the third.  The first is applied with the whole
-record; the other two are withheld and stay pending, after one retry.
+attempts, and forgets the third, also when asked again.  The first is
+applied with the whole record; the other two are withheld and stay
+pending, after one retry that asks about both.  The stand-in answers each paper by
+its title (\cref{sec:classifier-run-cost}).
 
 <<test functions>>=
 class TestClassificationIsRecorded:
@@ -3673,32 +4434,15 @@ class TestClassificationIsRecorded:
             )
             for i in range(3)
         ]
-        answer = json.dumps({"classifications": [
-            {"paper_index": 0, "decision": "discarded", "tags": ["off"],
-             "confidence": 0.75, "reasoning": "r" * 900},
-            {"paper_index": 1, "decision": "unsure", "tags": ["off"],
-             "confidence": 0.5, "reasoning": "?"},
-        ]})
-
-        class FakeResponse:
-            def text(self):
-                return answer
-
-        class FakeModel:
-            model_id = "fake-model"
-            prompts = []
-
-            def prompt(self, prompt):
-                self.prompts.append(prompt)
-                return FakeResponse()
-
-        model = FakeModel()
-
-        class FakeLLMModule:
-            def get_model(self, _model_id=None):
-                return model
-
-        monkeypatch.setattr(llm_review, "llm", FakeLLMModule(), raising=False)
+        model = TitleAnsweringModel({
+            "New 0": [{"decision": "discarded", "tags": ["off"],
+                       "confidence": 0.75, "reasoning": "r" * 900}],
+            "New 1": [{"decision": "unsure", "tags": ["off"],
+                       "confidence": 0.5, "reasoning": "?"}],
+            "New 2": [None],
+        })
+        model.model_id = "fake-model"
+        model.install(monkeypatch)
         result = classify_papers_with_llm(
             session, model_id="fake-model", enrich_missing=False,
             require_examples=False,
@@ -7500,9 +8244,10 @@ the sample its paper was drawn in, the band's for a banded draw, so
 that a report can find the sample, and so the band, from any screening.
 
 The selection is taken in session order, [[count]] papers per run, as
-the ordinary classifier takes pending papers: one request and at most
-one retry per run, so a second screen costs per paper what the first
-did.  A paper this model has already screened since its last reset (a
+the ordinary classifier takes pending papers: one request for the
+batch and at most one more for the papers whose answers had to be asked
+for again (\cref{sec:retry-one-paper}), so a second screen costs per paper
+what the first did.  A paper this model has already screened since its last reset (a
 counted screening of the model's second-screen identity,
 [[screener_identity]] in the review module) is skipped unless
 [[rescreen]] is given, so that repeated runs work through the selection
@@ -7806,8 +8551,9 @@ Let's check the second screen with a fake model, through the
 The session is invented: an unreviewed classifier discard and a
 human-confirmed keep, each with a tag and a reason no other record has,
 two human decisions that can serve as examples, and a pending paper.
-The fake answers every paper in its prompt, with an answer per index
-that a test can replace.
+The fake answers every paper in its prompt, with an answer per index,
+or per title, that a test can replace; an answer by title follows the
+paper when it is asked about again (\cref{sec:retry-one-paper}).
 
 <<test functions>>=
 class TestSecondScreen:
@@ -7876,12 +8622,11 @@ def _fake(self, monkeypatch, model_id="model-b", answers=None):
 
   answers = answers or {}
 
-  def answer(index):
-    return answers.get(index, {
-      "paper_index": index, "decision": "kept",
-      "tags": ["adjacent-subtopic"], "confidence": 0.6,
-      "reasoning": "Background only.",
-    })
+  def answer(index, title):
+    return {**answers.get(title, answers.get(index, {
+      "decision": "kept", "tags": ["adjacent-subtopic"],
+      "confidence": 0.6, "reasoning": "Background only.",
+    })), "paper_index": index}
 
   class FakeModel:
     def __init__(self):
@@ -7890,9 +8635,10 @@ def _fake(self, monkeypatch, model_id="model-b", answers=None):
 
     def prompt(self, prompt):
       self.prompts.append(prompt)
-      indices = sorted({int(i) for i in re.findall(r"\[Paper (\d+)\]",
-                                                   prompt)})
-      text = json.dumps({"classifications": [answer(i) for i in indices]})
+      shown = re.findall(r"\[Paper (\d+)\]\nTitle: (.*)", prompt)
+      text = json.dumps({"classifications": [
+        answer(int(i), title) for i, title in shown
+      ]})
       return SimpleNamespace(text=lambda: text)
 
   model = FakeModel()
@@ -8002,7 +8748,8 @@ def test_the_prompt_holds_no_verdict_of_the_screened_papers(
 
 An answer the classifier withholds (here a keep under a category that
 only fits a discard) stores nothing, after the one retry the ordinary
-run makes; the other paper of the batch is screened.
+run makes, which shows that paper only; the other paper of the batch is
+screened, from its first answer.
 
 <<second screen test methods>>=
 def test_a_withheld_answer_stores_nothing(self, monkeypatch):
@@ -8010,13 +8757,20 @@ def test_a_withheld_answer_stores_nothing(self, monkeypatch):
 
   session = self._session()
   machine, confirmed = session.decisions[:2]
-  model = self._fake(monkeypatch, answers={1: {
-    "paper_index": 1, "decision": "kept", "tags": ["off-topic-false-hit"],
+  model = self._fake(monkeypatch, answers={"Recursion as Loops": {
+    "decision": "kept", "tags": ["off-topic-false-hit"],
     "confidence": 0.5, "reasoning": "Unrelated, but kept.",
   }})
   result = second_screen_with_llm(session, over="all", count=2,
                                   enrich_missing=False)
   assert len(model.prompts) == 2
+  assert "Compiler Course Design" not in model.prompts[1]
+  important = "IMPORTANT: give every paper exactly one of these category"
+  assert important not in model.prompts[0]
+  assert important in model.prompts[1]
+  assert (result.batch.requests, len(result.batch.retried)) == (2, 1)
+  assert run_cost_line(result.batch, "no screening stored").startswith(
+    "Requests: 1 batch + 1 retry of 1 paper; no screening stored: 1; ")
   assert [d.paper_id for d in result.batch.withheld] \
     == [get_paper_id(confirmed.paper)]
   assert confirmed.screenings == []
