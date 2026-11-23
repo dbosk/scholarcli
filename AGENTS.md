@@ -865,6 +865,26 @@ identity of every outgoing request:
   on request; skipped with `--offline`).
 - Not done: per-provider proxy selection (e.g. only Scopus and PDF
   downloads through the tunnel).
+- **Identifiers in URL paths** (#304): never paste a DOI or id into a
+  URL; a `#` cut it at the fragment, a `?` started a query. Query
+  strings go to `requests`/the client as a mapping. S2:
+  `providers.s2_paper_url(paper_id, relation=None)` = `quote(paper_id,
+  safe="/:")` (the swagger's examples `DOI:10.18653/v1/N18-3011`
+  unchanged), used by the DOI lookup, citations/references and
+  `pdf.resolve_doi_s2`. doi.org: `pdf.doi_resolver_url(doi)` per the
+  DOI Handbook 2025 sec. 4.7 (prefix and suffix quoted apart, safe
+  `!$&'()*+;=:@`, so a slash inside the suffix is `%2F`); the PDF
+  cache key `get_cached_doi_pdf_path` stays unencoded (never
+  requested; changing it would orphan imports). Already encoded, left
+  as they were: Crossref and Unpaywall (`quote(doi, safe='')`; Crossref's
+  docs disagree on the slash, the `%2F` form is answered), OpenAlex
+  (pyalex `quote_plus`s the whole `https://doi.org/...`; a space
+  becomes `+`, whether OpenAlex reads that as a space is unchecked),
+  Europe PMC, IEEE, WoS, Scopus (query parameters), arXiv (library).
+  Tests: conftest's `request_targets` (loopback stand-in for named
+  hosts, rewrites in `HTTPAdapter.send`, keeps raw request targets;
+  `paths()`/`queries()` decode) and `awkward_doi`
+  (`10.5555/a#b?c%d e<f>g`).
 
 ### PDF Cache and `scholar pdf import` (#296)
 
@@ -3055,6 +3075,21 @@ fixture has a quoted query, a `[`-row, `ĸ`, `CO₂`, a ligature. About
   and journal go through `escape_bibtex` like the export's `.bib`
   (#230; before, raw `& % $ # _` and symbols stopped pdfLaTeX); the
   layout, field order and DOI (verbatim in biblatex) are unchanged.
+  Every field of both writers (`format_bibtex_entry`, the search
+  formatter's `_format_paper`) goes through `review.bibtex_field(name,
+  value)` (#304, review.nw `sec:bibtex-field-values`): `doi`/`url`
+  (`BIBTEX_VERBATIM_FIELDS`) written as given except an unpaired brace
+  (`unpaired_braces`, counted as BibTeX does, backslash or not) or a
+  line break, percent-encoded (`%7B %7D %0D %0A`); other fields
+  `escape_bibtex` then an unpaired brace -> `\textbraceleft{}` /
+  `\textbraceright{}` (a backslash escaping it goes with it), a final
+  odd backslash -> `\textbackslash{}`. Paired braces stay. Ordinary
+  values byte-identical (checked on 6,594 papers of two copied real
+  sessions). Keys need nothing (`cite_key_base` is letters/digits).
+  bibtexparser 2.1's writer was tried and not used: it encloses values
+  unchecked and doubles braces on a second write. Biber counts `\{`
+  as a brace, so there is no BibTeX escape for an unpaired one.
+  `TestAwkwardBibCompiles` (latex marker) compiles such a report.
   `prov import/export`
   match entries by `Paper.id`, never by key, so old `.bib` files still
   round-trip.
