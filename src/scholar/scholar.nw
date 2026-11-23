@@ -84,6 +84,7 @@ from .scholar import provider_via, result_via
 from .scholar import provider_order, result_order, ANSWER_ORDERS
 from .scholar import count_label, provider_total, result_total
 from .scholar import search_provider, parts_returning, provider_fetch
+from .scholar import answer_places, places_in_parts
 from .scholar import result_dates
 from .scholar import applied_filters, without_search_in, filter_flags
 from .scholar import RANKED_PROVIDERS, is_ranked_provider
@@ -98,6 +99,8 @@ __all__ = [
     "result_total",
     "search_provider",
     "parts_returning",
+    "answer_places",
+    "places_in_parts",
     "provider_fetch",
     "result_dates",
     "RANKED_PROVIDERS",
@@ -2599,6 +2602,7 @@ class SearchResult:
     <<search result total>>
     <<search result dates>>
     <<search result parts>>
+    <<search result places>>
 
     <<search result methods>>
 @
@@ -3965,6 +3969,7 @@ def merge(self, other: "SearchResult") -> "SearchResult":
         f"({duplicates} duplicates removed)"
     )
     parts = self.search_parts() + other.search_parts()
+    found_in = parts_returning(deduped, parts)
     return SearchResult(
         query=f"{self.query} | {other.query}",
         provider=f"{self.provider}, {other.provider}",
@@ -3983,7 +3988,8 @@ def merge(self, other: "SearchResult") -> "SearchResult":
             ORDER_UNKNOWN if self.order or other.order else None
         ),
         parts=parts,
-        found_in=parts_returning(deduped, parts),
+        found_in=found_in,
+        found_at=places_in_parts(deduped, parts, found_in),
     )
 @
 
@@ -4001,7 +4007,10 @@ so that the search metadata survives for provenance reconstruction.
 It is a [[replace]] of the result rather than a new one built field by
 field, so that a field added to [[SearchResult]] later (its reported
 total, its dates) survives as well without anyone remembering this
-place.
+place.  The one field it must recompute is [[places]], each paper's
+place in the provider's answer (\cref{sec:answer-places}): dropping a
+duplicate moves every later paper up the list, and the list position
+would then no longer be the place the provider gave it.
 
 <<search result methods>>=
 def deduplicate(self) -> "SearchResult":
@@ -4012,7 +4021,9 @@ def deduplicate(self) -> "SearchResult":
         f"Deduplicated {self.provider}: {len(deduped)} unique papers "
         f"({duplicates} duplicates removed)"
     )
-    return replace(self, papers=deduped)
+    return replace(
+        self, papers=deduped, places=answer_places(deduped, self)
+    )
 @
 
 \subsubsection{Testing search results}
@@ -4357,6 +4368,208 @@ paper that absorbed a preprint from arXiv under another DOI.
                               papers=[])
         assert result.search_parts() == [result]
         assert result.parts == []
+@
+
+\paragraph{Each paper's place in its answer.}
+\label{sec:answer-places}
+A screener who screens the head of each relevance-ranked answer and
+counts the rest needs to know where in an answer a record stood
+(\url{https://github.com/dbosk/scholarcli/issues/302}): in the issue's
+measurement on the author's own sessions, the records that bear on a
+claim were concentrated in the first places of the relevance-ordered
+answers.  The place is the paper's position in the list the provider
+returned, counted from one.  No provider needs to report it: the order
+of the list \emph{is} the ranking, for a relevance search as for the
+semantic search's [[RankedPapers]], and a cached answer is stored and
+served as the list it was, so its places are the fetched ones.  Whether
+a place means anything is a matter of the answer's [[order]]
+(\cref{sec:search-result-order}): the tenth of a newest-first list is
+merely the tenth newest.  So the place is kept for every answer and the
+order decides later what may be read from it
+(\cref{sec:screening-tier} in the review module).
+
+The place has to be taken before anything changes the list.  Two
+things do.  Deduplicating a single answer drops later copies and moves
+the rest up; the copy that stays gets the place of the first
+occurrence, the one the provider ranked highest.  Merging joins
+several answers into a list that is no provider's ranking; there the
+place lives with each part, as the parts that returned a paper do
+([[found_in]]).  So a result has two more fields: [[places]], the place
+of each of its own papers, empty while the list order is the place (an
+answer as the provider returned it), and [[found_at]], for a merged
+result, the place in each part listed in [[found_in]], in the same
+order, [[None]] where the part's copy cannot be told.
+
+<<search result places>>=
+places: list[int | None] = field(
+    default_factory=list, repr=False, compare=False
+)
+found_at: list[tuple[int | None, ...]] = field(
+    default_factory=list, repr=False, compare=False
+)
+<<search result methods>>=
+def place_of(self, index: int) -> int | None:
+    """The 1-based place of `self.papers[index]` in its provider's answer.
+
+    `None` for a merged result, whose list is no provider's answer, and
+    when `places` no longer fits the papers.
+    """
+    if self.parts:
+        return None
+    if not self.places:
+        return index + 1
+    if len(self.places) != len(self.papers):
+        return None
+    return self.places[index]
+@
+
+Which copy in an answer is a merged or deduplicated paper?  The same
+identities that made them one paper: the [[Paper.id]] (a DOI, or the
+title--author hash for a paper without one), the hash the DOI copy
+would have without its DOI, under which [[link_doi_less_copies]] folds
+a DOI-less copy into it (\cref{sec:doi-less-copies}), and the DOIs of
+the versions folded into it ([[version_link_dois]]).  A copy without a
+DOI is matched by a hash, which two works by one surname may share, so
+it counts only when [[plausibly_same_work]] admits it: two namesakes
+years apart in one answer keep their own places.  Among the matching
+copies the smallest place wins, which for a deduplicated answer is the
+first occurrence.  A part that returned a paper only by its
+[[sources]] (\cref{sec:search-result-parts}) has no copy to point at;
+its place is [[None]], unknown, rather than a guess.  The hash of a
+DOI paper is computed only when the answer holds a copy without a DOI,
+since it is the one costly step and only such a copy can be found by
+it.
+
+<<functions>>=
+def answer_places(
+    papers: list[Paper], answer: "SearchResult"
+) -> list[int | None]:
+    """For each paper, its place in the single-provider `answer`.
+
+    The smallest place of a copy in `answer` that is the paper: same id,
+    or the paper's title-author hash or a version DOI of it, a copy
+    without a DOI only when `plausibly_same_work`; `None` when no copy
+    is found.
+    """
+    copies: dict[str, list[tuple[int, Paper]]] = {}
+    for index, copy in enumerate(answer.papers):
+        place = answer.place_of(index)
+        if place is not None:
+            copies.setdefault(copy.id, []).append((place, copy))
+    hashed = any(not copy.doi for copy in answer.papers)
+    places = []
+    for paper in papers:
+        identities = {paper.id, *version_link_dois(paper)}
+        if hashed and paper.doi:
+            identities.add(legacy_hash_paper_id(paper.title, paper.authors))
+        found = [
+            place for identity in identities
+            for place, copy in copies.get(identity, ())
+            if copy.doi or plausibly_same_work(copy, paper)
+        ]
+        places.append(min(found) if found else None)
+    return places
+
+
+def places_in_parts(
+    papers: list[Paper],
+    parts: list["SearchResult"],
+    found_in: list[tuple[int, ...]],
+) -> list[tuple[int | None, ...]]:
+    """For each paper, its place in each part `found_in` lists for it."""
+    per_part = [answer_places(papers, part) for part in parts]
+    return [
+        tuple(per_part[part][index] for part in indices)
+        for index, indices in enumerate(found_in)
+    ]
+@
+
+Let's verify the places: in a plain answer the list order, after
+deduplication the first occurrence (with the later papers keeping
+theirs), and in a merge each part's own place, also for a preprint
+folded into its published version, while a namesake years apart keeps
+its own and a part that returned a paper only by its sources gives
+none.
+
+<<test functions>>=
+class TestAnswerPlaces:
+    """Each paper keeps its place in the answer that returned it (#302)."""
+
+    def _answer(self, provider, papers):
+        return SearchResult(query="q", provider=provider, timestamp="t",
+                            papers=papers)
+
+    def test_the_list_order_is_the_place(self):
+        answer = self._answer("openalex", [
+            Paper(title=f"T{i}", authors=["X"], doi=f"10.1/p{i}")
+            for i in range(3)
+        ])
+        assert [answer.place_of(i) for i in range(3)] == [1, 2, 3]
+
+    def test_deduplication_keeps_the_first_place(self):
+        with isolated_registry():
+            first = Paper(title="Same", authors=["X"], doi="10.1/same")
+            other = Paper(title="Other", authors=["Y"], doi="10.1/other")
+            again = Paper(title="Same", authors=["X"], doi="10.1/SAME")
+            last = Paper(title="Last", authors=["Z"], doi="10.1/last")
+            deduped = self._answer(
+                "openalex", [first, other, again, last]
+            ).deduplicate()
+        assert [p.doi for p in deduped.papers] == [
+            "10.1/same", "10.1/other", "10.1/last",
+        ]
+        assert [deduped.place_of(i) for i in range(3)] == [1, 2, 4]
+
+    def test_a_merge_keeps_each_parts_place(self):
+        with isolated_registry():
+            both = Paper(title="Both", authors=["X"], doi="10.1/both")
+            filler = Paper(title="Filler", authors=["W"], doi="10.1/fill")
+            published = Paper(
+                title="A Work", authors=["Ada Lovelace"], year=2021,
+                doi="10.1145/1", venue="TOPLAS", sources=["openalex"],
+            )
+            preprint = Paper(
+                title="A Work", authors=["Ada Lovelace"], year=2021,
+                doi="10.48550/arXiv.2401.1", venue="arXiv",
+                sources=["arxiv"],
+            )
+            oa = self._answer("openalex", [filler, published, both])
+            arxiv = self._answer("arxiv", [both, preprint])
+            merged = oa.merge(arxiv)
+        places = {
+            paper.doi: {
+                merged.parts[part].provider: place
+                for part, place in zip(indices, at)
+            }
+            for paper, indices, at in zip(
+                merged.papers, merged.found_in, merged.found_at
+            )
+        }
+        assert places["10.1/both"] == {"openalex": 3, "arxiv": 1}
+        assert places["10.1145/1"] == {"openalex": 2, "arxiv": 2}
+        assert merged.place_of(0) is None
+
+    def test_a_namesake_years_apart_keeps_its_own_place(self):
+        early = Paper(title="Editorial", authors=["J. Smith"], year=2010)
+        late = Paper(title="Editorial", authors=["J. Smith"], year=2020)
+        answer = self._answer("dblp", [early, late])
+        assert answer_places([early, late], answer) == [1, 2]
+
+    def test_a_doi_less_copy_is_found_by_its_hash(self):
+        bare = Paper(title="A Work", authors=["Ada Lovelace"], year=2021)
+        filler = Paper(title="Filler", authors=["W"], doi="10.1/fill")
+        with_doi = Paper(title="A Work", authors=["Ada Lovelace"],
+                         year=2021, doi="10.1145/2")
+        answer = self._answer("dblp", [filler, bare])
+        assert answer_places([with_doi], answer) == [2]
+
+    def test_a_part_known_only_by_sources_has_no_place(self):
+        paper = Paper(title="Elsewhere", authors=["V"], doi="10.1/else",
+                      sources=["dblp"])
+        dblp = self._answer("dblp", [
+            Paper(title="Unrelated", authors=["U"], doi="10.1/u"),
+        ])
+        assert answer_places([paper], dblp) == [None]
 @
 
 
