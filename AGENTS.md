@@ -1507,6 +1507,60 @@ the summary, `agent_reasons_sentence`: agent and agent_reviewed
 decisions with/without a reason). An older Scholar loads such files
 and drops the fields on its next save (checked with the installed
 pre-#249 pipx build).
+**Batch ids (#292, cli.nw `sec:batch-ids-in-files`,
+`sec:batch-against-sheet`, `sec:sheet-batches`; review.nw
+`sec:stored-batches`).** `agent_batch` is the 4th field of
+`AGENT_AUDIT_FIELDS` (so load, save-when-set, `decision_state`, merge,
+`is_unscreened`, `clear_machine_audit`, the reset trace, `show -f
+json`, and the CSV column right after `agent_decided_at` all handle it;
+not in the text listing). A screening has key `batch` (in
+`SCREENING_KEYS` after `sample_id`, `new_screening(batch=)`; a
+snapshot takes `agent_batch` via `SNAPSHOT_FIELDS`/`verdict_screener`
+for agent verdicts). `parse_tab_file` entries are 4-tuples `(line, id,
+values, batch)`: a comment line `# batch: ID` (`BATCH_LINE`, `batch`
+any case) gives the lines after it that id until the next one (several
+batches concatenated; lines before the first: None); `ReasonLine`/
+`VerdictLine.batch`. `read_batch_id`: white space collapsed, empty or >
+`MAX_BATCH_ID_CHARS` = 100 → bad line (exit 2). Free text, never
+checked against a manifest. `decide --batch ID` (needs `--reason`/
+`--reasons-file`, exit 2) and `screen --batch ID` give the id to a
+run without batch lines; with a file that has them exit 2
+(`lines_with_batch`). The incoming batch check also runs per named
+batch (`<<check each batch the file names>>`, `rows_by_batch`, "In batch
+ID (n rows):" lines; skipped when one batch holds every row;
+`without_repeated_reasons`: a shared reason (`BatchFinding.reason`)
+is reported once, under the batch when its count equals the file's,
+else in the file's line with ", k of them in batch B"); `--strict`
+refuses on any. `--sheet FILE` (repeatable, both commands; decide needs
+a reason option): `read_screen_sheets` (comment/blank lines and an `id`
+header skipped, first column = id; no id, two batch lines, unreadable →
+exit 2 before loading); `compare_with_sheets` matches the sheet's batch
+rows (one sheet: all rows when it has no `# batch:` or the rows name
+no batch; several sheets must each have a distinct batch id, else exit
+2 before loading) by `decisions_named_by`; rows no sheet takes are
+`SheetCheck.uncompared` ("N row(s) of batch X / with no batch id were
+not compared with any sheet", refused under `--strict` as
+`sheet_uncompared`);
+stderr "NAME (batch B): returned R of N; M missing: …", "K id(s) not on
+the sheet: …", "Missing rows are fine …"; ids not on the sheet set
+`sheet_extras`, refused under `--strict` in `<<check the batch as a
+whole>>`. `sessions reset --batch ID` (repeatable, `read_batch_id`;
+alone or narrowing like `--source`) selects decisions by
+`agent_batch`, never screenings; an id no decision carries is a stderr
+note (a reset clears it). `stored_batch_check` → also
+`StoredBatchCheck.batches` (`stored_batches`: rows with a batch id per
+(what, kind, name, batch), `batch_findings` whole, confidence included,
+one-reason runs NOT pooled; `stored_batch_findings`: a batch whose rows
+all share one reason over >= `SHARED_REASON_MIN_RECORDS` works gets one
+`one-reason` note "one reason for all N records of batch X: a rule given
+with --reason, or the same reason on every line", no flat finding;
+fewer works: nothing); `check-batches` lists them ("Stored
+batches …: N, …; k with findings", `BATCH_CONFIDENCE_NOTE` on a flat
+one: a `-c` for a whole run looks the same), JSON `batches`. The
+installed pre-#292 pipx build (no screenings) drops `agent_batch` and
+the screenings on save (checked); a build from main before #292 keeps
+a screening's `batch` (dicts kept verbatim, `list(dec_data.get(
+"screenings"))`, read) and drops only `agent_batch`.
 **Quote check (#256, review.nw `sec:reason-quotes`, cli.nw
 `sec:decide-quote-check`).** Pure functions: `quotes_in_reason`
 (text between double marks `"…"`, `“…”`, `”…”`, `„…“`/`„…”`, `«…»`,
@@ -1612,10 +1666,12 @@ and `--strict` refuses it); shared reasons are looked for
 session-wide over the pooled rows, agent reasons and screening reasons
 apart (`shared["agent decisions"]`, `shared["screenings"]`), since a
 stored run is neither a screener's batch nor a superset of one; flat
-confidence is not judged there (needs a stored batch id, #292). Text:
-counts line, session-wide shared reasons, runs with one reason, then
-what a stored run is and that flat confidence is not judged. JSON:
-`shared_reasons`, `runs`, `flat_confidence`. The help states the
+confidence is not judged from runs, only per stored batch id (#292,
+above). Text:
+counts line, session-wide shared reasons, runs with one reason, stored
+batches, then what a stored run is and that flat confidence is judged
+per batch only. JSON:
+`shared_reasons`, `runs`, `batches`, `flat_confidence`. The help states the
 thresholds (a test ties them to the constants).
 **Records decided without an abstract (#293, review.nw
 `sec:abstract-lookup`, enrich.nw `sec:enrich-lookup-record`, cli.nw
@@ -1940,7 +1996,7 @@ Each record has every key of `review.SCREENING_KEYS` (`id` uuid4 hex,
 `confirmed_from`, `confirmed_name`, `status` kept|discarded, `tags`,
 `confidence`, `reason` whole, `at`, `recorded_at`, `prompt_version`,
 `abstract_truncated`, `blind`, `blind_basis` prompt|tui|declared,
-`sample_id`, `via`), built by `new_screening` (validates) or
+`sample_id`, `batch` (#292), `via`), built by `new_screening` (validates) or
 `decision_snapshot`. `record_screening(decision, record)` first adds a
 snapshot of a *decided* paper's current verdict (`origin: "decision"`,
 `via: "snapshot"`) unless a counted snapshot with the same
@@ -2284,6 +2340,25 @@ screeners)} over records screened twice, `screen_sample` (the one
   from tui.nw with `sample_holding`, review.nw `sec:sample-giveaway`;
   the TUI imports both) go to stderr. The two options with another
   format, or empty, exit 2; unknown sample exit 2 (screen's chunk).
+  `--batch-size N` (#292; screen sheet only, >= 1, else exit 2; no
+  default, the help gives the protocol's ~100 as a recommendation
+  only: defaulted rows frequent at several hundred, rare at <= 100, in
+  one run still in batches of 100) writes `BASE-001.tsv`… of at most N rows, each starting
+  `# batch: <digest>-NNN`, `# session: <file name>`, `# records: n`,
+  then header and rows as the single sheet (`csv.writer`, tab,
+  `QUOTE_NONE`, `quotechar=None`, `\n`: quote marks as stored, bytes
+  as the old tab-join, checked on 3.12-3.14; the reasons/verdicts
+  reader stays own code, `csv.reader` splits at a lone `\r`); plus `BASE-manifest.tsv`
+  (`batch file records first_id last_id`, written with `csv`, tab,
+  `\n`, no comment line). Digest =
+  first `SHEET_DIGEST_CHARS` = 8 hex of SHA-256 of [session file name,
+  size, ids] (`screen_sheet_batches`): stable for one selection and
+  size. Without the option the output is unchanged. `--pending`
+  (#292, cli.nw `sec:first-screen-sheet`, `pending_sheet_decisions`)
+  lists the pending papers instead (first screen; one per paper id,
+  same columns), exit 2 before loading with `--sample`/`--undecided-by`
+  or another format; its batch ids differ from a decided sheet's
+  because the id lists differ.
   Prints "N paper(s) on the screen sheet." and no machine-review
   table. `all` stays csv + latex.
 
@@ -2583,6 +2658,72 @@ search just run, which is current, so it never carries the mark (#275).
 case-insensitive byte search for the id in each file (every decision
 stores `paper_id`; an arXiv DOI also matches its bare arXiv id) and
 decodes only those; non-ASCII/`"`/`\` fragments decode every file.
+
+### `search -f csv` rows (#300)
+
+`search -f csv` is tab-separated, written by Python's `csv` module
+(`csv.writer(sys.stdout, delimiter="\t", lineterminator="\n")`, default
+quote mark `"` and `QUOTE_MINIMAL`); read it with
+`csv.reader(f, delimiter="\t")` (cli.nw `sec:search-csv-rows`). The `#`
+lines and blank lines are printed as before; only the header and paper
+rows go through the writer. A row whose fields hold no tab, line break
+or quote mark is byte-identical to the old f-string output (tested);
+**behaviour change**: a field holding a quote mark, a tab or a line
+break is now quoted, its quote marks doubled (in the tests' invented
+sample, 3 of 20 titles, the ones with a quote mark). Before, a tab or
+line break split the cell or row. `clean_metadata_text` keeps tabs and
+line breaks (and decodes `&#9;`/`&#10;` into them), so ingest cleaning
+does not prevent them. Reading (cli.nw `sec:search-csv-comments`, in
+the `--format` help): the output is blocks of `#` lines, a blank
+line, the header, the paper rows, a blank line; parse it whole with
+`csv.reader(f, delimiter="\t")`, rows up to the first empty row are
+comments, then the header, then papers up to the next empty row. Never
+drop lines starting with `#` before parsing (a quoted title can hold
+`\n#...`, a title can begin with `#`). `csv_comment` turns tab,
+CR and LF in every `#` line into spaces (a query `x<TAB>"y` or
+`a<LF>"b` used to open a quoted field that swallowed every row);
+quote marks stay, since a comment row is one field beginning with `#`
+(tested with `"a b"`, several blocks, `# Results:`/`# Search:`
+errors with line breaks).
+
+### Spreadsheet-safe CSV (`--spreadsheet-safe`, #285)
+
+`sessions export -f csv|all --spreadsheet-safe` and `search -f csv
+--spreadsheet-safe` (review.nw `sec:spreadsheet-safe`) write each cell
+that begins with a character of `SPREADSHEET_FORMULA_STARTS` (`=
++ - @`, tab, CR, LF, full-width U+FF1D U+FF0B U+FF0D U+FF20: OWASP's
+CSV-injection list, read 2026-11-20 at
+https://owasp.org/www-community/attacks/CSV_Injection, no more and no
+fewer), or with `'` itself, with one `'` in front
+(`spreadsheet_safe_cell`). The page's tab prefix was not taken: the
+same page lists tab as a trigger. The page wraps and prefixes *every*
+field; prefixing only trigger cells and leaving quoting to
+`csv.writer`'s minimal rule is scholar's choice (exact undo, other
+cells unchanged for scripts; quoting every field changed nothing in
+LibreOffice, comma import). Numeric columns (`CSV_NUMERIC_COLUMNS` =
+`year`, `llm_confidence`; `SpreadsheetSafeWriter` finds them by header
+name, so a new column is text; search's year likewise) go through
+`spreadsheet_safe_number`: left alone only for an int, a float or a
+string `float()` reads that equals its `strip()` (`"\t5"` is text), else treated as text (a session can hold
+`"year": "=1+2"`; `Paper.from_dict` keeps it). Undo: drop the first
+character of every cell, in any column, that begins with `'` (exact: a
+leading `'` is doubled, and a number left alone never begins with
+`'`). `#` lines and headers are unchanged. In `search` the prefix is
+put on the cell before `csv.writer` writes it, so a cell beginning with
+a tab or line break stays one quoted cell (tested; LibreOffice read it
+as one text cell, the old unquoted row as a formula). Off by default
+and byte-identical without it (checked against e7dc5f5): scripts read
+the raw file. To make it the default, set
+`cli.SPREADSHEET_SAFE_DEFAULT = True` (the flag has
+`--no-spreadsheet-safe`; `None` = not given). With another format it is
+refused (exit 2; search: not csv/auto, before searching; export: not
+csv/all, before loading). Limits, also in both helps: it protects only
+a reader that uses the file's own separator (comma for the export, tab
+for search; a semicolon import of the safe export gave the same
+formulas as the raw one for a field holding `a;=1+2`); LibreOffice
+shows the `'` as part of the text; Excel may drop the prefix on save
+and reopen (the page). LibreOffice 26.2.6.3, tried 2026-11-20; Excel
+not tried. Not covered: `sessions check -f csv`, the screen sheet.
 
 ### LaTeX Output: Standalone, Fragment, Audit Table
 
