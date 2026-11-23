@@ -3487,6 +3487,10 @@ log; the shared rule fails on none of these reliably; the root `doc/scholar.pdf`
 `publish-github`) runs it.
 `doc/Makefile`'s rules for `../src/scholar/%.tex` name the `.nw`, so a
 changed source is re-woven (before, a stale woven chapter was used).
+`doc/preamble.tex` redefines noweb's `\@subpageref` to always print
+the chunk letter (`1865a`): with noweb's default, a letter only when
+the page holds 2+ chunks, the references' width depended on the page
+breaks and the document flipped between two layouts on every pass.
 
 ## Caching
 
