@@ -3192,15 +3192,28 @@ fixture has a quoted query, a `[`-row, `ĸ`, `CO₂`, a ligature. About
   line break (placeholders, dates, fields parsed line by line), except
   FOUND-VIA's query (#323, left open: a shell command). Text fields (`bibtex_text_value`): tab
   and line breaks -> space, other C0 dropped (biber 2.21 core-dumps on
-  a NUL); an escaped `\{`/`\}` -> `\textbraceleft{}`/`\textbraceright{}`;
-  then `escape_bibtex`, which now writes every backslash of the text as
-  `\textbackslash{}` (`BIBTEX_SPECIALS`; a title `x\y` stopped pdfLaTeX
-  on main); so provider markup now prints literally, as intended (the
-  report always printed titles literally; `$` was escaped already):
-  `The \textit{wolf}` printed "The *wolf*" (italic), now "The
-  \textitwolf"; `{\em x}` an italic "x", now "\em x"; `Caf\'e` "Café",
-  now "Caf\'e" (standalone report, pdfLaTeX, TeX Live 2025; accent
-  decoding not done); then an unpaired brace -> the same commands. No output
+  a NUL); then `escape_bibtex` (review.nw `sec:latex-titles`): a value
+  with a backslash is read as LaTeX by pylatexenc (declared dependency
+  since #304; bibtexparser 2 depends on it) and, when safe, written as
+  its Unicode text. Only command nodes are decoded (`LatexWalker` nodes:
+  macros with their arguments, math; groups kept with their braces and
+  read inside; other text, `~`, `--`, quotes kept as written); a bare
+  `%` becomes `\%` before parsing (no comment). Safe = parses with
+  `tolerant_parsing=False`, every backslash starts a macro the
+  converter knows (`get_macro_spec`), no comment inside a command, no
+  environment, non-empty text (`latex_text_pieces`). Added through
+  `add_context_category`: font switches `\em \it \bf ...` (discard) and
+  `\texttt`-like commands (`%s`). `\{`/`\}` decode to `LatexBrace` ->
+  `\textbraceleft{}`/`\textbraceright{}`. Anything else: every backslash
+  -> `\textbackslash{}` (`BIBTEX_SPECIALS`), a still-escaped `\{`/`\}`
+  -> brace commands. Printed (main / every backslash escaped / now):
+  `Caf\'e` Café / Caf\'e / Café; `The \textit{wolf}` The *wolf* / The
+  \textitwolf / The wolf; `{\em x}` *x* / \em x / x; `$\alpha$-stable`
+  stops / $\alpha$-stable / α-stable; `x\y`, `C:\dir\new` stop / literal
+  / literal (table `tab:latex-titles`). The report's `escape_latex`
+  still prints titles as stored; ingest-time cleaning is #329. Values
+  without a backslash never reach the parser (byte-identical). Then an
+  unpaired brace -> the same commands. No output
   value holds a backslash before a brace or at its end (bibtexparser
   then loses the entry, biber does not). Paired braces stay. 3 of 6,594
   papers of two copied real sessions write differently (2 titles with
