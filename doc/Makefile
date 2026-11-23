@@ -29,12 +29,29 @@ SRC_TEX+=	../src/scholar/tutorials/scholar-with-an-agent.tex
 all: ${DOC}
 
 # A LaTeX error does not reliably fail the build: the shared rule ignores
-# the exit status of its first latexmk run and writes the PDF anyway.
-# This target fails when the log of the last run holds an error or an
-# undefined reference (#279).  Run it non-interactively, e.g.
+# the exit status of its first latexmk run (even 127, no latexmk at all)
+# and its rerun loop ends in a successful `break`.  This target fails
+# unless the PDF and the log exist and the log is newer than every
+# source, and when that log holds an error, an undefined reference or
+# cross-references that did not settle (#279).  latexmk's own "Maximum
+# runs of pdflatex reached" goes to the terminal, not to the log; the
+# log lines it reacts to are what we find.  Run it non-interactively:
 #   make check LATEXFLAGS="-shell-escape -interaction=nonstopmode"
+CHECK_LOG=	${TEX_OUTDIR}/scholar.log
+CHECK_PATTERNS=	-e '^! ' -e 'There were undefined' \
+		-e 'Label(s) may have changed' -e 'Rerun to get'
+
 check: scholar.pdf
-	@! grep -n -A3 -e '^! ' -e 'There were undefined' ${TEX_OUTDIR}/scholar.log
+	@for f in ${CHECK_LOG} ${TEX_OUTDIR}/scholar.pdf scholar.pdf; do \
+	  [ -e $$f ] || { echo "check: $$f is missing; the build did not run" >&2; \
+	                  exit 1; }; \
+	done
+	@for f in scholar.tex preamble.tex ${SRC_TEX}; do \
+	  [ ${CHECK_LOG} -nt $$f ] || { \
+	    echo "check: ${CHECK_LOG} is older than $$f; the build did not run" >&2; \
+	    exit 1; }; \
+	done
+	@! grep -n -A3 ${CHECK_PATTERNS} ${CHECK_LOG}
 
 scholar.pdf: scholar.tex preamble.tex
 scholar.pdf: ${SRC_TEX}

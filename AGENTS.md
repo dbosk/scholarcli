@@ -3271,20 +3271,24 @@ test_cli.py, no LaTeX, under a second per check) reads every
 `src/scholar/**/*.nw` and fails, naming file and line, on (a) a
 documentation-chunk quote that takes a LaTeX bracket: noweb closes a
 quote at the *last* two of a run of `]`, so `\item[A [[x]]]` leaves the
-label open (runaway argument) and `\item[[[x]]]` loses the label;
+label open (runaway argument) and `\item[[[x]]]` (or `\item [[[x]]]`)
+loses the label;
 write `\item[A [[x]] ]` / `\item[ [[x]] ]` (`[[[]]]`, quoting code that
 ends in `]`, is fine); (b) a character pdfLaTeX cannot set: allowed are
 printable ASCII and tab, U+00A0-U+024F outside `review.T1_UNSET_RANGES`,
 the `\newunicodechar`s of `doc/preamble.tex`, and
-`DOCUMENT_EXTRA_CHARACTERS` (a dozen code points with the `.dfu` file
+`DOCUMENT_EXTRA_CHARACTERS` (eleven code points with the `.dfu` file
 declaring each, checked by a `latex`-marked test). Write CJK, Cyrillic,
-U+2028 and the like in code chunks as Python escapes (`"\u5b66"`), as
+U+2028, U+FEFF and the like in code chunks as Python escapes
+(`"\u5b66"`), as
 most non-Latin tests already did; name them in the prose if the reader
 needs to know. The full build is `make -C doc check
-LATEXFLAGS="-shell-escape -interaction=nonstopmode"` (7 to 19 minutes
-measured, 2471 pages): `check` fails when the last run's log holds an
-error or an undefined reference, which the shared rule does not
-reliably do; the root `doc/scholar.pdf` target (used by
+LATEXFLAGS="-shell-escape -interaction=nonstopmode"` (between 7 and
+26 minutes on the machines tried, longer under load; 2471 pages):
+`check` fails unless `ltxobj/scholar.log` and the PDF exist and the
+log is newer than every source, and on `^! `, "There were
+undefined", "Label(s) may have changed" or "Rerun to get" in the
+log; the shared rule fails on none of these reliably; the root `doc/scholar.pdf` target (used by
 `publish-github`) runs it.
 `doc/Makefile`'s rules for `../src/scholar/%.tex` name the `.nw`, so a
 changed source is re-woven (before, a stale woven chapter was used).
