@@ -528,6 +528,22 @@ A raw DOI is not decoded: a [[%]] in it is a character of the DOI.
 The PDF imports follow, since they choose their key through
 [[extract_doi]] too (\cref{sec:pdf-import-key}): the URL and the DOI
 it names share one key.
+Before the decoding, an import by such a URL was keyed by the DOI as
+written in it, escapes and all, so the lookups also try that key
+([[doi_url_path]] keeps the written form, \cref{sec:pdf-import-key}).
+
+<<doi resolution functions>>=
+def doi_url_path(identifier: str) -> str | None:
+    """Return the DOI of a DOI URL as written, escapes undecoded.
+
+    None for anything but a DOI URL.
+    """
+    identifier = identifier.strip()
+    if DOI_PATTERN.match(identifier):
+        return None
+    match = DOI_URL_PATTERN.match(identifier)
+    return match.group(1) if match else None
+@
 
 \subsection{Unpaywall Resolution}
 
@@ -1442,19 +1458,23 @@ def download_doi_pdf(
     doi: str,
     progress_callback: Callable[[str], None] | None = None,
     skip: tuple[str, ...] = (),
+    written: str | None = None,
 ) -> Path:
     """
     Download the PDF for a DOI, trying each candidate URL in turn.
+
+    `written` is the DOI as a doi.org URL wrote it, before decoding, so
+    that a PDF imported under that older key is found.
 
     Raises:
         PDFDownloadError: If no source names a PDF, or none delivers;
             the message lists every attempt.
     """
-    imported = get_cached_doi_pdf_path(doi)
-    if usable_cached_pdf(imported):
-        if progress_callback:
-            progress_callback(f"Using imported PDF: {imported}")
-        return imported
+    for imported in doi_pdf_paths(doi, written):
+        if usable_cached_pdf(imported):
+            if progress_callback:
+                progress_callback(f"Using imported PDF: {imported}")
+            return imported
     failures = []
     for source, url in doi_pdf_candidates(doi, progress_callback):
         if url in skip:
@@ -1527,7 +1547,9 @@ def get_pdf(
             logger.debug("Source is a DOI: %s", doi)
             if progress_callback:
                 progress_callback(f"Resolving DOI: {doi}")
-            return download_doi_pdf(doi, progress_callback)
+            return download_doi_pdf(
+                doi, progress_callback, written=doi_url_path(source)
+            )
         logger.debug("Source is a URL: %s", source)
         return download_pdf(source, progress_callback)
 
@@ -2023,6 +2045,36 @@ def get_cached_doi_pdf_path(doi: str) -> Path:
 DOI_TRAILING_PUNCTUATION = ".,;:'\""
 @
 
+A DOI given as a [[doi.org]] URL is decoded once
+(\cref{sec:doi-resolution}), and before that it was not: an import by
+[[--url https://doi.org/10.5555/(SICI)abc;2-%23]] was stored under the
+key of [[10.5555/(sici)abc;2-%23]], escapes and all, while the same
+URL now names the DOI [[10.5555/(SICI)abc;2-#]] and its key.
+So every lookup of a DOI that came from such a URL tries both keys,
+the decoded one first: [[doi_pdf_paths]] takes the DOI as written in
+the URL beside the decoded DOI ([[doi_url_path]]) and adds its key when
+it differs.
+A new import goes under the decoded key; one that finds a copy under
+the old key and none under the new one goes to the old key instead
+(\cref{sec:pdf-import-write}), so the same PDF is \enquote{unchanged},
+another needs [[--replace]], and there are never two copies of one
+paper.
+
+<<pdf cache functions>>=
+def doi_pdf_paths(doi: str, written: str | None = None) -> list[Path]:
+    """The cache paths a PDF imported for `doi` may have, newest key first.
+
+    `written` is the DOI as a doi.org URL wrote it, before decoding; its
+    key, used by imports before the URL was decoded, comes second.
+    """
+    paths = [get_cached_doi_pdf_path(doi)]
+    if written:
+        old = get_cached_doi_pdf_path(written)
+        if old != paths[0]:
+            paths.append(old)
+    return paths
+@
+
 \subsection{Copying, recording and refusing to overwrite}
 \label{sec:pdf-import-write}
 
@@ -2151,18 +2203,29 @@ the DOI, so an import under that URL's own key would never be found.
 The record keeps the URL as given beside the DOI it named.
 A DOI that does not have the form of one, once normalised, is refused
 rather than imported under a key nothing will look up.
+A resolver URL whose DOI was keyed as written before it was decoded
+([[doi_pdf_paths]], \cref{sec:pdf-import-key}) goes to that old key when
+a copy is there and none under the decoded key, so that the comparison
+below judges the existing copy and the import never leaves a second
+one.
 
 <<choose the key of an import>>=
 if (url is None) == (doi is None):
     raise ValueError("give exactly one of url and doi")
+written = None
 if url is not None and extract_doi(url):
     doi = extract_doi(url)
+    written = doi_url_path(url)
 stored_doi = None
 if doi is not None:
     stored_doi = normalized_pdf_doi(doi)
     if not DOI_PATTERN.match(stored_doi):
         raise PDFImportError(f"not a DOI: {doi}")
-    cache_path = get_cached_doi_pdf_path(doi)
+    keys = doi_pdf_paths(doi, written)
+    cache_path = next(
+        (path for path in keys[1:] if not keys[0].exists() and path.exists()),
+        keys[0],
+    )
 else:
     cache_path = get_cached_pdf_path(url)
 <<copy the file to import and check the copy>>=
@@ -2205,6 +2268,64 @@ if cache_path.exists():
             f"(sha256 {cached}); pass --replace to overwrite it"
         )
     status = "replaced"
+@
+
+Let's verify that an import made before resolver URLs were decoded is
+still found and still counts as the paper's one copy.
+The old import is made as the code before the change made it: its key
+is the resolver URL with the DOI as the URL wrote it, which an import
+by that spelling of the DOI produces exactly.
+The lookups must find it without a request ([[requests.get]] fails the
+test if called), and importing the same file again by the URL must
+answer \enquote{unchanged}, another file must need [[--replace]], and
+the cache must hold one PDF throughout.
+
+<<test functions>>=
+class TestImportsUnderTheWrittenKey:
+  """PDFs imported by a doi.org URL before it was decoded (#304)."""
+
+  URL = "https://doi.org/10.5555/(SICI)abc;2-%23"
+  WRITTEN = "10.5555/(SICI)abc;2-%23"
+
+  def _old_import(self, tmp_path, monkeypatch):
+    monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path / "cache"))
+    pdf = make_pdf(tmp_path / "paper.pdf", text="old import")
+    old = import_pdf(pdf, doi=self.WRITTEN).path
+    assert old != get_cached_doi_pdf_path(extract_doi(self.URL))
+    return pdf, old
+
+  @staticmethod
+  def _pdfs():
+    return sorted(get_pdf_cache_dir().glob("*.pdf"))
+
+  def test_the_lookups_find_it_without_a_request(
+    self, tmp_path, monkeypatch
+  ):
+    _, old = self._old_import(tmp_path, monkeypatch)
+    with patch("scholar.pdf.requests.get",
+               side_effect=AssertionError("no request")):
+      assert get_pdf(self.URL) == old
+      assert download_doi_pdf(extract_doi(self.URL),
+                              written=self.WRITTEN) == old
+
+  def test_importing_it_again_keeps_one_copy(self, tmp_path, monkeypatch):
+    pdf, old = self._old_import(tmp_path, monkeypatch)
+    again = import_pdf(pdf, url=self.URL)
+    assert (again.status, again.path) == ("unchanged", old)
+    other = make_pdf(tmp_path / "other.pdf", text="another file")
+    with pytest.raises(PDFImportError, match="--replace"):
+      import_pdf(other, url=self.URL)
+    replaced = import_pdf(other, url=self.URL, replace=True)
+    assert (replaced.status, replaced.path) == ("replaced", old)
+    assert self._pdfs() == [old]
+
+  def test_a_new_import_takes_the_decoded_key(self, tmp_path, monkeypatch):
+    monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path / "cache"))
+    pdf = make_pdf(tmp_path / "paper.pdf")
+    outcome = import_pdf(pdf, url=self.URL)
+    assert outcome.path == get_cached_doi_pdf_path("10.5555/(SICI)abc;2-#")
+    assert doi_pdf_paths(extract_doi(self.URL), self.WRITTEN)[0] \
+      == outcome.path
 @
 
 The listing of [[scholar pdf info]] shows the PDFs whose records mark
