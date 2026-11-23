@@ -2777,10 +2777,10 @@ first answer by paper id, in the order of the first answers, which
 pairs two copies of one paper in a batch with one answer each.  It
 replaces that first answer in its place, so the decisions keep the
 order of the batch.  A second response with no JSON at all, which
-[[parse_llm_response]] raises for, leaves every paper asked again with
-its first answer, which is then withheld; it used to end the run and
-lose the batch's usable answers with it.  Every paper asked again is
-recorded in [[retried]], whatever came of it.
+[[parse_llm_response]] raises for, withholds every paper asked again
+(below); it used to end the run and lose the batch's usable answers
+with it.  Every paper asked again is recorded in [[retried]], whatever
+came of it.
 
 <<ask again, in one request, about the unusable answers>>=
 retried: list[str] = []
@@ -2793,51 +2793,89 @@ if needing:
         len(needing),
     )
     <<choose the papers to ask again>>
+    retry_prompt = prompt_for(
+        again, [paper_quotes[i] for i in shown] if paper_quotes else None,
+    ) + _retry_reminder(allowed, categories)
     answers = []
+    failure = ""
     try:
-        text = requests.ask(model, prompt_for(
-            again, [paper_quotes[i] for i in shown] if paper_quotes
-            else None,
-        ) + _retry_reminder(allowed, categories))
+        text = requests.ask(model, retry_prompt)
     except Exception as error:
-        <<withhold the papers of a failed retry request>>
+        failure = f"retry request failed: {retry_failure_reason(error)}"
     else:
         try:
             answers = parse(text, again)
         except ValueError as error:
-            logger.warning("Retry unreadable, its papers stay withheld: %s",
-                           error)
+            failure = f"retry unreadable: {error}"
+    if failure:
+        <<withhold the papers of a failed retry>>
     <<put each new answer in place of the first>>
 @
 
 A retry request can fail as any request can: the connection is
 refused, the service answers with an error, the model's plugin raises.
-The first answers it was meant to mend are then all the run has for
-those papers, so they are withheld as after an unreadable retry, and
-the batch's usable answers are applied as usual; a failure used to end
-the run with an exception and lose them all.  Each withheld paper's
-problem names the failure after its first answer's problem, worded by
-[[request_failure_reason]] (\cref{sec:request-failure-reason} in the
-network module), which leaves out the request's address and any key in
-it.  The exception is caught whatever its class, since each plugin
-raises its own, and only around the request: a fault in scholar's
-parsing is not a failed request.  The first request has no such
-fallback: when it fails, no paper has an answer, and its exception
-leaves [[classify_papers_with_llm]] as before (the command ends with
-it, and nothing is decided).
+The exception is caught whatever its class, since each plugin raises
+its own, but only around the request: the retry's prompt is built
+before it, so a fault in scholar's own code (in building the prompt,
+say) still ends the run as a fault rather than passing for a failed
+request.  The first request has no
+such fallback: when it fails, no paper has an answer, and its
+exception leaves [[classify_papers_with_llm]] as before (the command
+ends with it, and nothing is decided).
 
-<<withhold the papers of a failed retry request>>=
-from dataclasses import replace
+A failed or unreadable retry leaves the first answers it was meant to
+mend as all the run has for those papers, and every paper asked again
+is withheld, while the batch's usable answers are applied as usual.
+That includes a paper whose only defect was that every tag it got lay
+outside the vocabulary: its first answer has no [[problem]] of its
+own, but it is no usable answer either, a keep without the tags the
+run was meant to give.  On main such a paper got no decision when the
+retry failed (the run ended with the exception, and nothing was
+applied), so withholding it keeps what main did for it; applying it
+with no tag, as an earlier version of this change did after an
+unreadable retry, made the two kinds of failure treat it differently.
+Each withheld paper's problem names its first answer's defect and the
+retry's failure, the empty parts left out.
 
-from scholar.network import request_failure_reason
+The failure of a request is worded for the user and the session file,
+so it must not quote a key.  [[request_failure_reason]]
+(\cref{sec:request-failure-reason} in the network module) words the
+failures of [[requests]] itself, without their URLs; the model plugins
+raise exceptions of their own whose text may hold anything, a header
+with the key among it, so for those only the class is named
+([[retry_failure_reason]]), as [[request_failure_reason]] already does
+for the other [[requests]] exceptions for the same reason.
 
-failure = f"retry request failed: {request_failure_reason(error)}"
+<<withhold the papers of a failed retry>>=
 logger.warning("%s; its papers stay withheld", failure)
 for position in needing:
-    first = decisions[position]
-    decisions[position] = replace(
-        first, answer_problem=f"{first.problem}; {failure}"
-    )
+    decisions[position] = _withheld_after_retry(decisions[position],
+                                                failure)
+<<llm review llm interaction>>=
+NO_TAG_LEFT = "no tag left inside the vocabulary"
+
+
+def _withheld_after_retry(first: LLMDecision, failure: str) -> LLMDecision:
+    """Return `first` withheld, naming its defect and the retry's failure."""
+    from dataclasses import replace
+
+    parts = [first.problem or NO_TAG_LEFT, failure]
+    return replace(first, answer_problem="; ".join(p for p in parts if p))
+
+
+def retry_failure_reason(error: Exception) -> str:
+    """Word a failed retry request without quoting a key.
+
+    A `requests` exception is worded by `request_failure_reason`; any
+    other is named by its class only.
+    """
+    from requests import RequestException
+
+    from scholar.network import request_failure_reason
+
+    if isinstance(error, RequestException):
+        return request_failure_reason(error)
+    return type(error).__name__
 @
 
 The papers to ask again are found by the paper id of each first
@@ -3551,15 +3589,17 @@ class TitleAnsweringModel:
   `shown` lists, per prompt, the titles it showed.  `usage` is the
   (input, output) pair each response reports, `None` for an empty
   `Usage`, or a function returning what `usage()` returns; the calls
-  numbered in `fail_on` (1 = the first) raise a refused connection.
+  numbered in `fail_on` (1 = the first) raise `failure`, by default a
+  refused connection.
   """
 
   model_id = "stub-model"
 
-  def __init__(self, answers, usage=(100, 10), fail_on=()):
+  def __init__(self, answers, usage=(100, 10), fail_on=(), failure=None):
     self.answers = answers
     self.usage = usage
     self.fail_on = fail_on
+    self.failure = failure
     self.prompts = []
     self.shown = []
     self.asked = {}
@@ -3572,7 +3612,7 @@ class TitleAnsweringModel:
 
     self.prompts.append(prompt)
     if len(self.prompts) in self.fail_on:
-      raise http.ConnectionError(
+      raise self.failure or http.ConnectionError(
         "refused: https://api.example.invalid/v1?api_key=SECRET-KEY")
     answers = []
     papers = re.findall(r"\[Paper (\d+)\]\nTitle: (.*)", prompt)
@@ -3634,8 +3674,9 @@ def _session(self):
 VOCABULARY = {"t", "off"}
 
 def _run(self, monkeypatch, answers, usage=(100, 10), fail_on=(),
-         **options):
-  model = TitleAnsweringModel(answers, usage, fail_on).install(monkeypatch)
+         failure=None, **options):
+  model = TitleAnsweringModel(answers, usage, fail_on,
+                              failure).install(monkeypatch)
   session = self._session()
   result = classify_papers_with_llm(
     session, model_id="stub-model", enrich_missing=False,
@@ -3756,8 +3797,11 @@ def test_an_unreadable_retry_loses_no_other_answer(self, monkeypatch):
     "Delta Heaps": [self.MAYBE],
   })
   assert model.shown == [self.TITLES, ["Beta Stacks", "Delta Heaps"]]
-  assert [d.problem for d in result.withheld] \
-    == ["invalid decision 'maybe'", "no answer for this paper"]
+  unreadable = "retry unreadable: No JSON found in LLM response"
+  assert [d.problem for d in result.withheld] == [
+    f"invalid decision 'maybe'; {unreadable}",
+    f"no answer for this paper; {unreadable}",
+  ]
   assert len(result.decisions) == 3
   assert run_cost_line(result).startswith(
     "Requests: 1 batch + 1 retry of 2 papers; left pending: 2; ")
@@ -3850,6 +3894,71 @@ def test_a_failed_retry_request_loses_no_other_answer(self, monkeypatch):
     DecisionStatus.KEPT) == 4
   assert run_cost_line(result).startswith(
     "Requests: 1 batch + 1 retry of 1 paper; left pending: 1; ")
+
+def test_a_failed_retry_quotes_no_plugin_text(self, monkeypatch):
+  failure = RuntimeError(
+    "401 {'x-api-key': 'sk-ant-SECRET4', 'type': 'error'}")
+  session, model, result = self._run(
+    monkeypatch, {"Beta Stacks": [self.MAYBE]}, fail_on=(2,),
+    failure=failure)
+  assert [d.problem for d in result.withheld] == [
+    "invalid decision 'maybe'; retry request failed: RuntimeError"
+  ]
+
+def test_a_fault_building_the_retry_prompt_is_no_failed_request(
+  self, monkeypatch
+):
+  import scholar.llm_review as llm_review
+
+  real = llm_review.build_classification_prompt
+  calls = []
+
+  def builder(*args, **kwargs):
+    calls.append(1)
+    if len(calls) == 2:
+      raise TypeError("a fault in scholar's own code")
+    return real(*args, **kwargs)
+
+  monkeypatch.setattr(llm_review, "build_classification_prompt", builder)
+  with pytest.raises(TypeError):
+    self._run(monkeypatch, {"Beta Stacks": [self.MAYBE]})
+  assert len(calls) == 2
+@
+
+A paper whose every tag lay outside the vocabulary has no problem of
+its own, but it is asked again; when the retry fails or cannot be
+read, it is withheld like the others, its defect named.  After them
+come the values a usage may give that are no token count, and two
+tests that belong with the failed retry above: a failing first
+request, and a retry under [[candidates]].
+
+<<retry only the unusable test methods>>=
+OUTSIDE = {"decision": "kept", "tags": ["not-in-vocabulary"],
+           "confidence": 0.8, "reasoning": "Fits."}
+
+def test_tags_all_dropped_and_retry_request_failed(self, monkeypatch):
+  session, model, result = self._run(
+    monkeypatch, {"Beta Stacks": [self.OUTSIDE]}, fail_on=(2,))
+  assert model.shown == [self.TITLES]
+  assert [d.problem for d in result.withheld] == [
+    f"{NO_TAG_LEFT}; retry request failed: connection failed "
+    "(ConnectionError)"
+  ]
+  assert len(result.decisions) == 4
+
+def test_tags_all_dropped_and_retry_unreadable(self, monkeypatch):
+  session, model, result = self._run(
+    monkeypatch, {"Beta Stacks": [self.OUTSIDE, "No JSON here."]})
+  assert model.shown == [self.TITLES, ["Beta Stacks"]]
+  assert [d.problem for d in result.withheld] == [
+    f"{NO_TAG_LEFT}; retry unreadable: No JSON found in LLM response"
+  ]
+  assert len(result.decisions) == 4
+
+def test_what_is_no_token_count(self):
+  assert token_count(12) == 12 and token_count(0) == 0
+  for value in ("12", 3.5, True, -1, None):
+    assert token_count(value) is None, value
 
 def test_a_failed_first_request_ends_the_run(self, monkeypatch):
   import requests as http

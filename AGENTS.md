@@ -694,7 +694,11 @@ lookups (`get_paper_by_doi`, `get_preprint_locations`,
 
 Keys in messages (#159): `network.redact_secrets(text)` hides the
 values of `api_key`/`apikey`/`api-key`/`key` URL parameters and
-`mailto`/`email` (personal data, #160, #259), in any case. `check_provider` applies it to every health message; the
+`mailto`/`email` (personal data, #160, #259), in any case, and (#306)
+the header/mapping forms `x-api-key`/`api-key`/`api_key`/`apikey`/
+`authorization` followed by `:` or `=` and a bare or quoted value
+(scheme word Bearer/Basic/Token kept: `SECRET_HEADER`) and any
+`Bearer <token>` (`BEARER_TOKEN`). `check_provider` applies it to every health message; the
 OpenAlex and IEEE (`apikey` in the URL) error logs use it. The OpenAlex
 `/works` probe sends the key as `Authorization: Bearer` (documented,
 as pyalex does); `/rate-limit` keeps the `api_key` parameter (the only
@@ -3353,11 +3357,17 @@ papers whose first answer needs it (`_needs_retry(decision, allowed)`:
 `_retry_reminder` (at the end); papers shown in batch (session) order;
 each answer replaces its paper's first answer in place (matched by
 paper id); the others are untouched. No third pass: still unusable ->
-withheld; a retry with no JSON withholds its papers; a retry REQUEST
-that raises (any exception, caught around `RequestTally.ask` only)
-withholds its papers with problem "<first problem>; retry request
-failed: <`network.request_failure_reason`>" and the usable answers are
-applied. A failing FIRST request still raises out of
+withheld. The retry prompt is built before the `try`, which holds
+only `RequestTally.ask` (a fault in scholar's code propagates). A retry
+REQUEST that raises (any exception) or a retry with no JSON withholds
+EVERY paper asked again (`_withheld_after_retry`: problem = the non-empty
+parts of "<first problem or `NO_TAG_LEFT`>; retry request failed:
+<reason>" / "...; retry unreadable: <parse error>"; a paper whose tags
+were all dropped is withheld too, as main left it undecided when the
+run ended); the usable answers are applied. Reason via
+`retry_failure_reason`: `requests` exceptions through
+`network.request_failure_reason`, any other by class name only (plugin
+texts may hold a header with the key). A failing FIRST request still raises out of
 `classify_papers_with_llm` (command ends with the exception, nothing
 decided). Covers `llm classify`, `--second-screen` and `rq`
 (`candidates=` too). A first version (one request
