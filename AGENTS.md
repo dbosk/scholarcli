@@ -2842,8 +2842,26 @@ aside into `.scholar-replaced-*` before the new file goes in, and a
 failure part-way undoes the moves (old file back, new file without a
 predecessor removed). Removals (`staged_outputs(dir, remove=[names])`,
 the screen sheet's stale `BASE-tier.json`) are moves aside in the same
-transaction, made after every file is in place. A failure raises
-`OutputsNotPlaced` (`new`/`old`/`missing`/`not_written`, `kept`,
+transaction, made after every file is in place. The moves run under
+`placing_lock(dir)` = `file_lock(dir / "scholar-outputs",
+timeout=PLACING_LOCK_TIMEOUT (5 s), required=True)`; the lock file
+`.scholar-outputs.lock` stays in the output directory (by design, as
+session lock files do); a refused lock fails the export with one line
+("another export is moving files into DIR"), moving nothing (#320
+review: without it two exports could delete a file). The undo removes
+or overwrites a placed file only while it still is that file
+(`file_identity` = lstat `st_dev`/`st_ino` of the staged file before
+its rename); otherwise it leaves it and lists it in `others` ("Replaced
+by another program meanwhile"). SIGTERM is an interrupt during the
+moves (`utils.sigterm_as_keyboard_interrupt`, moved here from cli.nw;
+`enrich` imports it), so it is rolled back like Ctrl-C. A replaced
+file's mode is kept (`shutil.copymode` onto the staged file). Each
+export holds `file_lock(staging)` (lock file beside it, removed at the
+end); under the directory lock `leftover_directories` finds
+`.scholar-replaced-*` (always left over) and `.scholar-staging-*` whose
+lock is free (`staging_left_over`) and logs one WARNING each
+(`leftover_warning`), deleting nothing. A failure raises
+`OutputsNotPlaced` (`new`/`old`/`missing`/`not_written`/`others`, `kept`,
 `rolled_back`, `changed`); `cli.export_failure_text` words the message
 from it: "no files were written or changed" (with "and was rolled
 back" when files had moved) only when `not changed`, else "Export
@@ -2851,10 +2869,14 @@ failed part-way and could not be rolled back" plus one line per kind
 naming where an earlier version is kept (that directory is then left).
 The rest-sample export says "None of the exported files was written or
 changed" and "the screen sheet was not written" unless a restore
-failed. Limits (in the prose): several renames are not one atomic step;
-between the move aside and the move in the name holds no file; a killed
-process undoes nothing (replaced files stay in `.scholar-replaced-*`);
-the check is a forecast (`os.access` caveats), the undo is the guard.
+failed, then "... after the draw was recorded and could not be rolled
+back" with the list. Limits (in the prose): several renames are not
+one atomic step; between the move aside and the move in the name holds
+no file; SIGKILL or a power loss undoes nothing: the moved files stay,
+the earlier versions are in `.scholar-replaced-*` under their own names
+(move them back, then delete both hidden directories), the unmoved new
+files in `.scholar-staging-*`; the check is a forecast (`os.access`
+caveats), the undo is the guard.
 `sessions list` warns on stderr about sessions with records but no
 decisions and no context (`needs_check` in the JSON). The paper registry
 is process-global, so tests that load sessions should use unique DOIs or
