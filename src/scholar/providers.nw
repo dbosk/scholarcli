@@ -378,9 +378,18 @@ The policy (when a total is large, what to print, whether the user
 asked for everything) belongs to the command line; the providers only
 know the moment.  So the providers announce the total to whoever
 listens, and the command line listens.  [[first_total_known]] is the
-announcement, called once per fetched answer where the provider reads
-the first page's total; [[listening_for_totals]] installs a listener
-for the duration of a search.  The listener sits in a
+announcement, called where the provider reads the first page's
+total; [[listening_for_totals]] installs a listener for the duration of
+a search.  A provider that restarts its paging announces again: arXiv
+starts over after an empty page or an HTTP error, DBLP repeats a search
+that answered with nothing.  The providers are not changed for that;
+the listener has to take a repeated announcement in its stride (the
+command line's prints at most once per provider).
+A provider that stops before the total on its own, Semantic Scholar's
+bulk search at its safety cap ([[S2_BULK_SAFETY_CAP]]), passes that
+[[cap]] too, so that the listener does not promise everything when the
+provider will fetch only the first [[cap]] records; [[None]] means no
+cap.  The listener sits in a
 [[contextvars.ContextVar]] rather than a module global, so that it is
 restored however the search ends and a listener can never outlive the
 search it was installed for.  Without a listener (the TUI, [[rq]] with
@@ -397,7 +406,7 @@ _TOTAL_LISTENER: contextvars.ContextVar = contextvars.ContextVar(
 
 @contextlib.contextmanager
 def listening_for_totals(listener):
-    """Call `listener(name, total, estimated)` when a search hears its total.
+    """Call `listener(name, total, estimated, cap)` when a search hears its total.
 
     `listener` None installs nothing, so a caller can pass it
     conditionally.
@@ -409,12 +418,18 @@ def listening_for_totals(listener):
         _TOTAL_LISTENER.reset(token)
 
 
-def first_total_known(name: str, total, estimated: bool = False) -> None:
-    """Tell the current listener, if any, the total of a search's first page."""
+def first_total_known(
+    name: str, total, estimated: bool = False, cap: int | None = None
+) -> None:
+    """Tell the current listener, if any, the total of a search's first page.
+
+    `cap` is the number of records the provider stops at by itself, if
+    it has such a cap; None means it fetches up to the total.
+    """
     listener = _TOTAL_LISTENER.get()
     if (listener is not None and isinstance(total, int)
             and not isinstance(total, bool)):
-        listener(name, total, estimated)
+        listener(name, total, estimated, cap)
 <<imports>>=
 import contextlib
 import contextvars
@@ -431,8 +446,10 @@ class TestFirstTotalKnown:
     heard = []
     with listening_for_totals(lambda *a: heard.append(a)):
       first_total_known("openalex", 25_000)
-      first_total_known("s2", 18_149, True)
-    assert heard == [("openalex", 25_000, False), ("s2", 18_149, True)]
+      first_total_known("s2", 18_149, True, cap=100_000)
+    assert heard == [
+      ("openalex", 25_000, False, None), ("s2", 18_149, True, 100_000),
+    ]
 
   def test_nothing_is_heard_outside_or_without_a_listener(self):
     heard = []
@@ -3359,8 +3376,10 @@ The answer is cached like the ceiling's, since it is what the search
 gives every time, and the reason is derived again on a cache hit.
 The first page's total is announced ([[first_total_known]],
 \cref{sec:first-total}), marked as an estimate like
-[[last_total_estimated]]; the first page is the request without a
-[[token]], since every later one carries the token of the page before.
+[[last_total_estimated]], and with the safety cap when the search has
+no limit, since that is where it will stop; the first page is the
+request without a [[token]], since every later one carries the token of
+the page before.
 
 The fields are those of the relevance search.
 The issue found that the bulk search refuses the field [[tldr]]; the
@@ -3399,7 +3418,10 @@ def _search_bulk(
             data = response.json()
             total = s2_total(data)
             if "token" not in params:
-                first_total_known(self.name, total, True)
+                first_total_known(
+                    self.name, total, True,
+                    cap=S2_BULK_SAFETY_CAP if unlimited else None,
+                )
             page = data.get("data") or []
             papers.extend(self._convert_paper(p) for p in page)
             logger.info(
@@ -5713,7 +5735,7 @@ class OpenAlexProvider:
     ) -> list[Paper]:
         """Fetch papers from OpenAlex without touching the cache."""
         all_papers: list[Paper] = []
-        page_size = min(limit, 200)  # OpenAlex returns max 200 per page
+        page_size = min(limit, OPENALEX_PAGE_SIZE)
 
         logger.debug(f"{self.name}: Searching for '{query}' with limit={limit}")
         works = self._base_query(query, filters)
@@ -5734,6 +5756,15 @@ class OpenAlexProvider:
     <<openalex get paper by doi>>
     <<openalex preprint lookups>>
     <<convert openalex work>>
+@
+
+A page holds at most [[OPENALEX_PAGE_SIZE]] works, the most OpenAlex
+returns per page.  It is named because [[scholar syntax]] states it too,
+in its table of what a search without a limit costs: every page is a
+request against the daily budget.
+
+<<constants>>=
+OPENALEX_PAGE_SIZE = 200   # OpenAlex returns at most 200 works per page
 @
 
 \subsubsection{Paging through the limiter}
@@ -18227,7 +18258,7 @@ def test_openalex(self):
     works.return_value.search.return_value.paginate = pages
     with listening_for_totals(lambda *a: heard.append((*a, len(served)))):
       provider.search("total query", limit=UNLIMITED_PROVIDER_LIMIT)
-  assert heard == [("openalex", 2, False, 1)]
+  assert heard == [("openalex", 2, False, None, 1)]
 
 def test_dblp(self):
   def page(title):
@@ -18236,7 +18267,7 @@ def test_dblp(self):
     }}}
   empty = {"result": {"hits": {"@total": "2", "hit": []}}}
   heard = self._heard(DBLPProvider(), [page("A"), page("B"), empty])
-  assert heard == [("dblp", 2, False, 1)]
+  assert heard == [("dblp", 2, False, None, 1)]
 
 def test_wos_starter(self):
   provider = WebOfScienceProvider(
@@ -18245,7 +18276,7 @@ def test_wos_starter(self):
   def page(title):
     return {"metadata": {"total": 2}, "hits": [{"title": title}]}
   heard = self._heard(provider, [page("A"), page("B")])
-  assert heard == [("wos", 2, False, 1)]
+  assert heard == [("wos", 2, False, None, 1)]
 
 def test_ieee(self):
   def page(title):
@@ -18255,7 +18286,7 @@ def test_ieee(self):
   heard = self._heard(
     IEEEXploreProvider(api_key="test_key"), [page("A"), page("B")]
   )
-  assert heard == [("ieee", 2, False, 1)]
+  assert heard == [("ieee", 2, False, None, 1)]
 
 def test_hal(self):
   def page(title):
@@ -18263,7 +18294,7 @@ def test_hal(self):
   empty = {"response": {"numFound": 2, "docs": []}}
   with patch("scholar.providers.HAL_PAGE_SIZE", 1):
     heard = self._heard(HALProvider(), [page("A"), page("B"), empty])
-  assert heard == [("hal", 2, False, 1)]
+  assert heard == [("hal", 2, False, None, 1)]
 
 def test_scopus(self, monkeypatch):
   monkeypatch.setenv("SCOPUS_VIEW", "standard")
@@ -18276,7 +18307,7 @@ def test_scopus(self, monkeypatch):
   heard = self._heard(
     ScopusProvider(api_key="test_key"), [page("A"), page("B"), empty]
   )
-  assert heard == [("scopus", 2, False, 1)]
+  assert heard == [("scopus", 2, False, None, 1)]
 
 def test_arxiv_first_page_only(self, monkeypatch):
   from types import SimpleNamespace
@@ -18291,7 +18322,7 @@ def test_arxiv_first_page_only(self, monkeypatch):
     client._parse_feed("https://export.arxiv.org/x")
     client._parse_feed("https://export.arxiv.org/x", first_page=False)
     client._parse_feed("https://export.arxiv.org/x", _try_index=1)
-  assert heard == [("arxiv", 77, False)]
+  assert heard == [("arxiv", 77, False, None)]
 
 def test_s2_bulk(self, monkeypatch):
   sent = _replay_s2(
@@ -18302,7 +18333,15 @@ def test_s2_bulk(self, monkeypatch):
   with listening_for_totals(lambda *a: heard.append((*a, len(sent)))):
     provider.search("plain words", limit=UNLIMITED_PROVIDER_LIMIT)
   assert len(sent) == 2
-  assert heard == [("s2", 4903, True, 1)]
+  assert heard == [("s2", 4903, True, S2_BULK_SAFETY_CAP, 1)]
+
+def test_s2_bulk_with_a_limit_has_no_cap(self, monkeypatch):
+  _replay_s2(monkeypatch, [S2_BULK_PAGE_1, S2_BULK_PAGE_2])
+  provider = SemanticScholarProvider(api_key=None)
+  heard = []
+  with listening_for_totals(lambda *a: heard.append(a)):
+    provider.search("phishing AND mfa", limit=5)
+  assert heard == [("s2", 4903, True, None)]
 @
 
 A cached answer must come back with the time it was fetched and the

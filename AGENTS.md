@@ -285,17 +285,34 @@ OpenAlex pages of 200 against the metered budget.
   estimated)` (providers.nw `sec:first-total`) where they read the
   first page's total: OpenAlex (+ source-pinned), DBLP, WoS Starter and
   Expanded, IEEE, HAL, Scopus, arXiv (client, `_try_index == 0`), S2
-  bulk (request without `token`). Not S2's relevance search (total
-  known only at the end; an unlimited search never uses it) and never
-  a cache hit. The listener lives in a `ContextVar`, installed by
-  `listening_for_totals(listener)` (None = nothing); `search`/`rq`
-  install `cli.notice_large_total` only when `--limit` was not given,
-  which prints one stderr line for a total >= `LARGE_RESULT_NOTICE`
-  (10,000): "<provider>: [about ]<total> results for this query;
-  fetching all of them (give --limit N to take fewer)". `-l 0` gets
-  none. Nothing is refused or cut.
-- Tutorials keep `-l 5` on every practice search;
-  `test_tutorial_searches_carry_a_limit` checks every lesson command.
+  bulk (request without `token`, with `cap=S2_BULK_SAFETY_CAP` when
+  unlimited). Not S2's relevance search (total known only at the end;
+  an unlimited search never uses it) and never a cache hit. Restarts
+  (arXiv after an empty page/HTTP error, DBLP's zero-hit retry)
+  announce again. The listener `(name, total, estimated, cap)` lives
+  in a `ContextVar`, installed by `listening_for_totals(listener)`
+  (None = nothing); `search`/`rq` install `cli.large_total_notices()`
+  (a fresh closure per command, remembering noticed providers: at most
+  one notice per provider) only when `--limit` was not given. For a
+  total >= `LARGE_RESULT_NOTICE` (10,000) it prints one unwrapped
+  (`soft_wrap=True`) stderr line, `large_total_notice`:
+  "<provider>: [about ]<total> results for this query; fetching all of
+  them (give --limit N to take fewer)", or above a cap "...; fetching
+  the first 100,000 (Semantic Scholar's safety cap; give --limit N to
+  take fewer)" (`PROVIDER_FULL_NAMES`). `-l 0` gets none. Nothing is
+  refused or cut. `--limit` has `min=0` on both commands (a negative
+  limit is a usage error, exit 2).
+- `scholar syntax`'s table reads `S2_BULK_SAFETY_CAP`,
+  `OPENALEX_SEMANTIC_MAX_RESULTS`, IEEE's `LIMITS.daily`/`MAX_LIMIT`
+  and `OPENALEX_PAGE_SIZE` (200, also the OpenAlex paging size).
+- Tutorials keep `-l 5` on every practice search, and every search
+  step's required pattern has the lookahead
+  `(?=.*\s(?:-l|--limit)[\s=]+[1-9])`, so a learner who drops it fails
+  the step. `test_tutorial_searches_carry_a_limit` (any line running
+  `scholar search`/`rq`, wherever on the line) and
+  `test_tutorial_search_steps_require_the_limit` (each search pattern
+  matches the step's command, and not without its limit) check them.
+  `TestShowPinnedOutput` pins a limit-1000 record's `--limit 1000`.
 
 ### Search Flow
 

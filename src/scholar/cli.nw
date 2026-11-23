@@ -669,7 +669,7 @@ name: Annotated[
 limit: Annotated[
     Optional[int],
     typer.Option(
-        "--limit", "-l",
+        "--limit", "-l", min=0,
         help=SEARCH_LIMIT_HELP,
     ),
 ] = None,
@@ -1015,6 +1015,8 @@ not asked to fetch everything gets the notice below.  Both reach the
 providers as [[UNLIMITED_PROVIDER_LIMIT]] (the [[scholar]] module), so
 the session records them alike, and a reproduced command says
 [[--limit 0]] for both (\cref{sec:search-flags}).
+A negative limit is refused as a usage error ([[min=0]]); it used to be
+stored and shown as [[--limit -5]].
 
 What \enquote{everything} costs differs per provider; each of these is
 in the providers chapter, and [[scholar syntax]] lists them in its
@@ -1054,8 +1056,10 @@ providers announce the total they read from the first page
 chapter); during a search without [[--limit]] the command listens, and
 for a total of at least [[LARGE_RESULT_NOTICE]] it prints one line on
 standard error, so that [[-f json]] and [[-f bibtex]] output stays
-pure.  The threshold is our own choice: ten pages of a thousand, well
-above what a focused query returns and well below the safety cap.
+pure.  The threshold is our own choice, ten thousand records: a
+total that size takes many pages with every provider (the largest page
+any of them is asked for holds a thousand), and it is still a tenth of
+Semantic Scholar's safety cap.
 Nothing is refused or cut: the notice informs, and the user who
 typed [[-l 0]] has said already that everything is wanted, so gets no
 notice.  The total is the provider's, so Semantic Scholar's estimate
@@ -1064,19 +1068,62 @@ cannot, is the providers chapter's business: every provider that
 reports a total reads it from the first page, except Semantic
 Scholar's relevance search, which an unlimited search never uses.
 
+Three details keep the notice true and single.
+\begin{description}
+\item[At most once per provider] A provider that restarts its paging
+  announces again (arXiv after an empty page, DBLP's zero-hit retry;
+  the providers chapter says why it is left so).  The listener
+  therefore remembers, in a set held by its closure, which providers it
+  has noticed, and a new listener is made for each command, so the
+  memory lasts exactly one search (in [[rq]], one run over its
+  providers, each searched once).
+\item[A provider's own cap] Above Semantic Scholar's safety cap the
+  bulk search stops at the cap, so \enquote{fetching all of them} would
+  be false.  A provider that has such a cap announces it with the total,
+  and the notice then says how many it will fetch and whose cap stops
+  it, with the provider's full name ([[PROVIDER_FULL_NAMES]], the review
+  module).
+\item[One line] The line is printed with [[soft_wrap=True]], as the
+  unknown-model error is, so that Rich does not break it at the
+  terminal's width (80 columns when standard error is a pipe): a
+  script reading standard error gets the notice as one line.
+\end{description}
+
 <<constants>>=
 LARGE_RESULT_NOTICE = 10_000
 <<search command>>=
-def notice_large_total(name: str, total: int, estimated: bool) -> None:
-    """Print one notice on stderr when a search will fetch many results."""
-    if total < LARGE_RESULT_NOTICE:
-        return
+def large_total_notice(
+    name: str, total: int, estimated: bool, cap: int | None = None
+) -> str:
+    """The notice for a search of `total` results without a limit."""
     about = "about " if estimated else ""
-    Console(stderr=True).print(Text(
-        f"{name}: {about}{total:,} results for this query; fetching all "
-        f"of them (give --limit N to take fewer)",
-        style="yellow",
-    ))
+    head = f"{name}: {about}{total:,} results for this query; "
+    if cap is not None and total > cap:
+        from scholar.review import PROVIDER_FULL_NAMES
+
+        full_name = PROVIDER_FULL_NAMES.get(name, name)
+        return head + (
+            f"fetching the first {cap:,} ({full_name}'s safety cap; "
+            f"give --limit N to take fewer)"
+        )
+    return head + "fetching all of them (give --limit N to take fewer)"
+
+
+def large_total_notices():
+    """A listener printing the notice at most once per provider."""
+    noticed: set[str] = set()
+
+    def notice(name, total, estimated, cap=None):
+        if name in noticed or total < LARGE_RESULT_NOTICE:
+            return
+        noticed.add(name)
+        Console(stderr=True).print(
+            Text(large_total_notice(name, total, estimated, cap),
+                 style="yellow"),
+            soft_wrap=True,
+        )
+
+    return notice
 @
 
 The search itself follows.  Large (or unlimited) searches may take time
@@ -1124,7 +1171,7 @@ if any([
 <<refuse filters for a semantic search>>
 
 s = Search(query)
-with listening_for_totals(notice_large_total if limit is None else None):
+with listening_for_totals(large_total_notices() if limit is None else None):
     results = s.execute(
         providers=None if provider is None else provider_names,
         limit=effective_limit,
@@ -1180,14 +1227,20 @@ and the flags [[sessions show]] prints for it can be checked too.
 
 <<test functions>>=
 class AnnouncingProvider:
-  """A provider whose first page reports `total` matches (no service)."""
+  """A provider whose first page reports `total` matches (no service).
+
+  It announces `times` times, as a provider that restarts its paging
+  does, with its own `cap` if it has one.
+  """
 
   MAX_LIMIT = None
 
-  def __init__(self, total, estimated=False):
+  def __init__(self, total, estimated=False, times=1, cap=None):
     self.name = "announcing"
     self.total = total
     self.estimated = estimated
+    self.times = times
+    self.cap = cap
     self.seen = []
     self.last_error = None
     self.last_retries = 0
@@ -1198,7 +1251,8 @@ class AnnouncingProvider:
 
     self.seen.append(limit)
     self.last_total = self.total
-    first_total_known(self.name, self.total, self.estimated)
+    for _ in range(self.times):
+      first_total_known(self.name, self.total, self.estimated, self.cap)
     return [Paper(title="Found", authors=["A"], doi="10.1/no-limit")]
 
 
@@ -1212,11 +1266,11 @@ class TestNoLimitByDefault:
 
   <<no limit by default test methods>>
 <<no limit by default test methods>>=
-def _search(self, monkeypatch, tmp_path, total, *args, estimated=False):
+def _search(self, monkeypatch, tmp_path, total, *args, **announcing):
   from scholar import providers
 
   monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
-  provider = AnnouncingProvider(total, estimated)
+  provider = AnnouncingProvider(total, **announcing)
   monkeypatch.setattr(providers, "PROVIDERS", {provider.name: provider})
   result = runner.invoke(app, [
     "search", "q", "-p", provider.name, "-n", "s", "-f", "json", *args,
@@ -1253,10 +1307,48 @@ def test_large_total_without_a_limit_gets_the_notice(
   self, monkeypatch, tmp_path
 ):
   _, result = self._search(monkeypatch, tmp_path, 25_000)
-  stderr = " ".join(result.stderr.split())
-  assert stderr.count(self.NOTICE) == 1
+  assert self.NOTICE in result.stderr.splitlines()
+  assert result.stderr.count("fetching all") == 1
   assert "fetching all" not in result.stdout
   json.loads(result.stdout)
+
+def test_a_provider_announcing_twice_gets_one_notice(
+  self, monkeypatch, tmp_path
+):
+  _, result = self._search(monkeypatch, tmp_path, 25_000, times=2)
+  assert result.stderr.splitlines().count(self.NOTICE) == 1
+
+def test_above_its_cap_the_notice_names_the_cap(
+  self, monkeypatch, tmp_path
+):
+  from scholar.providers import S2_BULK_SAFETY_CAP
+
+  _, result = self._search(
+    monkeypatch, tmp_path, 2 * S2_BULK_SAFETY_CAP + 50_000,
+    estimated=True, cap=S2_BULK_SAFETY_CAP,
+  )
+  assert (
+    "announcing: about 250,000 results for this query; fetching the "
+    "first 100,000 (announcing's safety cap; give --limit N to take "
+    "fewer)"
+  ) in result.stderr.splitlines()
+  _, result = self._search(
+    monkeypatch, tmp_path, S2_BULK_SAFETY_CAP, cap=S2_BULK_SAFETY_CAP,
+  )
+  assert (
+    "announcing: 100,000 results for this query; fetching all of them "
+    "(give --limit N to take fewer)"
+  ) in result.stderr.splitlines()
+
+def test_the_cap_is_named_by_the_provider_full_name(self):
+  from scholar.providers import S2_BULK_SAFETY_CAP
+
+  notice = large_total_notice("s2", 250_000, True, S2_BULK_SAFETY_CAP)
+  assert notice == (
+    "s2: about 250,000 results for this query; fetching the first "
+    "100,000 (Semantic Scholar's safety cap; give --limit N to take "
+    "fewer)"
+  )
 
 def test_no_notice_for_l_0_or_below_the_threshold(
   self, monkeypatch, tmp_path
@@ -1280,7 +1372,7 @@ that answers the two prompts [[rq]] sends (no service), as in the test
 of [[--in]] above.
 
 <<no limit by default test methods>>=
-def _rq(self, monkeypatch, tmp_path, *args):
+def _rq(self, monkeypatch, tmp_path, *args, name="rqs"):
   import sys
   import types
   from scholar import providers
@@ -1311,15 +1403,26 @@ def _rq(self, monkeypatch, tmp_path, *args):
   monkeypatch.setitem(sys.modules, "llm", llm_mod)
   result = runner.invoke(app, [
     "rq", "Is there a limit?", "-p", provider.name, "--count", "1",
-    "--no-enrich", *args,
+    "--no-enrich", "-n", name, *args,
   ])
   assert result.exit_code == 0, result.output
   return provider, result
 
 def test_rq_without_a_limit_fetches_everything(self, monkeypatch, tmp_path):
+  from scholar.review import load_session
+
   provider, result = self._rq(monkeypatch, tmp_path)
   assert provider.seen == [UNLIMITED_PROVIDER_LIMIT]
   assert "fetching all of them" in result.stderr
+  self._rq(monkeypatch, tmp_path, "-l", "0", name="rq0")
+  [default] = load_session("rqs").search_records
+  [all_asked] = load_session("rq0").search_records
+  assert default.limit == all_asked.limit == UNLIMITED_PROVIDER_LIMIT
+
+def test_a_negative_limit_is_a_usage_error(self):
+  for command in (["search", "q"], ["rq", "a question"]):
+    result = runner.invoke(app, [*command, "-l", "-5"])
+    assert result.exit_code == 2, result.output
 
 def test_rq_with_a_limit_limits(self, monkeypatch, tmp_path):
   provider, result = self._rq(monkeypatch, tmp_path, "-l", "7")
@@ -2247,6 +2350,7 @@ def rq(
         typer.Option(
             "--limit",
             "-l",
+            min=0,
             help=SEARCH_LIMIT_HELP,
         ),
     ] = None,
@@ -2455,15 +2559,14 @@ called the provider directly and never looked at the limiter first.
 <<execute rq provider searches>>=
 results: list[SearchResult] = []
 timestamp = datetime.now().isoformat()
+notices = large_total_notices() if limit is None else None
 for pname in provider_names:
     p = get_provider(pname)
     if p is None:
         continue
 
     q = provider_queries.get(pname, rq_text)
-    with listening_for_totals(
-        notice_large_total if limit is None else None
-    ):
+    with listening_for_totals(notices):
         results.append(search_provider(
             p, q, effective_limit, filters, timestamp=timestamp,
         ))
@@ -6266,13 +6369,18 @@ with the place in the providers chapter: Semantic Scholar's routing
 ([[s2_uses_bulk]]) and safety cap ([[S2_BULK_SAFETY_CAP]]), the semantic
 search's maximum ([[MAX_LIMIT]]), IEEE's limiter ([[LIMITS]], two hundred
 requests a day) and page size ([[MAX_LIMIT]]), and OpenAlex's page size
-and its metered budget.  The numbers are read from those constants, so
-that the table follows a change in them.  Providers not listed page
+([[OPENALEX_PAGE_SIZE]]) and its metered budget.  The numbers are read
+from those constants, so that the table follows a change in them.
+Semantic Scholar's row says what [[s2_uses_bulk]] decides: without a
+limit every query goes to the bulk search; with [[-l N]] plain words go
+to the relevance search, while a query with operators stays on the bulk
+search.  Providers not listed page
 through everything at their limiter's pace.
 
 <<searches without a limit table>>=
 from scholar.providers import (
-    IEEEXploreProvider, OPENALEX_SEMANTIC_MAX_RESULTS, S2_BULK_SAFETY_CAP,
+    IEEEXploreProvider, OPENALEX_PAGE_SIZE, OPENALEX_SEMANTIC_MAX_RESULTS,
+    S2_BULK_SAFETY_CAP,
 )
 
 table4 = Table(title="Searches without --limit (the default)",
@@ -6280,16 +6388,16 @@ table4 = Table(title="Searches without --limit (the default)",
 table4.add_column("Provider", style="cyan")
 table4.add_column("What fetching everything means")
 
-table4.add_row("s2", "bulk search for every query (no relevance ranking "
-               f"unless -l N is given); stops at {S2_BULK_SAFETY_CAP} "
-               "papers, recorded as incomplete")
+table4.add_row("s2", "bulk search for every query (the relevance "
+               "search only for plain words with -l N); stops at "
+               f"{S2_BULK_SAFETY_CAP} papers, recorded as incomplete")
 table4.add_row("openalex-semantic",
                f"top {OPENALEX_SEMANTIC_MAX_RESULTS}, as always")
 table4.add_row("ieee", f"{IEEEXploreProvider.LIMITS.daily} requests a day "
                f"of {IEEEXploreProvider.MAX_LIMIT} records each; a broad "
                "query can spend the day")
-table4.add_row("openalex, ssrn, ...", "every page of 200 is a request "
-               "against OpenAlex's metered daily budget")
+table4.add_row("openalex, ssrn, ...", f"every page of {OPENALEX_PAGE_SIZE} "
+               "is a request against OpenAlex's metered daily budget")
 table4.add_row("others", "every page, at the provider's pace")
 
 console.print(table4)
@@ -6303,7 +6411,7 @@ class TestSyntaxWithoutLimit:
     """scholar syntax says what a search without --limit costs."""
 
     def test_table_names_the_costs(self):
-        from scholar.providers import S2_BULK_SAFETY_CAP
+        from scholar.providers import OPENALEX_PAGE_SIZE, S2_BULK_SAFETY_CAP
 
         result = runner.invoke(app, ["syntax"])
         assert result.exit_code == 0
@@ -6311,6 +6419,8 @@ class TestSyntaxWithoutLimit:
         assert "Searches without --limit" in text
         assert str(S2_BULK_SAFETY_CAP) in text
         assert "200 requests a day" in text
+        assert "relevance search only for plain words with -l N" in text
+        assert f"every page of {OPENALEX_PAGE_SIZE} is a request" in text
 @
 
 \subsection{Testing syntax command}
@@ -9656,7 +9766,11 @@ error and the bracketed theme are recorded from the old code.  The line
 on decisions made without an abstract
 (\url{https://github.com/dbosk/scholarcli/issues/293}) came later and
 was added where it appears, after the quote check; nothing else
-changed.
+changed.  Since \url{https://github.com/dbosk/scholar/issues/301} a
+command always carries its limit (\cref{sec:search-flags}), so the
+search of [[key:id:value]] has the limit of the old default, a
+thousand, which the code before that printed no flag for: its line is
+the one that shows the change, [[--limit 1000]].
 
 <<test functions>>=
 class TestShowPinnedOutput:
@@ -9765,7 +9879,7 @@ def _make_session(self, tmp_path, monkeypatch):
     SearchRecord("old", "arxiv", None, None),
     SearchRecord("an early draft of the query", "openalex", None, 100,
                  hits=7),
-    SearchRecord("key:id:value", "openalex", None, 100, hits=0),
+    SearchRecord("key:id:value", "openalex", None, 1000, hits=0),
     SearchRecord("ends in a backslash \\", "hand\\", None, 100, hits=1,
                  error="refused \\"),
   ]
@@ -9851,7 +9965,7 @@ def test_stored_text_prints_as_stored(self, tmp_path, monkeypatch):
   assert ("Ends in a backslash \\ (p\\) "
           "[off-topic-false-hit, slash\\]\n") in result.output
   assert "Keys like key:id:value and a:b:c (openalex)" in result.output
-  assert "] openalex: key:id:value --limit 100" in result.output
+  assert "] openalex: key:id:value --limit 1000" in result.output
 @
 
 On a terminal the paper lines keep the styles their markup gives them
@@ -9916,7 +10030,7 @@ PINNED_SHOW = {
     '  [54ad49d] openalex: an early draft of the query --limit 10'
     '0 \u2014 hits: 7 (retired',
     '2026-11-06 by a reviewer: a draft, replaced \\)',
-    '  [05c5114] openalex: key:id:value --limit 100 \u2014 hits: '
+    '  [05c5114] openalex: key:id:value --limit 1000 \u2014 hits: '
     '0',
     '  [a34825a] hand\\: ends in a backslash \\ --limit 100 '
     '\u2014 1, incomplete (refused \\)',
@@ -10087,7 +10201,7 @@ PINNED_SHOW = {
     '  [54ad49d] openalex: an early draft of the query --limit 10'
     '0 \u2014 hits: 7 (retired 2026-11-06 by a reviewer: a draft,'
     ' replaced \\)',
-    '  [05c5114] openalex: key:id:value --limit 100 \u2014 hits: '
+    '  [05c5114] openalex: key:id:value --limit 1000 \u2014 hits: '
     '0',
     '  [a34825a] hand\\: ends in a backslash \\ --limit 100 '
     '\u2014 1, incomplete (refused \\)',
@@ -28904,23 +29018,39 @@ A search without [[--limit]] fetches everything
 (\cref{sec:no-limit-default}), so a practice search copied from a lesson
 must carry a small limit, or one lesson step could page through a whole
 database.  The test reads every command a lesson shows (lines of its
-code blocks, joined where they end in a backslash) and requires a
-positive [[-l]] or [[--limit]] on each [[scholar search]] and
-[[scholar rq]].  It reads the tangled [[.md]], the text the learner
-copies from.
+code blocks, joined where they end in a backslash; not the
+[[tutorial-step]] blocks, which define the steps and may list a
+command as a quiz answer) and requires a
+positive [[-l]] or [[--limit]] on each line that runs [[scholar search]]
+or [[scholar rq]], wherever on the line: after a prompt ([[$]]), after
+[[uv run]] or behind a path.  It reads the tangled [[.md]], the text the
+learner copies from.
+
+The learner may still leave the flag out, so each search step's
+required pattern demands it too (the lessons' prose says how).  That is
+checked against the lesson itself: every pattern of a step that names
+[[scholar search]] or [[scholar rq]] must match one of the commands the
+step shows, and none of them once their limit is taken out.  The
+commands are checked as typed, one line each, which is how the pattern
+sees them in the transcript.
 
 <<test functions>>=
 TUTORIAL_LIMIT = re.compile(r"(?:^|\s)(?:-l|--limit)[\s=]+[1-9]\d*\b")
+TUTORIAL_SEARCH = re.compile(r"(?:^|[^\w-])scholar\s+(?:search|rq)\b")
 
 
 def tutorial_commands(text: str) -> list[str]:
-    """The commands shown in a lesson's code blocks, continuations joined."""
-    commands, in_block, pending = [], False, ""
+    """The commands shown in a lesson's code blocks, continuations joined.
+
+    A `tutorial-step` block is pytorial's step definition, not commands.
+    """
+    commands, in_block, shown, pending = [], False, False, ""
     for line in text.splitlines():
         if line.startswith("```"):
             in_block, pending = not in_block, ""
+            shown = in_block and not line[3:].startswith("tutorial-")
             continue
-        if not in_block:
+        if not shown:
             continue
         line = pending + line.strip()
         if line.endswith("\\"):
@@ -28931,23 +29061,61 @@ def tutorial_commands(text: str) -> list[str]:
     return commands
 
 
+def tutorial_searches(text: str) -> list[str]:
+    """The `scholar search` and `scholar rq` commands a lesson shows."""
+    return [c for c in tutorial_commands(text) if TUTORIAL_SEARCH.search(c)]
+
+
 @pytest.mark.parametrize("name", TUTORIAL_FILES)
 def test_tutorial_searches_carry_a_limit(name):
     """Every practice search of a lesson asks for a few results only."""
     text = (TUTORIAL_DIR / name).read_text(encoding="utf-8")
-    searches = [
-        c for c in tutorial_commands(text)
-        if re.match(r"scholar\s+(?:search|rq)\b", c)
+    unlimited = [
+        c for c in tutorial_searches(text) if not TUTORIAL_LIMIT.search(c)
     ]
-    unlimited = [c for c in searches if not TUTORIAL_LIMIT.search(c)]
     assert not unlimited, f"{name}: searches without a limit: {unlimited}"
 
 
+@pytest.mark.parametrize("name", TUTORIAL_FILES)
+def test_tutorial_search_steps_require_the_limit(name):
+    """A search step passes only with the limit typed."""
+    from pytorial.catalog import load_tutorial_file
+
+    tutorial = load_tutorial_file(TUTORIAL_DIR / name)
+    for step in tutorial.steps:
+        shown = tutorial_searches(step.instructions)
+        patterns = [
+            p.pattern for p in step.required_patterns
+            if p.mode == "regex" and re.search(r"scholar\\s\+", p.pattern)
+            and re.search(r"search|rq", p.pattern)
+        ]
+        for pattern in patterns:
+            assert any(re.search(pattern, c) for c in shown), (
+                f"{name}: {step.title!r}: {pattern} matches no command"
+            )
+            without = [TUTORIAL_LIMIT.sub(" ", c) for c in shown]
+            assert not any(re.search(pattern, c) for c in without), (
+                f"{name}: {step.title!r}: {pattern} passes without -l"
+            )
+
+
 def test_tutorial_commands_join_continuations():
+    step = "```tutorial-step\noptions:\n  - scholar rq\n```\n"
+    assert tutorial_commands(step) == []
     text = "```\nscholar search q -p openalex \\\n    -l 5 -n x\n```\n"
     assert tutorial_commands(text) == ["scholar search q -p openalex -l 5 -n x"]
     assert TUTORIAL_LIMIT.search(tutorial_commands(text)[0])
     assert not TUTORIAL_LIMIT.search("scholar search q -l 0")
+
+
+def test_tutorial_searches_are_found_anywhere_on_the_line():
+    text = (
+        "```\n$ scholar search a\nuv run scholar rq b\n"
+        "~/bin/scholar search c\nscholarly search d\nscholar list\n```\n"
+    )
+    assert tutorial_searches(text) == [
+        "$ scholar search a", "uv run scholar rq b", "~/bin/scholar search c",
+    ]
 @
 
 
