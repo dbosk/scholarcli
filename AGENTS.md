@@ -2932,7 +2932,92 @@ caller's enrichment run or search append), raising only on write
 errors; a refused notes lock is skipped the same way (#319, see
 `sec:notes-lock` above). `notes export` also writes atomically (no `.bak`).
 `sessions export` stages all its files with `utils.staged_outputs` and
-moves them into place only if every format succeeded (#83).
+moves them into place only if every format succeeded (#83). The moves
+are a transaction (#320, utils.nw `sec:staged-outputs`,
+`place_staged_files`): every target is checked first
+(`output_target_problem`: a directory there, an unwritable directory,
+the sticky-bit rule of rename(2)); then each existing target is moved
+aside into `.scholar-replaced-*` before the new file goes in, and a
+failure part-way undoes the moves (old file back, new file without a
+predecessor removed). Removals (`staged_outputs(dir, remove=[names])`,
+the screen sheet's stale `BASE-tier.json`) are moves aside in the same
+transaction, made after every file is in place. The moves run under
+`placing_lock(dir)`: `file_lock` (required, `PLACING_LOCK_TIMEOUT` 5 s)
+on `<cache dir>/locks/.export-<16 hex of sha256(resolved dir)>.lock`
+(`placing_lock_path`, via `cache.get_cache_dir`, so
+`SCHOLAR_CACHE_DIR` applies; `locks/` made on demand; `cache
+clear`/`cache info` look only at top-level `*.pkl`, tested). Nothing
+of the lock lies in the output directory (exports go into paper
+repositories). A lock another export holds fails the export with one
+line ("another export is moving files into DIR"), moving nothing; a
+cache directory that cannot hold the lock (`OSError`, or a lock file
+that cannot be made) gives one WARNING ("Moving the files into DIR
+without a lock ...") and the export goes on. Limit: processes with
+different cache directories (agents with their own
+`SCHOLAR_CACHE_DIR`) do not exclude each other; the identity check
+then still keeps every export from removing or overwriting on undo a
+file it did not place, so the worst case is files of two exports mixed
+(as before #320), never a deleted file (tested with two cache dirs).
+The undo removes
+or overwrites a placed file only while it still is that file:
+`file_identity` = lstat `(st_dev, st_ino, st_size, st_mtime_ns)` of the
+staged file just before its rename (after `copymode`, which changes
+ctime, not mtime; a rename keeps all four). Any write, a delete and
+re-create (ext4 reuses inode numbers) and a mere touch (safe side)
+count as another program's file: left in place, earlier version kept,
+listed in `others` ("Replaced by another program meanwhile"). NOT
+detected: a writer that restores size and mtime exactly; little to
+compare on a file system without inode numbers and with coarse times.
+SIGINT and SIGTERM are HELD BACK for the whole transaction
+(`utils.InterruptHeldBack(HELD_SIGNALS)`, moved from review.nw, which
+imports it and still holds only SIGINT for the session keep; main
+thread only, elsewhere it does nothing): a signal is noted, the loop
+checks the note between moves (never inside one), then undoes with the
+signals still held, so a second or third signal changes nothing; the
+outcome is raised once as `MovesInterrupted` (a `KeyboardInterrupt`
+with `.failure`; `None` = the note came during the commit, every file
+in place). Each move records its intent before the rename
+(`pending_aside`, `placing`) and the undo settles a pending step from
+the file system (`_settle_pending`: earlier version found in the
+replaced-files directory = moved aside; target with the staged
+identity = placed), so an exception between a rename and its record
+(not only a signal) loses nothing. The replaced-files directory is
+deleted after an undo only when nothing in it is unaccounted
+(`strays`; else it stays and the error names the files, "Earlier
+versions left, not put back"). Restore errors go into the one message
+("Could not put back: ..."), not WARNING lines. The export prints one
+line for Ctrl-C and SIGTERM alike ("Export stopped by an interrupt and
+was rolled back: no files were written or changed.", or the lists when
+a
+restore failed) and exits 130. A replaced file's mode is kept
+(`shutil.copymode` onto the staged file). Each export holds
+`file_lock(staging / "staging")` (`.staging.lock` INSIDE the staging
+directory) and, while its moves run, `file_lock(kept / "replaced")`
+(`.replaced.lock` inside the `.scholar-replaced-*` directory); both go
+with their directory and stay, unlocked, in a directory a killed
+export (or a failed restore) leaves. Under the directory lock
+`leftover_directories` reports each `.scholar-replaced-*` and
+`.scholar-staging-*` whose own lock is free (`left_over`), so a live
+export of another cache directory is never reported; one WARNING each
+(`leftover_warning`; the replaced-files one says it holds the versions
+from before the unfinished export and that the files in the directory
+are the latest finished export's), deleting nothing. A failure raises
+`OutputsNotPlaced` (`new`/`old`/`missing`/`not_written`/`others`, `kept`,
+`rolled_back`, `changed`); `cli.export_failure_text` words the message
+from it: "no files were written or changed" (with "and was rolled
+back" when files had moved) only when `not changed`, else "Export
+failed part-way and could not be rolled back" plus one line per kind
+naming where an earlier version is kept (that directory is then left).
+The rest-sample export says "None of the exported files was written or
+changed" and "the screen sheet was not written" unless a restore
+failed, then "... after the draw was recorded and could not be rolled
+back" with the list. Limits (in the prose): several renames are not
+one atomic step; between the move aside and the move in the name holds
+no file; SIGKILL or a power loss undoes nothing: the moved files stay,
+the earlier versions are in `.scholar-replaced-*` under their own names
+(move them back, then delete both hidden directories), the unmoved new
+files in `.scholar-staging-*`; the check is a forecast (`os.access`
+caveats), the undo is the guard.
 `sessions list` warns on stderr about sessions with records but no
 decisions and no context (`needs_check` in the JSON). The paper registry
 is process-global, so tests that load sessions should use unique DOIs or
@@ -3995,6 +4080,43 @@ assignments (`by = by.strip()`) are allowed.
 This project uses noweb-style literate programming. The `.nw` files are the source of truth:
 - Edit `.nw` files, then tangle to generate `.py` files
 - Use the `literate-programming` skill when modifying `.nw` files
+
+The woven document (`doc/scholar.pdf`, pdfLaTeX, T1) must keep building
+(#279, cli.nw `sec:woven-document`). `TestWovenDocumentSources` (in
+test_cli.py, no LaTeX, under a second per check) reads every
+`src/scholar/**/*.nw` and fails, naming file and line, on (a) a
+documentation-chunk quote that takes a LaTeX bracket: noweb closes a
+quote at the *last* two of a run of `]`, so `\item[A [[x]]]` leaves the
+label open (runaway argument) and `\item[[[x]]]` (or `\item [[[x]]]`)
+loses the label;
+write `\item[A [[x]] ]` / `\item[ [[x]] ]` (`[[[]]]`, quoting code that
+ends in `]`, is fine); (b) a character pdfLaTeX cannot set: allowed are
+printable ASCII and tab, U+00A0-U+024F outside `review.T1_UNSET_RANGES`,
+the `\newunicodechar`s of `doc/preamble.tex`, and
+`DOCUMENT_EXTRA_CHARACTERS` (eleven code points with the `.dfu` file
+declaring each, checked by a `latex`-marked test). Write CJK, Cyrillic,
+U+2028, U+FEFF and the like in code chunks as Python escapes
+(`"\u5b66"`), as
+most non-Latin tests already did; name them in the prose if the reader
+needs to know. The full build is `make -C doc check
+LATEXFLAGS="-shell-escape -interaction=nonstopmode"` (between 7 and
+26 minutes on the machines tried, longer under load; 2692 pages at
+6b9d135). `check` is `doc/check.mk` (included by `doc/Makefile`; it
+sets latexmk's `$max_repeat=10`) plus `doc/check-settled.py`: it fails
+on a missing or stale log, a LaTeX error, undefined references,
+missing PythonTeX output, or a non-zero build status, and passes a
+**two-state flip** (references alternating between two layouts) with
+the warning "the references alternate between two states and cannot
+settle". The full description is in cli.nw `sec:woven-document`
+("What the check accepts", "Two-state flips"); `TestDocumentCheck`
+(latex marker, about a minute) tests it on small documents. The root
+`doc/scholar.pdf` target (used by `publish-github`) runs `check`.
+`doc/Makefile`'s rules for `../src/scholar/%.tex` name the `.nw`, so a
+changed source is re-woven (before, a stale woven chapter was used).
+`doc/preamble.tex` redefines noweb's `\@subpageref` to always print
+the chunk letter (`1865a`): with noweb's default, a letter only when
+the page holds 2+ chunks, the references' width depended on the page
+breaks and the document flipped between two layouts on every pass.
 
 ## Caching
 
