@@ -740,18 +740,258 @@ the notes file is not merged on save, so the window is the whole
 read--modify--write.  Every function that rewrites the file therefore
 runs under [[file_lock]] on it (\cref{sec:file-lock}): the second
 process reads only after the first has written.  The decorator below
-applies it, to [[get_note]] too, which rewrites the file when it moves a
-note to a paper's new DOI id.  The lock is reentrant, so a locked
-function may call another.
+applies it.  The lock is reentrant, so a locked function may call
+another; the per-query decision stores
+(\cref{sec:notes-search-decisions}) are written under the same lock,
+since [[migrate_paper_id]] changes both stores in one step.
 
+\paragraph{Never without the lock.}
+\label{sec:notes-lock}
+[[file_lock]] on its own gives up after [[LOCK_TIMEOUT]] (ten seconds)
+and lets the body run unlocked, and for the notes file that is the
+lost update the lock is there to prevent: a whole file of notes,
+written by a process that read it before another process added its
+note (\url{https://github.com/dbosk/scholarcli/issues/319}).  A session
+save already refuses to write without its lock (\cref{sec:session-lock}
+in the review chapter), and a note is a user's own writing, which no
+provider can fetch again, so a notes write follows the same rule: the
+lock is [[required]], and when it cannot be taken nothing is written
+and [[NotesNotLocked]] says so in one line.  Two things differ from the
+session, both because a notes write is small.
+\begin{description}
+\item[A shorter wait] A notes write holds the lock for a read and a
+  write of one file of notes, a migration for that plus a scan of the
+  decision stores.  On invented data (5\,000 notes of 2\,kB each, an
+  11\,MB file, and 200 decision stores of 50 records each; November
+  2026, one laptop) a [[save_note]] took 0.2\,s and a
+  [[migrate_paper_id]] 0.3\,s.  A session waits five minutes because a
+  save of a large session takes seconds and several may be queued; a
+  holder of the notes lock for [[NOTES_LOCK_TIMEOUT]], thirty seconds,
+  is a hundred times over that and stuck (a process suspended with
+  Ctrl-Z in mid-write), and waiting longer would only hold up the
+  command, often the TUI, whose user has just closed the editor.
+  After the first [[LOCK_TIMEOUT]] it says once which file it is
+  waiting for, so that the pause is explained.
+\item[No kept file here] The session keeps the whole session beside the
+  file; a refused notes write has one note at stake, and where it
+  could be lost the caller keeps it: the TUI's editor writes the text
+  just typed to a file of its own and names it ([[keep_unsaved_note]],
+  \cref{sec:editor-integration}), the [[notes]] commands have the text
+  in the user's command or file, so the one-line error is enough, an
+  import is not made at all, and [[migrate_paper_id]] leaves the note
+  where it is and says how it is moved later
+  (\cref{sec:notes-migrate-paper-id}).
+\end{description}
+A lock file that cannot be opened or created (another user's lock
+file, a read-only data directory) is no other process's doing, and no
+wait cures it, so its error says so and names the lock file
+([[LockNotTaken.held]], \cref{sec:file-lock}).  [[NotesNotLocked]] is a
+[[NotesFileError]], so every caller that reports an unwritable notes
+file reports this one too; the CLI prints it without the advice to
+repair the file, which is not broken (\cref{sec:cli-main}).
+
+Deleting is writing too: [[scholar notes clear]] deletes the file
+through [[delete_all_notes]], under the lock, so that it neither
+deletes a note another process is adding nor reports a count that is
+no longer true.
+
+Readers take no lock.  A write replaces the file in one rename, so a
+reader sees the old file or the new one, never a part; locking a read
+would only make a stuck writer stop every command that shows a note.
+[[get_note]] is a reader that sometimes writes (it moves a note to a
+paper's new DOI id, below), and it takes the lock for that move alone.
+
+<<notes constants>>=
+NOTES_LOCK_TIMEOUT = 30  # seconds a notes write waits for its lock
+NOTES_LOCK_NOTICE = LOCK_TIMEOUT  # after this many, it says so once
+<<notes imports>>=
+from scholar.utils import LOCK_TIMEOUT, LockNotTaken
 <<paper notes functions>>=
+class NotesNotLocked(NotesFileError):
+    """A notes write refused: the notes file's lock was not taken.
+
+    Nothing was written. `held` is True when another process held the
+    lock, False when the lock file `lock_file` could not be opened.
+    """
+
+    def __init__(self, error: LockNotTaken):
+        self.path = error.path
+        self.cause = error
+        self.unsaved_note: Path | None = None
+        self.held = error.held
+        self.lock_file = error.lock_file
+        why = (
+            f"is locked by another scholar process ({error.reason})"
+            if error.held else
+            f"cannot be locked ({error.reason}; check its permissions)"
+        )
+        Exception.__init__(
+            self,
+            f"Notes file {error.path} {why}, so no note or decision "
+            "record was written.",
+        )
+
+
 def _holding_notes_lock(function):
-    """Run `function` while holding the notes file's lock."""
+    """Run `function` while holding the notes file's lock.
+
+    Raises `NotesNotLocked`, before `function` runs, if the lock is not
+    taken within `NOTES_LOCK_TIMEOUT` seconds or cannot be opened.
+    """
     @functools.wraps(function)
     def locked(*args, **kwargs):
-        with file_lock(get_data_dir() / NOTES_FILE):
-            return function(*args, **kwargs)
+        try:
+            with file_lock(
+                get_data_dir() / NOTES_FILE, timeout=NOTES_LOCK_TIMEOUT,
+                required=True, notice_after=NOTES_LOCK_NOTICE,
+            ):
+                return function(*args, **kwargs)
+        except LockNotTaken as error:
+            raise NotesNotLocked(error) from error
     return locked
+@
+
+The tests hold the lock in another process, as a stuck writer would:
+a child Python takes the lock file with [[filelock]], the package
+[[file_lock]] uses, so it is the same [[flock]] on the same file, and
+holds it until the test closes its standard input.  The waits are
+shortened to fractions of a second.  A refused write must leave the
+notes file byte for byte as it was, raise [[NotesNotLocked]] with one
+line, and say once that it waits; deletion (of one note or all),
+import and the decision stores are refused alike; a read still reads, a legacy note included,
+which stays where it is; and a lock file that cannot be opened gets
+its own words.
+
+<<test functions>>=
+import contextlib
+import subprocess
+import sys
+
+
+@contextlib.contextmanager
+def notes_lock_held_elsewhere():
+    """Hold the notes file's lock in another process while the block runs."""
+    from scholar.utils import lock_path
+
+    target = lock_path(get_data_dir() / NOTES_FILE)
+    holder = subprocess.Popen(
+        [sys.executable, "-c",
+         "import sys\n"
+         "from filelock import FileLock\n"
+         "lock = FileLock(sys.argv[1])\n"
+         "lock.acquire()\n"
+         "print('held', flush=True)\n"
+         "sys.stdin.read()\n",
+         str(target)],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+    )
+    try:
+        assert holder.stdout.readline().strip() == "held"
+        yield target
+    finally:
+        holder.stdin.close()
+        holder.wait(10)
+
+
+class TestNotesLockRefused:
+    """A notes write never runs without its lock (#319)."""
+
+    @pytest.fixture
+    def notes_file(self, tmp_path, monkeypatch):
+        import scholar.notes as notes
+
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        monkeypatch.setattr(notes, "NOTES_LOCK_TIMEOUT", 0.4)
+        monkeypatch.setattr(notes, "NOTES_LOCK_NOTICE", 0.1)
+        invalidate_notes_cache()
+        save_note(Paper(title="T", authors=["A"], doi="10.1/held"), "Kept.")
+        save_search_decisions("q", {"doi:10.1/held": ReviewDecisionRecord(
+            status="kept", title="T")})
+        yield get_data_dir() / NOTES_FILE
+        invalidate_notes_cache()
+
+    @staticmethod
+    def stores():
+        return {path: path.read_bytes()
+                for path in get_data_dir().rglob("*.json")}
+
+    def test_a_refused_save_writes_nothing(self, notes_file, caplog):
+        before = self.stores()
+        with notes_lock_held_elsewhere():
+            with pytest.raises(NotesNotLocked) as refused:
+                save_note(Paper(title="U", authors=["B"], doi="10.1/new"),
+                          "Lost?")
+        assert self.stores() == before
+        message = str(refused.value)
+        assert "\n" not in message
+        assert message == (
+            f"Notes file {notes_file} is locked by another scholar process "
+            "(still locked after 0.4 s), so no note or decision record "
+            "was written."
+        )
+        assert refused.value.held
+        notices = [r.message for r in caplog.records
+                   if "locked by another scholar process" in r.message]
+        assert len(notices) == 1 and str(notes_file) in notices[0]
+
+    def test_every_writer_is_refused(self, notes_file, tmp_path):
+        held = Paper(title="T", authors=["A"], doi="10.1/held")
+        export = tmp_path / "export.json"
+        export_notes(export)
+        before = self.stores()
+        with notes_lock_held_elsewhere():
+            for write in (
+                lambda: delete_note(held),
+                lambda: import_notes(export, merge=False),
+                lambda: save_search_decisions("q", {}),
+                lambda: get_previous_decision("q", held),
+                delete_all_notes,
+                clear_all_decisions,
+            ):
+                with pytest.raises(NotesNotLocked):
+                    write()
+        assert self.stores() == before
+
+    def test_a_read_moves_nothing_while_refused(self, notes_file, caplog):
+        bare = Paper(title="Old", authors=["Ada Lovelace"])
+        save_note(bare, "Under the hash.")
+        with_doi = Paper(title="Old", authors=["Ada Lovelace"],
+                         doi="10.1/gained")
+        before = self.stores()
+        with notes_lock_held_elsewhere():
+            note = get_note(with_doi)
+        assert note.note == "Under the hash."
+        assert note.paper_id == "doi:10.1/gained"
+        assert self.stores() == before
+        assert f"The note stays under {bare.id} for now." in caplog.text
+        assert get_note(with_doi).note == "Under the hash."
+        invalidate_notes_cache()
+        assert {n.paper_id for n in list_papers_with_notes()} == {
+            "doi:10.1/held", "doi:10.1/gained"}
+
+    def test_a_lock_file_that_cannot_be_opened(self, notes_file):
+        from scholar.utils import lock_path
+
+        lock_file = lock_path(notes_file)
+        lock_file.touch()
+        lock_file.chmod(0)
+        before = self.stores()
+        try:
+            with pytest.raises(NotesNotLocked) as refused:
+                save_note(Paper(title="U", authors=["B"], doi="10.1/new"),
+                          "Lost?")
+        finally:
+            lock_file.chmod(0o600)
+        assert self.stores() == before
+        assert not refused.value.held
+        assert str(refused.value).startswith(
+            f"Notes file {notes_file} cannot be locked (cannot open the "
+            f"lock file {lock_file}: "
+        )
+        assert str(refused.value).endswith(
+            "; check its permissions), so no note or decision record was "
+            "written."
+        )
 @
 
 The test makes the first writer slow: its read of the file starts a
@@ -789,17 +1029,27 @@ def test_concurrent_note_saves_keep_both(tmp_path, monkeypatch):
     assert get_note(second).note == "Second."
 @
 
+[[get_note]] reads without the lock.  When it finds the note under
+the paper's legacy hash id (a paper that has gained a DOI since), it
+moves the note to the DOI id, and that move is a write: it takes the
+lock and reads the file again under it, since another process may have
+changed the notes since the unlocked read.  A refused move is no reason
+to fail the read: the note is returned all the same and stays where it
+is, under the legacy id, where every lookup still finds it, and the
+next lookup that gets the lock moves it.
+
 <<paper notes functions>>=
-
-
-@_holding_notes_lock
 def get_note(paper: Any) -> PaperNote | None:
     """
     Get the note for a paper, if one exists.
-    
+
+    A note stored under the paper's legacy hash id is moved to its DOI
+    id, under the notes lock; if the lock is refused, the note is
+    returned unmoved and a warning is logged.
+
     Args:
         paper: A Paper object.
-    
+
     Returns:
         PaperNote if found, None otherwise.
     """
@@ -809,32 +1059,47 @@ def get_note(paper: Any) -> PaperNote | None:
     note = notes.get(paper_id)
     if note is not None:
         return note
+    if not getattr(paper, "doi", None):
+        return None
+    legacy_id = legacy_hash_paper_id(
+        getattr(paper, "title", ""),
+        getattr(paper, "authors", []) or [],
+    )
+    legacy_note = notes.get(legacy_id)
+    if legacy_note is None:
+        return None
+    try:
+        return _move_legacy_note(paper, legacy_id)
+    except NotesNotLocked as error:
+        logger.warning("%s The note stays under %s for now.",
+                       error, legacy_id)
+        return _note_under(paper, paper_id, legacy_note)
 
-    # Backward compatibility: if the paper gained a DOI, it may have been
-    # previously stored under its legacy hash id.
-    if getattr(paper, "doi", None):
-        legacy_id = legacy_hash_paper_id(
-            getattr(paper, "title", ""),
-            getattr(paper, "authors", []) or [],
-        )
-        legacy_note = notes.get(legacy_id)
-        if legacy_note is None:
-            return None
 
-        # Migrate to the DOI-based id for future lookups.
-        migrated = PaperNote(
-            paper_id=paper_id,
-            title=getattr(paper, "title", legacy_note.title) or legacy_note.title,
-            note=legacy_note.note,
-            created_at=legacy_note.created_at,
-            updated_at=legacy_note.updated_at,
-        )
-        notes[paper_id] = migrated
-        del notes[legacy_id]
-        _save_all_notes(notes)
-        return migrated
+def _note_under(paper: Any, paper_id: str, note: PaperNote) -> PaperNote:
+    """`note` re-keyed to `paper_id`, with `paper`'s title if it has one."""
+    return PaperNote(
+        paper_id=paper_id,
+        title=getattr(paper, "title", note.title) or note.title,
+        note=note.note,
+        created_at=note.created_at,
+        updated_at=note.updated_at,
+    )
 
-    return None
+
+@_holding_notes_lock
+def _move_legacy_note(paper: Any, legacy_id: str) -> PaperNote | None:
+    """Move `paper`'s note from `legacy_id` to its own id; return it."""
+    paper_id = get_paper_id(paper)
+    notes = _load_all_notes()
+    if paper_id in notes:
+        return notes[paper_id]
+    legacy_note = notes.pop(legacy_id, None)
+    if legacy_note is None:
+        return None
+    notes[paper_id] = _note_under(paper, paper_id, legacy_note)
+    _save_all_notes(notes)
+    return notes[paper_id]
 
 
 @_holding_notes_lock
@@ -917,6 +1182,21 @@ def delete_note(paper: Any) -> bool:
             return True
 
     return False
+
+
+@_holding_notes_lock
+def delete_all_notes() -> int:
+    """Delete the notes file, under the notes lock.
+
+    Returns how many notes it held. Raises `NotesFileError` if it
+    cannot be read, `NotesNotLocked` if the lock is refused.
+    """
+    notes = _load_all_notes()
+    notes_file = get_data_dir() / NOTES_FILE
+    if notes_file.exists():
+        notes_file.unlink()
+    invalidate_notes_cache()
+    return len(notes)
 
 
 def list_papers_with_notes() -> list[PaperNote]:
@@ -1342,6 +1622,12 @@ query's file when no session file exists, so reviews made before session
 files can be resumed.
 [[save_search_decisions]] remains because [[migrate_paper_id]] rewrites
 those old files when a paper changes identity.
+The writers, [[save_search_decisions]], [[get_previous_decision]]
+(which moves a record to a paper's new DOI id, as [[get_note]] moves a
+note) and [[clear_all_decisions]], hold the notes lock
+(\cref{sec:notes-lock}), which is never skipped:
+[[get_previous_decision]] for its whole read--modify--write, since no
+caller outside the tests is left to wait for it.
 
 <<search decisions functions>>=
 def load_search_decisions(query: str) -> SearchDecisions | None:
@@ -1381,6 +1667,7 @@ def read_search_decisions_file(decisions_file: Path) -> SearchDecisions:
         raise NotesFileError(decisions_file, error) from error
 
 
+@_holding_notes_lock
 def save_search_decisions(
     query: str,
     decisions: dict[str, ReviewDecisionRecord],
@@ -1414,6 +1701,7 @@ def save_search_decisions(
         raise NotesFileError(decisions_file, error, "write") from error
 
 
+@_holding_notes_lock
 def get_previous_decision(query: str, paper: Any) -> ReviewDecisionRecord | None:
     """
     Get the previous decision for a paper in a specific search.
@@ -1459,6 +1747,7 @@ def get_previous_decision(query: str, paper: Any) -> ReviewDecisionRecord | None
     return None
 
 
+@_holding_notes_lock
 def clear_all_decisions() -> int:
     """
     Clear all saved search decisions.
@@ -1538,9 +1827,27 @@ the migration carries on with the other files.  Write errors still
 raise: they mean the data directory cannot be written at all, and the
 caller's own save is about to fail the same way.
 
+\paragraph{A refused lock is reported, not raised.}
+The same reasoning holds for a lock that is not taken
+(\cref{sec:notes-lock}): the callers' work is worth more than an
+immediate move, and nothing is lost by waiting, since the records stay
+under the old id, whole.  So [[migrate_paper_id]] catches
+[[NotesNotLocked]], writes nothing to either store, and logs a WARNING
+that names the notes file, both ids and how the move is made later;
+it returns [[False]] then, [[True]] otherwise.  The later move needs
+both ids, and a note alone does not know its new id: the session
+does.  Every caller that renames a paper in a session records the
+rename there ([[record_rename]], \cref{sec:session-renames} in the
+review chapter), and [[sessions reconcile]] moves every note it finds
+stranded under a renamed or folded-away id ([[move_stranded_notes]]),
+so running it once the lock is free completes the move.  The decision
+stores' records under the old id stay where they are: those stores
+are read only for a search without a session file
+(\cref{sec:notes-search-decisions}), and a session holds the paper
+under its new id.
+
 <<search decisions functions>>=
-@_holding_notes_lock
-def migrate_paper_id(old_id: str, new_id: str) -> None:
+def migrate_paper_id(old_id: str, new_id: str) -> bool:
     """Move any note and search decisions from `old_id` to `new_id`.
 
     Used when an entry's identity changes, e.g. when enrichment
@@ -1548,10 +1855,27 @@ def migrate_paper_id(old_id: str, new_id: str) -> None:
     already present under `new_id` are kept and the old ones dropped.
     A notes or decisions file that cannot be read is left untouched
     and named in a warning; a failed write raises `NotesFileError`.
+    If the notes lock is not taken, nothing is moved, a warning says
+    so, and the result is False.
     """
     if old_id == new_id:
-        return
+        return True
+    try:
+        _move_records(old_id, new_id)
+    except NotesNotLocked as error:
+        logger.warning(
+            "%s The note and decision records of %s were not moved to "
+            "%s; the session records the rename, and `scholar sessions "
+            "reconcile` on it moves the note once the lock is free.",
+            error, old_id, new_id,
+        )
+        return False
+    return True
 
+
+@_holding_notes_lock
+def _move_records(old_id: str, new_id: str) -> None:
+    """Move the note and decision records of `old_id`, under the lock."""
     try:
         notes = _load_all_notes()
     except NotesFileError as error:
@@ -1694,6 +2018,45 @@ class TestMigratePaperIdUnreadableStores:
         assert NOTES_FILE in caplog.text
         moved = load_search_decisions("readable").decisions
         assert list(moved) == ["doi:10.1/new"]
+@
+
+A refused lock moves nothing and says so, without raising: both stores
+stay byte for byte as they were, the result is [[False]], and the
+warning names the notes file, both ids and the command that moves the
+note later.  Once the lock is free, the same call moves it.
+
+<<test functions>>=
+class TestMigratePaperIdRefusedLock:
+    """migrate_paper_id skips a refused lock and says how (#319)."""
+
+    def test_skips_with_a_warning(self, tmp_path, monkeypatch, caplog):
+        import scholar.notes as notes
+
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        monkeypatch.setattr(notes, "NOTES_LOCK_TIMEOUT", 0.3)
+        invalidate_notes_cache()
+        old = Paper(title="A Work", authors=["Ada Lovelace"],
+                    doi="10.1145/old")
+        save_note(old, "Read this carefully.")
+        save_search_decisions("q", {old.id: ReviewDecisionRecord(
+            status="kept", title=old.title)})
+        stores = sorted(get_data_dir().rglob("*.json"))
+        before = [path.read_bytes() for path in stores]
+
+        with notes_lock_held_elsewhere():
+            moved = migrate_paper_id(old.id, "doi:10.48550/new")
+
+        assert moved is False
+        assert [path.read_bytes() for path in stores] == before
+        warning = caplog.records[-1]
+        assert warning.levelname == "WARNING"
+        for named in (str(get_data_dir() / NOTES_FILE), old.id,
+                      "doi:10.48550/new", "scholar sessions reconcile"):
+            assert named in warning.getMessage()
+        assert migrate_paper_id(old.id, "doi:10.48550/new") is True
+        invalidate_notes_cache()
+        assert [n.paper_id for n in list_papers_with_notes()] == [
+            "doi:10.48550/new"]
 @
 
 \subsection{Testing search decisions}
@@ -1926,6 +2289,7 @@ class TestSearchDecisions:
 
 
 \section{Editor Integration}
+\label{sec:editor-integration}
 
 To edit notes, we open the user's preferred editor (from [[VISUAL]] or
 [[EDITOR]] environment variables). We use [[click.edit()]] which handles

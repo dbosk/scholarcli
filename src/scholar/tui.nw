@@ -184,12 +184,14 @@ from rich.markup import escape
 from scholar.scholar import Paper, SearchResult, SearchFilters
 from scholar.notes import (
     get_note, has_note, edit_note_in_editor,
-    _get_cached_notes, get_paper_id, NotesFileError, PaperNote,
+    _get_cached_notes, get_paper_id, NotesFileError, NotesNotLocked,
+    PaperNote,
 )
 from scholar.utils import backup_path
 from scholar.review import (
     DecisionStatus, ReviewDecision, ReviewSession, ReviewSource,
-    create_review_session, record_human_decision, save_session,
+    create_review_session, record_human_decision, record_rename,
+    save_session,
     escape_latex, filter_decisions,
     generate_csv_report, generate_latex_report,
 )
@@ -708,7 +710,10 @@ class AbstractScreen(Screen[None]):
             # Update decision and notify from main thread
             def finish():
                 if enriched_fields:
+                    old_id = decision.paper.id
                     decision.paper = enriched
+                    if enriched.id != old_id:
+                        record_rename(app.session, old_id, enriched.id)
                     app.notify(f"'{title_preview}': {', '.join(enriched_fields)}", severity="information")
                     # Refresh screen if still mounted
                     if screen.is_mounted:
@@ -2833,9 +2838,20 @@ without them:
   (\cref{sec:abstract-screen}).  [[migrate_paper_id]] reports an
   unreadable file itself and only raises when a write fails; the thread
   turns that into the same notification instead of dying with a
-  traceback over the screen.
+  traceback over the screen.  A refused notes lock it reports only in
+  a warning and moves nothing (\cref{sec:notes-migrate-paper-id}); the
+  adoption itself is recorded in the session as a rename when the
+  enriched paper replaces the decision's ([[record_rename]],
+  \cref{sec:session-renames}), on the main thread like every other
+  change to the session, so the samples drawn before it still find the
+  paper and [[sessions reconcile]] can move the note later.
 \end{description}
-The message names the file and its [[.bak]], like the CLI's.  The TUI
+The message names the file and its [[.bak]], like the CLI's.
+A write refused because another process holds the notes file's lock
+([[NotesNotLocked]], \cref{sec:notes-lock}) is reported the same way,
+the kept text included, but without the advice to repair the file,
+which is not broken: the note can be saved again once the lock is
+free.  The TUI
 cannot meet the session file's [[SessionFileError]] this way: it never
 reads the session file while it runs, only the caller saves it after
 the TUI has closed, and [[save_session]] treats an unreadable file on
@@ -2851,6 +2867,8 @@ def notes_unavailable_message(error: NotesFileError) -> str:
         f"Your note was not saved; its text is in {error.unsaved_note}.\n"
         if error.unsaved_note is not None else ""
     )
+    if isinstance(error, NotesNotLocked):
+        return f"{error}\n{kept}Try again once the lock is free."
     return (
         f"{error}\n{kept}"
         "Notes are unavailable until the file is repaired or its previous "
@@ -3017,6 +3035,111 @@ class TestUnreadableNotesFile:
         assert severity == "error"
         kept = Path(message.split("its text is in ")[1].split(".md")[0] + ".md")
         assert kept.read_text().endswith("Hours of reading.\n")
+@
+
+A note typed while another process holds the notes lock is kept the
+same way.  The lock is held by a child Python, a real other process,
+for the whole run of the app; the notes file must be as it was, and
+the message must name the kept file and not ask for a repair.
+
+<<test functions>>=
+class TestRefusedNotesLock:
+    """A note refused its lock is kept and named in the TUI (#319)."""
+
+    def test_the_typed_note_is_kept(self, tmp_path, monkeypatch):
+        import subprocess
+        import sys
+        from contextlib import nullcontext
+        import scholar.notes as notes
+        from scholar.utils import lock_path
+
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        monkeypatch.setattr(notes, "NOTES_LOCK_TIMEOUT", 0.3)
+        notes_file = notes.get_data_dir() / notes.NOTES_FILE
+        notes_file.write_text("{}")
+        notes.invalidate_notes_cache()
+        monkeypatch.setattr(
+            notes.click, "edit", lambda *args, **kwargs: "Hours of reading."
+        )
+        monkeypatch.setattr(
+            PaperReviewApp, "suspend", lambda self: nullcontext()
+        )
+        holder = subprocess.Popen(
+            [sys.executable, "-c",
+             "import sys\n"
+             "from filelock import FileLock\n"
+             "lock = FileLock(sys.argv[1])\n"
+             "lock.acquire()\n"
+             "print('held', flush=True)\n"
+             "sys.stdin.read()\n",
+             str(lock_path(notes_file))],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+        )
+        try:
+            assert holder.stdout.readline().strip() == "held"
+            app, notices = TestUnreadableNotesFile.run(["n"])
+        finally:
+            holder.stdin.close()
+            holder.wait(10)
+        notes.invalidate_notes_cache()
+        assert notes_file.read_text() == "{}"
+        [(message, severity)] = notices
+        assert severity == "error"
+        assert "is locked by another scholar process" in message
+        assert "repaired" not in message and ".bak" not in message
+        kept = Path(message.split("its text is in ")[1].split(".md")[0] + ".md")
+        assert kept.read_text().endswith("Hours of reading.\n")
+@
+
+The TUI's enrichment records an adopted preprint as a rename too
+(\cref{sec:session-renames} in the review chapter), so a sample drawn
+before it still names the paper.  The enrichment is stood in for,
+since it would ask the providers; the app, its thread and its screens
+are real.
+
+<<test functions>>=
+class TestEnrichmentRename:
+    """An adoption in the TUI is recorded as a rename (#319)."""
+
+    def test_a_sample_follows_the_adopted_preprint(self, monkeypatch):
+        import asyncio
+        from dataclasses import replace
+        from scholar.review import TierSample
+
+        published = Paper(title="A Published Version", authors=["A B"],
+                          doi="10.5555/tui-pub")
+        session = ReviewSession(
+            query="q", providers=["openalex"], timestamp=datetime.now(),
+            decisions=[ReviewDecision(paper=published, provider="openalex")],
+        )
+        session.tier_samples.append(TierSample(
+            sample_id="r", drawn_at="2026-11-23T10:00:00+00:00", seed=1,
+            size=1, rule={}, rest=1, rest_digest="d",
+            papers=["doi:10.5555/tui-pub"],
+        ))
+        monkeypatch.setattr(
+            "scholar.enrich.enrich_paper",
+            lambda paper, **kwargs: replace(
+                paper, doi="10.48550/tui-pre", abstract="An abstract.",
+                published_versions=[{"doi": paper.doi,
+                                     "relation": "preprint-of"}],
+            ),
+        )
+        app = PaperReviewApp(session)
+
+        async def drive():
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                await pilot.press("enter", "e")
+                for _ in range(100):
+                    await pilot.pause(0.05)
+                    if session.renamed:
+                        break
+
+        asyncio.run(drive())
+        assert session.renamed == {
+            "doi:10.5555/tui-pub": "doi:10.48550/tui-pre"}
+        assert session.tier_samples[0].papers == ["doi:10.48550/tui-pre"]
 @
 
 \subsection{Search Filters Action}
