@@ -3987,6 +3987,43 @@ This project uses noweb-style literate programming. The `.nw` files are the sour
 - Edit `.nw` files, then tangle to generate `.py` files
 - Use the `literate-programming` skill when modifying `.nw` files
 
+The woven document (`doc/scholar.pdf`, pdfLaTeX, T1) must keep building
+(#279, cli.nw `sec:woven-document`). `TestWovenDocumentSources` (in
+test_cli.py, no LaTeX, under a second per check) reads every
+`src/scholar/**/*.nw` and fails, naming file and line, on (a) a
+documentation-chunk quote that takes a LaTeX bracket: noweb closes a
+quote at the *last* two of a run of `]`, so `\item[A [[x]]]` leaves the
+label open (runaway argument) and `\item[[[x]]]` (or `\item [[[x]]]`)
+loses the label;
+write `\item[A [[x]] ]` / `\item[ [[x]] ]` (`[[[]]]`, quoting code that
+ends in `]`, is fine); (b) a character pdfLaTeX cannot set: allowed are
+printable ASCII and tab, U+00A0-U+024F outside `review.T1_UNSET_RANGES`,
+the `\newunicodechar`s of `doc/preamble.tex`, and
+`DOCUMENT_EXTRA_CHARACTERS` (eleven code points with the `.dfu` file
+declaring each, checked by a `latex`-marked test). Write CJK, Cyrillic,
+U+2028, U+FEFF and the like in code chunks as Python escapes
+(`"\u5b66"`), as
+most non-Latin tests already did; name them in the prose if the reader
+needs to know. The full build is `make -C doc check
+LATEXFLAGS="-shell-escape -interaction=nonstopmode"` (between 7 and
+26 minutes on the machines tried, longer under load; 2692 pages at
+6b9d135). `check` is `doc/check.mk` (included by `doc/Makefile`; it
+sets latexmk's `$max_repeat=10`) plus `doc/check-settled.py`: it fails
+on a missing or stale log, a LaTeX error, undefined references,
+missing PythonTeX output, or a non-zero build status, and passes a
+**two-state flip** (references alternating between two layouts) with
+the warning "the references alternate between two states and cannot
+settle". The full description is in cli.nw `sec:woven-document`
+("What the check accepts", "Two-state flips"); `TestDocumentCheck`
+(latex marker, about a minute) tests it on small documents. The root
+`doc/scholar.pdf` target (used by `publish-github`) runs `check`.
+`doc/Makefile`'s rules for `../src/scholar/%.tex` name the `.nw`, so a
+changed source is re-woven (before, a stale woven chapter was used).
+`doc/preamble.tex` redefines noweb's `\@subpageref` to always print
+the chunk letter (`1865a`): with noweb's default, a letter only when
+the page holds 2+ chunks, the references' width depended on the page
+breaks and the document flipped between two layouts on every pass.
+
 ## Caching
 
 Search results are cached to avoid redundant API calls:

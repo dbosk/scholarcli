@@ -26,6 +26,7 @@ publish-github: doc/scholar.pdf
 	git push
 	gh release create -t v${version} v${version} doc/scholar.pdf
 
-# Always delegate to sub-make for freshness check
+# Always delegate to sub-make for freshness check; its check target also
+# refuses a document whose last LaTeX run had errors (#279)
 doc/scholar.pdf:
-	${MAKE} -C doc scholar.pdf
+	${MAKE} -C doc check
