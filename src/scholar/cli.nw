@@ -3714,27 +3714,15 @@ class TestEnrichKeepsTheLookup:
     assert saved["10.1/c137-0"].abstract_lookup is None
 @
 
-[[signal.signal]] may only be called from the main thread, and the
-command can be called from elsewhere (a worker thread of a test runner
-or an application); there we leave SIGTERM alone rather than fail.
+The context manager that does it, [[sigterm_as_keyboard_interrupt]],
+lives in the utilities (\cref{sec:sigterm}), since an export's file
+moves use it too.  [[signal.signal]] may only be called from the main
+thread, and the command can be called from elsewhere (a worker thread
+of a test runner or an application); there it leaves SIGTERM alone
+rather than fail.
 
 <<enrich command>>=
-@contextlib.contextmanager
-def sigterm_as_keyboard_interrupt():
-    """Raise `KeyboardInterrupt` on SIGTERM while the block runs."""
-
-    def interrupt(signum, frame):
-        raise KeyboardInterrupt
-
-    try:
-        previous = signal.signal(signal.SIGTERM, interrupt)
-    except ValueError:  # not the main thread
-        yield
-        return
-    try:
-        yield
-    finally:
-        signal.signal(signal.SIGTERM, previous)
+from scholar.utils import sigterm_as_keyboard_interrupt
 <<cli imports>>=
 import contextlib
 import signal
@@ -11115,7 +11103,7 @@ def sessions_export(
 
     <<draw the rest of the tier on a dry run>>
     <<write the export files all or nothing>>
-    <<remove the tier counts of an earlier sheet>>
+    <<say that the tier counts of an earlier sheet were removed>>
 
     console.print("[green]Exported:[/green]")
     for f in files_created:
@@ -12056,9 +12044,23 @@ into place only when every format has been built.  The generators need no
 change: each receives a path in the staging directory under the final
 file name, and the \LaTeX{} report derives its [[.bib]] from that path as
 before.  Any failure, a bug in a generator as much as a missing output
-directory, ends in one error line and exit code~1, with the previous
-outputs untouched.  The traceback goes to the debug log, where
-[[--verbose]] shows it.
+directory, ends in an error line and exit code~1.  The traceback goes
+to the debug log, where [[--verbose]] shows it.
+
+The message says what the failure left, because a user who reads that
+nothing was written will trust the old files beside it.  A failure while
+the files are produced leaves the earlier outputs untouched, since
+nothing has been moved yet.  A failure while they are moved into place
+is undone by [[staged_outputs]] (\cref{sec:staged-outputs}), which
+first checks every target, so that a directory where a file should go
+stops the export before anything moves, and otherwise puts back what it
+had replaced.  In both cases the earlier outputs are as they were, and
+the message says so, adding that the export was rolled back when files
+had been moved.  Only when putting a file back fails too are the
+outputs mixed, and then the message lists, per file, whether it holds
+the new version, the earlier one or none, and where an earlier version
+is kept (\url{https://github.com/dbosk/scholar/issues/320}: the message
+used to claim that nothing was written in this case as well).
 
 <<write the export files all or nothing>>=
 from scholar.review import SessionNotSaved
@@ -12068,8 +12070,9 @@ out_base = Path(output)
 files_created = []
 tex_path = Path(f"{output}.tex")
 rest_draw_saved = None
+<<find the tier counts of an earlier sheet>>
 try:
-    with staged_outputs(out_base.parent) as staging:
+    with staged_outputs(out_base.parent, remove=stale_tiers) as staging:
         staged = staging / out_base.name
 
         if format_type in ("csv", "all"):
@@ -12105,18 +12108,76 @@ try:
             files_created.append(tex_path)
 
         <<write the screen sheet>>
-except Exception as error:
+except (Exception, KeyboardInterrupt) as caught:
     logger.debug("Export of %s failed", name, exc_info=True)
-    if isinstance(error, SessionNotSaved):
+    if isinstance(caught, SessionNotSaved):
         raise
+    interrupted = isinstance(caught, KeyboardInterrupt)
+    error = getattr(caught, "failure", caught)
     if rest_draw_saved is not None:
         <<say that the draw is recorded although the export failed>>
     else:
         console.print(
-            f"[red]Export failed, no files were written or changed: "
-            f"{escape(type(error).__name__)}: {escape(str(error))}[/red]"
+            f"[red]{escape(export_failure_text(error, interrupted=interrupted))}"
+            "[/red]", soft_wrap=True,
         )
-    raise typer.Exit(1)
+    raise typer.Exit(130 if interrupted else 1)
+@
+
+An interrupt, Ctrl-C or SIGTERM, which the moves hold back until they
+are settled (\cref{sec:staged-outputs}), ends the export the same way, with exit
+code~130 (the status bash gives a command ended by SIGINT, as
+[[scholar enrich]] uses it, \cref{sec:enrich-chunks}).  During the moves
+it arrives as a [[MovesInterrupted]] that carries the outcome, which is
+worded like a failure's; at any other time nothing has been moved.
+
+[[export_failure_text]] words the message from the error.  Only an
+[[OutputsNotPlaced]] can have changed a file, and only when its
+[[changed]] is true; every other error came before the first move.
+With [[recorded_draw]] (\cref{sec:rest-sample-sheet} has why the session is
+saved before the files are moved) the first line says that the draw was
+recorded, which is a change to the session, so the line about the files
+names the exported files rather than claiming that no file at all was
+written.  With [[interrupted]] the lead says that the export was
+stopped by an interrupt and gives no reason, since an interrupt has
+none to give.
+
+<<sessions command>>=
+def export_failure_text(
+    error: BaseException, recorded_draw: bool = False,
+    interrupted: bool = False,
+) -> str:
+    """What a failed or interrupted export says, from what its files
+    hold now."""
+    from scholar.utils import OutputsNotPlaced
+
+    placing = isinstance(error, OutputsNotPlaced)
+    if interrupted and error is None:
+        return ("Export stopped by an interrupt after every file was in "
+                "place: the files are this export's.")
+    if interrupted:
+        what, reason = "Export stopped by an interrupt", ""
+    else:
+        what = "Export failed"
+        reason = ": " + (error.reason if placing
+                         else f"{type(error).__name__}: {error}")
+    changed = placing and error.changed
+    rolled_back = placing and error.rolled_back
+    if changed:
+        lead = (
+            f"{what} after the draw was recorded and could not be "
+            "rolled back" if recorded_draw
+            else f"{what} part-way and could not be rolled back"
+        )
+        return "\n".join([f"{lead}{reason}", *error.file_lines()])
+    if recorded_draw:
+        return (f"{what} after the draw was recorded{reason}\n"
+                "None of the exported files was written or changed"
+                + ("; the moves were rolled back." if rolled_back else "."))
+    rolled = " and was rolled back" if rolled_back else ""
+    if interrupted:
+        return f"{what}{rolled}: no files were written or changed."
+    return f"{what}{rolled}, no files were written or changed{reason}"
 @
 
 The regression test makes the \LaTeX{} step fail after it has already
@@ -12168,6 +12229,286 @@ def test_failed_export_leaves_previous_outputs(tmp_path, monkeypatch):
     assert "Traceback" not in result.output
     after = {p.name: p.read_bytes() for p in out_dir.iterdir()}
     assert after == before
+@
+
+The moves themselves are tested on an export of three files,
+[[rep.bib]], [[rep.csv]] and [[rep.tex]] (moved in that order), over an
+earlier export of a session that has since gained a paper, so that every
+new file differs from the old one.  The case of
+\url{https://github.com/dbosk/scholar/issues/320} is a directory at the
+second target: the export must stop before moving [[rep.bib]] and say
+that nothing was written.  A failure the check cannot see, and a failure
+to put a file back, are injected through [[os.replace]], as in
+\cref{sec:staged-outputs}: a staged file's move has its source in the
+staging directory, a restore in the directory of replaced files.
+
+<<test functions>>=
+class TestExportMoves:
+  """A failed move leaves the earlier export and says so (#320)."""
+
+  <<export moves test methods>>
+
+<<export moves test methods>>=
+def _save(self, tmp_path, monkeypatch, count):
+  from scholar import review
+
+  monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+  session = review.ReviewSession(
+    query="q", providers=["openalex"], timestamp=datetime(2026, 11, 23),
+    name="moves",
+  )
+  session.decisions = [review.ReviewDecision(
+    paper=Paper(title=f"Tidal Ledger {n}", authors=["Pia Lund"],
+                year=2024, doi=f"10.5555/moves-{n}"),
+    provider="openalex", status=review.DecisionStatus.KEPT,
+  ) for n in range(count)]
+  review.save_session(session)
+
+def _earlier_export(self, tmp_path, monkeypatch, fmt="all"):
+  out_dir = tmp_path / "out"
+  out_dir.mkdir()
+  self._save(tmp_path, monkeypatch, 1)
+  assert self._export(out_dir, fmt).exit_code == 0
+  self._save(tmp_path, monkeypatch, 2)
+  return out_dir
+
+def _export(self, out_dir, fmt="all"):
+  return runner.invoke(app, [
+    "sessions", "export", "moves", "-f", fmt, "-o", str(out_dir / "rep"),
+  ])
+
+def _content(self, out_dir):
+  return {
+    p.name: "dir" if p.is_dir() else p.read_bytes()
+    for p in out_dir.iterdir()
+  }
+
+def _fail_on(self, monkeypatch, failing):
+  import os
+
+  real_replace = os.replace
+
+  def replace(source, target, *args, **kwargs):
+    if failing(Path(source), Path(target)):
+      raise OSError(28, "No space left on device")
+    return real_replace(source, target, *args, **kwargs)
+
+  monkeypatch.setattr(os, "replace", replace)
+
+def test_a_directory_at_the_second_target_changes_nothing(
+  self, tmp_path, monkeypatch,
+):
+  out_dir = self._earlier_export(tmp_path, monkeypatch, fmt="latex")
+  (out_dir / "rep.csv").mkdir()
+  before = self._content(out_dir)
+  result = self._export(out_dir)
+  assert result.exit_code == 1
+  assert self._content(out_dir) == before
+  text = " ".join(result.output.split())
+  assert "Export failed, no files were written or changed:" in text
+  assert f"{out_dir / 'rep.csv'} is a directory" in text
+
+def test_a_failed_last_move_is_rolled_back(self, tmp_path, monkeypatch):
+  from scholar.utils import STAGING_PREFIX
+
+  out_dir = self._earlier_export(tmp_path, monkeypatch)
+  before = self._content(out_dir)
+  self._fail_on(monkeypatch, lambda source, target: (
+    STAGING_PREFIX in str(source) and target.name == "rep.tex"
+  ))
+  result = self._export(out_dir)
+  assert result.exit_code == 1
+  assert self._content(out_dir) == before
+  text = " ".join(result.output.split())
+  assert ("Export failed and was rolled back, no files were written or "
+          "changed: OSError: [Errno 28] No space left on device") in text
+
+def test_a_failed_restore_lists_each_file(self, tmp_path, monkeypatch):
+  from scholar.utils import KEPT_PREFIX, STAGING_PREFIX
+
+  out_dir = self._earlier_export(tmp_path, monkeypatch)
+  old_bib = (out_dir / "rep.bib").read_bytes()
+  self._fail_on(monkeypatch, lambda source, target: (
+    STAGING_PREFIX in str(source) and target.name == "rep.tex"
+    or KEPT_PREFIX in str(source) and target.name == "rep.bib"
+  ))
+  result = self._export(out_dir)
+  assert result.exit_code == 1
+  text = " ".join(result.output.split())
+  assert "no files were written" not in text
+  assert "Export failed part-way and could not be rolled back" in text
+  [kept] = [p for p in out_dir.iterdir() if p.name.startswith(KEPT_PREFIX)]
+  assert (kept / "rep.bib").read_bytes() == old_bib
+  assert (f"Holding the new version: {out_dir / 'rep.bib'} (earlier "
+          f"version kept as {kept / 'rep.bib'})") in text
+  assert (f"Holding the earlier version: {out_dir / 'rep.csv'}, "
+          f"{out_dir / 'rep.tex'}") in text
+@
+
+Ctrl-C and SIGTERM during the moves end the export the same way: the
+moves are rolled back, the exit code is 130 and one line says so.  The
+SIGTERM is sent only once the moves' own handler is installed, so that
+the test cannot end the test run.
+
+<<export moves test methods>>=
+@pytest.mark.parametrize("signal_name", ["SIGINT", "SIGTERM"])
+def test_an_interrupt_is_rolled_back_and_said(
+  self, tmp_path, monkeypatch, signal_name,
+):
+  import os
+  import signal
+  from scholar.utils import STAGING_PREFIX
+
+  out_dir = self._earlier_export(tmp_path, monkeypatch)
+  before = self._content(out_dir)
+  previous = signal.getsignal(signal.SIGTERM)
+  real_replace = os.replace
+
+  def replace(source, target, *args, **kwargs):
+    real_replace(source, target, *args, **kwargs)
+    if STAGING_PREFIX in str(source) and Path(target).name == "rep.csv":
+      if signal_name == "SIGINT":
+        raise KeyboardInterrupt
+      assert signal.getsignal(signal.SIGTERM) is not previous
+      signal.raise_signal(signal.SIGTERM)
+
+  monkeypatch.setattr(os, "replace", replace)
+  result = self._export(out_dir)
+  assert result.exit_code == 130
+  assert self._content(out_dir) == before
+  assert " ".join(result.output.split()) == (
+    "Export stopped by an interrupt and was rolled back: no files were "
+    "written or changed.")
+@
+
+The moments a reviewer of \url{https://github.com/dbosk/scholar/pull/324}
+found are tested on a real process: a child runs [[sessions export -f
+all]] over an earlier export (whose session has since gained a paper,
+so that every new file differs), with [[os.replace]] wrapped so that
+right after a chosen rename, before the code records it, the child
+sends itself a real signal or raises an exception.  The moments: after
+[[rep.csv]] was moved aside, after it was moved in, the same with a
+second and a third signal while the moves are undone, a restore that
+fails under an interrupt, and an exception at both moments, and at the
+move in once more with a target that did not exist before (such a
+target has nothing to move aside).  After each, the earlier files are
+byte for byte as they were (or, where a restore was made to fail, as
+the one message says), nothing of the export is left, the outcome is
+said once, and the exit code is 130 for a signal, 1 for an exception.
+
+<<test functions>>=
+class TestExportInterrupts:
+  """Signals and errors between a rename and its record (#320)."""
+
+  <<export interrupts test methods>>
+
+<<export interrupts test methods>>=
+CHILD = """
+import os, signal, sys
+from pathlib import Path
+import scholar.utils as utils
+
+out, plan = sys.argv[1], [step.split(":") for step in sys.argv[2:]]
+real_replace = os.replace
+
+def replace(source, target, *args, **kwargs):
+    source, target = Path(source), Path(target)
+    if utils.KEPT_PREFIX in str(source):
+        moment, name = "restore", target.name
+    elif utils.KEPT_PREFIX in str(target):
+        moment, name = "aside", source.name
+    elif utils.STAGING_PREFIX in str(source):
+        moment, name = "placed", target.name
+    else:
+        return real_replace(source, target, *args, **kwargs)
+    actions = [a for m, n, a in plan if (m, n) == (moment, name)]
+    if "fail" in actions:
+        raise OSError(28, "No space left on device")
+    real_replace(source, target, *args, **kwargs)
+    for action in actions:
+        if action == "raise":
+            raise RuntimeError("between the rename and its record")
+        if action.startswith("SIG"):
+            os.kill(os.getpid(), getattr(signal, action))
+
+os.replace = replace
+from scholar.cli import main
+sys.argv = ["scholar", "sessions", "export", "moves", "-f", "all",
+            "-o", str(Path(out) / "rep")]
+main()
+"""
+
+ROLLED_BACK = ("Export stopped by an interrupt and was rolled back: no "
+               "files were written or changed.")
+
+def _run(self, tmp_path, monkeypatch, plan, without=None):
+  import subprocess
+  import sys
+  import textwrap
+
+  out_dir = TestExportMoves()._earlier_export(tmp_path, monkeypatch)
+  if without:
+    (out_dir / without).unlink()
+  before = TestExportMoves()._content(out_dir)
+  child = subprocess.run(
+    [sys.executable, "-c", textwrap.dedent(self.CHILD), str(out_dir),
+     *plan],
+    capture_output=True, text=True, timeout=120,
+  )
+  return out_dir, before, child
+
+def _check_rolled_back(self, out_dir, before, child, code, message):
+  assert child.returncode == code, child.stderr
+  assert TestExportMoves()._content(out_dir) == before
+  text = " ".join((child.stdout + child.stderr).split())
+  assert text == message
+  assert "KeyboardInterrupt" not in child.stderr
+
+@pytest.mark.parametrize("signal_name", ["SIGINT", "SIGTERM"])
+@pytest.mark.parametrize("plan", [
+  ["aside:rep.csv:{s}"],
+  ["placed:rep.csv:{s}"],
+  ["placed:rep.csv:{s}", "restore:rep.csv:{s}"],
+  ["placed:rep.csv:{s}", "restore:rep.csv:{s}", "restore:rep.bib:{s}"],
+], ids=["aside", "placed", "second", "third"])
+def test_a_signal_is_held_back_and_rolled_back(
+  self, tmp_path, monkeypatch, plan, signal_name,
+):
+  out_dir, before, child = self._run(
+    tmp_path, monkeypatch, [step.format(s=signal_name) for step in plan])
+  self._check_rolled_back(out_dir, before, child, 130, self.ROLLED_BACK)
+
+@pytest.mark.parametrize("moment, without", [
+  ("aside", None), ("placed", None), ("placed", "rep.csv"),
+])
+def test_an_exception_after_a_rename_is_settled(
+  self, tmp_path, monkeypatch, moment, without,
+):
+  out_dir, before, child = self._run(
+    tmp_path, monkeypatch, [f"{moment}:rep.csv:raise"], without=without)
+  self._check_rolled_back(
+    out_dir, before, child, 1,
+    "Export failed and was rolled back, no files were written or changed: "
+    "RuntimeError: between the rename and its record")
+
+def test_a_failed_restore_under_an_interrupt_is_said_once(
+  self, tmp_path, monkeypatch,
+):
+  from scholar.utils import KEPT_PREFIX
+
+  out_dir, before, child = self._run(
+    tmp_path, monkeypatch, ["placed:rep.tex:SIGINT", "restore:rep.bib:fail"])
+  assert child.returncode == 130, child.stderr
+  [kept] = [p for p in out_dir.iterdir() if p.name.startswith(KEPT_PREFIX)]
+  assert (kept / "rep.bib").read_bytes() == before["rep.bib"]
+  text = " ".join((child.stdout + child.stderr).split())
+  assert text.count("Export stopped by an interrupt") == 1
+  assert text.startswith(
+    "Export stopped by an interrupt part-way and could not be rolled back "
+    f"Holding the new version: {out_dir / 'rep.bib'}")
+  assert "KeyboardInterrupt" not in text and "WARNING" not in text
+  assert (out_dir / "rep.csv").read_bytes() == before["rep.csv"]
+  assert (out_dir / "rep.tex").read_bytes() == before["rep.tex"]
 @
 
 \paragraph{A CSV for a spreadsheet program.}
@@ -12690,8 +13031,6 @@ for option, value in (("--sample", sample),
         raise typer.Exit(2)
 <<write the screen sheet>>=
 if format_type == "screen-sheet":
-    sheet_path = out_base if out_base.suffix == ".tsv" \
-        else Path(f"{output}.tsv")
     sheet_decisions = (
         pending_sheet_decisions(session) if pending
         else screen_sheet_decisions(
@@ -13124,12 +13463,16 @@ A sheet exported without the tier options lists every paper, so the
 counts of an earlier tiered export of the same base name,
 [[BASE-tier.json]], no longer describe the sheet beside them, and a
 reader who found both would quote the wrong selection.  Such a file is
-removed, and the export says so.  It is removed after the staged files
-are in place rather than staged itself: [[staged_outputs]] only moves
-files in, and a removal after its block has completed has the same
-guarantee, since a failed export raises before it, removing nothing.
-Batches left from an earlier, longer export are not removed: that was
-so before tiers and is not about them.
+removed, and the export says so.  The removal is part of the export's
+last step: [[staged_outputs]] takes the names to remove
+([[stale_tiers]]) and removes them only when every staged file has been
+moved into place, undoing the removal with the moves when one fails
+(\cref{sec:staged-outputs}), so a failed export never removes the
+counts while leaving the sheet they describe.  The decision is made
+before the staging, from the file as it is then; that is also where the
+sheet's own path is settled, since the stale file's name derives from
+it.  Batches left from an earlier, longer export are not removed: that
+was so before tiers and is not about them.
 
 The name is ours, but a file of that name need not be: a user may have
 put notes there, or a file of another tool.  So it is removed only when
@@ -13151,24 +13494,31 @@ def is_tier_file(path: Path) -> bool:
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return False
     return isinstance(data, dict) and all(k in data for k in TIER_FILE_KEYS)
-<<remove the tier counts of an earlier sheet>>=
+<<find the tier counts of an earlier sheet>>=
+stale_tier = None
+stale_tiers = []
+if format_type == "screen-sheet":
+    sheet_path = out_base if out_base.suffix == ".tsv" \
+        else Path(f"{output}.tsv")
 if format_type == "screen-sheet" and tier_rule is None:
     stale_tier = sheet_path.parent / (
         sheet_path.name.removesuffix(".tsv") + "-tier.json"
     )
     if stale_tier.is_file() and is_tier_file(stale_tier):
-        stale_tier.unlink()
-        console.print(
-            f"Removed {escape(str(stale_tier))}: the tier counts of an "
-            "earlier export, which this sheet does not follow.",
-            soft_wrap=True,
-        )
-    elif stale_tier.is_file():
-        Console(stderr=True).print(
-            f"[yellow]Left {escape(str(stale_tier))}: it is not tier "
-            "counts scholar wrote, and the sheet does not follow it."
-            "[/yellow]", soft_wrap=True,
-        )
+        stale_tiers.append(stale_tier.name)
+<<say that the tier counts of an earlier sheet were removed>>=
+if stale_tiers:
+    console.print(
+        f"Removed {escape(str(stale_tier))}: the tier counts of an "
+        "earlier export, which this sheet does not follow.",
+        soft_wrap=True,
+    )
+elif stale_tier is not None and stale_tier.is_file():
+    Console(stderr=True).print(
+        f"[yellow]Left {escape(str(stale_tier))}: it is not tier "
+        "counts scholar wrote, and the sheet does not follow it."
+        "[/yellow]", soft_wrap=True,
+    )
 @
 
 Let's verify both: an export without the options removes an earlier
@@ -13380,9 +13730,12 @@ same seed would then draw other papers, so that sample could never be
 recorded.  A recorded draw without a sheet loses nothing: [[sessions
 tier-sample]] lists its papers and [[llm classify --tier-sample]] takes
 them.  So the export saves first, and once it has saved, a failure says
-so: the draw's id, that it is recorded, that the sheet may not have been
-written, and where its papers are listed.  (The files moved before the
-failure stay where they are; the staging moves them one by one.)
+so: the draw's id, that it is recorded, what became of the exported
+files, and where its papers are listed.  The files are moved all or
+nothing as far as the file system allows (\cref{sec:staged-outputs}),
+so the sheet was not written unless putting a file back failed too; in
+that case the message lists what each file holds and leaves the sheet
+to that list.
 
 A save can also be refused: when another process holds the session's
 lock past the wait, [[save_session]] writes nothing to the session,
@@ -13402,15 +13755,120 @@ be run again, and with the same seed and the same pending papers it
 draws the same papers.
 
 <<say that the draw is recorded although the export failed>>=
+sheet_written = (
+    "is in place" if error is None
+    else "was not written" if not getattr(error, "changed", False)
+    else "may be among the files listed above"
+)
 console.print(
-    f"[red]Export failed after the draw was recorded: "
-    f"{escape(type(error).__name__)}: {escape(str(error))}[/red]\n"
+    f"[red]{escape(export_failure_text(error, recorded_draw=True,
+                                       interrupted=interrupted))}"
+    f"[/red]\n"
     f"The draw {escape(rest_draw_saved.sample_id)} is recorded in the "
-    "session, but the screen sheet may not have been written; "
+    f"session, but the screen sheet {sheet_written}; "
     f"`scholar sessions tier-sample {escape(shlex.quote(name))}` lists "
     "its papers.",
     soft_wrap=True,
 )
+@
+
+Let's verify the message against the moves, over the files of an
+earlier export with the same seed (whose draw has another id, so its
+tier file differs from the new one): a directory where the sheet goes
+stops the export before the tier file moves, and a failure to move the
+sheet after the tier file was moved puts the earlier tier file back.
+Either way the earlier files are as they were, the draw is recorded,
+and the message says that the sheet was not written.
+
+<<test functions>>=
+class TestRestSampleSheetMoves:
+  """A failed move after the draw leaves the earlier sheet (#320)."""
+
+  <<rest sample sheet moves test methods>>
+
+<<rest sample sheet moves test methods>>=
+def _earlier_export(self, tmp_path, monkeypatch):
+  sheets = TestRestSampleSheet()
+  sheets._save(tmp_path, monkeypatch)
+  result = sheets._export(tmp_path, "--rest-sample", "3", "--seed", "320")
+  assert result.exit_code == 0, result.output
+  return sheets
+
+def _files(self, tmp_path):
+  return {
+    p.name: "dir" if p.is_dir() else p.read_bytes()
+    for p in tmp_path.iterdir() if p.name.startswith("rest")
+  }
+
+def _check(self, sheets, tmp_path, before, result, rolled_back):
+  assert result.exit_code == 1
+  assert self._files(tmp_path) == before
+  assert not [p for p in tmp_path.iterdir()
+              if p.name.startswith(".scholar-")]
+  first, second = sheets._session().tier_samples
+  text = " ".join(result.output.split())
+  assert ("None of the exported files was written or changed"
+          + ("; the moves were rolled back." if rolled_back else ".")
+          ) in text
+  assert (f"The draw {second.sample_id} is recorded in the session, but "
+          "the screen sheet was not written") in text
+
+def test_a_directory_at_the_sheet(self, tmp_path, monkeypatch):
+  sheets = self._earlier_export(tmp_path, monkeypatch)
+  (tmp_path / "rest.tsv").unlink()
+  (tmp_path / "rest.tsv").mkdir()
+  before = self._files(tmp_path)
+  result = sheets._export(tmp_path, "--rest-sample", "3", "--seed", "320")
+  self._check(sheets, tmp_path, before, result, rolled_back=False)
+  assert "rest.tsv is a directory" in " ".join(result.output.split())
+
+def test_a_failed_move_of_the_sheet(self, tmp_path, monkeypatch):
+  import os
+  from scholar.utils import STAGING_PREFIX
+
+  sheets = self._earlier_export(tmp_path, monkeypatch)
+  before = self._files(tmp_path)
+  real_replace = os.replace
+
+  def failing_move(source, target, *args, **kwargs):
+    if STAGING_PREFIX in str(source) and Path(target).name == "rest.tsv":
+      raise OSError(28, "No space left on device")
+    return real_replace(source, target, *args, **kwargs)
+
+  monkeypatch.setattr(os, "replace", failing_move)
+  result = sheets._export(tmp_path, "--rest-sample", "3", "--seed", "320")
+  self._check(sheets, tmp_path, before, result, rolled_back=True)
+@
+
+When putting the tier file back fails too, the message says that the
+export could not be rolled back, lists the files, and leaves the sheet
+to the list instead of claiming that it was not written.
+
+<<rest sample sheet moves test methods>>=
+def test_a_failed_restore(self, tmp_path, monkeypatch):
+  import os
+  from scholar.utils import KEPT_PREFIX, STAGING_PREFIX
+
+  sheets = self._earlier_export(tmp_path, monkeypatch)
+  real_replace = os.replace
+
+  def failing_move(source, target, *args, **kwargs):
+    if (STAGING_PREFIX in str(source) and Path(target).name == "rest.tsv"
+        or KEPT_PREFIX in str(source)
+        and Path(target).name == "rest-tier.json"):
+      raise OSError(28, "No space left on device")
+    return real_replace(source, target, *args, **kwargs)
+
+  monkeypatch.setattr(os, "replace", failing_move)
+  result = sheets._export(tmp_path, "--rest-sample", "3", "--seed", "320")
+  assert result.exit_code == 1
+  text = " ".join(result.output.split())
+  assert ("Export failed after the draw was recorded and could not be "
+          "rolled back") in text
+  assert f"Holding the new version: {tmp_path / 'rest-tier.json'}" in text
+  assert f"Holding the earlier version: {tmp_path / 'rest.tsv'}" in text
+  assert "the screen sheet may be among the files listed above" in text
+  assert "was not written" not in text
 @
 
 The dry run draws before the staging, prints what a real run would
