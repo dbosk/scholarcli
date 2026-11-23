@@ -112,8 +112,9 @@ from cachetools import cachedmethod
 from scholar.scholar import Paper, SearchFilters, merge_version_of
 from scholar.scholar import filters_key, filter_flags
 from scholar.scholar import hits_label, result_outcome, result_via
-from scholar.scholar import result_order
+from scholar.scholar import result_order, ORDER_RELEVANCE
 from scholar.scholar import parts_returning, result_total, result_dates
+from scholar.scholar import answer_places, places_in_parts
 from scholar.scholar import RANKED_PROVIDERS, is_ranked_provider
 from scholar.notes import (
     get_paper_id, get_query_hash, get_data_dir,
@@ -620,7 +621,89 @@ the same query.  So a resolved link supersedes the unresolved links of
 its query and provider ([[without_superseded_links]]), whenever a link
 is recorded and when a file is read.
 
+A link also knows the paper's place in the answer of its search
+([[rank]], counted from one;
+\url{https://github.com/dbosk/scholarcli/issues/302}), so that a first
+tier of the records can be screened and the rest counted
+(\cref{sec:screening-tier}).  The place is taken from the provider's
+own list before any merging or deduplication
+(\cref{sec:answer-places} in the [[scholar]] module).  It is no part of
+the link's identity: the link still names the record, and two links to
+one record are one link whatever their places.  That decides the
+representation.  A [[SearchLink]] is the key tuple itself, with the
+place as an attribute beside it: it compares and hashes as the key, so
+every place that looks a link up, unites links in a set, maps them
+through a dictionary of replaced keys or compares them with a plain
+tuple works as before, and a list copied with the decision
+([[list(prev.found_by)]]) carries the places along without anyone
+remembering them.  A separate dictionary from key to place would have
+had to be copied, repointed and united by hand everywhere the list is.
+The price is that a key rebuilt from its parts is a plain tuple
+without a place; that happens only where a link is moved to
+\emph{another} record (a legacy or merged record replaced by a newer
+one), and there the place is rightly lost, since it was the place in
+the other record's answer.
+
+When one record is linked twice, by a re-run of its search that found
+the paper elsewhere in the list or by two copies of a decision being
+united, the smaller place is kept ([[smaller_rank]]): the paper did
+stand that high in an answer of that search, and keeping the larger
+would let the order of two saves decide the tier.  A link without a
+place ([[None]]: made before places were kept, by a snowball, or moved
+to another record) never replaces a known one.
+
+A tuple subclass is also rebuilt by code that knows only tuples:
+[[dataclasses.asdict]] calls the type with one iterable of the
+elements.  So the constructor takes the three parts or one iterable of
+them, and the place only by name; such a rebuilt link has no place,
+which is what a plain tuple would have.  Copying and pickling pass the
+place by name too ([[__getnewargs_ex__]]).
+
 <<review data structures>>=
+class SearchLink(tuple):
+    """A `found_by` link, `(query, provider, filters key)`, and a place.
+
+    Compares and hashes as the plain key tuple; `rank` is the paper's
+    1-based place in the search's answer, `None` when unknown. Built
+    from the three parts, or from one iterable of them.
+    """
+
+    def __new__(cls, *parts, rank: int | None = None):
+        if len(parts) == 1:
+            parts = tuple(parts[0])
+        if len(parts) != 3:
+            raise TypeError("a link has a query, a provider and a key")
+        link = super().__new__(cls, parts)
+        link.rank = rank
+        return link
+
+    def __getnewargs_ex__(self):
+        return tuple(self), {"rank": self.rank}
+
+
+def link_rank(link) -> int | None:
+    """The place a `found_by` link records, `None` for a plain key."""
+    return getattr(link, "rank", None)
+
+
+def smaller_rank(a: int | None, b: int | None) -> int | None:
+    """The smaller of two places, a known one over `None`."""
+    if a is None:
+        return b
+    if b is None:
+        return a
+    return min(a, b)
+
+
+def united_links(links) -> list[SearchLink]:
+    """`links` without repeats, in first-seen order, smallest place kept."""
+    held: dict[tuple, int | None] = {}
+    for link in links:
+        key = tuple(link)
+        held[key] = smaller_rank(held.get(key), link_rank(link))
+    return [SearchLink(*key, rank=rank) for key, rank in held.items()]
+
+
 def without_superseded_links(
     links: list[tuple[str, str, str | None]],
 ) -> list[tuple[str, str, str | None]]:
@@ -665,7 +748,9 @@ class ReviewDecision:
             records whose results contained the paper, in the order
             recorded; empty when not recorded (sessions saved before the
             link existed, snowballing). The filters key is `None` for an
-            old link that could not be tied to one record.
+            old link that could not be tied to one record. A link may be
+            a `SearchLink`, which also holds the paper's place in that
+            search's answer (`link_rank`).
         same_id_copies: Other works a search returned under this
             paper's DOI-less id, with years too far apart to be the same
             work (`{"year", "venue", "provider"}` each); see
@@ -811,17 +896,30 @@ class ReviewDecision:
         )
 
     def record_search(
-        self, query: str, provider: str, key: str | None
+        self, query: str, provider: str, key: str | None,
+        rank: int | None = None,
     ) -> None:
         """Note that the search `(query, provider, key)` returned this paper.
 
         `key` is the `filters_key` of the search's filters, or `None` for
-        an old link that names no filters.
+        an old link that names no filters. `rank` is the paper's place in
+        the search's answer, if known; a link held already keeps the
+        smaller place.
         """
-        if (query, provider, key) not in self.found_by:
-            self.found_by = without_superseded_links(
-                self.found_by + [(query, provider, key)]
-            )
+        link = (query, provider, key)
+        for index, held in enumerate(self.found_by):
+            if held == link:
+                kept = smaller_rank(link_rank(held), rank)
+                if kept != link_rank(held):
+                    self.found_by[index] = SearchLink(*link, rank=kept)
+                return
+        self.found_by = without_superseded_links(
+            self.found_by + [SearchLink(*link, rank=rank)]
+        )
+
+    def record_link(self, link: tuple) -> None:
+        """Note the `found_by` link `link`, with its place if it has one."""
+        self.record_search(*link, rank=link_rank(link))
 
     @property
     def is_decided(self) -> bool:
@@ -6494,7 +6592,7 @@ def supersede_merged_records(session: "ReviewSession") -> None:
             if not any(link in cover_keys for link in links):
                 links += cover_keys
             decision.found_by = without_superseded_links(
-                list(dict.fromkeys(links))
+                united_links(links)
             )
 @
 
@@ -8569,9 +8667,9 @@ if record.is_legacy:
 <<point links at the records that replaced theirs>>=
 if replaced_links:
     for decision in session.decisions:
-        decision.found_by = without_superseded_links(list(dict.fromkeys(
+        decision.found_by = without_superseded_links(united_links(
             replaced_links.get(link, link) for link in decision.found_by
-        )))
+        ))
 @
 
 Let's verify both halves: a failed search is recorded as failed, with
@@ -9483,6 +9581,16 @@ treated so too.  Should a merged result's [[found_in]] not fit its
 papers---code that filtered the papers after merging---the links are
 computed again from the papers themselves.
 
+Each link carries the paper's place in its part's answer
+(\cref{sec:answer-places} in the [[scholar]] module): for a result that
+is its own part, the place of each of its papers ([[place_of]]: the
+list order, or the first occurrence after deduplication); for a merged
+one, the places the merge took in [[found_at]], beside [[found_in]].
+Where those had to be computed again, the places are too, from the
+parts' own lists, which the merge kept unchanged.  A stand-in without
+these fields (a [[Mock]]) gives the list order, as a provider's list
+does.
+
 <<review session functions>>=
 def search_parts_of(result) -> list:
     """The single-provider searches of a `SearchResult`-like object."""
@@ -9492,21 +9600,43 @@ def search_parts_of(result) -> list:
     return [result]
 
 
-def paper_search_links(result) -> list[list[tuple[str, str, str]]]:
-    """For each paper of `result`, the keys of the searches that returned it.
+def paper_search_links(result) -> list[list[SearchLink]]:
+    """For each paper of `result`, the links to the searches that returned it.
 
-    A key is `(query, provider, filters key)` of one part of the result
-    (see `search_parts_of`); a result that is not a merge links every
-    paper to itself.
+    A link is `(query, provider, filters key)` of one part of the result
+    (see `search_parts_of`) with the paper's place in that part's
+    answer; a result that is not a merge links every paper to itself.
     """
     parts = search_parts_of(result)
     keys = [(p.query, p.provider, filters_key(p.filters)) for p in parts]
     if len(parts) == 1:
-        return [[keys[0]] for _ in result.papers]
+        places = own_answer_places(result, parts[0])
+        return [[SearchLink(*keys[0], rank=rank)] for rank in places]
     found_in = getattr(result, "found_in", None)
+    found_at = getattr(result, "found_at", None)
     if not isinstance(found_in, list) or len(found_in) != len(result.papers):
         found_in = parts_returning(result.papers, parts)
-    return [[keys[i] for i in indices] for indices in found_in]
+        found_at = None
+    if not isinstance(found_at, list) or [len(a) for a in found_at] != [
+        len(i) for i in found_in
+    ]:
+        found_at = places_in_parts(result.papers, parts, found_in)
+    return [
+        [SearchLink(*keys[i], rank=rank) for i, rank in zip(indices, at)]
+        for indices, at in zip(found_in, found_at)
+    ]
+
+
+def own_answer_places(result, part) -> list[int | None]:
+    """The place of each paper of `result` in the answer `part`."""
+    if part is not result:
+        return answer_places(result.papers, part)
+    place_of = getattr(result, "place_of", None)
+    if not callable(place_of) or not isinstance(
+        getattr(result, "places", None), list
+    ):
+        return list(range(1, len(result.papers) + 1))
+    return [place_of(index) for index in range(len(result.papers))]
 @
 
 <<convert search results to decisions>>=
@@ -9548,7 +9678,7 @@ for result in results:
                 target.provider, found_by_provider
             )
             for link in links:
-                target.record_search(*link)
+                target.record_link(link)
             continue
 
         existing = decision_lookup.get(paper_id)
@@ -9564,7 +9694,7 @@ for result in results:
                 existing.provider, found_by_provider
             )
             for link in links:
-                existing.record_search(*link)
+                existing.record_link(link)
             continue
 
         renamed = renamed_lookup.pop(paper_id, None)
@@ -9580,7 +9710,7 @@ for result in results:
             decision_lookup.pop(old_id, None)
             decision_lookup[paper_id] = renamed
             for link in links:
-                renamed.record_search(*link)
+                renamed.record_link(link)
             continue
 
         adopted = provenance_lookup.get(paper_id)
@@ -9590,7 +9720,7 @@ for result in results:
                 adopted.provider, found_by_provider
             )
             for link in links:
-                adopted.record_search(*link)
+                adopted.record_link(link)
             continue
 
         replaced = None
@@ -9608,7 +9738,7 @@ for result in results:
             decision_lookup[paper_id] = replaced
             provenance_lookup[old_id] = replaced
             for link in links:
-                replaced.record_search(*link)
+                replaced.record_link(link)
             continue
 
         # Check for previous decision (prefer session data over notes)
@@ -9663,7 +9793,7 @@ for result in results:
 
 
         for link in links:
-            decision.record_search(*link)
+            decision.record_link(link)
         session.decisions.append(decision)
         decision_lookup[paper_id] = decision
 
@@ -10708,7 +10838,7 @@ survivor.abstract_lookup = with_doi.abstract_lookup
 for record in absorbed.abstract_fetched:
     survivor.add_fetched_abstract(record)
 for link in absorbed.found_by:
-    survivor.record_search(*link)
+    survivor.record_link(link)
 for copy in absorbed.same_id_copies:
     survivor.add_same_id_copy(copy)
 unite_screenings(survivor, absorbed.screenings)
@@ -10964,7 +11094,7 @@ target.abstract_set = abstract_records_after_fold(target.paper, before_fold)
 for record in decision.abstract_fetched:
     target.add_fetched_abstract(record)
 for link in decision.found_by:
-    target.record_search(*link)
+    target.record_link(link)
 for copy in decision.same_id_copies:
     target.add_same_id_copy(copy)
 target.provider = united_providers(target.provider, decision.provider)
@@ -13116,18 +13246,256 @@ def _found_by_link_data(link: tuple[str, str, str | None]) -> dict:
     data = {"query": query, "provider": provider}
     if key is not None:
         data["filters"] = key
+    if link_rank(link) is not None:
+        data["rank"] = link_rank(link)
     return data
 
 
 def _load_found_by_link(
     session: ReviewSession, data: dict
-) -> tuple[str, str, str | None]:
+) -> SearchLink:
     """Read one `found_by` link, resolving an old one if it is certain."""
     query, provider = data["query"], data["provider"]
+    rank = stored_rank(data.get("rank"))
     if "filters" in data:
-        return (query, provider, data["filters"])
+        return SearchLink(query, provider, data["filters"], rank=rank)
     record = session.search_record(query, provider)
-    return (query, provider, record.key[2] if record else None)
+    return SearchLink(query, provider, record.key[2] if record else None,
+                      rank=rank)
+
+
+def stored_rank(value) -> int | None:
+    """A stored place as a place: a whole number from 1, else `None`."""
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 1:
+        return value
+    return None
+@
+
+A link's place is saved as [[rank]] in the link's object, and only when
+known, so a file without places reads as before and a link without one
+is written as before.  A stored place that is not a whole number from
+one is read as unknown rather than trusted ([[stored_rank]]): it is a
+hand-editable file.  A Scholar from before places reads a link through
+the two keys and the filters above and ignores any other key of the
+object, so it loads such a file and drops the places on its next save,
+as it does with the other fields it does not know.
+
+Let's verify that each link gets the paper's place in its own answer
+and keeps it through what happens to links: a merge of two providers,
+a deduplicated answer, saving and loading, a second query, a re-run of
+the same search (the smaller place stays), saves of two processes at
+once in both orders, and a fold of two copies; and that a link from an
+older file loads without a place.
+
+<<test functions>>=
+class TestLinkPlaces:
+  """Each `found_by` link keeps the paper's place in its answer (#302)."""
+
+  <<link place test methods>>
+
+<<link place test methods>>=
+def _paper(self, name, doi=True):
+  return Paper(title=f"Paper {name}", authors=["Ada Lovelace"],
+               year=2021, doi=f"10.5555/place-{name}" if doi else None)
+
+def _answer(self, provider, papers, query="q"):
+  from scholar.scholar import SearchResult
+
+  return SearchResult(query=query, provider=provider, timestamp="t",
+                      papers=papers, limit=10, order="relevance")
+
+def _reload(self, name):
+  from scholar.scholar import isolated_registry
+
+  with isolated_registry():
+    return self._places(load_session(name))
+
+def _places(self, session):
+  return {
+    d.paper.title: sorted((link[0], link[1], link_rank(link))
+                          for link in d.found_by)
+    for d in session.decisions
+  }
+
+def test_a_link_is_its_key_and_survives_copies(self):
+  import copy
+  import pickle
+  from dataclasses import asdict
+
+  link = SearchLink("q", "openalex", "", rank=4)
+  assert link == ("q", "openalex", "") and hash(link) == hash(tuple(link))
+  for copied in (copy.deepcopy(link), pickle.loads(pickle.dumps(link))):
+    assert (copied, link_rank(copied)) == (link, 4)
+  decision = ReviewDecision(paper=self._paper("x"), provider="openalex",
+                            found_by=[link])
+  assert asdict(decision)["found_by"] == [("q", "openalex", "")]
+
+def test_a_merged_search_links_each_part_with_its_place(
+  self, tmp_path, monkeypatch,
+):
+  monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+  a, b, c = (self._paper(n) for n in "abc")
+  merged = self._answer("openalex", [a, b, c]).merge(
+    self._answer("dblp", [self._paper("c"), self._paper("a")])
+  )
+  session = create_review_session([merged], "q", session_name="pl-merge")
+  assert self._places(session) == {
+    "Paper a": [("q", "dblp", 2), ("q", "openalex", 1)],
+    "Paper b": [("q", "openalex", 2)],
+    "Paper c": [("q", "dblp", 1), ("q", "openalex", 3)],
+  }
+
+def test_a_deduplicated_answer_keeps_the_first_places(
+  self, tmp_path, monkeypatch,
+):
+  monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+  answer = self._answer("openalex", [
+    self._paper("a"), self._paper("b"), self._paper("a"), self._paper("c"),
+  ]).deduplicate()
+  session = create_review_session([answer], "q", session_name="pl-dedup")
+  assert self._places(session) == {
+    "Paper a": [("q", "openalex", 1)],
+    "Paper b": [("q", "openalex", 2)],
+    "Paper c": [("q", "openalex", 4)],
+  }
+
+def test_places_are_saved_and_loaded(self, tmp_path, monkeypatch):
+  import json
+  from scholar.review import _get_sessions_dir
+
+  monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+  answer = self._answer("openalex", [self._paper("a"), self._paper("b")])
+  session = create_review_session([answer], "q", session_name="pl-save")
+  save_session(session)
+  saved = json.loads((_get_sessions_dir() / "pl-save.json").read_text())
+  assert [d["found_by"] for d in saved["decisions"]] == [
+    [{"query": "q", "provider": "openalex", "filters": "", "rank": 1}],
+    [{"query": "q", "provider": "openalex", "filters": "", "rank": 2}],
+  ]
+  assert self._reload("pl-save") == {
+    "Paper a": [("q", "openalex", 1)],
+    "Paper b": [("q", "openalex", 2)],
+  }
+
+def test_a_link_from_an_older_file_has_no_place(
+  self, tmp_path, monkeypatch,
+):
+  import json
+  from scholar.review import _get_sessions_dir
+
+  monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+  answer = self._answer("openalex", [self._paper("a"), self._paper("b")])
+  save_session(create_review_session([answer], "q",
+                                     session_name="pl-old"))
+  path = _get_sessions_dir() / "pl-old.json"
+  data = json.loads(path.read_text())
+  del data["decisions"][0]["found_by"][0]["rank"]
+  data["decisions"][1]["found_by"][0]["rank"] = "2"
+  path.write_text(json.dumps(data))
+  assert self._reload("pl-old") == {
+    "Paper a": [("q", "openalex", None)],
+    "Paper b": [("q", "openalex", None)],
+  }
+
+def test_a_second_query_adds_its_own_places(self, tmp_path, monkeypatch):
+  monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+  first = self._answer("openalex", [self._paper("a"), self._paper("b")],
+                       query="q1")
+  save_session(create_review_session([first], "q1", session_name="pl-two"))
+  second = self._answer("openalex", [self._paper("b"), self._paper("a")],
+                        query="q2")
+  session = create_review_session([second], "q2", session_name="pl-two")
+  assert self._places(session) == {
+    "Paper a": [("q1", "openalex", 1), ("q2", "openalex", 2)],
+    "Paper b": [("q1", "openalex", 2), ("q2", "openalex", 1)],
+  }
+
+def test_a_rerun_of_the_same_search_keeps_the_smaller_place(
+  self, tmp_path, monkeypatch,
+):
+  monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+  first = self._answer("openalex", [self._paper("a"), self._paper("b")])
+  save_session(create_review_session([first], "q", session_name="pl-re"))
+  again = self._answer("openalex", [
+    self._paper("c"), self._paper("b"), self._paper("a"),
+  ])
+  session = create_review_session([again], "q", session_name="pl-re")
+  assert self._places(session) == {
+    "Paper a": [("q", "openalex", 1)],
+    "Paper b": [("q", "openalex", 2)],
+    "Paper c": [("q", "openalex", 1)],
+  }
+
+def test_a_fold_keeps_the_absorbed_copys_places(
+  self, tmp_path, monkeypatch,
+):
+  monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+  bare = ReviewDecision(paper=self._paper("f", doi=False), provider="dblp")
+  bare.record_search("q", "dblp", "", 3)
+  twin = ReviewDecision(paper=self._paper("f"), provider="openalex, dblp",
+                        status=DecisionStatus.KEPT, tags=["t"])
+  twin.record_search("q", "openalex", "", 1)
+  twin.record_search("q", "dblp", "", 5)
+  session = ReviewSession(query="q", providers=["openalex", "dblp"],
+                          timestamp=datetime(2026, 11, 23))
+  session.decisions = [bare, twin]
+  assert reconcile_copies(session) != []
+  assert self._places(session) == {
+    "Paper f": [("q", "dblp", 3), ("q", "openalex", 1)],
+  }
+
+RACE = """
+  from scholar.review import load_session, save_session
+  session = load_session("pl-race")
+  WAIT
+  decision = session.decisions[0]
+  for query, rank in LINKS:
+    decision.record_search(query, "openalex", "", rank)
+  save_session(session)
+"""
+WAIT = 'import sys; print("loaded", flush=True); sys.stdin.readline()'
+
+def _code(self, links, wait):
+  import textwrap
+
+  return textwrap.dedent(self.RACE).replace(
+    "WAIT", self.WAIT if wait else "").replace("LINKS", repr(links))
+
+def _race(self, stale, other):
+  """`stale` loads and waits; `other` runs whole; then `stale` saves."""
+  import subprocess
+  import sys
+
+  decision = ReviewDecision(paper=self._paper("r"), provider="openalex")
+  decision.record_search("q", "openalex", "")
+  save_session(ReviewSession(
+    query="q", providers=["openalex"], timestamp=datetime(2026, 11, 23),
+    name="pl-race", decisions=[decision],
+  ))
+  first = subprocess.Popen(
+    [sys.executable, "-c", self._code(stale, wait=True)],
+    stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+  )
+  try:
+    assert first.stdout.readline().strip() == "loaded"
+    subprocess.run([sys.executable, "-c", self._code(other, wait=False)],
+                   check=True, timeout=120)
+    first.communicate("go\n", timeout=120)
+  finally:
+    if first.poll() is None:
+      first.kill()
+  assert first.returncode == 0
+  return self._reload("pl-race")
+
+EARLY_RUN = [("q", 7), ("q2", 4)]
+LATE_RUN = [("q", 2)]
+UNITED = {"Paper r": [("q", "openalex", 2), ("q2", "openalex", 4)]}
+
+def test_concurrent_saves_keep_the_smaller_place(self):
+  assert self._race(self.EARLY_RUN, self.LATE_RUN) == self.UNITED
+
+def test_concurrent_saves_in_the_other_order(self):
+  assert self._race(self.LATE_RUN, self.EARLY_RUN) == self.UNITED
 @
 
 The test makes the race happen on purpose.  Process~A's merge starts
@@ -13710,7 +14078,7 @@ def merge_concurrent_changes(
             )
             <<settle the abstract against the file's hand records>>
             for link in theirs.found_by:
-                decision.record_search(*replaced.get(link, link))
+                decision.record_link(replaced.get(link, link))
             for copy in theirs.same_id_copies:
                 decision.add_same_id_copy(copy)
             for record in theirs.relabelled:
@@ -14177,9 +14545,9 @@ for record in list(session.search_records):
     replaced[record.key] = successor.key
 for decision in session.decisions:
     if any(link in replaced for link in decision.found_by):
-        decision.found_by = without_superseded_links(list(dict.fromkeys(
+        decision.found_by = without_superseded_links(united_links(
             replaced.get(link, link) for link in decision.found_by
-        )))
+        ))
 <<merge research context from disk>>=
 theirs_context = on_disk.research_context
 if base is not None:
@@ -18728,6 +19096,458 @@ class TestFilterDecisions:
         filters = SearchFilters(year="2025-")
         result = filter_decisions(sample_decisions, filters)
         assert result == []
+@
+
+
+\section{Selecting a screening tier}
+\label{sec:screening-tier}
+
+A large review cannot screen every record with the same care.  The rule
+this section serves
+(\url{https://github.com/dbosk/scholarcli/issues/302}) screens a first
+tier and counts the rest: the first [[K]] records of each answer that a
+source ranked by relevance, plus the records that several providers
+returned.  The issue reports the measurement behind it, on the author's
+own sessions: in relevance-ordered answers the records bearing on a
+claim sat near the top, and a work that four providers returned bore on
+it more often than one that a single provider returned.  Scholar does
+not decide whether the rule is right for a review; it makes the tier
+selectable and says exactly what was left out, so that a method can
+state \enquote{screened [[N]] of [[M]] returned, by this rule}.
+
+The tier is read from the links (\cref{sec:review-found-by}).  Each
+link names a search record and, for links made since places were kept,
+the paper's place in that record's answer ([[link_rank]]).  Three
+conditions select a paper; a rule gives any of them, and a paper is in
+the tier when it meets at least one:
+\begin{description}
+\item[A place] ([[top]]) The paper stood at place [[top]] or better in
+  the answer of a record whose [[order]] is [[relevance]]
+  (\cref{sec:search-result-order} in the [[scholar]] module).  A place
+  in a newest-first or unordered answer says nothing about relevance,
+  so it never selects: the first record of a date-ordered answer is
+  merely the newest.
+\item[Several providers] ([[min_providers]]) Records of at least that
+  many different providers returned the paper.
+\item[A provider] ([[providers]], optionally narrowed by
+  [[query_like]]) A record of one of these providers returned the
+  paper, of a query holding the text (any case).  The same rule screens
+  everything that Scopus and Web of Science returned for a
+  counter-query, and Scholar cannot know which query is one; this
+  condition lets the screener say so.
+\end{description}
+Only current records count (\cref{sec:retired-searches}): a retired
+search is one the review no longer stands by, so it should neither put
+a paper in the tier nor be named in the counts.  A merged record from
+before searches were recorded per provider
+(\cref{sec:search-result-parts} in the [[scholar]] module) does not say which of its providers
+returned a paper, so it counts for none of them, and its links carry no
+place.  An old link that names no filters counts for its record when
+the session has exactly one record of its query and provider, as
+[[search_record]] resolves it.
+
+A paper may lack a place for two reasons, and the counts keep them
+apart because they call for different remedies: \emph{place unknown}
+(no link with a place, as for every link made before places were
+kept---running the search again records them) and \emph{placed only
+outside a relevance order} (its places are in answers ordered by date,
+by citations or not at all).  Neither is selected by [[top]].
+
+<<review filtering functions>>=
+@dataclass(frozen=True)
+class TierRule:
+    """What puts a paper in the screening tier; any condition suffices.
+
+    `top`: a place at most this in a relevance-ordered answer;
+    `min_providers`: returned by records of at least this many
+    providers; `providers` (with `query_like`, a part of the query, any
+    case): returned by a record of one of these providers.
+    """
+
+    top: int | None = None
+    min_providers: int | None = None
+    providers: tuple[str, ...] = ()
+    query_like: str | None = None
+
+    def conditions(self) -> list[str]:
+        """The names of the conditions this rule gives, in a fixed order."""
+        given = {
+            "top": self.top is not None,
+            "min_providers": self.min_providers is not None,
+            "provider": bool(self.providers),
+        }
+        return [name for name in TIER_CONDITIONS if given[name]]
+
+    def data(self) -> dict:
+        """The rule as JSON data."""
+        return {
+            "top": self.top,
+            "min_providers": self.min_providers,
+            "providers": list(self.providers),
+            "query_like": self.query_like,
+        }
+<<review constants>>=
+TIER_CONDITIONS = ("top", "min_providers", "provider")
+@
+
+The records a decision's links name are looked up once per session, in
+a [[LinkedRecords]], since every paper's links are read and a session
+holds thousands of decisions.
+
+<<review filtering functions>>=
+class LinkedRecords:
+    """The current search record each `found_by` link names."""
+
+    def __init__(self, session: "ReviewSession"):
+        self.session = session
+        self.by_key = {
+            record.key: record
+            for record in current_records(session.search_records)
+        }
+
+    def record_of(self, link) -> "SearchRecord | None":
+        """The current record `link` names, `None` if none or retired."""
+        query, provider, key = link
+        if key is not None:
+            return self.by_key.get((query, provider, key))
+        record = self.session.search_record(query, provider)
+        return record if record is not None and record.retired is None \
+            else None
+
+
+def relevance_place(
+    decision: ReviewDecision, records: LinkedRecords
+) -> int | None:
+    """The paper's best place in a current relevance-ordered answer."""
+    places = [
+        link_rank(link) for link in decision.found_by
+        if link_rank(link) is not None
+        and getattr(records.record_of(link), "order", None)
+        == ORDER_RELEVANCE
+    ]
+    return min(places) if places else None
+
+
+def returning_providers(
+    decision: ReviewDecision, records: LinkedRecords
+) -> set[str]:
+    """The providers of the current, single-provider records linked."""
+    found = set()
+    for link in decision.found_by:
+        record = records.record_of(link)
+        if record is not None and not record.is_merged:
+            found.add(record.provider)
+    return found
+
+
+def has_place(decision: ReviewDecision, records: LinkedRecords) -> bool:
+    """Whether a link to a current record holds the paper's place."""
+    return any(
+        link_rank(link) is not None and records.record_of(link) is not None
+        for link in decision.found_by
+    )
+@
+
+[[screening_tier]] applies a rule to a list of decisions (the sheet's
+papers, or the pending ones a classifier would take) and keeps their
+order.  Its counts are built so that they add up, which is what a
+method section needs: every paper is either selected or not; a selected
+paper meets one condition only (counted under it) or several (counted
+once, under \enquote{more than one}); and the papers that meet each
+condition are given too, overlapping.  The two kinds of missing place
+are counted over all the papers, selected or not, since a paper without
+a place may still be selected by its providers.
+
+<<review filtering functions>>=
+@dataclass
+class TierSelection:
+    """The papers a `TierRule` selects from a list, and the counts."""
+
+    rule: TierRule
+    decisions: list
+    total: int
+    met: dict[str, int]
+    only: dict[str, int]
+    several: int
+    place_unknown: int
+    no_relevance_place: int
+
+    @property
+    def not_selected(self) -> int:
+        """How many papers the rule leaves out."""
+        return self.total - len(self.decisions)
+
+    def data(self) -> dict:
+        """The rule and the counts as JSON data."""
+        return {
+            "rule": self.rule.data(),
+            "total": self.total,
+            "selected": len(self.decisions),
+            "not_selected": self.not_selected,
+            "met": dict(self.met),
+            "only": dict(self.only),
+            "more_than_one": self.several,
+            "place_unknown": self.place_unknown,
+            "placed_only_outside_relevance_order": self.no_relevance_place,
+        }
+
+
+def screening_tier(
+    decisions: list, session: "ReviewSession", rule: TierRule
+) -> TierSelection:
+    """The decisions that meet at least one condition of `rule`."""
+    records = LinkedRecords(session)
+    conditions = rule.conditions()
+    wanted = {p.casefold() for p in rule.providers}
+    like = (rule.query_like or "").casefold()
+    selected, several = [], 0
+    met = dict.fromkeys(conditions, 0)
+    only = dict.fromkeys(conditions, 0)
+    place_unknown = no_relevance_place = 0
+    for decision in decisions:
+        place = relevance_place(decision, records)
+        <<count the papers without a relevance place>>
+        <<find the conditions [[decision]] meets>>
+        for name in meets:
+            met[name] += 1
+        if len(meets) == 1:
+            only[meets[0]] += 1
+        elif meets:
+            several += 1
+        if meets:
+            selected.append(decision)
+    return TierSelection(rule, selected, len(decisions), met, only,
+                         several, place_unknown, no_relevance_place)
+<<count the papers without a relevance place>>=
+if place is None:
+    if has_place(decision, records):
+        no_relevance_place += 1
+    else:
+        place_unknown += 1
+<<find the conditions [[decision]] meets>>=
+meets = []
+if rule.top is not None and place is not None and place <= rule.top:
+    meets.append("top")
+if rule.min_providers is not None and len(
+    returning_providers(decision, records)
+) >= rule.min_providers:
+    meets.append("min_providers")
+if wanted and any(
+    record is not None and not record.is_merged
+    and record.provider.casefold() in wanted
+    and like in record.query.casefold()
+    for record in map(records.record_of, decision.found_by)
+):
+    meets.append("provider")
+@
+
+The counts are printed by the commands that select a tier, in the same
+words everywhere ([[tier_lines]]).  [[noun]] names what the papers are
+(\enquote{pending papers}, \enquote{papers}), and the rule is spelled
+as the options that gave it, so a line can be quoted with its command.
+
+<<review filtering functions>>=
+def tier_lines(tier: TierSelection, noun: str = "papers") -> list[str]:
+    """The tier's counts as lines of text, the selection first."""
+    rule = tier.rule
+    labels = {
+        "top": f"--top {rule.top} (a place at most {rule.top} in a "
+               "relevance-ordered answer)",
+        "min_providers": f"--min-providers {rule.min_providers} "
+                         f"(returned by at least {rule.min_providers} "
+                         "providers)",
+        "provider": "--provider " + ", ".join(rule.providers) + (
+            f" --query-like {rule.query_like!r}"
+            if rule.query_like else ""
+        ),
+    }
+    lines = [
+        f"Tier: {len(tier.decisions)} of {tier.total} {noun} selected, "
+        f"{tier.not_selected} not selected."
+    ]
+    for name in rule.conditions():
+        lines.append(
+            f"  {labels[name]}: {tier.met[name]} "
+            f"({tier.only[name]} by this condition alone)"
+        )
+    if len(rule.conditions()) > 1:
+        lines.append(f"  by more than one condition: {tier.several}")
+    lines.append(
+        f"  place unknown (no place recorded): {tier.place_unknown}; "
+        "placed only in answers not ordered by relevance: "
+        f"{tier.no_relevance_place}"
+    )
+    return lines
+@
+
+To plan a screen, a user needs two numbers before choosing a rule: how
+many pending papers a place cut would select and how many several
+providers would.  [[sessions show]] prints them in one line
+([[tier_overview_line]]) for one place and one number of providers,
+[[TIER_SHOW_TOP]] and [[TIER_SHOW_PROVIDERS]], named once here.  The
+line appears only when some link holds a place, so a session from
+before places were kept shows what it always showed.
+
+<<review constants>>=
+TIER_SHOW_TOP = 100
+TIER_SHOW_PROVIDERS = 3
+<<review filtering functions>>=
+def tier_overview_line(session: "ReviewSession") -> str | None:
+    """How many pending papers a place cut and a provider count select.
+
+    `None` when no link of the session holds a place.
+    """
+    if not any(
+        link_rank(link) is not None
+        for decision in session.decisions for link in decision.found_by
+    ):
+        return None
+    records = LinkedRecords(session)
+    pending = [d for d in session.decisions if not d.is_decided]
+    places = [relevance_place(d, records) for d in pending]
+    within = sum(1 for p in places if p is not None and p <= TIER_SHOW_TOP)
+    several = sum(
+        1 for d in pending
+        if len(returning_providers(d, records)) >= TIER_SHOW_PROVIDERS
+    )
+    return (
+        f"Screening tier: of {len(pending)} pending papers, {within} "
+        f"within the first {TIER_SHOW_TOP} places of a relevance-ordered "
+        f"answer, {several} returned by {TIER_SHOW_PROVIDERS} or more "
+        "providers."
+    )
+@
+
+[[sessions show -f json]] gives each link's place where one is known
+([[link_places_data]]): the link as the session file stores it, with
+[[rank]].  A decision without places gets no key, so the JSON of a
+session from before places were kept is unchanged.
+
+<<review filtering functions>>=
+def link_places_data(decision: ReviewDecision) -> list[dict]:
+    """The links of `decision` that hold a place, as stored."""
+    return [
+        _found_by_link_data(link) for link in decision.found_by
+        if link_rank(link) is not None
+    ]
+@
+
+Let's verify the selection on an invented session: two relevance
+answers and one newest-first answer, three providers, a retired search
+and an old link without a place.  The first place of the date-ordered
+answer does not select, the retired record's provider does not count,
+the old link is \enquote{place unknown}, and the counts add up to the
+papers given.
+
+<<test functions>>=
+class TestScreeningTier:
+  """A tier selected by place and by providers (#302)."""
+
+  <<screening tier test methods>>
+
+<<screening tier test methods>>=
+def _session(self):
+  records = [
+    SearchRecord(query="q", provider="openalex", filters={}, limit=50,
+                 hits=50, order="relevance"),
+    SearchRecord(query="q", provider="arxiv", filters={}, limit=50,
+                 hits=50, order="relevance"),
+    SearchRecord(query="q", provider="scopus", filters={}, limit=50,
+                 hits=50, order="date"),
+    SearchRecord(query="counter q", provider="scopus", filters={},
+                 limit=50, hits=50, order="date"),
+    SearchRecord(query="old", provider="dblp", filters={}, limit=50,
+                 hits=50, retired={"at": "2026-11-23", "by": None,
+                                   "note": None}),
+  ]
+  def decision(name, *links):
+    d = ReviewDecision(
+      paper=Paper(title=name, authors=["Ada Lovelace"],
+                  doi=f"10.5555/tier-{name}"),
+      provider="openalex",
+    )
+    for query, provider, rank in links:
+      d.record_search(query, provider, "", rank)
+    return d
+  decisions = [
+    decision("top", ("q", "openalex", 3)),
+    decision("deep", ("q", "openalex", 80), ("q", "arxiv", 90)),
+    decision("newest", ("q", "scopus", 1)),
+    decision("three", ("q", "openalex", 200), ("q", "arxiv", 300),
+             ("q", "scopus", 5)),
+    decision("retired", ("q", "openalex", 400), ("q", "arxiv", 500),
+             ("old", "dblp", 1)),
+    decision("old link", ("q", "openalex", None)),
+    decision("counter", ("counter q", "scopus", 44)),
+  ]
+  session = ReviewSession(query="q", providers=["openalex"],
+                          timestamp=datetime(2026, 11, 23),
+                          search_records=records)
+  session.decisions = decisions
+  return session
+
+def _titles(self, tier):
+  return [d.paper.title for d in tier.decisions]
+
+def test_top_reads_only_relevance_ordered_answers(self):
+  session = self._session()
+  tier = screening_tier(session.decisions, session, TierRule(top=10))
+  assert self._titles(tier) == ["top"]
+  assert (tier.place_unknown, tier.no_relevance_place) == (1, 2)
+
+def test_min_providers_counts_only_current_records(self):
+  session = self._session()
+  tier = screening_tier(session.decisions, session,
+                        TierRule(min_providers=3))
+  assert self._titles(tier) == ["three"]
+
+def test_a_provider_and_a_query_part(self):
+  session = self._session()
+  tier = screening_tier(session.decisions, session, TierRule(
+    providers=("Scopus",), query_like="COUNTER"))
+  assert self._titles(tier) == ["counter"]
+
+def test_the_counts_add_up(self):
+  session = self._session()
+  tier = screening_tier(session.decisions, session,
+                        TierRule(top=100, min_providers=2))
+  assert self._titles(tier) == ["top", "deep", "three", "retired"]
+  assert tier.met == {"top": 2, "min_providers": 3}
+  assert tier.only == {"top": 1, "min_providers": 2}
+  assert tier.several == 1
+  assert sum(tier.only.values()) + tier.several == len(tier.decisions)
+  assert len(tier.decisions) + tier.not_selected == 7
+  assert tier_lines(tier, "pending papers")[0] \
+    == "Tier: 4 of 7 pending papers selected, 3 not selected."
+
+def test_the_overview_counts_pending_papers(self):
+  session = self._session()
+  session.decisions[0].status = DecisionStatus.KEPT
+  assert tier_overview_line(session) == (
+    "Screening tier: of 6 pending papers, 1 within the first 100 "
+    "places of a relevance-ordered answer, 1 returned by 3 or more "
+    "providers."
+  )
+
+def test_the_csv_gives_the_two_numbers(self, tmp_path):
+  import csv
+
+  session = self._session()
+  generate_csv_report(session, tmp_path / "r.csv", spreadsheet_safe=True)
+  with open(tmp_path / "r.csv", newline="", encoding="utf-8") as f:
+    rows = list(csv.DictReader(f))
+  assert [(r["title"], r["best_rank"], r["providers_count"])
+          for r in rows] == [
+    ("top", "3", "1"), ("deep", "80", "2"), ("newest", "", "1"),
+    ("three", "200", "3"), ("retired", "400", "2"), ("old link", "", "1"),
+    ("counter", "", "1"),
+  ]
+
+def test_no_overview_without_places(self):
+  session = self._session()
+  for decision in session.decisions:
+    decision.found_by = [tuple(link) for link in decision.found_by]
+  assert tier_overview_line(session) is None
 @
 
 
@@ -30918,6 +31738,15 @@ side by side, and a reader must tell them apart.  The truncation flag
 is written [[true]] or [[false]]: under the [[value or ""]] rule of the
 agent's columns [[False]] would become an empty cell, and an empty cell
 here means that the flag was never recorded.
+[[best_rank]] and [[providers_count]] follow [[provider]], since they
+say more about the searches that returned the paper: the paper's best
+place in a relevance-ordered answer of a current search
+([[relevance_place]], empty when none is known) and the number of
+providers whose current searches returned it ([[returning_providers]]),
+the two numbers a screening tier is selected by
+(\cref{sec:screening-tier}).  A spreadsheet can then sort and filter by
+them, as a tier would.  Both are numbers, and the spreadsheet-safe
+writer treats them as such.
 [[abstract_from]] says where each abstract given by hand was found
 (\cref{sec:set-abstract}), as [[from time]] (with [[by NAME]]),
 separated by semicolons, so that a spreadsheet that reads the
@@ -30941,6 +31770,9 @@ def generate_csv_report(
     - tags: semicolon-separated list of themes/motivations
     - abstract: full abstract text
     - provider: search provider that returned the paper
+    - best_rank: the paper's best place in a relevance-ordered answer
+      of a current search, empty when none is known
+    - providers_count: how many providers' current searches returned it
     - decision_source: where the keep/discard decision originated
     - llm_confidence: 0.0-1.0 confidence for LLM decisions (if available)
     - llm_review_outcome: human/unreviewed/confirmed/changed (for LLM
@@ -30996,6 +31828,7 @@ def generate_csv_report(
             return "discarded->kept"
         return ""
 
+    records = LinkedRecords(session)
     with open(output_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         if spreadsheet_safe:
@@ -31014,6 +31847,8 @@ def generate_csv_report(
                 "tags",
                 "abstract",
                 "provider",
+                "best_rank",
+                "providers_count",
                 "decision_source",
                 "llm_confidence",
                 "llm_review_outcome",
@@ -31031,6 +31866,7 @@ def generate_csv_report(
         # Write all decisions
         for decision in session.decisions:
             paper = decision.paper
+            place = relevance_place(decision, records)
             writer.writerow(
                 [
                     decision.status.value,
@@ -31043,6 +31879,8 @@ def generate_csv_report(
                     "; ".join(decision.tags) if decision.tags else "",
                     paper.abstract or "",
                     decision.provider,
+                    "" if place is None else place,
+                    len(returning_providers(decision, records)),
                     decision.source.value,
                     (
                         f"{decision.llm_confidence:.3f}"
@@ -31573,7 +32411,9 @@ replacing it, so [[generate_csv_report]] keeps building its rows as
 before and only the line that makes the writer differs.
 
 <<review report generation>>=
-CSV_NUMERIC_COLUMNS = ("year", "llm_confidence")
+CSV_NUMERIC_COLUMNS = (
+    "year", "best_rank", "providers_count", "llm_confidence",
+)
 
 
 class SpreadsheetSafeWriter:

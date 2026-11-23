@@ -2361,6 +2361,31 @@ screeners)} over records screened twice, `screen_sample` (the one
   because the id lists differ.
   Prints "N paper(s) on the screen sheet." and no machine-review
   table. `all` stays csv + latex.
+- **Screening tier** (#302, review.nw `sec:screening-tier`, cli.nw
+  `sec:sheet-tier`): `sessions export S -f screen-sheet [--pending]
+  [--top K] [--min-providers N] [--provider P ... [--query-like T]]`
+  keeps the sheet's papers meeting any given condition
+  (`screening_tier(decisions, session, TierRule)`): `top` = place <= K
+  on a link whose current record has `order == "relevance"`
+  (`relevance_place`; a date-ordered first place never selects);
+  `min_providers` = distinct providers of current, non-merged linked
+  records (`returning_providers`); `provider` = a link to a current
+  non-merged record of P whose query holds T (casefold). Records via
+  `LinkedRecords` (current only; key None resolved as `search_record`).
+  `TierSelection` counts: `met` (overlapping), `only`, `several`,
+  `not_selected`, `place_unknown` (no ranked link to a current record),
+  `no_relevance_place` (ranks only outside relevance answers); selected
+  = sum(only) + several. Printed by `tier_lines` and written to
+  `BASE-tier.json` (session, selection, rule, counts) with or without
+  `--batch-size` (batch ids follow the tier). Without the options the
+  sheet is unchanged (tested). Exit 2 before loading: another format,
+  K/N < 1, `--query-like` without `--provider` or empty; after loading:
+  a `--provider` no current non-merged record has. `sessions show`:
+  `tier_overview_line` (`TIER_SHOW_TOP` = 100, `TIER_SHOW_PROVIDERS` =
+  3, pending decisions) only when some link has a rank; JSON `ranks`
+  per decision (`link_places_data`, ranked links only, key absent
+  otherwise). CSV: `best_rank`, `providers_count` after `provider`
+  (both in `CSV_NUMERIC_COLUMNS`).
 
 ### Session Arguments
 
@@ -2648,6 +2673,32 @@ with the records of its query and provider as candidates). Old sessions get link
 searches are re-run with `-n` (cache hits cost nothing). Never fall back
 to `search_record_for(provider)`: with several queries on a provider it
 returns the latest search, which is how #128 named wrong queries.
+
+**Places (#302, review.nw `sec:review-found-by`, scholar.nw
+`sec:answer-places`).** A link may be a `SearchLink`: a tuple subclass
+equal to and hashing as its 3-tuple key, with `.rank` = the paper's
+1-based place in that part's answer (`link_rank(link)`, None for a
+plain tuple; not part of the identity). Saved as `"rank"` in the link
+object only when set; `stored_rank` reads a whole number >= 1, else
+None; old files load None (a pre-#302 Scholar reads only
+query/provider/filters and drops `rank` on save: read from its
+`_load_found_by_link`, not run). Source: `SearchResult.places`
+(empty = list order) and `place_of(i)` (None for a merged result);
+`deduplicate()` recomputes places (`answer_places`: first occurrence,
+matched by id, title-author hash of a DOI paper with
+`plausibly_same_work` for a DOI-less copy, version DOIs; a part known
+only by `sources` -> None); `merge` sets `found_at` (places per
+`found_in` entry, `places_in_parts`). `paper_search_links` returns
+`SearchLink`s (recomputes places when `found_in`/`found_at` do not
+fit). Every link site uses `record_link(link)` /
+`record_search(q, p, k, rank)` (a held link keeps the smaller rank,
+`smaller_rank`): the six append branches, folds (`reconcile_copies`,
+`apply_tombstones`), the concurrent merge union. Repoints use
+`united_links` (dedup, smaller rank): legacy replacement in
+`create_review_session` and in the merge, `supersede_merged_records`;
+a link moved to another record is a plain key, so no rank (a covering
+record's link keeps a rank only if the paper already had one). Copies
+(`list(prev.found_by)`) carry ranks. Snowball adds no links.
 A retired search's command gets a shell comment on the same line
 (`FOUND-VIA: scholar search ... # retired 2026-11-20: note`,
 `_retired_comment`, whitespace collapsed), so it stays inside a
@@ -3187,6 +3238,12 @@ moved five places, `paper_id` stays last): empty when unset,
   Nothing is withheld or retried for it. Later checks (`sessions show`,
   report) see only title and abstract (see Headless Review Sessions).
   Answers without a valid `paper_index` are skipped (never index 0).
+- **First tier (#302, cli.nw `sec:llm-classify-tier`).** `llm classify
+  S --top K --min-providers N` classifies only the pending papers of
+  `screening_tier` (either condition), printing `tier_lines`; passed as
+  `classify_papers_with_llm(..., candidates=)` (pending among them, in
+  order; examples and vocabulary unchanged, unlike `papers=`). Exit 2
+  with `--second-screen` or K/N < 1.
 - **Second screen (#253 C).** `scholar llm classify S --second-screen
   (--over all|machine | --sample ID) [-n N] [--rescreen]` (exactly one
   selection, no default: exit 2 before loading; `second_screen_candidates`
