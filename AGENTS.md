@@ -312,6 +312,13 @@ OpenAlex pages of 200 against the metered budget.
   `scholar search`/`rq`, wherever on the line) and
   `test_tutorial_search_steps_require_the_limit` (each search pattern
   matches the step's command, and not without its limit) check them.
+  pytorial matches regex patterns with `re.search` on the recorded
+  transcript (no DOTALL, continuations not joined; bash's PS2 `> `
+  after a line break), so commands are fed as typed
+  (`tutorial_commands(text, typed=True)`) and
+  `test_tutorial_patterns_match_commands_as_typed` checks every regex
+  pattern of every lesson; a pattern spanning a continued command uses
+  `(?:.|\\\n)*` instead of `.*` (scholar-with-an-agent's two searches).
   `TestShowPinnedOutput` pins a limit-1000 record's `--limit 1000`.
 
 ### Search Flow
