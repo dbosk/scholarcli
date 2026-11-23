@@ -10340,6 +10340,26 @@ def sessions_export(
                  "confirmed it.",
         ),
     ] = None,
+    pending: Annotated[
+        bool,
+        typer.Option(
+            "--pending",
+            help="Screen sheet: the papers whose decision is pending, for "
+                 "a first screen (with `sessions decide --reasons-file`), "
+                 "instead of the decided ones. Not with --sample or "
+                 "--undecided-by.",
+        ),
+    ] = False,
+    batch_size: Annotated[
+        Optional[int],
+        typer.Option(
+            "--batch-size",
+            help="Screen sheet: write numbered sheets of at most N "
+                 "records (BASE-001.tsv, ...), each starting with its "
+                 "`# batch:` id, plus BASE-manifest.tsv. No default: "
+                 "without it, one sheet.",
+        ),
+    ] = None,
     <<sessions export spreadsheet option>>
 ) -> None:
     """
@@ -10359,12 +10379,25 @@ def sessions_export(
     the works the session excludes or lacks are listed on stderr.
     The screen-sheet format writes a tab-separated sheet for a blind
     second screen: a header, then id, title, year, venue and abstract,
-    no verdict. It lists decided papers only, since a second screen is
+    no verdict. It lists decided papers, since a second screen is
     compared with a first verdict and a pending paper has none;
+    --pending lists the pending papers instead, for a first screen;
     --sample ID keeps a review sample's papers (and says on stderr what
     the sample gives away, e.g. that it holds discards only);
     --undecided-by NAME leaves out the papers NAME already has a verdict
     on (a screening of theirs, or the decision they made or confirmed).
+    --batch-size N splits the sheet into numbered sheets of at most N
+    records, BASE-001.tsv, BASE-002.tsv, ..., each starting with the
+    comment lines `# batch: ID`, `# session: FILE` and `# records: N`,
+    and writes BASE-manifest.tsv (batch, file, records, first and last
+    id). The id is the same for the same session file, selection and
+    size; a reasons or verdicts file that keeps the `# batch:` line has
+    its verdicts stored with it. Scholar sets no batch size. The
+    screening protocol this was written for recommends batches of about
+    100 records, and that is only a recommendation: in the runs behind
+    it, defaulted rows were frequent in batches of several hundred, rare
+    at 100 or fewer, and in one run still came back in batches of 100.
+    A batch id lets a bad batch be found and redone.
     With --spreadsheet-safe the CSV (-f csv or -f all) is written for
     opening in a spreadsheet program: a text cell that could be read as
     a formula gets one ' in front (see the option's help); scripts
@@ -11834,6 +11867,21 @@ line, so both become spaces: every character Python's
 [[str.splitlines]] breaks at, and the tab.  The other characters stay
 as stored.
 
+The header and the rows are written by the standard library's [[csv]]
+module, tab-separated, with [[QUOTE_NONE]] and no quote character, so
+that a quote mark in a title is written as it is stored, as the
+unquoted format of the reasons and verdicts files has it
+(\cref{sec:sessions-decide}), and a newline ends each line.  Such a
+writer refuses only a field holding a tab or a line end, which
+[[sheet_field]] has already turned into spaces (checked on Python
+3.12, 3.13 and 3.14: the bytes equal a tab-join of the fields).  The
+comment lines a sheet in batches begins with
+(\cref{sec:sheet-batches}) are no CSV rows and are written first, as
+text.  Reading is another matter: the reasons and verdicts files keep
+their own reader (\cref{sec:batch-against-sheet}), since [[csv.reader]]
+ends a line at a lone carriage return, which that format keeps inside
+a field.
+
 <<sessions command>>=
 SCREEN_SHEET_COLUMNS = ("id", "title", "year", "venue", "abstract")
 SHEET_SEPARATORS = re.compile("[\t\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029]")
@@ -11884,13 +11932,22 @@ def screen_sheet_rows(decisions) -> list[list[str]]:
     ]
 
 
-def write_screen_sheet(path: Path, rows: list[list[str]]) -> None:
-    """Write the header and `rows` as tab-separated UTF-8 lines."""
-    path.write_text(
-        "".join("\t".join(row) + "\n"
-                for row in [list(SCREEN_SHEET_COLUMNS), *rows]),
-        encoding="utf-8",
-    )
+def write_screen_sheet(
+    path: Path, rows: list[list[str]], comments=()
+) -> None:
+    """Write the header and `rows` as tab-separated UTF-8 lines.
+
+    Each `(key, value)` of `comments` comes first as `# key: value`.
+    """
+    import csv
+
+    with path.open("w", newline="", encoding="utf-8") as sheet:
+        sheet.write("".join(f"# {key}: {sheet_field(value)}\n"
+                            for key, value in comments))
+        writer = csv.writer(sheet, delimiter="\t", quoting=csv.QUOTE_NONE,
+                            quotechar=None, lineterminator="\n")
+        writer.writerow(SCREEN_SHEET_COLUMNS)
+        writer.writerows(rows)
 @
 
 The export takes the two options only with this format: with another
@@ -11903,10 +11960,22 @@ decisions confirmed or changed, which counts verdicts.
 <<refuse the screen sheet's options with other formats>>=
 if format_type != "screen-sheet" and (
     sample is not None or undecided_by is not None
+    or batch_size is not None or pending
 ):
     Console(stderr=True).print(
-        "[red]--sample and --undecided-by apply to the screen sheet only "
-        "(-f screen-sheet).[/red]"
+        "[red]--sample, --undecided-by, --pending and --batch-size apply "
+        "to the screen sheet only (-f screen-sheet).[/red]"
+    )
+    raise typer.Exit(2)
+if pending and (sample is not None or undecided_by is not None):
+    Console(stderr=True).print(
+        "[red]--pending selects the papers of a first screen; --sample "
+        "and --undecided-by select decided papers for a second.[/red]"
+    )
+    raise typer.Exit(2)
+if batch_size is not None and batch_size < 1:
+    Console(stderr=True).print(
+        f"[red]--batch-size {batch_size}: give at least 1.[/red]"
     )
     raise typer.Exit(2)
 for option, value in (("--sample", sample),
@@ -11918,17 +11987,188 @@ for option, value in (("--sample", sample),
 if format_type == "screen-sheet":
     sheet_path = out_base if out_base.suffix == ".tsv" \
         else Path(f"{output}.tsv")
-    sheet_decisions = screen_sheet_decisions(
-        session, sample=sample, undecided_by=undecided_by
+    sheet_decisions = (
+        pending_sheet_decisions(session) if pending
+        else screen_sheet_decisions(
+            session, sample=sample, undecided_by=undecided_by
+        )
     )
     sheet_rows = screen_sheet_rows(sheet_decisions)
-    write_screen_sheet(staging / sheet_path.name, sheet_rows)
-    files_created.append(sheet_path)
+    if batch_size is None:
+        write_screen_sheet(staging / sheet_path.name, sheet_rows)
+        files_created.append(sheet_path)
+    else:
+        <<write the screen sheet in batches>>
 <<say how many papers the screen sheet lists>>=
 if format_type == "screen-sheet":
-    console.print(f"{len(sheet_rows)} paper(s) on the screen sheet.")
+    if batch_size is None:
+        console.print(f"{len(sheet_rows)} paper(s) on the screen sheet.")
+    else:
+        console.print(
+            f"{len(sheet_rows)} paper(s) on {len(sheet_batches)} screen "
+            f"sheet(s) of at most {batch_size}."
+        )
     <<say what the sample gives away>>
     return
+@
+
+\paragraph{A sheet for the first screen.}
+\label{sec:first-screen-sheet}
+The sheet above is for a second screen, so it lists decided papers.
+But most screening by agents is the first screen: the pending records,
+decided with [[sessions decide --reasons-file]], and that is where the
+defaulted batches of \cref{sec:decide-batch-check} were seen.  So
+[[--pending]] lists the papers whose decision is pending instead, one
+line per paper id (a copy under the same id once, as above), with the
+same columns and the same cleaning.  No verdict exists for them, so
+nothing can give one away.  It cannot be combined with [[--sample]]
+or [[--undecided-by]], which select decided papers for a second
+screen; that is a usage error before the session is read.  With
+[[--batch-size]] the pending papers are cut into sheets as the decided
+ones are (\cref{sec:sheet-batches}), and a screener's reasons file that
+keeps its sheet's [[# batch:]] line can be checked against the sheet
+([[--sheet]], \cref{sec:batch-against-sheet}).
+
+<<sessions command>>=
+def pending_sheet_decisions(session) -> list:
+    """The pending decisions a first-screen sheet lists, one per paper id."""
+    chosen: dict[str, object] = {}
+    for decision in session.decisions:
+        if not decision.is_decided:
+            chosen.setdefault(decision.paper.id, decision)
+    return list(chosen.values())
+@
+
+\paragraph{Sheets in batches.}
+\label{sec:sheet-batches}
+Screeners given several hundred records at once have filled the rest
+of a batch with one verdict, one reason and one confidence
+(\url{https://github.com/dbosk/scholarcli/issues/291}), and the issue
+that asked for batches (\url{https://github.com/dbosk/scholarcli/issues/292})
+reports that it happened in batches of about 365 records.  A batch
+check can find such a batch afterwards (\cref{sec:decide-batch-check}),
+but only when the rows say which batch they came from, and only a
+batch of known extent can be redone as a unit.  So [[--batch-size N]]
+writes the sheet as numbered sheets of at most [[N]] records,
+[[BASE-001.tsv]], [[BASE-002.tsv]], \dots, in the order of the single
+sheet, and a manifest [[BASE-manifest.tsv]] that lists them: batch id,
+file name, number of records, first and last id.  Without the option
+the export writes the one sheet it always wrote, byte for byte.
+
+Scholar imposes no batch size.  The screening protocol this was written
+for recommends batches of about 100 records, and the help says why that
+is only a recommendation: in the runs behind it, defaulted rows were
+frequent in batches of several hundred, rare at 100 or fewer, and in
+one run still came back in batches of 100.  What the option does is
+give each batch an id, which lets a bad batch be found and redone.
+Nothing more is known about what a batch size achieves, so nothing more
+is claimed, and a default would claim it.
+
+Each sheet starts with three comment lines, [[# batch: ID]],
+[[# session: FILE]] and [[# records: N]], before the header and the
+rows of the single sheet.  The reasons and verdicts files skip comment
+lines and read [[# batch:]] as the batch of the lines after it
+(\cref{sec:batch-ids-in-files}), so a screener that writes its verdicts
+below the sheet's comment lines returns its batch id with them.  The
+session line names the session file (not its path, which is the
+exporter's own) so that a sheet found later can be traced back.
+
+The batch id is the selection's digest and the sheet's number,
+[[5be0c1d2-001]]: readable enough to type, and the same for the same
+session file, selection and batch size, so that exporting again gives
+the sheets the same ids, while another selection (a screener's verdicts
+recorded since, with [[--undecided-by]]) or another size gives new
+ones and cannot be confused with the old sheets.  The digest is the
+first [[SHEET_DIGEST_CHARS]] hexadecimal digits of the SHA-256 of the
+session file's name, the batch size and the sheet's ids in order.  A
+first-screen sheet and a second-screen sheet of the same session and
+size therefore get other ids, because a paper is either pending or
+decided: their id lists can only be equal if every paper id held both
+a pending and a decided copy and no other paper existed, and the two
+sheets would then list the same records anyway.  It
+depends only on what selects the rows, not on the records' titles or
+abstracts, which [[scholar enrich]] may fill in between two exports of
+the same sheet.
+
+<<write the screen sheet in batches>>=
+from scholar.review import session_file_path
+
+session_file = session_file_path(session).name
+sheet_stem = sheet_path.name.removesuffix(".tsv")
+sheet_batches = screen_sheet_batches(sheet_rows, batch_size, session_file)
+for sheet_batch in sheet_batches:
+    write_screen_sheet(
+        staging / f"{sheet_stem}-{sheet_batch.number:03d}.tsv",
+        sheet_batch.rows,
+        comments=(("batch", sheet_batch.batch), ("session", session_file),
+                  ("records", len(sheet_batch.rows))),
+    )
+    files_created.append(
+        sheet_path.parent / f"{sheet_stem}-{sheet_batch.number:03d}.tsv"
+    )
+write_sheet_manifest(staging / f"{sheet_stem}-manifest.tsv", sheet_batches,
+                     sheet_stem)
+files_created.append(sheet_path.parent / f"{sheet_stem}-manifest.tsv")
+<<sessions command>>=
+SHEET_DIGEST_CHARS = 8
+
+
+@dataclass(frozen=True)
+class SheetBatch:
+    """One numbered sheet of a batched screen sheet."""
+
+    batch: str
+    number: int
+    rows: list[list[str]]
+
+
+def screen_sheet_batches(
+    rows: list[list[str]], size: int, session_file: str
+) -> list[SheetBatch]:
+    """`rows` cut into sheets of at most `size`, each with its batch id.
+
+    The id is a digest of `session_file`, `size` and the rows' ids, then
+    the sheet's number: `5be0c1d2-001`.
+    """
+    import hashlib
+
+    selection = json.dumps([session_file, size, [row[0] for row in rows]])
+    digest = hashlib.sha256(selection.encode("utf-8")).hexdigest()
+    digest = digest[:SHEET_DIGEST_CHARS]
+    return [
+        SheetBatch(f"{digest}-{number:03d}", number, rows[start:start + size])
+        for number, start in enumerate(range(0, len(rows), size), start=1)
+    ]
+@
+
+The manifest lists the sheets, one line per sheet under a header, so
+that whoever hands out the sheets can check them off and a sheet's id
+can be found from its file.  Unlike the sheets it is a new file, read
+by scripts rather than by a screener, so it is written by the standard
+library's [[csv]] module, tab-separated with [[\n]] line ends: a field
+holding a tab, a line break or a quote mark (an [[-o]] name, a
+DOI) is quoted as [[csv]] quotes it and reads back whole with
+[[csv.reader(..., delimiter="\t")]].  It has no comment line, which a
+CSV reader would take for a row; each sheet names its session.
+
+<<sessions command>>=
+SHEET_MANIFEST_COLUMNS = ("batch", "file", "records", "first_id", "last_id")
+
+
+def write_sheet_manifest(
+    path: Path, batches: list[SheetBatch], stem: str
+) -> None:
+    """Write the manifest of batched sheets named `stem-NNN.tsv`."""
+    import csv
+
+    with path.open("w", newline="", encoding="utf-8") as manifest:
+        writer = csv.writer(manifest, delimiter="\t", lineterminator="\n")
+        writer.writerow(SHEET_MANIFEST_COLUMNS)
+        writer.writerows(
+            (batch.batch, f"{stem}-{batch.number:03d}.tsv",
+             len(batch.rows), batch.rows[0][0], batch.rows[-1][0])
+            for batch in batches
+        )
 @
 
 A sheet made for a review sample is not blind to what the sample
@@ -12078,6 +12318,261 @@ def test_all_stays_csv_and_latex(self, tmp_path, monkeypatch):
   assert result.exit_code == 0, result.output
   assert sorted(p.name for p in out.iterdir()) == ["r.bib", "r.csv",
                                                    "r.tex"]
+@
+
+The sheets in batches (\cref{sec:sheet-batches}) are checked on the same
+session.  Cut into sheets of two, its three papers give two sheets and
+a manifest; each sheet starts with its three comment lines, and below
+them the header and rows are those of the single sheet, cut in order.
+A second export gives the same ids, another size other ids, and the
+manifest reads back with [[csv]] even when the base name starts with a
+quote mark.  A sheet
+then goes round the loop: a reasons file that keeps the sheet's
+[[# batch:]] line is given to [[sessions decide]] with the sheet, the
+batch id is stored with each decision, and the sheet is all returned.
+
+<<test functions>>=
+class TestScreenSheetBatches:
+  """`-f screen-sheet --batch-size N` writes numbered sheets (#292)."""
+
+  def _sheets(self, tmp_path, monkeypatch):
+    out = TestScreenSheet()._save(tmp_path, monkeypatch)
+    out.mkdir()
+    return out
+
+  def _export(self, out, *options):
+    return TestScreenSheet()._export(out, *options)
+
+  def test_numbered_sheets_and_a_manifest(self, tmp_path, monkeypatch):
+    out = self._sheets(tmp_path, monkeypatch)
+    assert self._export(out / "one.tsv").exit_code == 0
+    single = (out / "one.tsv").read_text(encoding="utf-8").splitlines()
+    result = self._export(out / "b.tsv", "--batch-size", "2")
+    assert result.exit_code == 0, result.output
+    assert "3 paper(s) on 2 screen sheet(s) of at most 2." in result.output
+    assert sorted(p.name for p in out.iterdir()) == [
+      "b-001.tsv", "b-002.tsv", "b-manifest.tsv", "one.tsv"]
+    first = (out / "b-001.tsv").read_text(encoding="utf-8").splitlines()
+    second = (out / "b-002.tsv").read_text(encoding="utf-8").splitlines()
+    batch = first[0].removeprefix("# batch: ")
+    digest, number = batch.split("-")
+    assert len(digest) == 8 and number == "001"
+    assert first[:3] == [f"# batch: {batch}", "# session: sheet.json",
+                         "# records: 2"]
+    assert second[:3] == [f"# batch: {digest}-002",
+                          "# session: sheet.json", "# records: 1"]
+    assert first[3:] == single[:3]
+    assert second[3:] == single[:1] + single[3:]
+    manifest = (out / "b-manifest.tsv").read_text(encoding="utf-8")
+    assert manifest.splitlines() == [
+      "batch\tfile\trecords\tfirst_id\tlast_id",
+      f"{digest}-001\tb-001.tsv\t2\tdoi:10.5555/sheet-1\t"
+      "doi:10.5555/sheet-2",
+      f"{digest}-002\tb-002.tsv\t1\tdoi:10.5555/sheet-3\t"
+      "doi:10.5555/sheet-3",
+    ]
+
+  def test_the_manifest_reads_back_with_csv(self, tmp_path, monkeypatch):
+    import csv
+
+    out = self._sheets(tmp_path, monkeypatch)
+    assert self._export(out / '"q', "--batch-size", "2").exit_code == 0
+    with (out / '"q-manifest.tsv').open(newline="", encoding="utf-8") as f:
+      rows = list(csv.reader(f, delimiter="\t"))
+    assert [row[1:3] for row in rows[1:]] == [
+      ['"q-001.tsv', "2"], ['"q-002.tsv', "1"]]
+
+  def test_quote_marks_are_written_as_stored(self, tmp_path):
+    path = tmp_path / "q.tsv"
+    write_screen_sheet(path, [["doi:1/a", '"Quoted" title', "2020",
+                               "V", 'It said "yes".']],
+                       comments=(("batch", "b-1"),))
+    assert path.read_text(encoding="utf-8").splitlines() == [
+      "# batch: b-1", "id\ttitle\tyear\tvenue\tabstract",
+      'doi:1/a\t"Quoted" title\t2020\tV\tIt said "yes".']
+
+  def test_ids_are_stable_for_one_selection_and_size(
+    self, tmp_path, monkeypatch
+  ):
+    out = self._sheets(tmp_path, monkeypatch)
+    for base, size in (("a", "2"), ("b", "2"), ("c", "3")):
+      assert self._export(out / base, "--batch-size", size).exit_code == 0
+
+    def first_id(base):
+      return (out / f"{base}-001.tsv").read_text().splitlines()[0]
+
+    assert first_id("a") == first_id("b")
+    assert first_id("a") != first_id("c")
+
+  def test_refusals(self, tmp_path, monkeypatch):
+    out = self._sheets(tmp_path, monkeypatch)
+    for options in (["-f", "csv", "--batch-size", "2"],
+                    ["-f", "screen-sheet", "--batch-size", "0"]):
+      result = runner.invoke(app, ["sessions", "export", "sheet",
+                                   "-o", str(out / "x"), *options])
+      assert result.exit_code == 2, (options, result.output)
+    assert list(out.iterdir()) == []
+
+  def test_a_sheet_goes_round_the_loop(self, tmp_path, monkeypatch):
+    from scholar.review import load_session
+
+    out = self._sheets(tmp_path, monkeypatch)
+    assert self._export(out / "b", "--batch-size", "2").exit_code == 0
+    sheet = out / "b-001.tsv"
+    lines = sheet.read_text(encoding="utf-8").splitlines()
+    reasons = out / "reasons.tsv"
+    reasons.write_text("".join(
+      [line + "\n" for line in lines[:3]]
+      + [f"{line.split(chr(9))[0]}\tAn invented reason for row {n}.\n"
+         for n, line in enumerate(lines[4:])]
+    ), encoding="utf-8")
+    result = runner.invoke(app, [
+      "sessions", "decide", "sheet", "--source", "agent", "--discard",
+      "--tag", "off-topic-false-hit", "--by", "agent-9",
+      "--reasons-file", str(reasons), "--sheet", str(sheet), "--strict",
+    ])
+    assert result.exit_code == 0, result.output
+    batch = lines[0].removeprefix("# batch: ")
+    assert f"b-001.tsv (batch {batch}): returned 2 of 2." in result.stderr
+    stored = {d.paper.id: d.agent_batch
+              for d in load_session("sheet").decisions}
+    assert stored == {
+      "doi:10.5555/sheet-1": batch, "doi:10.5555/sheet-2": batch,
+      "doi:10.5555/sheet-3": None, "doi:10.5555/sheet-4": None,
+    }
+@
+
+The first screen has sheets of its own (\cref{sec:first-screen-sheet}).
+On an invented session of six pending papers, one of them held twice
+under one id, and two decided ones, [[--pending]] lists the six pending
+papers once each, with the columns of the other sheets, and no decided
+one; the batch ids of the pending sheets are not those of the decided
+sheets of the same size.  The option is refused with [[--sample]],
+[[--undecided-by]] and another format before any session is read (a
+session that does not exist would exit 1).  Then the first screen goes
+round the loop with two batches of three: the first screener returns
+two of its three records, which is reported and saved; the second
+returns its three and one record of the first batch, which
+[[--strict]] refuses and which is saved, with the batch id, without
+it.
+
+<<test functions>>=
+class TestFirstScreenSheets:
+  """`-f screen-sheet --pending` hands out pending papers (#292)."""
+
+  def _save(self, tmp_path, monkeypatch):
+    from datetime import datetime
+    from scholar import review
+    from scholar.scholar import Paper
+
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+
+    def paper(n):
+      return Paper(title=f"Pending invented title {n}", authors=["B"],
+                   year=2000 + n, venue=f"Venue {n}",
+                   doi=f"10.5555/first-{n}", abstract=f"Abstract {n}.")
+
+    pending = [review.ReviewDecision(paper=paper(n), provider="openalex")
+               for n in range(6)]
+    copy = review.ReviewDecision(paper=paper(2), provider="dblp")
+    decided = [review.ReviewDecision(
+      paper=paper(10 + n), provider="openalex",
+      status=review.DecisionStatus.DISCARDED, tags=["off-topic-false-hit"],
+      source=review.ReviewSource.AGENT_UNREVIEWED, agent_by="a-1")
+      for n in range(2)]
+    session = review.ReviewSession(
+      query="q", providers=["openalex"], timestamp=datetime(2026, 11, 20),
+      name="first", decisions=pending[:3] + [copy] + decided + pending[3:])
+    review.save_session(session)
+    out = tmp_path / "out"
+    out.mkdir()
+    return out
+
+  def _export(self, out, *options, name="first"):
+    return runner.invoke(app, ["sessions", "export", name, "-f",
+                               "screen-sheet", "-o", str(out), *options])
+
+  def test_pending_papers_once_each(self, tmp_path, monkeypatch):
+    out = self._save(tmp_path, monkeypatch)
+    result = self._export(out / "p.tsv", "--pending")
+    assert result.exit_code == 0, result.output
+    assert "6 paper(s) on the screen sheet." in result.output
+    lines = (out / "p.tsv").read_text(encoding="utf-8").splitlines()
+    assert lines[0] == "id\ttitle\tyear\tvenue\tabstract"
+    assert lines[1] == ("doi:10.5555/first-0\tPending invented title 0"
+                        "\t2000\tVenue 0\tAbstract 0.")
+    assert [line.split("\t")[0] for line in lines[1:]] == [
+      f"doi:10.5555/first-{n}" for n in range(6)]
+
+  def test_pending_and_decided_sheets_have_other_ids(
+    self, tmp_path, monkeypatch
+  ):
+    out = self._save(tmp_path, monkeypatch)
+    assert self._export(out / "p", "--pending", "--batch-size",
+                        "2").exit_code == 0
+    assert self._export(out / "d", "--batch-size", "2").exit_code == 0
+    first = (out / "p-001.tsv").read_text().splitlines()[0]
+    decided = (out / "d-001.tsv").read_text().splitlines()[0]
+    assert first.startswith("# batch: ") and decided.startswith("# batch: ")
+    assert first != decided
+
+  def test_refusals_before_loading(self, tmp_path, monkeypatch):
+    out = self._save(tmp_path, monkeypatch)
+    for options in (["-f", "screen-sheet", "--pending", "--sample", "s"],
+                    ["-f", "screen-sheet", "--pending",
+                     "--undecided-by", "a-1"],
+                    ["-f", "csv", "--pending"]):
+      result = runner.invoke(app, ["sessions", "export", "no-such-session",
+                                   "-o", str(out / "x"), *options])
+      assert result.exit_code == 2, (options, result.output)
+    assert list(out.iterdir()) == []
+
+  def test_the_first_screen_goes_round_the_loop(self, tmp_path,
+                                                 monkeypatch):
+    from scholar.review import load_session
+
+    out = self._save(tmp_path, monkeypatch)
+    assert self._export(out / "b", "--pending", "--batch-size",
+                        "3").exit_code == 0
+    sheets = [out / "b-001.tsv", out / "b-002.tsv"]
+    lines = [s.read_text(encoding="utf-8").splitlines() for s in sheets]
+    ids = [[line.split("\t")[0] for line in sheet[4:]] for sheet in lines]
+    batches = [sheet[0].removeprefix("# batch: ") for sheet in lines]
+
+    def reasons(name, sheet, chosen):
+      path = out / name
+      path.write_text("".join(
+        [line + "\n" for line in sheet[:3]]
+        + [f"{value}\tInvented reason about {value}.\n"
+           for value in chosen]), encoding="utf-8")
+      return str(path)
+
+    def decide(path, sheet, *extra):
+      return runner.invoke(app, [
+        "sessions", "decide", "first", "--source", "agent", "--discard",
+        "--tag", "off-topic-false-hit", "--by", "agent-5",
+        "--reasons-file", path, "--sheet", str(sheet), *extra])
+
+    short = decide(reasons("r1.tsv", lines[0], ids[0][:2]), sheets[0])
+    assert short.exit_code == 0, short.output
+    stderr = " ".join(short.stderr.split())
+    assert (f"b-001.tsv (batch {batches[0]}): returned 2 of 3; 1 missing: "
+            f"{ids[0][2]}.") in stderr
+    assert "Missing rows are fine" in stderr
+    stray = reasons("r2.tsv", lines[1], ids[1] + [ids[0][2]])
+    refused = decide(stray, sheets[1], "--strict")
+    assert refused.exit_code == 2, refused.output
+    assert "1 id(s) not on their sheet" in refused.output
+    saved = decide(stray, sheets[1])
+    assert saved.exit_code == 0, saved.output
+    assert (f"b-002.tsv (batch {batches[1]}): 1 id(s) not on the sheet: "
+            f"{ids[0][2]}") in " ".join(saved.stderr.split())
+    stored = {d.paper.id: d.agent_batch
+              for d in load_session("first").decisions
+              if d.agent_by == "agent-5"}
+    assert stored[ids[0][0]] == batches[0]
+    assert stored[ids[1][0]] == batches[1]
+    assert stored[ids[0][2]] == batches[1]
 @
 
 The export command is exercised end to end through the CLI runner with a
@@ -12492,7 +12987,31 @@ def sessions_decide(
                  "links). Columns are not quoted (not CSV): quote marks "
                  "are stored as written, and a reason cannot hold a "
                  "tab. Blank and # lines are skipped. Replaces "
-                 "--doi/--paper-id.",
+                 "--doi/--paper-id. A `# batch: ID` line gives the "
+                 "lines after it that batch id.",
+            exists=True, dir_okay=False, readable=True,
+        ),
+    ] = None,
+    batch: Annotated[
+        Optional[str],
+        typer.Option(
+            "--batch",
+            help="With --reason or --reasons-file: the batch the reasons "
+                 "came from (e.g. a screen sheet's `# batch:` id), stored "
+                 "with each decision's trace; for a file without "
+                 "`# batch:` lines. Free text, at most 100 characters.",
+        ),
+    ] = None,
+    sheet: Annotated[
+        Optional[list[Path]],
+        typer.Option(
+            "--sheet",
+            help="With --reason or --reasons-file: a screen sheet the "
+                 "reasons answer (repeatable). Its ids are compared with "
+                 "the rows of its batch (its `# batch:` id; every row "
+                 "for a sheet without one); missing ids and ids not on "
+                 "the sheet are listed on stderr. Missing rows are fine; "
+                 "--strict refuses ids not on the sheet.",
             exists=True, dir_okay=False, readable=True,
         ),
     ] = None,
@@ -12606,6 +13125,17 @@ def sessions_decide(
     One --reason for many records is a rule applied on purpose and only
     noted. --dry-run runs every check and writes nothing.
 
+    A reasons file may name the batch its lines came from in a comment
+    line `# batch: ID` (a screen sheet starts with one); a later such
+    line starts a new batch, and --batch ID names the batch of a file
+    without one (or of a --reason). The id is stored with each
+    decision's trace, `sessions show -f json` and the CSV show it, and
+    `sessions reset --batch ID` selects its decisions. A file that names
+    batches is also checked batch by batch. --sheet FILE compares a
+    batch with the screen sheet it answers: missing ids are listed
+    (fewer rows are better than defaulted ones), and ids not on the
+    sheet are listed too and refused under --strict.
+
     An agent or LLM decision on records without an abstract prints one
     line counting them, with what the last `scholar enrich` found.
 
@@ -12654,6 +13184,7 @@ def sessions_decide(
     <<refuse to let a machine replace a human decision>>
     saving = not dry_run
     <<check the quotes of the agent's reasons>>
+    <<compare the batch with its sheets>>
     <<check the batch as a whole>>
     <<warn about decided records without an abstract>>
 
@@ -13489,6 +14020,12 @@ if strict_quotes and reason is None and reasons_file is None:
         "--reason or --reasons-file too.[/red]"
     )
     raise typer.Exit(2)
+if (batch is not None or sheet) and reason is None and reasons_file is None:
+    console.print(
+        "[red]--batch and --sheet concern a batch of reasons; give "
+        "--reason or --reasons-file too.[/red]"
+    )
+    raise typer.Exit(2)
 if strict and reason is None and reasons_file is None:
     console.print(
         "[red]--strict checks the reasons of a batch; give --reason or "
@@ -13524,6 +14061,7 @@ if by is not None:
     by = by.strip()
     if not by:
         problems.append("--by: empty name")
+<<check the batch option>>
 if reasons_file is not None:
     try:
         text = reasons_file.read_bytes().decode("utf-8-sig")
@@ -13534,6 +14072,12 @@ if reasons_file is not None:
         problems.extend(f"{reasons_file}: {p}" for p in file_problems)
         if not reason_lines and not file_problems:
             problems.append(f"{reasons_file}: names no paper")
+        reason_lines, batch_problems = lines_with_batch(
+            reason_lines, batch, reasons_file
+        )
+        problems.extend(batch_problems)
+sheets, sheet_problems = read_screen_sheets(sheet or [])
+problems.extend(sheet_problems)
 for problem in problems:
     console.print(f"[red]{escape(problem)}[/red]", soft_wrap=True)
 if problems:
@@ -13575,18 +14119,20 @@ class ReasonLine:
     paper: str
     reason: str
     confidence: float | None
+    batch: str | None = None
 
 
 def parse_reasons_file(text: str) -> tuple[list[ReasonLine], list[str]]:
     """Parse a `--reasons-file`: `ID<TAB>REASON[<TAB>CONFIDENCE]` lines.
 
     Returns the valid lines and a problem per invalid line, naming its
-    number. Blank lines and lines starting with `#` are skipped.
+    number. Blank lines and lines starting with `#` are skipped; a
+    `# batch: ID` line gives the lines after it that batch id.
     """
     entries, problems = parse_tab_file(text, REASONS_LAYOUT)
     return [
-        ReasonLine(number, paper, reason, confidence)
-        for number, paper, (reason, confidence) in entries
+        ReasonLine(number, paper, reason, confidence, batch)
+        for number, paper, (reason, confidence), batch in entries
     ], problems
 @
 
@@ -13635,18 +14181,24 @@ class TabFileLayout:
 
 def parse_tab_file(
     text: str, layout: TabFileLayout
-) -> tuple[list[tuple[int, str, tuple]], list[str]]:
+) -> tuple[list[tuple[int, str, tuple, str | None]], list[str]]:
     """Parse the lines of a tab-separated batch file by `layout`.
 
-    Returns `(line number, id, column values)` for each valid line and
-    a problem per invalid line, naming its number. Blank lines and lines
-    starting with `#` are skipped.
+    Returns `(line number, id, column values, batch id)` for each valid
+    line and a problem per invalid line, naming its number. Blank lines
+    and lines starting with `#` are skipped; a `# batch: ID` line gives
+    the lines after it, up to the next such line, that batch id (None
+    before the first).
     """
-    entries: list[tuple[int, str, tuple]] = []
+    entries: list[tuple[int, str, tuple, str | None]] = []
     problems: list[str] = []
+    batch: str | None = None
     for number, raw in enumerate(text.split("\n"), start=1):
         raw = raw.removesuffix("\r")
-        if not raw.strip() or raw.lstrip().startswith("#"):
+        if not raw.strip():
+            continue
+        if raw.lstrip().startswith("#"):
+            <<note the batch a comment line names>>
             continue
         <<parse one line of a batch file>>
     return entries, problems
@@ -13711,7 +14263,163 @@ if not line_problems and layout.check is not None:
 if line_problems:
     problems.append(f"line {number}: {'; '.join(line_problems)}")
     continue
-entries.append((number, paper, tuple(values)))
+entries.append((number, paper, tuple(values), batch))
+@
+
+\paragraph{Batch ids in a file.}
+\label{sec:batch-ids-in-files}
+A screener is given its records in batches, and a batch is where
+defaulted rows happen: a screener that reads some records of a long
+batch and fills the rest with one reason
+(\url{https://github.com/dbosk/scholarcli/issues/292}, and the batch
+check of \cref{sec:decide-batch-check}).  So a file may say which batch
+its lines came from, in a comment line [[# batch: ID]], which the screen
+sheets of [[sessions export -f screen-sheet --batch-size]] begin with
+(\cref{sec:sheet-batches}).  It is a comment line because the lines of
+a file are its verdicts and every comment line was skipped already: a
+file written for an older Scholar, or one that copies the sheet's
+comment lines, means the same as before.  A later [[# batch:]] line
+starts a new batch for the lines after it, so that the files of several
+batches can be concatenated into one; lines before the first have no
+batch.  The id is stored with each verdict's trace
+([[agent_batch]] of a decision, [[batch]] of a screening, in the review
+module).
+
+The id is free text and is not looked up anywhere: the sheet may have
+been made by another tool, on another machine, and Scholar keeps no
+list of the sheets it wrote.  It is read as [[read_batch_id]] reads it,
+white space collapsed (a line break pasted into it is no part of the
+name), and refused when it is empty or longer than
+[[MAX_BATCH_ID_CHARS]] (100 characters, far more than Scholar's own ids
+of a dozen, but bounded since every record of the batch stores it).  A
+refused id is a bad line like any other, named and refused before the
+session is loaded; the lines after it are then read without a batch,
+which does not matter since nothing is saved.  The word [[batch]] is
+matched in any case and the colon may have spaces before it, but
+[[# batch size: 100]] or [[# batches]] name no batch.
+
+<<note the batch a comment line names>>=
+marked = BATCH_LINE.fullmatch(raw.strip())
+if marked:
+    batch, problem = read_batch_id(marked.group(1))
+    if problem:
+        problems.append(f"line {number}: # batch: {problem}")
+        batch = None
+<<sessions command>>=
+BATCH_LINE = re.compile(r"#\s*batch\s*:(.*)", re.IGNORECASE)
+MAX_BATCH_ID_CHARS = 100
+
+
+def read_batch_id(text: str) -> tuple[str, str | None]:
+    """A batch id with white space collapsed, and its problem, if any."""
+    batch = " ".join(text.split())
+    if not batch:
+        return batch, "empty batch id"
+    if len(batch) > MAX_BATCH_ID_CHARS:
+        return batch, (
+            f"batch id of {len(batch)} characters, over the limit of "
+            f"{MAX_BATCH_ID_CHARS}"
+        )
+    return batch, None
+@
+
+[[--batch ID]] gives one batch id to a run whose file names none, or to
+the papers of a [[--reason]] or of a single verdict.  It is refused with
+a file that names its batches: two sources of one id would have to be
+ranked, and a caller who passes [[--batch]] with a file of
+concatenated batches most likely means something the file already says
+otherwise.
+
+<<sessions command>>=
+def lines_with_batch(lines: list, batch: str | None, path) -> tuple:
+    """`lines` with `batch` (from `--batch`) given to each, and problems.
+
+    A file that names a batch on any line keeps its own ids and makes
+    `--batch` a problem.
+    """
+    if batch is None:
+        return lines, []
+    named = next((entry for entry in lines if entry.batch is not None),
+                 None)
+    if named is not None:
+        return lines, [
+            f"{path}: names its batches (# batch: {named.batch}, before "
+            f"line {named.line}); --batch is for a file without "
+            "# batch: lines"
+        ]
+    return [dataclasses.replace(entry, batch=batch) for entry in lines], []
+@
+
+Both commands read the option the same way, into the list of problems
+reported before the session is loaded.
+
+<<check the batch option>>=
+if batch is not None:
+    batch, problem = read_batch_id(batch)
+    if problem:
+        problems.append(f"--batch: {problem}")
+@
+
+Let's check the lines on a file of two concatenated batches with lines
+before either, a bad batch line, an id with inner white space, and
+comment lines that name no batch; [[--batch]] goes to a file without
+batch lines and is refused with one that has them.
+
+<<test functions>>=
+class TestBatchIdsInFiles:
+  """A `# batch: ID` line names the batch of the lines after it (#292)."""
+
+  def test_lines_carry_the_batch_before_them(self):
+    entries, problems = parse_reasons_file(
+      "doi:10.1/a\tBefore any batch.\n"
+      "# batch: 1a2b3c4d-001\n"
+      "# session: invented.json\n"
+      "# records: 2\n"
+      "doi:10.1/b\tFirst batch, first line.\n"
+      "doi:10.1/c\tFirst batch, second line.\n"
+      "#Batch :  sheet \t 2  \n"
+      "# batch size: 100\n"
+      "doi:10.1/d\tSecond batch.\t0.4\n"
+    )
+    assert problems == []
+    assert [(e.paper, e.batch) for e in entries] == [
+      ("doi:10.1/a", None), ("doi:10.1/b", "1a2b3c4d-001"),
+      ("doi:10.1/c", "1a2b3c4d-001"), ("doi:10.1/d", "sheet 2"),
+    ]
+
+  def test_verdicts_files_carry_it_too(self):
+    entries, problems = parse_verdicts_file(
+      "# batch: b-7\ndoi:10.1/a\tkept\tt\tOn topic.\n"
+    )
+    assert problems == []
+    assert entries[0].batch == "b-7"
+
+  def test_a_bad_batch_line_is_a_bad_line(self):
+    entries, problems = parse_reasons_file(
+      "# batch:   \n"
+      "doi:10.1/a\tA reason.\n"
+      f"# batch: {'x' * 101}\n"
+      "doi:10.1/b\tAnother reason.\n"
+    )
+    assert problems == [
+      "line 1: # batch: empty batch id",
+      "line 3: # batch: batch id of 101 characters, over the limit of 100",
+    ]
+    assert [e.batch for e in entries] == [None, None]
+
+  def test_the_batch_option(self):
+    plain, _ = parse_reasons_file("doi:10.1/a\tA reason.\n")
+    given, problems = lines_with_batch(plain, "b-1", "f.tsv")
+    assert problems == [] and given[0].batch == "b-1"
+    named, _ = parse_reasons_file(
+      "doi:10.1/a\tA reason.\n# batch: b-2\ndoi:10.1/b\tOther.\n")
+    kept, problems = lines_with_batch(named, "b-1", "f.tsv")
+    assert kept == named
+    assert problems == [
+      "f.tsv: names its batches (# batch: b-2, before line 3); --batch is "
+      "for a file without # batch: lines"
+    ]
+    assert read_batch_id("  a \n b ") == ("a b", None)
 @
 
 The reason column is checked as [[--reason]] is
@@ -13815,6 +14523,7 @@ if given is not None:
     decision.agent_reason = given
     decision.agent_by = by
     decision.agent_decided_at = decided_at
+    decision.agent_batch = entry.batch if entry is not None else batch
 @
 
 The loop over the agent's fields names its variable [[audit_field]],
@@ -14345,7 +15054,7 @@ def test_reset_keeps_the_reason_in_its_history(self, tmp_path, monkeypatch):
   self._make_session(tmp_path, monkeypatch)
   result = self._decide("--source", "agent", "--keep", "--tag", "ml",
                         "--doi", "10.1/one", "--reason", "Fits.",
-                        "--by", "agent-1")
+                        "--by", "agent-1", "--batch", "b-1")
   assert result.exit_code == 0, result.output
   trace = agent_audit_of(load_session("reasons").decisions[0])
   result = runner.invoke(app, ["sessions", "reset", "reasons", "--doi",
@@ -14357,6 +15066,7 @@ def test_reset_keeps_the_reason_in_its_history(self, tmp_path, monkeypatch):
   assert after.resets[-1]["trace"] == trace
   assert trace["agent_reason"] == "Fits."
   assert trace["agent_by"] == "agent-1"
+  assert trace["agent_batch"] == "b-1"
 
 def test_the_help_states_the_limit(self):
   import click
@@ -15884,6 +16594,7 @@ def batch_rows_of(lines, by_id: dict, by_doi: dict) -> list:
             confidence=entry.confidence,
             status=getattr(entry, "status", None),
             tags=tuple(getattr(entry, "tags", ())),
+            batch=entry.batch,
         ))
     return rows
 
@@ -15920,19 +16631,22 @@ work held twice under one id is mapped from both copies.
 <<check the batch as a whole>>=
 from scholar.review import batch_findings
 
+parts: list[tuple[str, int, list]] = []
 if trace_of:
     lines_given = {id(entry): entry for entry in trace_of.values()}
-    findings = batch_findings(
-        batch_rows_of(lines_given.values(), by_id, by_doi)
-    )
+    rows = batch_rows_of(lines_given.values(), by_id, by_doi)
+    findings = batch_findings(rows)
+    <<check each batch the file names>>
+    findings, parts = without_repeated_reasons(findings, parts)
 elif reason is not None:
     findings = batch_findings(
         one_reason_rows(selected.values(), reason), one_reason=True
     )
 else:
     findings = []
-refusable = [finding for finding in findings if not finding.information]
-if findings:
+every_finding = findings + [f for _, _, part in parts for f in part]
+refusable = [f for f in every_finding if not f.information]
+if every_finding:
     errors = Console(stderr=True)
     if refusable:
         errors.print(
@@ -15942,24 +16656,102 @@ if findings:
         )
     for line in batch_finding_lines(findings):
         errors.print(f"  {escape(line)}", soft_wrap=True, highlight=False)
+    for batch_id, size, part in parts:
+        if part:
+            errors.print(f"  In batch {escape(batch_id)} ({size} rows):",
+                         soft_wrap=True, highlight=False)
+        for line in batch_finding_lines(part):
+            errors.print(f"    {escape(line)}", soft_wrap=True,
+                         highlight=False)
     if refusable and saving and not strict:
         errors.print(
             "[yellow]Saved all the same; --strict refuses such a "
             "batch.[/yellow]"
         )
-if strict and (refusable or quote_misses):
+if strict and (refusable or quote_misses or sheet_extras
+               or sheet_uncompared):
     console.print(
         "[red]--strict: the batch has "
         + " and ".join(
             what for what, present in (
                 (f"{len(refusable)} batch finding(s)", refusable),
                 (f"{len(quote_misses)} quote(s) not found", quote_misses),
+                (f"{sheet_extras} id(s) not on their sheet", sheet_extras),
+                (f"{sheet_uncompared} row(s) not compared with any sheet",
+                 sheet_uncompared),
             ) if present
         )
         + ".[/red]"
     )
     console.print("[yellow]No changes saved.[/yellow]")
     raise typer.Exit(2)
+@
+
+A file that names its batches ([[# batch:]] lines,
+\cref{sec:batch-ids-in-files}) is also checked batch by batch, since a
+batch is one screener's piece of work: the file as a whole may be the
+concatenation of several screeners' batches, of which one was
+defaulted, and that one is then a small share of the file.  The
+confidence in particular is judged per batch, where a defaulted batch
+shows one value on every row although the file as a whole does not.
+Each batch's findings are listed under its id after the file's; rows
+before the first [[# batch:]] line are in no batch.  A batch that holds
+every row of the file (a file of one batch, or [[--batch]]) is the file
+again and is not checked twice.  The thresholds are the same; under
+[[--strict]] a finding in any batch refuses the run.
+
+A reason shared in a batch is also shared in the file, so it would be
+reported twice and counted twice under [[--strict]].  It is reported
+once ([[without_repeated_reasons]]): under its batch when the file's
+finding concerns the same records (the batch's count equals the
+file's), else in the file's line, which then says how many of its
+records are in each batch that shares it, and the batch's line is left
+out.
+
+<<check each batch the file names>>=
+for batch_id, group in rows_by_batch(rows).items():
+    if len(group) < len(rows):
+        parts.append((batch_id, len(group), batch_findings(group)))
+<<sessions command>>=
+def without_repeated_reasons(findings: list, parts: list) -> tuple:
+    """The file's and the batches' findings, each shared reason once.
+
+    `parts` holds `(batch id, rows, findings)`. A file finding whose
+    reason one batch reports with the same count is dropped; otherwise
+    it names the batches' counts and their findings are dropped.
+    """
+    in_batches: dict[str, list] = {}
+    for batch_id, _, part in parts:
+        for finding in part:
+            if finding.kind == "shared-reason":
+                in_batches.setdefault(finding.reason, []).append(
+                    (batch_id, finding))
+    kept, folded = [], set()
+    for finding in findings:
+        held = (in_batches.get(finding.reason)
+                if finding.kind == "shared-reason" else None)
+        if not held:
+            kept.append(finding)
+        elif len(held) == 1 and held[0][1].count == finding.count:
+            continue
+        else:
+            kept.append(dataclasses.replace(finding, detail=finding.detail
+                + "".join(f", {part_finding.count} of them in batch "
+                          f"{batch_id}" for batch_id, part_finding in held)))
+            folded.update(id(part_finding) for _, part_finding in held)
+    return kept, [
+        (batch_id, size, [f for f in part if id(f) not in folded])
+        for batch_id, size, part in parts
+    ]
+
+
+def rows_by_batch(rows) -> dict[str, list]:
+    """The rows that name a batch, grouped by it, in the order met."""
+    groups: dict[str, list] = {}
+    for row in rows:
+        if row.batch is not None:
+            groups.setdefault(row.batch, []).append(row)
+    return groups
 @
 
 Let's check it through [[sessions decide]] on invented sessions.  The
@@ -16245,6 +17037,574 @@ def test_a_dry_run_checks_and_writes_nothing(self, tmp_path, monkeypatch):
   assert list(path.parent.glob("*.bak")) == []
 @
 
+\paragraph{A batch against its sheet.}
+\label{sec:batch-against-sheet}
+A screener may return fewer rows than its sheet held, or rows for
+records that were never on it: an id copied from the wrong batch, or a
+record the screener added.  [[sessions decide]] and [[sessions
+screen]] cannot know a sheet they are not given, so [[--sheet FILE]]
+(repeatable) gives it.  Each sheet is compared with the rows of its
+batch, the batch named by the sheet's own [[# batch:]] line (the
+sheets of \cref{sec:sheet-batches} begin with one): the rows that the
+file's [[# batch:]] lines or [[--batch]] gave that id.  A sheet without
+a [[# batch:]] line, such as the single sheet of an export without
+[[--batch-size]], is compared with every row of the run.  Ids are
+matched as the file's lines are matched to the session
+([[decisions_named_by]]), so a DOI written without [[doi:]] on one side
+meets its paper id on the other.
+
+The differences go to standard error: \enquote{returned 88 of 100; 12
+missing: \dots} and \enquote{3 id(s) not on the sheet: \dots}, with
+the first [[BATCH_PAPERS_SHOWN]] ids of each.  Missing rows are no
+error, and the output says so: a screener that leaves out the records
+it did not read has done better than one that fills them with a
+default, and the missing records stay as they were, ready for another
+batch.  An id not on the sheet is a verdict on a record the screener
+was not given, so [[--strict]] refuses the run for it, with the batch
+check's other refusals; without [[--strict]] the run is saved and the
+output says that [[--strict]] would refuse it.
+
+A sheet is read as a file of this kind is read (UTF-8 with an optional
+byte-order mark, lines ended by a newline): blank lines and comment
+lines are skipped, a header line whose first column is [[id]] is
+skipped, and every other line's first column is an id.  It is read by
+hand, like the reasons file, not by the [[csv]] module: [[csv.reader]]
+ends a line at a lone carriage return, which this format keeps inside
+a field, and with its default quoting it would strip the quote marks
+of a field quoted whole, which this format stores as written.  A sheet that
+cannot be read, that lists no id or names two batches, or whose batch
+line is refused, is a usage error before the session is loaded, like a
+bad line of the file itself.
+
+<<sessions command>>=
+@dataclass(frozen=True)
+class ScreenSheet:
+    """A screen sheet given with `--sheet`: its file, batch and ids."""
+
+    path: Path
+    batch: str | None
+    ids: tuple[str, ...]
+
+
+def parse_screen_sheet(text: str) -> tuple[str | None, list[str], list[str]]:
+    """The batch id, the ids and the problems of a screen sheet's text."""
+    batch: str | None = None
+    ids: list[str] = []
+    problems: list[str] = []
+    header_seen = False
+    for number, raw in enumerate(text.split("\n"), start=1):
+        raw = raw.removesuffix("\r")
+        if not raw.strip():
+            continue
+        if raw.lstrip().startswith("#"):
+            marked = BATCH_LINE.fullmatch(raw.strip())
+            if marked and batch is not None:
+                problems.append(f"line {number}: names a second batch")
+            elif marked:
+                batch, problem = read_batch_id(marked.group(1))
+                if problem:
+                    problems.append(f"line {number}: # batch: {problem}")
+            continue
+        first = raw.split("\t")[0].strip()
+        if not header_seen:
+            header_seen = True
+            if first == "id":
+                continue
+        if first and first not in ids:
+            ids.append(first)
+    if not ids:
+        problems.append("lists no id")
+    return batch, ids, problems
+
+
+def read_screen_sheets(paths) -> tuple[list[ScreenSheet], list[str]]:
+    """Read the `--sheet` files; return them and their problems."""
+    sheets: list[ScreenSheet] = []
+    problems: list[str] = []
+    for path in paths:
+        try:
+            text = path.read_bytes().decode("utf-8-sig")
+        except (OSError, UnicodeDecodeError) as error:
+            problems.append(f"--sheet {path}: cannot be read ({error})")
+            continue
+        batch, ids, sheet_problems = parse_screen_sheet(text)
+        problems.extend(f"--sheet {path}: {p}" for p in sheet_problems)
+        sheets.append(ScreenSheet(path, batch, tuple(ids)))
+    <<refuse sheets that cannot be told apart>>
+    return sheets, problems
+@
+
+Several sheets are matched to the rows by their batch ids, so each
+must have one, and no two the same: a sheet without a [[# batch:]]
+line could only be compared with every row, which the other sheets'
+rows would all miss, and two sheets of one batch would each call the
+other's rows foreign.  Both are usage errors, named before the session
+is read.
+
+<<refuse sheets that cannot be told apart>>=
+if len(sheets) > 1:
+    named: dict[str, Path] = {}
+    for held in sheets:
+        if held.batch is None:
+            problems.append(
+                f"--sheet {held.path}: has no # batch: line; a sheet "
+                "without one can only be given alone"
+            )
+        elif held.batch in named:
+            problems.append(
+                f"--sheet: two sheets name batch {held.batch} "
+                f"({named[held.batch]}, {held.path})"
+            )
+        else:
+            named[held.batch] = held.path
+@
+
+The run's rows are what the file returned, by its lines, or, without
+a file, the selected papers, all in the batch [[--batch]] named.  Each
+sheet is then compared with its batch's rows, by the papers both
+name; an id of the sheet that names no paper of the session stays as
+written, and so counts as missing.  One sheet is compared with every
+row when it has no batch id or the rows name no batch: a screener
+that dropped the [[# batch:]] line has still answered the one sheet
+it was given, and comparing it with no row would hide its strays.
+Every other row that no sheet's batch takes, a batch with no sheet or
+rows without a batch id beside batched sheets, is not compared at all;
+such rows are counted per batch ([[SheetCheck.uncompared]]) and
+reported, never skipped in silence, since under [[--strict]] a row
+nothing could check is refused like a row not on its sheet.
+
+<<sessions command>>=
+@dataclass(frozen=True)
+class SheetComparison:
+    """A sheet against the rows of its batch.
+
+    `listed` is the number of ids on the sheet; `missing` the sheet's
+    ids no row returned, in the sheet's order; `extra` the rows' ids
+    that are not on the sheet, in the run's order.
+    """
+
+    sheet: ScreenSheet
+    listed: int
+    missing: tuple[str, ...]
+    extra: tuple[str, ...]
+
+
+def returned_rows(trace_of: dict, selected: dict, batch: str | None) -> list:
+    """`(id as given, batch)` per row of a run, in the run's order."""
+    if trace_of:
+        lines = {id(entry): entry for entry in trace_of.values()}
+        return [(entry.paper, entry.batch) for entry in
+                sorted(lines.values(), key=lambda entry: entry.line)]
+    return list(dict.fromkeys(
+        (decision.paper.id, batch) for decision in selected.values()
+    ))
+
+
+@dataclass(frozen=True)
+class SheetCheck:
+    """The sheets against a run's rows.
+
+    `uncompared` maps a batch id (None: no batch id) to the rows of the
+    run that no sheet was compared with, as given, in the run's order.
+    """
+
+    comparisons: list[SheetComparison]
+    uncompared: dict
+
+
+def compare_with_sheets(sheets, rows, by_id: dict, by_doi: dict) -> SheetCheck:
+    """Compare each sheet with the rows of its batch; count the rest."""
+    def papers(value: str) -> set[str]:
+        matches = decisions_named_by(value, by_id, by_doi)
+        return {d.paper.id for d in matches} or {value}
+
+    whole = len(sheets) == 1 and (
+        sheets[0].batch is None
+        or all(row_batch is None for _, row_batch in rows)
+    )
+    covered = {held.batch for held in sheets}
+    uncompared: dict = {}
+    if not whole:
+        for value, row_batch in rows:
+            if row_batch not in covered:
+                uncompared.setdefault(row_batch, []).append(value)
+    comparisons = []
+    for held in sheets:
+        batch_rows = [value for value, row_batch in rows
+                      if whole or row_batch == held.batch]
+        returned = set().union(*map(papers, batch_rows))
+        listed = {value: papers(value) for value in held.ids}
+        on_sheet = set().union(*listed.values())
+        comparisons.append(SheetComparison(
+            held, len(held.ids),
+            tuple(value for value, named in listed.items()
+                  if not named & returned),
+            tuple(dict.fromkeys(value for value in batch_rows
+                                if not papers(value) & on_sheet)),
+        ))
+    return SheetCheck(comparisons, {
+        row_batch: tuple(dict.fromkeys(values))
+        for row_batch, values in uncompared.items()
+    })
+@
+
+The lines name each sheet by its file name and batch.
+
+<<sessions command>>=
+def _first_ids(ids) -> str:
+    shown = ", ".join(ids[:BATCH_PAPERS_SHOWN])
+    more = len(ids) - BATCH_PAPERS_SHOWN
+    return shown + (f" \N{HORIZONTAL ELLIPSIS}and {more} more"
+                    if more > 0 else "")
+
+
+def sheet_comparison_lines(check: SheetCheck, strict: bool) -> list[str]:
+    """The stderr lines of `--sheet`: missing, extra and uncompared rows."""
+    comparisons = check.comparisons
+    lines = []
+    for comparison in comparisons:
+        held = comparison.sheet
+        label = held.path.name + (f" (batch {held.batch})"
+                                  if held.batch else " (no batch id)")
+        returned = comparison.listed - len(comparison.missing)
+        line = f"{label}: returned {returned} of {comparison.listed}"
+        if comparison.missing:
+            line += (f"; {len(comparison.missing)} missing: "
+                     f"{_first_ids(comparison.missing)}")
+        lines.append(line + ".")
+        if comparison.extra:
+            lines.append(
+                f"{label}: {len(comparison.extra)} id(s) not on the "
+                f"sheet: {_first_ids(comparison.extra)}"
+            )
+    if any(comparison.missing for comparison in comparisons):
+        lines.append(
+            "Missing rows are fine: fewer rows are better than defaulted "
+            "ones; the missing records are left as they were."
+        )
+    if any(comparison.extra for comparison in comparisons) and not strict:
+        lines.append("--strict refuses ids that are not on their sheet.")
+    for row_batch, values in check.uncompared.items():
+        which = (f"of batch {row_batch}" if row_batch is not None
+                 else "with no batch id")
+        lines.append(
+            f"{len(values)} row(s) {which} were not compared with any "
+            f"sheet: {_first_ids(values)}"
+        )
+    if check.uncompared and not strict:
+        lines.append("--strict refuses rows not compared with any sheet.")
+    return lines
+@
+
+The chunk sets [[sheet_extras]] and [[sheet_uncompared]], which the
+batch check's refusal under [[--strict]] reads
+([[<<check the batch as a whole>>]]); it reads
+[[sheets]], [[trace_of]], [[selected]], [[batch]], [[by_id]],
+[[by_doi]] and [[strict]], which both commands define.
+
+<<compare the batch with its sheets>>=
+sheet_extras = sheet_uncompared = 0
+if sheets:
+    sheet_check = compare_with_sheets(
+        sheets, returned_rows(trace_of, selected, batch), by_id, by_doi
+    )
+    sheet_extras = sum(len(c.extra) for c in sheet_check.comparisons)
+    sheet_uncompared = sum(map(len, sheet_check.uncompared.values()))
+    for line in sheet_comparison_lines(sheet_check, strict):
+        Console(stderr=True).print(escape(line), soft_wrap=True,
+                                   highlight=False)
+@
+
+Let's check both on invented sessions.  A reasons file of two
+concatenated batches, each of thirty honest lines, of which the second
+gives every line 0.85, is not flat as a whole: only its batch shows the
+one confidence, under its id, and [[--strict]] refuses it.  The ids are
+stored per line and shown by [[sessions show -f json]].  [[--batch]]
+goes with [[--reason]], is refused without a reason, with a file that
+names its batches, and when too long.  A sheet of ten records answered
+by seven of them and one record not on it is reported both ways, saved
+without [[--strict]] and refused with it; a sheet that lists no id is a
+usage error.  [[sessions screen]] stores the batch of a verdicts file's
+line and of [[--batch]] with each screening.
+
+<<test functions>>=
+class TestBatchesInDecideAndScreen:
+  """Batch ids and sheets in `sessions decide` and `screen` (#292)."""
+
+  def _setup(self, tmp_path, monkeypatch, count):
+    helper = TestDecideChecksTheBatch()
+    path, _ = helper._make_session(tmp_path, monkeypatch, count)
+    return helper, path
+
+  def test_each_named_batch_is_checked(self, tmp_path, monkeypatch):
+    from scholar.review import load_session
+
+    helper, path = self._setup(tmp_path, monkeypatch, 60)
+    reasons = helper._file(tmp_path, (
+      ["# batch: b-1"]
+      + [f"doi:10.1/batch-{n}\tWork {n} is about topic {n}, not ours."
+         f"\t{(0.6, 0.75, 0.9)[n % 3]}" for n in range(30)]
+      + ["# batch: b-2"]
+      + [f"doi:10.1/batch-{n}\tWork {n} studies topic {n} instead."
+         "\t0.85" for n in range(30, 60)]
+    ))
+    before = path.read_bytes()
+    refused = helper._decide("--reasons-file", reasons, "--strict")
+    assert refused.exit_code == 2, refused.output
+    assert "--strict: the batch has 1 batch finding(s)." in refused.output
+    assert path.read_bytes() == before
+    result = helper._decide("--reasons-file", reasons)
+    assert result.exit_code == 0, result.output
+    stderr = " ".join(result.stderr.split())
+    assert ("In batch b-2 (30 rows): all 30 rows with a confidence have "
+            "the same one, 0.85: doi:10.1/batch-30") in stderr
+    assert "In batch b-1" not in stderr
+    stored = {d.paper.doi: d.agent_batch
+              for d in load_session("batch").decisions}
+    assert stored["10.1/batch-0"] == "b-1"
+    assert stored["10.1/batch-59"] == "b-2"
+    shown = json.loads(runner.invoke(
+      app, ["sessions", "show", "batch", "-f", "json"]).output)
+    assert {d["agent_batch"] for d in shown["decisions"]} == {"b-1", "b-2"}
+
+  def test_a_shared_reason_in_a_batch_is_reported_once(
+    self, tmp_path, monkeypatch
+  ):
+    helper, path = self._setup(tmp_path, monkeypatch, 60)
+    filled = "Off topic; the title shows an unrelated subject."
+
+    def reasons(spread):
+      return helper._file(tmp_path, (
+        ["# batch: b-1"]
+        + [f"doi:10.1/batch-{n}\t"
+           + (filled if n < spread else f"Work {n} studies topic {n}.")
+           for n in range(30)]
+        + ["# batch: b-2"]
+        + [f"doi:10.1/batch-{n}\t"
+           + (filled if n < 42 else f"Work {n} is about topic {n}.")
+           for n in range(30, 60)]
+      ))
+
+    alone = helper._decide("--reasons-file", reasons(0), "--strict")
+    assert alone.exit_code == 2, alone.output
+    assert "--strict: the batch has 1 batch finding(s)." in alone.output
+    stderr = " ".join(alone.stderr.split())
+    assert stderr.count("shared by 12 records") == 1
+    assert "In batch b-2 (30 rows): shared by 12 records" in stderr
+    spread = helper._decide("--reasons-file", reasons(3), "--strict")
+    assert "--strict: the batch has 1 batch finding(s)." in spread.output
+    stderr = " ".join(spread.stderr.split())
+    assert ("shared by 15 records with different titles (15 rows): "
+            f"\"{filled}\", 12 of them in batch b-2") in stderr
+    assert "In batch b-2" not in stderr
+
+  def test_the_batch_option(self, tmp_path, monkeypatch):
+    from scholar.review import load_session
+
+    helper, path = self._setup(tmp_path, monkeypatch, 3)
+    result = helper._decide("--doi", "10.1/batch-0", "--doi",
+                            "10.1/batch-1", "--reason", "Off topic.",
+                            "--batch", " sheet \t 7 ")
+    assert result.exit_code == 0, result.output
+    stored = [d.agent_batch for d in load_session("batch").decisions]
+    assert stored == ["sheet 7", "sheet 7", None]
+    named = helper._file(tmp_path, ["# batch: b-9",
+                                    "doi:10.1/batch-2\tOff topic."])
+    before = path.read_bytes()
+    result = runner.invoke(app, [
+      "sessions", "decide", "batch", "--source", "agent", "--discard",
+      "--tag", "t", "--doi", "10.1/batch-2", "--batch", "b-1"])
+    assert result.exit_code == 2, result.output
+    assert ("--batch and --sheet concern a batch of reasons"
+            in " ".join(result.output.split()))
+    for args, message in (
+      (["--reasons-file", named, "--batch", "b-1"],
+       "names its batches (# batch: b-9, before line 2); --batch is for "
+       "a file without # batch: lines"),
+      (["--doi", "10.1/batch-2", "--reason", "Off topic.",
+        "--batch", "x" * 101],
+       "--batch: batch id of 101 characters, over the limit of 100"),
+    ):
+      result = helper._decide(*args)
+      assert result.exit_code == 2, (args, result.output)
+      assert message in " ".join(result.output.split()), args
+    assert path.read_bytes() == before
+
+  def _sheet(self, tmp_path, name, batch, ids):
+    path = tmp_path / name
+    path.write_text(
+      (f"# batch: {batch}\n" if batch else "")
+      + "id\ttitle\tyear\tvenue\tabstract\n"
+      + "".join(f"{value}\tA title\t2020\tV\tA.\n" for value in ids),
+      encoding="utf-8")
+    return str(path)
+
+  def test_a_batch_against_its_sheet(self, tmp_path, monkeypatch):
+    helper, path = self._setup(tmp_path, monkeypatch, 15)
+    sheet = self._sheet(tmp_path, "sheet.tsv", "b-1",
+                        [f"doi:10.1/batch-{n}" for n in range(10)])
+    other = self._sheet(tmp_path, "other.tsv", "b-2", ["doi:10.1/batch-14"])
+    reasons = helper._file(tmp_path, ["# batch: b-1"] + [
+      f"10.1/batch-{n}\tWork {n} is about topic {n}, not ours."
+      for n in (*range(7), 12)
+    ])
+    before = path.read_bytes()
+    refused = helper._decide("--reasons-file", reasons, "--sheet", sheet,
+                             "--strict")
+    assert refused.exit_code == 2, refused.output
+    assert "1 id(s) not on their sheet" in refused.output
+    assert path.read_bytes() == before
+    result = helper._decide("--reasons-file", reasons, "--sheet", sheet,
+                            "--sheet", other)
+    assert result.exit_code == 0, result.output
+    stderr = " ".join(result.stderr.split())
+    assert ("sheet.tsv (batch b-1): returned 7 of 10; 3 missing: "
+            "doi:10.1/batch-7, doi:10.1/batch-8, doi:10.1/batch-9.") \
+      in stderr
+    assert ("sheet.tsv (batch b-1): 1 id(s) not on the sheet: "
+            "10.1/batch-12") in stderr
+    assert ("other.tsv (batch b-2): returned 0 of 1; 1 missing: "
+            "doi:10.1/batch-14.") in stderr
+    assert ("Missing rows are fine: fewer rows are better than defaulted "
+            "ones") in stderr
+    assert "--strict refuses ids that are not on their sheet." in stderr
+    empty = tmp_path / "empty.tsv"
+    empty.write_text("# batch: b-3\nid\ttitle\n", encoding="utf-8")
+    result = helper._decide("--reasons-file", reasons, "--sheet",
+                            str(empty))
+    assert result.exit_code == 2
+    assert "lists no id" in result.output
+
+  def test_screen_stores_the_batch(self, tmp_path, monkeypatch):
+    screen = TestSessionsScreen()
+    path = screen._make_session(tmp_path, monkeypatch)
+    verdicts = screen._file(
+      tmp_path, "# batch: v-1\n10.1/llm\tkept\tcompilers\tTeaching.\n")
+    result = screen._screen("--as", "agent", "--by", "agent-2",
+                            "--verdicts-file", verdicts)
+    assert result.exit_code == 0, result.output
+    result = screen._screen("--as", "agent", "--by", "agent-3", "--keep",
+                            "--tag", "loops", "--doi", "10.1/pending",
+                            "--batch", "v-2", "--sheet",
+                            self._sheet(tmp_path, "s.tsv", "v-2",
+                                        ["10.1/pending"]))
+    assert result.exit_code == 0, result.output
+    assert "s.tsv (batch v-2): returned 1 of 1." in result.stderr
+    saved = screen._saved(path)
+    assert [(r["origin"], r["batch"])
+            for r in saved["10.1/llm"]["screenings"]] \
+      == [("decision", None), ("screen", "v-1")]
+    assert [r["batch"] for r in saved["10.1/pending"]["screenings"]] \
+      == ["v-2"]
+@
+
+Rows that no sheet can be matched with are reported, not skipped.  A
+reasons file without a [[# batch:]] line, or a [[--reason]] without
+[[--batch]], given with one batched sheet, is compared with that sheet
+whole: two of its three records are returned and one row is not on it,
+which [[--strict]] refuses.  A file whose second batch has no sheet,
+and a file without batch ids given with two batched sheets, leave rows
+compared with no sheet: one line says how many, of which batch, and
+[[--strict]] refuses them.  A sheet without a [[# batch:]] line among
+several, or two sheets of one batch, cannot be matched to rows at all
+and are usage errors before the session is read.
+
+<<test functions>>=
+class TestRowsWithoutTheirSheet:
+  """Every row of a run is compared with a sheet or reported (#292)."""
+
+  def _setup(self, tmp_path, monkeypatch):
+    helper = TestDecideChecksTheBatch()
+    path, _ = helper._make_session(tmp_path, monkeypatch, 10)
+    sheets = TestBatchesInDecideAndScreen()
+    first = sheets._sheet(tmp_path, "s1.tsv", "b-1",
+                          [f"doi:10.1/batch-{n}" for n in range(3)])
+    second = sheets._sheet(tmp_path, "s2.tsv", "b-2",
+                           [f"doi:10.1/batch-{n}" for n in range(3, 6)])
+    return helper, path, first, second
+
+  def _reasons(self, helper, tmp_path, lines):
+    return helper._file(tmp_path, [
+      line if line.startswith("#")
+      else f"doi:10.1/batch-{line}\tWork {line} is about topic {line}."
+      for line in lines
+    ])
+
+  def test_rows_without_a_batch_meet_the_one_sheet(self, tmp_path,
+                                                   monkeypatch):
+    helper, path, first, _ = self._setup(tmp_path, monkeypatch)
+    reasons = self._reasons(helper, tmp_path, ["0", "1", "5"])
+    before = path.read_bytes()
+    refused = helper._decide("--reasons-file", reasons, "--sheet", first,
+                             "--strict")
+    assert refused.exit_code == 2, refused.output
+    assert "1 id(s) not on their sheet" in refused.output
+    assert path.read_bytes() == before
+    result = helper._decide("--reasons-file", reasons, "--sheet", first)
+    assert result.exit_code == 0, result.output
+    stderr = " ".join(result.stderr.split())
+    assert ("s1.tsv (batch b-1): returned 2 of 3; 1 missing: "
+            "doi:10.1/batch-2.") in stderr
+    assert ("s1.tsv (batch b-1): 1 id(s) not on the sheet: "
+            "doi:10.1/batch-5") in stderr
+
+  def test_a_reason_without_a_batch_meets_the_one_sheet(
+    self, tmp_path, monkeypatch
+  ):
+    helper, path, first, _ = self._setup(tmp_path, monkeypatch)
+    result = helper._decide("--doi", "10.1/batch-0", "--doi",
+                            "10.1/batch-5", "--reason", "Off topic.",
+                            "--sheet", first, "--strict")
+    assert result.exit_code == 2, result.output
+    assert "1 id(s) not on their sheet" in result.output
+    assert ("s1.tsv (batch b-1): returned 1 of 3; 2 missing"
+            in " ".join(result.stderr.split()))
+
+  def test_a_batch_without_a_sheet_is_reported(self, tmp_path,
+                                               monkeypatch):
+    helper, path, first, _ = self._setup(tmp_path, monkeypatch)
+    reasons = self._reasons(helper, tmp_path,
+                            ["# batch: b-1", "0", "1", "2",
+                             "# batch: b-9", "5"])
+    refused = helper._decide("--reasons-file", reasons, "--sheet", first,
+                             "--strict")
+    assert refused.exit_code == 2, refused.output
+    assert "1 row(s) not compared with any sheet" in refused.output
+    result = helper._decide("--reasons-file", reasons, "--sheet", first)
+    assert result.exit_code == 0, result.output
+    stderr = " ".join(result.stderr.split())
+    assert "s1.tsv (batch b-1): returned 3 of 3." in stderr
+    assert ("1 row(s) of batch b-9 were not compared with any sheet: "
+            "doi:10.1/batch-5") in stderr
+    assert "--strict refuses rows not compared with any sheet." in stderr
+
+  def test_rows_without_a_batch_and_several_sheets(self, tmp_path,
+                                                   monkeypatch):
+    helper, path, first, second = self._setup(tmp_path, monkeypatch)
+    reasons = self._reasons(helper, tmp_path, ["0", "1", "5"])
+    refused = helper._decide("--reasons-file", reasons, "--sheet", first,
+                             "--sheet", second, "--strict")
+    assert refused.exit_code == 2, refused.output
+    assert "3 row(s) not compared with any sheet" in refused.output
+    assert ("3 row(s) with no batch id were not compared with any sheet"
+            in " ".join(refused.stderr.split()))
+
+  def test_sheets_that_cannot_be_told_apart(self, tmp_path, monkeypatch):
+    helper, path, first, _ = self._setup(tmp_path, monkeypatch)
+    sheets = TestBatchesInDecideAndScreen()
+    plain = sheets._sheet(tmp_path, "plain.tsv", None, ["doi:10.1/batch-7"])
+    again = sheets._sheet(tmp_path, "again.tsv", "b-1", ["doi:10.1/batch-8"])
+    reasons = self._reasons(helper, tmp_path, ["0"])
+    for other, message in ((plain, "has no # batch: line"),
+                           (again, "two sheets name batch b-1")):
+      result = runner.invoke(app, [
+        "sessions", "decide", "no-such-session", "--source", "agent",
+        "--discard", "--tag", "t", "--by", "a", "--reasons-file", reasons,
+        "--sheet", first, "--sheet", other])
+      assert result.exit_code == 2, result.output
+      assert message in " ".join(result.output.split())
+@
+
 \paragraph{Checking the reasons a session stores.}
 \label{sec:sessions-check-batches}
 The batch check runs when a batch is recorded, so reasons written
@@ -16304,7 +17664,10 @@ def sessions_check_batches(
     on purpose, or the same reason on every line. A stored run is not
     a screener's batch: a batch is split over runs by verdict and tags,
     and several batches can be merged into one run, so one confidence
-    on every row is not judged here. Read-only; exits 0.
+    on every row is not judged from runs. Rows recorded with a batch id
+    (a `# batch:` line or --batch) are also checked per stored batch,
+    one screener's rows under one id: shared reasons and one confidence
+    on every row. Read-only; exits 0.
 
     The thresholds are scholar's own choice. A reason shared by at
     least 10 records with different titles is reported (in nine
@@ -16351,9 +17714,23 @@ ONE_REASON_RUN_NOTE = (
     "and --strict refuses it."
 )
 FLAT_NOT_JUDGED = (
-    "One confidence on every row is not judged from stored runs: that "
-    "needs the batch each row came from, which is not stored."
+    "One confidence on every row is not judged from stored runs; it is "
+    "judged per stored batch, for rows recorded with a batch id "
+    "(`# batch:` or --batch)."
 )
+BATCH_CONFIDENCE_NOTE = (
+    "A -c given to a whole `sessions decide` run is stored on every row "
+    "like a confidence of the row's own, so a batch recorded in one run "
+    "with -c shows one confidence on every row."
+)
+
+
+def stored_batch_label(stored) -> str:
+    """`agent screener-1, batch 5be0c1d2-001 (100 agent decisions)`."""
+    who = (f"{stored.kind} {stored.name}" if stored.name
+           else f"{stored.kind} (no name)")
+    return (f"{who}, batch {stored.batch} ({len(stored.rows)} "
+            f"{stored.what})")
 
 
 def stored_run_label(run) -> str:
@@ -16396,6 +17773,7 @@ def check_batches_lines(check, name: str) -> list[str]:
                 f"    {line}" for line in batch_finding_lines(run.findings)
             )
         lines.append(ONE_REASON_RUN_NOTE)
+    <<list the stored batches>>
     if check.runs:
         lines.extend([STORED_RUN_MEANING, FLAT_NOT_JUDGED])
     return lines
@@ -16422,8 +17800,42 @@ def check_batches_data(check) -> dict:
             }
             for run in check.runs
         ],
-        "flat_confidence": "not judged from stored runs",
+        "batches": [
+            {
+                "what": stored.what, "kind": stored.kind,
+                "name": stored.name, "batch": stored.batch,
+                "rows": len(stored.rows),
+                "findings": [_finding_data(f) for f in stored.findings],
+            }
+            for stored in check.batches
+        ],
+        "flat_confidence": "judged per stored batch, not from stored runs",
     }
+@
+
+The stored batches (\cref{sec:stored-batches} in the review module)
+come after the runs: how many there are, then each one with findings,
+under its screener and id, and, when a batch shows one confidence on
+every row, the note that a [[-c]] given to a whole run looks the same,
+for the reader to rule out before calling the batch defaulted.
+
+<<list the stored batches>>=
+if check.batches:
+    flagged = [stored for stored in check.batches if stored.findings]
+    lines.append(
+        f"Stored batches (rows recorded with a batch id): "
+        f"{len(check.batches)}, each checked for shared reasons and one "
+        f"confidence on every row; {len(flagged)} with findings"
+        + (":" if flagged else ".")
+    )
+    for stored in flagged:
+        lines.append(f"  {stored_batch_label(stored)}:")
+        lines.extend(
+            f"    {line}" for line in batch_finding_lines(stored.findings)
+        )
+    if any(f.kind == "flat-confidence"
+           for stored in flagged for f in stored.findings):
+        lines.append(BATCH_CONFIDENCE_NOTE)
 @
 
 Let's run it on a saved session where one loader stored two screeners'
@@ -16534,6 +17946,50 @@ class TestSessionsCheckBatches:
     assert (f"shared by at least {SHARED_REASON_MIN_RECORDS} records with "
             "different titles is reported") in help_text
     assert f"reported from {FLAT_CONFIDENCE_MIN_ROWS} rows" in help_text
+@
+
+The stored batches appear in the text and the JSON: of two batches of
+one agent, the one with twelve rows on one reason and 0.9 on every row
+is listed with both findings and the note on [[-c]].
+
+<<test functions>>=
+class TestSessionsCheckBatchesPerBatch:
+  """`sessions check-batches` lists the stored batches (#292)."""
+
+  def test_batches_in_text_and_json(self):
+    from scholar.review import (
+      DecisionStatus, ReviewDecision, ReviewSession, ReviewSource,
+      stored_batch_check,
+    )
+
+    def decision(n, batch, reason, confidence):
+      return ReviewDecision(
+        paper=Paper(title=f"Listed Work {n}", authors=["A"],
+                    doi=f"10.5555/listed-{n}"),
+        provider="p", status=DecisionStatus.DISCARDED, tags=["t"],
+        source=ReviewSource.AGENT_UNREVIEWED, agent_by="loader",
+        agent_decided_at="2026-11-20T10:00:00+00:00",
+        agent_reason=reason, agent_batch=batch, llm_confidence=confidence,
+      )
+
+    session = ReviewSession(query="q", providers=["p"],
+                            timestamp=datetime(2026, 11, 20))
+    session.decisions = [
+      decision(n, "b-1", "Not about it." if n < 12 else f"Work {n}.", 0.9)
+      for n in range(30)
+    ] + [decision(100 + n, "b-2", f"Work {100 + n}.", (0.6, 0.8)[n % 2])
+         for n in range(30)]
+    check = stored_batch_check(session)
+    flat = " ".join(" ".join(check_batches_lines(check, "b")).split())
+    assert ("Stored batches (rows recorded with a batch id): 2, each "
+            "checked for shared reasons and one confidence on every row; "
+            "1 with findings: agent loader, batch b-1 (30 agent "
+            "decisions): shared by 12 records") in flat
+    assert "all 30 rows with a confidence have the same one, 0.9" in flat
+    assert "A -c given to a whole `sessions decide` run is stored" in flat
+    data = check_batches_data(check)
+    assert [(b["batch"], b["rows"], len(b["findings"]))
+            for b in data["batches"]] == [("b-1", 30, 2), ("b-2", 30, 0)]
 @
 
 \paragraph{Records decided without an abstract.}
@@ -17479,6 +18935,17 @@ def sessions_reset(
             help="Select every paper.",
         ),
     ] = False,
+    batches: Annotated[
+        Optional[list[str]],
+        typer.Option(
+            "--batch",
+            help="Select the decisions whose agent's trace names this "
+                 "batch (`agent_batch`, from a `# batch:` line or "
+                 "--batch of `sessions decide`); with --doi, --paper-id, "
+                 "--all or --source, only those. Repeatable. Screenings "
+                 "are not selected by it.",
+        ),
+    ] = None,
     all_copies: Annotated[
         bool,
         typer.Option(
@@ -17525,7 +18992,11 @@ def sessions_reset(
     holds a human's decision or confirmation (human, llm_reviewed,
     agent_reviewed) is refused (exit 2); leave those out with --source.
     Pending papers are skipped. If --doi or --paper-id matches nothing,
-    nothing is saved (exit 1). The session file is copied to
+    nothing is saved (exit 1). --batch ID selects the decisions an
+    agent recorded from that batch (redo a bad batch as a unit); a
+    reset clears the id with the rest of the trace, so a batch already
+    reset is not found again. Screenings recorded from the batch are
+    not reset by it. The session file is copied to
     `<name>.json.pre-reset-<time>.bak` before it is saved; --dry-run
     writes nothing.
 
@@ -17535,6 +19006,7 @@ def sessions_reset(
             --note "classified before the trace was recorded" \\
             --by "the author"
         scholar sessions reset my-review --doi 10.1145/3568813
+        scholar sessions reset my-review --batch 5be0c1d2-003 --dry-run
     """
     from collections import Counter
 
@@ -17593,12 +19065,13 @@ if all_papers and (doi or paper_id):
         "(not both).[/red]"
     )
     raise typer.Exit(2)
-if not (all_papers or doi or paper_id or wanted_sources):
+if not (all_papers or doi or paper_id or wanted_sources or batches):
     console.print(
         "[red]Select papers with --doi/--paper-id, --source or "
-        "--all.[/red]"
+        "--all (or --batch).[/red]"
     )
     raise typer.Exit(2)
+<<read the batches to reset>>
 @
 
 <<refuse an unknown [[--source]] nobody holds>>=
@@ -17648,7 +19121,9 @@ chosen = [
     d for d in selected
     if d.is_decided
     and (not wanted_sources or d.source.value in wanted_sources)
+    and (not wanted_batches or d.agent_batch in wanted_batches)
 ]
+<<note the batches no decision carries>>
 if doi or paper_id:
     for d in selected:
         if d not in chosen:
@@ -17660,6 +19135,123 @@ if doi or paper_id:
 
 The refusal of a human's decision lists the decisions it found, and
 says how to leave them out and where a human redoes their own.
+
+[[--batch ID]] selects by the batch an agent's reasons came from
+([[agent_batch]], \cref{sec:batch-ids-in-files}), so that a batch the
+batch check flags (\cref{sec:sessions-check-batches}) can be redone as
+a unit: reset, then screened again.  Like [[--source]] it selects on
+its own and narrows the other selectors, and it is repeatable.  The
+value is read as the file's id is read ([[read_batch_id]]), so the
+white space of a copied id does not matter.  It selects decisions only.
+A screening recorded from the batch is another screener's verdict
+beside the decision and is not reset by this; a reset of the paper sets
+its screenings aside as any reset does (\cref{sec:reset-decision} in
+the review module).  A human's decision or confirmation in the batch
+refuses the run as below, so a caller resets the agent's part with
+[[--source agent]].  A batch id no decision carries is noted, not
+refused: a reset clears the id with the rest of the trace (it is kept
+in the reset history), so a second run finds nothing to do, as a
+second [[--source llm]] does.
+
+<<read the batches to reset>>=
+wanted_batches: list[str] = []
+for value in batches or []:
+    wanted, problem = read_batch_id(value)
+    if problem:
+        console.print(f"[red]--batch: {escape(problem)}[/red]")
+        raise typer.Exit(2)
+    wanted_batches.append(wanted)
+<<note the batches no decision carries>>=
+held_batches = {d.agent_batch for d in session.decisions}
+for wanted in wanted_batches:
+    if wanted not in held_batches:
+        Console(stderr=True).print(
+            f"[yellow]No decision carries batch {escape(wanted)} (a reset "
+            "clears it, so a batch already reset is not found "
+            "again).[/yellow]",
+            soft_wrap=True,
+        )
+@
+
+Let's check it on agent decisions from two batches, of which one also
+holds a decision a human confirmed: [[--batch]] alone is refused for
+that one, [[--source agent]] resets the agent's part and leaves the
+other batch and the screening alone, a second run finds nothing and
+says so, and [[--batch]] with [[--doi]] narrows.
+
+<<test functions>>=
+class TestResetByBatch:
+  """`sessions reset --batch ID` redoes a batch as a unit (#292)."""
+
+  def _make_session(self, tmp_path, monkeypatch):
+    from scholar.review import (
+      DecisionStatus, ReviewDecision, ReviewSession, ReviewSource,
+      new_screening, record_screening, save_session,
+    )
+
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+
+    def decision(n, batch, source=ReviewSource.AGENT_UNREVIEWED):
+      return ReviewDecision(
+        paper=Paper(title=f"Reset Work {n}", authors=["A"],
+                    doi=f"10.1/reset-{n}"),
+        provider="openalex", status=DecisionStatus.DISCARDED, tags=["t"],
+        source=source, agent_reason=f"Reason {n}.", agent_by="agent-1",
+        agent_decided_at="2026-11-20T10:00:00+00:00", agent_batch=batch,
+      )
+
+    decisions = [decision(n, "b-1") for n in range(3)] + [
+      decision(3, "b-1", ReviewSource.AGENT_REVIEWED),
+      decision(4, "b-2"), decision(5, "b-2"),
+    ]
+    record_screening(decisions[4], new_screening(
+      kind="agent", name="second", status="kept", tags=["t"],
+      recorded_at="2026-11-20T11:00:00+00:00", batch="b-1"))
+    save_session(ReviewSession(
+      query="q", providers=["openalex"], timestamp=datetime(2026, 11, 20),
+      name="resets", decisions=decisions))
+
+  def _reset(self, *args):
+    return runner.invoke(app, ["sessions", "reset", "resets", *args])
+
+  def test_a_batch_is_reset_as_a_unit(self, tmp_path, monkeypatch):
+    from scholar.review import counted_screenings, load_session
+
+    self._make_session(tmp_path, monkeypatch)
+    refused = self._reset("--batch", "b-1")
+    assert refused.exit_code == 2, refused.output
+    assert "Leave them out with --source agent,llm." in " ".join(
+      refused.output.split())
+    result = self._reset("--batch", " b-1 ", "--source", "agent")
+    assert result.exit_code == 0, result.output
+    assert "discarded by agent: 3" in result.output
+    after = {d.paper.doi: d for d in load_session("resets").decisions}
+    assert [after[f"10.1/reset-{n}"].status.value for n in range(6)] == [
+      "pending", "pending", "pending", "discarded", "discarded",
+      "discarded"]
+    assert after["10.1/reset-0"].resets[-1]["trace"]["agent_batch"] \
+      == "b-1"
+    assert len(counted_screenings(after["10.1/reset-4"])) == 2
+    again = self._reset("--batch", "b-1", "--source", "agent")
+    assert again.exit_code == 0, again.output
+    assert "Reset 0 decision(s)" in again.output
+    unheld = self._reset("--batch", "b-9")
+    assert unheld.exit_code == 0, unheld.output
+    assert "No decision carries batch b-9" in " ".join(
+      unheld.stderr.split())
+
+  def test_with_doi_it_narrows(self, tmp_path, monkeypatch):
+    from scholar.review import load_session
+
+    self._make_session(tmp_path, monkeypatch)
+    result = self._reset("--batch", "b-2", "--doi", "10.1/reset-4",
+                         "--doi", "10.1/reset-0")
+    assert result.exit_code == 0, result.output
+    after = {d.paper.doi: d.status.value
+             for d in load_session("resets").decisions}
+    assert (after["10.1/reset-4"], after["10.1/reset-5"],
+            after["10.1/reset-0"]) == ("pending", "discarded", "discarded")
+@
 
 <<refuse to reset a human's decision>>=
 confirmed = [d for d in chosen if not d.source.is_unreviewed]
@@ -19631,7 +21223,32 @@ def sessions_screen(
                  "doi:..., a bare DOI or a session paper id; TAGS are "
                  "comma-separated. Not quoted (not CSV), no tab in a "
                  "reason; blank and # lines are skipped. Replaces "
-                 "--doi/--paper-id/--keep/--discard/--tag/--reason.",
+                 "--doi/--paper-id/--keep/--discard/--tag/--reason. A "
+                 "`# batch: ID` line gives the lines after it that "
+                 "batch id.",
+            exists=True, dir_okay=False, readable=True,
+        ),
+    ] = None,
+    batch: Annotated[
+        Optional[str],
+        typer.Option(
+            "--batch",
+            help="The batch the verdicts came from (e.g. a screen "
+                 "sheet's `# batch:` id), stored with each screening; "
+                 "for a verdicts file without `# batch:` lines. Free "
+                 "text, at most 100 characters.",
+        ),
+    ] = None,
+    sheet: Annotated[
+        Optional[list[Path]],
+        typer.Option(
+            "--sheet",
+            help="A screen sheet the verdicts answer (repeatable). Its "
+                 "ids are compared with the rows of its batch (its "
+                 "`# batch:` id; every row for a sheet without one); "
+                 "missing ids and ids not on the sheet are listed on "
+                 "stderr. Missing rows are fine; --strict refuses ids "
+                 "not on the sheet.",
             exists=True, dir_okay=False, readable=True,
         ),
     ] = None,
@@ -19775,6 +21392,13 @@ def sessions_screen(
     listed on stderr and the batch is saved, unless --strict refuses it
     (exit 2), which it also does for a quote not found.
 
+    A verdicts file may name its batch in a comment line `# batch: ID`
+    (a screen sheet starts with one; a later such line starts a new
+    batch), and --batch ID names the batch otherwise. The id is stored
+    with each screening; a file that names batches is also checked
+    batch by batch. --sheet FILE compares a batch with the screen sheet
+    it answers, as in `sessions decide`.
+
     Examples:
         scholar sessions screen my-review --as agent --by second-agent \\
             --verdicts-file verdicts.tsv --blind
@@ -19804,6 +21428,7 @@ def sessions_screen(
     <<refuse to screen copies decided apart>>
     saving = not dry_run
     <<check the quotes of the agent's reasons>>
+    <<compare the batch with its sheets>>
     <<check the batch as a whole>>
     <<warn about screened records without an abstract>>
     <<record the screenings>>
@@ -19892,6 +21517,7 @@ if reason is not None:
     reason, problem = checked_agent_reason(reason)
     if problem:
         problems.append(f"--reason: {problem}")
+<<check the batch option>>
 if verdicts_file is not None:
     try:
         text = verdicts_file.read_bytes().decode("utf-8-sig")
@@ -19902,12 +21528,18 @@ if verdicts_file is not None:
         problems.extend(f"{verdicts_file}: {p}" for p in file_problems)
         if not verdict_lines and not file_problems:
             problems.append(f"{verdicts_file}: names no paper")
+        verdict_lines, batch_problems = lines_with_batch(
+            verdict_lines, batch, verdicts_file
+        )
+        problems.extend(batch_problems)
         if as_kind == "human":
             problems.extend(
                 f"{verdicts_file}: line {entry.line}: a human screening "
                 "carries no confidence"
                 for entry in verdict_lines if entry.confidence is not None
             )
+sheets, sheet_problems = read_screen_sheets(sheet or [])
+problems.extend(sheet_problems)
 for problem in problems:
     console.print(f"[red]{escape(problem)}[/red]", soft_wrap=True)
 if problems:
@@ -19933,6 +21565,7 @@ class VerdictLine:
     tags: tuple[str, ...]
     reason: str
     confidence: float | None
+    batch: str | None = None
 
 
 def read_verdict_column(text: str) -> tuple[str | None, str | None]:
@@ -19989,8 +21622,8 @@ def parse_verdicts_file(text: str) -> tuple[list[VerdictLine], list[str]]:
     """
     entries, problems = parse_tab_file(text, VERDICTS_LAYOUT)
     return [
-        VerdictLine(number, paper, *values)
-        for number, paper, values in entries
+        VerdictLine(number, paper, *values, batch)
+        for number, paper, values, batch in entries
     ], problems
 @
 
@@ -20089,6 +21722,12 @@ def verdict_of(decision) -> tuple[str, list[str], str | None, float | None]:
     return (entry.status, list(entry.tags), entry.reason,
             entry.confidence if entry.confidence is not None
             else confidence)
+
+
+def batch_of(decision) -> str | None:
+    """The batch the verdict for `decision` came from, if named."""
+    entry = trace_of.get(id(decision))
+    return entry.batch if entry is not None else batch
 @
 
 A screener may not screen a decision it made itself: when the
@@ -20237,7 +21876,7 @@ for decision in selected.values():
         recorded_at=recorded_at, confidence=verdict_confidence,
         reason=verdict_reason, blind=blind,
         blind_basis="declared" if blind is not None else None,
-        sample_id=sample, via="screen",
+        sample_id=sample, via="screen", batch=batch_of(decision),
     )
     if record_screening(decision, screening) is not None:
         snapshots += 1
