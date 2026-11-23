@@ -392,7 +392,7 @@ set.
 | Provider | Order | Source (read 2026-11-23) |
 |---|---|---|
 | scopus | relevance: sends `sort=relevancy` on every page | Scopus Search API WADL (dev.elsevier.com/documentation/ScopusSearchAPI.wadl): `sort` options incl. `relevancy`; no default stated |
-| wos (both tiers) | relevance: sends `sortField=RS+D` | Starter/Expanded OpenAPI (developer.clarivate.com/apis/wos-starter/swagger, …/apis/wos/swagger): "RS+D" = "Relevance (Descending)"; no default stated |
+| wos (both tiers) | relevance: sends `sortField=RS+D` | Starter OpenAPI (developer.clarivate.com/apis/wos-starter/swagger): supported fields list "RS - Relevance", example RS+D "Relevance (Descending)"; Expanded (…/apis/wos/swagger): no field list, RS rests on its example ("Relevance": RS+D) and the separator text ("'+' or ' '"); no default stated |
 | openalex, source-pinned, openalex-semantic | relevance (no `sort` sent) | help.openalex.org/api/searching/: "sorted by it (descending) by default" |
 | s2 | per endpoint (above) | swagger.json (#161) |
 | arxiv | relevance (`sortBy=relevance&sortOrder=descending`) | info.arxiv.org/help/api/user-manual.html |
@@ -404,9 +404,18 @@ Before #303 Scopus and WoS sent no sort and answered newest first
 (issue's measurement on twelve cached queries: Scopus all lists, WoS
 89 %). Both now key their cache by the order (`SCOPUS_ORDER_KEY`,
 `WOS_ORDER_KEY` = `"sortField=RS+D"`, plain strings, no
-`CACHE_VERSION` bump): old entries are unused, not deleted. Probes,
-DOI lookups and WoS's extended methods send no sort. No provider
-records `date` today.
+`CACHE_VERSION` bump): old entries are unused, not deleted. So every
+earlier Scopus/WoS cache entry is a miss: re-running an old session's
+searches spends live quota on those two, and the #139 fallback to old
+standard-view Scopus entries (off campus, inconclusive probe) no
+longer finds them, so such a search fails. Right all the same: an old
+entry's order is not the one now recorded, and a limited old entry
+holds other records (the newest) than a relevance search returns.
+Probes, DOI lookups (WoS: the tier functions take `sort_field`, only
+`_search_uncached` passes it) and WoS's extended methods send no sort.
+`search_provider` records no order for a search that failed outright
+(error, no papers) or was skipped; an incomplete answer with papers
+keeps it. No provider records `date` today.
 
 ### Title-and-Abstract Search (`--in`)
 
@@ -704,7 +713,9 @@ The never-expiring cache is keyed by view and order (#303):
 default-view results are `(query, limit, filters, "sort=relevancy")`
 (`SCOPUS_ORDER_KEY`), COMPLETE results add `"COMPLETE"` after it; the
 old 3-tuple / `"COMPLETE"` 4-tuple entries (newest first) are never
-served and stay unused until `cache clear --provider scopus`. COMPLETE results are served to everyone (unless
+served and stay unused until `cache clear --provider scopus`; so old
+sessions' Scopus re-runs cost live requests, and off campus a search
+that the old standard-view entry used to serve (#139) now fails. COMPLETE results are served to everyone (unless
 `SCOPUS_VIEW=standard`); default-view results only when COMPLETE is not
 available, which a new process learns from one `count=1` probe
 (`_complete_confirmed()`); a failed probe still serves the cache.

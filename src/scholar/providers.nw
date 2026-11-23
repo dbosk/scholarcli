@@ -10611,9 +10611,13 @@ def _search_uncached(
     logger.debug(f"wos: Searching for '{query}' with limit={limit}")
 
     if self._api_tier == "expanded":
-        return self._search_expanded(query, limit, filters)
+        return self._search_expanded(
+            query, limit, filters, sort_field=WOS_SORT_RELEVANCE
+        )
     else:
-        return self._search_starter(query, limit, filters)
+        return self._search_starter(
+            query, limit, filters, sort_field=WOS_SORT_RELEVANCE
+        )
 
 <<wos format query>>
 <<wos search starter>>
@@ -10657,13 +10661,15 @@ def _search_starter(
     query: str,
     limit: int,
     filters: SearchFilters | None,
+    sort_field: str | None = None,
 ) -> tuple[list[Paper], bool]:
     """
     Search using the WoS Starter API.
 
     Automatically fetches multiple pages if the requested limit exceeds
     the API's per-request maximum (50 results per page).  Returns
-    ``(papers, cacheable)``.
+    ``(papers, cacheable)``.  `sort_field` is sent as `sortField` when
+    given (searches give it; DOI lookups do not).
     """
     all_papers: list[Paper] = []
     page = 1
@@ -10686,7 +10692,7 @@ def _search_starter(
                     "db": "WOS",
                     "limit": current_page_size,
                     "page": page,
-                    "sortField": WOS_SORT_RELEVANCE,
+                    **({"sortField": sort_field} if sort_field else {}),
                 },
             )
             response.raise_for_status()
@@ -10733,13 +10739,15 @@ def _search_expanded(
     query: str,
     limit: int,
     filters: SearchFilters | None,
+    sort_field: str | None = None,
 ) -> tuple[list[Paper], bool]:
     """
     Search using the WoS Expanded API.
 
     Automatically fetches multiple pages if the requested limit exceeds
     the API's per-request maximum (100 results per page).  Returns
-    ``(papers, cacheable)``.
+    ``(papers, cacheable)``.  `sort_field` is sent as `sortField` when
+    given (searches give it; DOI lookups do not).
     """
     all_papers: list[Paper] = []
     first_record = 1  # 1-indexed
@@ -10762,7 +10770,7 @@ def _search_expanded(
                     "usrQuery": effective_query,
                     "count": current_page_size,
                     "firstRecord": first_record,
-                    "sortField": WOS_SORT_RELEVANCE,
+                    **({"sortField": sort_field} if sort_field else {}),
                 },
             )
             response.raise_for_status()
@@ -10809,7 +10817,9 @@ def _search_expanded(
             self._api_key = self._starter_key
             self._api_url = WOS_STARTER_API_URL
             self.MAX_LIMIT = 50
-            return self._search_starter(query, limit, filters)
+            return self._search_starter(
+                query, limit, filters, sort_field=sort_field
+            )
         return all_papers, False
 @
 
@@ -10832,12 +10842,20 @@ fields and the example value [[RS+D]], \enquote{Relevance
 (Descending)}.
 The Expanded API's
 (\url{https://developer.clarivate.com/apis/wos/swagger}, read the same
-day) has [[sortField]] on its search with the same description (the
-separator \enquote{'+' or ' '}) and the same example, [[RS+D]],
-\enquote{Relevance (Descending)}.
+day) has [[sortField]] on its search too, described as \enquote{Order
+by field(s). Field name and order by clause separated by '+' or ' ',
+use A for ASC and D for DESC, ex: PY+D.}, but without the Starter
+API's list of supported fields: there [[RS]] rests on the example
+named \enquote{Relevance}, value [[RS+D]], \enquote{Relevance
+(Descending)}, and on that separator text.
 So both tiers send [[sortField=RS+D]] on every page of a search;
 [[requests]] encodes the plus sign as [[%2B]], so the service reads
 the value as written.
+The tier functions take it as an argument, [[sort_field]], which only
+the search path ([[_search_uncached]]) gives, also to the Starter
+search that a failed Expanded search falls back to.
+The DOI lookup calls the same two functions for one record and gives
+none.
 The Expanded API's description of [[/query/{queryId}]] adds that
 \enquote{sorting is not a property of the query}; the provider does not
 page that way but repeats the search with a new [[firstRecord]], which
@@ -10853,6 +10871,11 @@ they shared the key before.
 An answer cached under the old key, newest first, is never served as a
 relevance-ordered one; it stays in the file, unused, until
 [[scholar cache clear --provider wos]] deletes it.
+So running an old session's Web of Science searches again spends live
+requests instead of reading the cache.  That is right for the same
+reason as for Scopus: the old answer was newest first, so its order is
+not the one the record would state, and a limited one holds other
+records than a relevance-ordered search returns.
 
 <<wos constants>>=
 WOS_SORT_RELEVANCE = "RS+D"
@@ -10901,6 +10924,42 @@ class TestWosRelevanceOrder:
     with patch("requests.get", return_value=response) as get:
       provider.search("q", limit=5)
     assert get.call_args.kwargs["params"]["sortField"] == "RS+D"
+
+  def test_the_starter_fallback_keeps_the_order(self):
+    """A failed Expanded search falls back to Starter, still by relevance."""
+    provider = WebOfScienceProvider(starter_api_key="s",
+                                    expanded_api_key="e")
+    refused = Mock(status_code=500, headers={})
+    refused.raise_for_status.side_effect = requests.HTTPError(
+      response=refused)
+    with patch("requests.get",
+               side_effect=[refused, self.starter_page(2, 2)]) as get:
+      assert len(provider.search("q", limit=5)) == 2
+    sent = [call.kwargs["params"] for call in get.call_args_list]
+    assert "usrQuery" in sent[0] and "q" in sent[1]
+    assert [p["sortField"] for p in sent] == ["RS+D", "RS+D"]
+
+  def test_a_doi_lookup_sends_no_sort_on_either_tier(self):
+    """A lookup asks for one record; an order would mean nothing."""
+    starter = WebOfScienceProvider(starter_api_key="k",
+                                   expanded_api_key=None)
+    with patch("requests.get",
+               return_value=self.starter_page(1, 1)) as get:
+      starter.get_paper_by_doi("10.1/x")
+    assert "sortField" not in get.call_args.kwargs["params"]
+
+    expanded = WebOfScienceProvider(starter_api_key=None,
+                                    expanded_api_key="k")
+    response = Mock(status_code=200, headers={})
+    response.raise_for_status = Mock()
+    response.json.return_value = {
+      "QueryResult": {"QueryID": 1, "RecordsFound": 0},
+      "Data": {"Records": {"records": ""}},
+    }
+    with patch("requests.get", return_value=response) as get:
+      expanded.get_paper_by_doi("10.1/x")
+    assert get.call_args.kwargs["params"]["usrQuery"] == "DO=10.1/x"
+    assert "sortField" not in get.call_args.kwargs["params"]
 
   def test_an_answer_cached_newest_first_is_not_served(self):
     provider = WebOfScienceProvider(starter_api_key="k",
@@ -17007,6 +17066,17 @@ key every entry shares; a part of the key that only these searches
 have touches nothing else.
 The record of the search says the order ([[ANSWER_ORDER]],
 \cref{sec:answer-orders}).
+
+The price is that every Scopus answer cached before is now a miss.
+Running an old session's searches again, which costs nothing on cache
+hits, spends live requests on Scopus; and off campus, or while the
+probe is inconclusive, the fallback to cached standard-view results
+(\cref{sec:scopus-cache-view}) no longer finds them, so such a search
+fails where it used to be served.
+A miss is still right: an old entry's order is not the one the record
+would now state, and a limited old entry holds other records than a
+relevance-ordered search returns, the newest rather than the best
+matches.
 
 <<scopus constants>>=
 SCOPUS_SORT_RELEVANCE = "relevancy"
