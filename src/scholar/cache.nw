@@ -1954,6 +1954,156 @@ def test_provider_keys_are_unset():
         assert var not in os.environ
 @
 
+\subsection{What a request asks for}
+\label{sec:request-targets}
+
+Several modules put an identifier, mostly a DOI, into the path of a
+URL, and a DOI may hold [[#]], [[?]], [[%]], a space or [[<>]]
+(\url{https://github.com/dbosk/scholar/issues/304}).
+Whether such a DOI reaches the service whole is decided below our code:
+[[requests]] drops a fragment and re-quotes what it finds illegal, and
+[[urllib3]] writes the request line.
+A test that reads the URL our code built would miss both, so the
+[[request_targets]] fixture lets those libraries run and looks at what
+arrives.
+It starts an HTTP server on the loopback interface that answers every
+request with a 404 and an empty JSON object, and keeps the request
+target of each, the path and query exactly as the request line
+carried them.
+A test names the hosts to stand in for ([[serve]]); inside
+[[HTTPAdapter.send]], below every session, a request to one of them
+goes to the server instead, as [[s2_loopback]] does for Semantic
+Scholar alone (\cref{providers-module}).
+A request to any other host still meets the network guard above.
+The 404 is an answer every lookup understands as \enquote{no such
+work}, so each test needs only the request.
+
+The [[awkward_doi]] fixture is the invented DOI those tests send: one
+of each of those characters in the suffix of an invented prefix.
+
+<<[[conftest.py]]>>=
+
+
+class RequestTargets:
+    """A loopback stand-in for remote hosts that keeps request targets.
+
+    `serve(*hosts)` routes requests for those hosts here; `targets`
+    holds each request's target (path and query, as sent); `paths()`
+    and `queries()` split and decode them.
+    """
+
+    def __init__(self):
+        import http.server
+        import threading
+
+        self.hosts = set()
+        self.targets = []
+        recorder = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                recorder.targets.append(self.path)
+                body = b"{}"
+                self.send_response(404)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        self.server = http.server.ThreadingHTTPServer(
+            ("127.0.0.1", 0), Handler
+        )
+        self.base = f"http://127.0.0.1:{self.server.server_address[1]}"
+        threading.Thread(
+            target=self.server.serve_forever, daemon=True
+        ).start()
+
+    def serve(self, *hosts):
+        """Stand in for `hosts` from now on."""
+        self.hosts.update(hosts)
+
+    def paths(self):
+        """Return the percent-decoded path of each request."""
+        from urllib.parse import unquote
+
+        return [unquote(t.partition("?")[0]) for t in self.targets]
+
+    def queries(self):
+        """Return the decoded query parameters of each request."""
+        from urllib.parse import parse_qs
+
+        return [parse_qs(t.partition("?")[2]) for t in self.targets]
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+@pytest.fixture
+def request_targets(monkeypatch):
+    """Answer requests to the hosts a test names, keeping their targets."""
+    from urllib.parse import urlsplit
+
+    import requests.adapters
+
+    recorder = RequestTargets()
+    real_send = requests.adapters.HTTPAdapter.send
+
+    def send(adapter, request, **kwargs):
+        url = urlsplit(request.url)
+        if url.hostname in recorder.hosts:
+            request.url = recorder.base + request.url[
+                len(f"{url.scheme}://{url.netloc}"):
+            ]
+        return real_send(adapter, request, **kwargs)
+
+    monkeypatch.setattr(requests.adapters.HTTPAdapter, "send", send)
+    yield recorder
+    recorder.close()
+
+
+@pytest.fixture
+def awkward_doi():
+    """An invented DOI holding `#`, `?`, `%`, a space and `<>`."""
+    return "10.5555/a#b?c%d e<f>g"
+@
+
+Let's check the stand-in itself: what a client sends arrives as sent,
+a host not named still meets the guard, and the decoding helpers give
+back a percent-encoded path and the query parameters.
+
+<<test functions>>=
+def test_request_targets_keeps_what_was_sent(request_targets):
+    """The target arrives as the client wrote it, encoding and all."""
+    import requests
+
+    request_targets.serve("service.example")
+    response = requests.get(
+        "https://service.example/a%23b/c", params={"q": "x y"}
+    )
+    assert response.status_code == 404
+    assert request_targets.targets == ["/a%23b/c?q=x+y"]
+    assert request_targets.paths() == ["/a#b/c"]
+    assert request_targets.queries() == [{"q": ["x y"]}]
+
+
+def test_request_targets_leaves_other_hosts_to_the_guard(
+    request_targets, block_network
+):
+    """A host the test did not name is not served."""
+    import requests
+
+    request_targets.serve("service.example")
+    with pytest.raises(requests.exceptions.ConnectionError):
+        requests.get("https://other.example/x", timeout=1)
+    assert request_targets.targets == []
+    assert "other.example" in block_network
+    block_network.clear()
+@
+
 Environment variables are not the only state a test can leave behind.
 The paper registry (\cref{sec:paper-registry}) is process-global, and
 [[Paper.from_dict]] answers with the registered object whenever the
