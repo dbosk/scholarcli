@@ -3179,14 +3179,28 @@ fixture has a quoted query, a `[`-row, `ĸ`, `CO₂`, a ligature. About
   percent-encoded (`%7B %7D %5C %00`..`%1F`); `read_bibtex_verbatim`
   is the exact inverse and is applied to the DOI by both readers
   (`_cited_bib_papers` for `--cited-from`, `_paper_from_entry` for
-  `prov import`). Blind spot, accepted: a value already holding one of
-  those escapes as text reads back decoded (escaping every `%` would
-  change every URL with a `%`). Text fields (`bibtex_text_value`): tab
+  `prov import`) and to the `% ID:` line (`bibtex+prov` and `prov
+  export` write it encoded, `_recorded_id` decodes; a line break in a
+  DOI split the line and lost the entry). Exactly invertible: a `%`
+  followed by zero or more `25` and then a writer code (`7B 7D 5C
+  00`..`1F`, `BIBTEX_BEFORE_CODE`) is written `%25`; the reader decodes
+  a code and such a `%25` (`BIBTEX_VERBATIM_ESCAPE`), nothing else, so
+  `%20` stays and the DOIs `10.5555/a%7Db` (written `a%257Db`) and
+  `10.5555/a}b` (written `a%7Db`) stay two papers (table
+  `tab:bibtex-verbatim-escapes`; inversion tested on a generated set
+  with every code after 0 to 3 `%25`). Other provenance fields carry no
+  line break (placeholders, dates, fields parsed line by line), except
+  FOUND-VIA's query (#323, left open: a shell command). Text fields (`bibtex_text_value`): tab
   and line breaks -> space, other C0 dropped (biber 2.21 core-dumps on
   a NUL); an escaped `\{`/`\}` -> `\textbraceleft{}`/`\textbraceright{}`;
   then `escape_bibtex`, which now writes every backslash of the text as
   `\textbackslash{}` (`BIBTEX_SPECIALS`; a title `x\y` stopped pdfLaTeX
-  on main); then an unpaired brace -> the same commands. No output
+  on main); so provider markup now prints literally, as intended (the
+  report always printed titles literally; `$` was escaped already):
+  `The \textit{wolf}` printed "The *wolf*" (italic), now "The
+  \textitwolf"; `{\em x}` an italic "x", now "\em x"; `Caf\'e` "Café",
+  now "Caf\'e" (standalone report, pdfLaTeX, TeX Live 2025; accent
+  decoding not done); then an unpaired brace -> the same commands. No output
   value holds a backslash before a brace or at its end (bibtexparser
   then loses the entry, biber does not). Paired braces stay. 3 of 6,594
   papers of two copied real sessions write differently (2 titles with

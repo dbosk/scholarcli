@@ -31028,6 +31028,105 @@ class TestAwkwardDoiReadsBack:
     assert result.exit_code == 0, result.output
     assert "1 entries, 1 matched by DOI" in " ".join(result.stderr.split())
     assert r"\emph{cited}: ml" in (tmp_path / "tab.tex").read_text()
+
+  TWINS = ("10.5555/a%7Db", "10.5555/a}b")
+
+  @staticmethod
+  def _twins():
+    from scholar import Paper
+
+    return [
+      Paper(title="Escaped form", authors=["Ash, Ann"], year=2024,
+            doi=TestAwkwardDoiReadsBack.TWINS[0]),
+      Paper(title="Brace form", authors=["Berg, Bo"], year=2023,
+            doi=TestAwkwardDoiReadsBack.TWINS[1]),
+    ]
+
+  def test_cited_from_tells_the_two_dois_apart(
+    self, tmp_path, monkeypatch
+  ):
+    from datetime import datetime
+    from scholar import review
+
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+    session = review.ReviewSession(
+      query="q", providers=["openalex"], timestamp=datetime(2026, 1, 1),
+      name="twins",
+    )
+    session.decisions = [
+      review.ReviewDecision(paper=paper, provider="openalex",
+                            status=review.DecisionStatus.KEPT, tags=["ml"])
+      for paper in self._twins()
+    ]
+    review.save_session(session)
+    keys = review.report_cite_keys(session.decisions)
+    bib = tmp_path / "report.bib"
+    bib.write_text(review.build_report_bibtex(
+      session.decisions, lambda decision: keys[id(decision)]))
+    result = runner.invoke(
+      app, ["sessions", "export", "twins", "-f", "table", "--cited-from",
+            str(bib), "-o", str(tmp_path / "tab")],
+    )
+    assert result.exit_code == 0, result.output
+    assert "2 entries, 2 matched by DOI" in " ".join(result.stderr.split())
+    table = (tmp_path / "tab.tex").read_text()
+    for title in ("Escaped form", "Brace form"):
+      row = next(line for line in table.splitlines() if title in line)
+      assert r"\emph{cited}" in row, row
+
+  def test_prov_import_files_each_note_under_its_own_paper(
+    self, tmp_path, monkeypatch, capsys
+  ):
+    from scholar.notes import get_note
+
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+    papers = self._twins()
+    BibTeXProvFormatter().format([SearchResult(
+      query="q", provider="openalex", timestamp="2024-01-01T00:00:00",
+      papers=papers,
+    )])
+    blocks = capsys.readouterr().out.split("% === provenance: ")
+    written = blocks[0] + "".join(
+      "% === provenance: " + block.replace(
+        "% CLAIM: TODO", f"% CLAIM: claim {number}")
+      for number, block in enumerate(blocks[1:])
+    )
+    bib = tmp_path / "refs.bib"
+    bib.write_text(written)
+    result = runner.invoke(app, ["prov", "import", str(bib)])
+    assert result.exit_code == 0, result.output
+    for number, paper in enumerate(papers):
+      note = get_note(paper)
+      assert note is not None and f"CLAIM: claim {number}" in note.note
+      assert f"CLAIM: claim {1 - number}" not in note.note
+
+  def test_an_id_with_a_line_break_stays_in_its_block(
+    self, tmp_path, monkeypatch, capsys
+  ):
+    from scholar import Paper
+    from scholar.notes import get_note
+    from scholar.review import bibtex_verbatim_value
+
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+    paper = Paper(title="Odd id", authors=["Cole, Cy"], year=2022,
+                  doi="10.5555/h\ni%7D}")
+    BibTeXProvFormatter().format([SearchResult(
+      query="q", provider="openalex", timestamp="2024-01-01T00:00:00",
+      papers=[paper],
+    )])
+    written = capsys.readouterr().out
+    block = written.split("@article")[0].strip().splitlines()
+    assert all(line.startswith("%") for line in block), block
+    assert f"% ID: {bibtex_verbatim_value(paper.id)}" in block
+    bib = tmp_path / "refs.bib"
+    bib.write_text(written.replace("% CLAIM: TODO", "% CLAIM: odd"))
+    assert runner.invoke(app, ["prov", "import", str(bib)]).exit_code == 0
+    note = get_note(paper)
+    assert note is not None and "CLAIM: odd" in note.note
+    exported = runner.invoke(app, ["prov", "export", str(bib)])
+    assert exported.exit_code == 0, exported.output
+    assert f"% ID: {bibtex_verbatim_value(paper.id)}\n% CLAIM: odd" \
+      in exported.stdout
 @
 
 \paragraph{Text in other scripts.}
@@ -31269,9 +31368,11 @@ class BibTeXProvFormatter(BibTeXFormatter):
 
     def _print_entry(self, result, paper, key: str, entry: str) -> None:
         """Print `entry` below its provenance stub."""
+        from scholar.review import bibtex_verbatim_value
+
         date = _prov_date(result, paper)
         print(f"% === provenance: {key} ===")
-        print(f"% ID: {paper.id}")
+        print(f"% ID: {bibtex_verbatim_value(paper.id)}")
         print("% CLAIM: TODO")
         print(f"% FOUND-VIA: {_found_via(result)}")
         print("% PICKED: TODO")
@@ -31988,9 +32089,11 @@ def _noted_titles() -> dict:
 
 def _recorded_id(entry) -> "str | None":
     """Return the paper id an entry's provenance block records, if any."""
+    from scholar.review import read_bibtex_verbatim
+
     for _, fields in entry.prov_blocks:
         if fields.get("ID"):
-            return fields["ID"]
+            return read_bibtex_verbatim(fields["ID"])
     return None
 
 
@@ -32395,6 +32498,19 @@ to the [[.bib]], not to the note: the note is filed under that id
 already, and a stored copy could only disagree with it after the paper
 gains a DOI.  So an import drops it from the blocks it stores, and an
 export writes the note's current id into every block it emits.
+The id is written with the encoding of a DOI field
+([[bibtex_verbatim_value]], \cref{sec:bibtex-field-values} in the
+review module) and read back with its inverse in [[_recorded_id]]: a
+DOI holding a line break split the [[% ID:]] line in two, the second
+half a bare line that ended the block, and [[prov import]] lost the
+entry.
+The other fields cannot carry a line break: [[bibtex+prov]] writes
+fixed placeholders and a date, and [[prov export]] writes fields
+parsed from the note line by line, a continuation joined with a space.
+The [[FOUND-VIA]] command, which holds the search's query, is the
+exception (\url{https://github.com/dbosk/scholar/issues/323}); it is a
+shell command to paste, so this encoding would break it, and it is left
+to that issue.
 
 <<formatter classes>>=
 def _without_ids(blocks) -> list:
@@ -32528,6 +32644,7 @@ def prov_export(
     from functools import cache
 
     from scholar.notes import get_note
+    from scholar.review import bibtex_verbatim_value
 
     console = Console()
     if not bib_file.exists():
@@ -32545,7 +32662,7 @@ def prov_export(
         if note is None:
             return []
         return [
-            (key, {"ID": note.paper_id, **fields})
+            (key, {"ID": bibtex_verbatim_value(note.paper_id), **fields})
             for key, fields in _without_ids(
                 payload
                 for kind, payload in _split_note_segments(note.note)
