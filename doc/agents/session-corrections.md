@@ -156,14 +156,17 @@ change is merged; not in `decision_verdict`, so copies decided alike
 with two reasons still fold and the fold keeps the newer record's
 reason; cleared by `clear_human_record`; kept in a relabel record's
 `"human"`; CSV column `human_reason` right after `human_by`; `show -f
-json` per decision, `null` when unset). Set only by
-`record_human_decision(..., reason=None)`, through
+json` per decision, `null` when unset). Set by
+`record_human_decision(..., reason=None)` and, for words added to a
+decision that is already a human's, by `set_human_reason(decision,
+reason)` (changes nothing else of the record), both through
 `checked_human_reason` (stripped, blank -> None, over
 `MAX_AGENT_REASON_CHARS` -> ValueError before anything is written); a
 later human record without a reason clears it. The TUI passes one
 since #349 part B: key `r` and the prompt that opens after a human
-changes a machine's decision (`ReasonModal`, see review-sessions.md
-"One procedure for a human"); a decision itself still records none.
+changes a decided record's status or category (`ReasonModal`, see
+review-sessions.md "One procedure for a human"); a TUI decision that
+keeps a human's own status and category keeps the reason.
 `sessions decide --source human` takes `--reason`, `--reasons-file`
 and a verdicts file's REASON (optional there: empty or `-`); a
 confidence in a human's file is read, then dropped with one note
