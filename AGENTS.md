@@ -303,7 +303,7 @@ breaks and the document flipped between two layouts on every pass.
   called directly with `requests`)
 - `cachetools` - Caching with decorators
 - `pytorial` - Interactive tutorial runner behind `scholar tutorial`
-- `llm` and its plugins (`llm-openai-plugin`, `llm-anthropic`, `llm-gemini`, `llm-mistral`, `llm-azure`, `llm-github-copilot`, `llm-gpt4all`, `llm-openai-via-codex`) - model access for `scholar rq` and `scholar llm`
+- `llm` and its plugins (`llm-openai-plugin`, `llm-anthropic`, `llm-gemini`, `llm-mistral`, `llm-azure`, `llm-github-copilot`, `llm-gpt4all`, `llm-ollama`, `llm-openai-via-codex`) - model access for `scholar rq` and `scholar llm`
 - `platformdirs` - Platform-appropriate cache directory
 - `filelock` - Cross-platform file lock around session/notes saves
 
