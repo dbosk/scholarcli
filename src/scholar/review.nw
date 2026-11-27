@@ -12184,12 +12184,16 @@ def foldable_copies(
     ]
 
 
-def reconcile_copies(session: ReviewSession) -> list[tuple[str, str]]:
+def reconcile_copies(
+    session: ReviewSession, *, trial: bool = False
+) -> list[tuple[str, str]]:
     """Fold the foldable copy pairs of `session`, in memory.
 
     Each fold is recorded in `session.folded` (old id to new id). Notes
     are not moved; `reconcile_session` does that after the write.
-    Returns the `(old id, new id)` of each fold.
+    Returns the `(old id, new id)` of each fold. With `trial` (a dry
+    run, whose folds are never written) a warning says what a fold
+    would do, not what it did.
     """
     pairs = foldable_copies(session)
     if not pairs:
@@ -12246,6 +12250,7 @@ warn_about_a_dropped_reason(
     {id(d): paper_id for d, (paper_id, _, _)
      in zip((survivor, absorbed), before_fold)},
     kept_record, survivor if kept_record is absorbed else absorbed,
+    trial=trial,
 )
 for name, value in human_record_of(kept_record).items():
     setattr(survivor, name, value)
@@ -12292,17 +12297,28 @@ a fold has no record of its own to keep a reason in (its tombstone,
 [[folded]], maps one id to the other and nothing more), so the warning
 gives the reason whole, which keeps the words findable in the log of
 the run that dropped them.  A [[sessions reconcile --dry-run]] folds in
-memory and so warns too, before anything is written.
+memory and so warns too, before anything is written; since nothing is
+dropped by it, its warning says what a fold would do.
 
 <<review session functions>>=
 def warn_about_a_dropped_reason(
     ids: dict[int, str], kept: ReviewDecision, dropped: ReviewDecision,
+    *, trial: bool = False,
 ) -> None:
     """Warn when a fold keeps a record without a reason over one with.
 
     `ids` maps `id()` of each copy to its paper id before the fold.
+    With `trial` nothing was folded, and the warning says "would".
     """
     if kept.human_reason or not dropped.human_reason:
+        return
+    if trial:
+        logger.warning(
+            "%s: the reason the human gave on this copy would not be "
+            "kept: a fold would join it with %s, whose newer record of "
+            "the review has no reason. The reason is: %s",
+            ids[id(dropped)], ids[id(kept)], dropped.human_reason,
+        )
         return
     logger.warning(
         "%s: the reason the human gave on this copy was not kept; it was "
@@ -12353,7 +12369,7 @@ def reconcile_session(
     if session is None:
         raise FileNotFoundError(f"Session not found: {name}")
     if dry_run:
-        return reconcile_copies(session)
+        return reconcile_copies(session, trial=True)
     try:
         with session_lock(session_file_path(session),
                           hint=NOTHING_CHANGED_HINT):
@@ -24703,7 +24719,7 @@ def stored_batch_check(session: "ReviewSession") -> StoredBatchCheck:
                               tuple(findings)))
     return StoredBatchCheck(
         {what: shared_reason_findings(rows) for what, rows in pooled.items()},
-        runs, stored_batches({**groups, **_relayed_batch_rows(session)}),
+        runs, stored_batches(_with_rows_outside_the_runs(groups, session)),
     )
 @
 
@@ -24773,16 +24789,60 @@ batch, when a relay names one ([[llm_batch]]), is a screener's piece of
 work like any other, so its rows join the stored batches under
 [[classifier decisions]], named by the model.
 
+The runs hold only rows with a reason in words, since the runs are
+where reasons are compared.
+A human's (or an agent's) row that carries a batch id and tags but no
+words is in no run, and joins the stored batches here too, under its
+own kind, beside the rows of its batch that do have words.
+
 <<review batch check>>=
-def _relayed_batch_rows(session) -> dict[tuple, list[BatchRow]]:
-    groups: dict[tuple, list[BatchRow]] = {}
+def _with_rows_outside_the_runs(
+    groups: dict[tuple, list[BatchRow]], session
+) -> dict[tuple, list[BatchRow]]:
+    """`groups` and the rows with a batch id that are in no run."""
+    batches = {key: list(rows) for key, rows in groups.items()}
     for decision in session.decisions:
         for part in decision_trace(decision).parts:
-            if part.kind == "llm" and part.batch is not None:
-                groups.setdefault(
-                    ("classifier decisions", "llm", part.name, part.at), [],
-                ).append(_trace_row(decision, part))
-    return groups
+            if part.batch is None:
+                continue
+            if part.kind == "llm":
+                what = "classifier decisions"
+            elif part.kind in STORED_REASON_GROUPS and not part.reason:
+                what = STORED_REASON_GROUPS[part.kind]
+            else:
+                continue
+            batches.setdefault((what, part.kind, part.name, part.at), []) \
+                .append(_trace_row(decision, part))
+    return batches
+@
+
+A batch is a screener's piece of work whether or not its rows give a
+reason in words: a human's file of verdicts with tags only is the
+common case, and its batch must be listed like any other, with nothing
+in it for the reason checks to find.
+
+<<test functions>>=
+def test_a_batch_without_reasons_in_words_is_listed(tmp_path, monkeypatch):
+  monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+  decisions = []
+  for n in range(3):
+    decision = ReviewDecision(
+      paper=Paper(title=f"Batch Work {n}", authors=["A"],
+                  doi=f"10.1/batch-{n}"),
+      provider="openalex", status=DecisionStatus.KEPT, tags=["loops"])
+    record_human_decision(decision, "decide", by="Ada",
+                          at="2026-11-27T09:00:00+00:00",
+                          reason="Read in full." if n == 0 else None,
+                          batch="hb-1")
+    decisions.append(decision)
+  session = ReviewSession(
+    query="q", providers=["openalex"], timestamp=datetime(2026, 11, 27),
+    name="batches", decisions=decisions)
+  [batch] = stored_batch_check(session).batches
+  assert (batch.what, batch.kind, batch.name, batch.batch) \
+      == ("human decisions", "human", "Ada", "hb-1")
+  assert len(batch.rows) == 3
+  assert batch.findings == ()
 @
 
 The batches are gathered from the runs' rows, keyed by what they are,

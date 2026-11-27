@@ -65,8 +65,12 @@ run (help says so); an id no decision carries is a stderr note (a
 reset clears it). `stored_batch_check` → also
 `StoredBatchCheck.batches` (`stored_batches`: rows with a batch id per
 (what, kind, name, batch), what = agent decisions, human decisions,
-screenings, or `classifier decisions` (llm parts with `llm_batch`,
-`_relayed_batch_rows`; relayed reasons are not in runs), `batch_findings` whole, confidence included,
+screenings, or `classifier decisions` (llm parts with `llm_batch`;
+relayed reasons are not in runs). Rows with a batch id that are in no
+run are added by `_with_rows_outside_the_runs`: the llm parts, and an
+agent's or a human's row without a reason in words (a human's file of
+verdicts with tags only), so such a batch is listed too.
+`batch_findings` whole, confidence included,
 one-reason runs NOT pooled; `stored_batch_findings`: a batch whose rows
 all share one reason over >= `SHARED_REASON_MIN_RECORDS` works gets one
 `one-reason` note "one reason for all N records of batch X: a rule given
