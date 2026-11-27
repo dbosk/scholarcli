@@ -182,6 +182,8 @@ KINDS = [
 LIST_HEAD, NUMBERS_ONLY = KINDS[0][0], KINDS[2][1]
 CHUNK_TAG = re.compile(r"^\d+[a-z]?$")
 WIDTH = 76           # longer lines are cut when shown
+TEXT_TIMEOUT = 120   # seconds one pdftotext read may take (book: 14 s)
+PLACE_HEAD = "check: where the layouts first part"
 
 
 def masked(line):
@@ -232,20 +234,41 @@ class Layout:
                 self.heads[page + 1] if page + 1 < len(self) else None)
 
 
-def read_layout(pdf):
+def read_layout(pdf, timeout=TEXT_TIMEOUT):
     """Return the Layout of `pdf`, or why it cannot be read."""
     if shutil.which("pdftotext") is None:
         return "pdftotext (poppler-utils) is not installed"
     try:
         result = subprocess.run(
             ["pdftotext", "-q", "-enc", "UTF-8", str(pdf), "-"],
-            stdin=subprocess.DEVNULL, capture_output=True, check=False)
+            stdin=subprocess.DEVNULL, capture_output=True, check=False,
+            timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return f"pdftotext did not finish reading {pdf} within {timeout} s"
     except OSError as error:
         return f"pdftotext could not run ({error})"
     if result.returncode != 0:
         return (f"pdftotext could not read {pdf} (exit status "
                 f"{result.returncode})")
+    if not result.stdout.strip():
+        return f"pdftotext found no text in {pdf}"
     return Layout(result.stdout.decode("utf-8", errors="replace"))
+
+
+def guarded(find, *args):
+    """Return `find(*args)`, or why it failed, as a string.
+
+    Finding the place only adds to the warning; whatever goes wrong
+    there must not change the verdict, so nothing may escape.
+    """
+    try:
+        return find(*args)
+    except Exception as error:  # the verdict is not this code's to change
+        return f"{type(error).__name__}: {error}"
+
+
+def not_found(reason):
+    return [f"{PLACE_HEAD} could not be found: {reason}"]
 
 
 def first_parting(layouts):
@@ -424,14 +447,13 @@ def counted(count):
 
 def place(layouts, labels, sources, toc):
     """Say where the layouts of a cycle's states first part."""
-    head = "check: where the layouts first part"
     reasons = [layout for layout in layouts if isinstance(layout, str)]
     if reasons:
-        return [f"{head} could not be found: {reasons[0]}"]
+        return not_found(reasons[0])
     page = first_parting(layouts)
     if page is None:
-        return [f"{head}: no page break differs between the states; their "
-                "pages differ at most in numbers"]
+        return [f"{PLACE_HEAD}: no page break differs between the states; "
+                "their pages differ at most in numbers"]
     folio = layouts[0].folios[page]
     if folio is None:
         at = f"page {page + 1} of the PDF"
@@ -439,8 +461,8 @@ def place(layouts, labels, sources, toc):
         at = f"page {folio}"
     else:
         at = f"page {folio} (page {page + 1} of the PDF)"
-    lines = [f"{head}: {at}, the first page whose break is not the same "
-             "in all the states (numbered in the order of the runs)"]
+    lines = [f"{PLACE_HEAD}: {at}, the first page whose break is not the "
+             "same in all the states (numbered in the order of the runs)"]
     variants = {}
     for number, layout in enumerate(layouts, 1):
         key = (tuple(map(masked, layout.lines(page))),
@@ -568,7 +590,7 @@ def cycle_warning(job, cycle, where, sources):
         + ["check: passed with that warning (the PDF is the last run's)"])
 
 
-def settle(job, outdir, engine, sources):
+def settle(job, outdir, engine, sources, text_timeout=TEXT_TIMEOUT):
     """Run the engine up to MORE_RUNS times; pass a cycle."""
     log, aux, known, pdf, toc = (
         outdir / f"{job}.{ext}" for ext in ("log", "aux", "cycle", "pdf",
@@ -595,11 +617,13 @@ def settle(job, outdir, engine, sources):
             known.unlink(missing_ok=True)
             return
         states.append(snapshot(files, aux))
-        layouts.append(read_layout(pdf))
+        layouts.append(guarded(read_layout, pdf, text_timeout))
         if back := period(states):
             cycle = states[-back:]
-            where = place(layouts[-back:], [labels for _, labels in cycle],
-                          sources, toc)
+            where = guarded(place, layouts[-back:],
+                            [labels for _, labels in cycle], sources, toc)
+            if isinstance(where, str):
+                where = not_found(where)
             warning = cycle_warning(job, cycle, where, sources)
             known.write_text(json.dumps(
                 {"sources": sources_digest(sources),
@@ -623,6 +647,7 @@ def main(argv):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--status", type=int, required=True)
     parser.add_argument("--sources", default="")
+    parser.add_argument("--text-timeout", type=int, default=TEXT_TIMEOUT)
     parser.add_argument("job")
     parser.add_argument("outdir", type=Path)
     parser.add_argument("engine", nargs=argparse.REMAINDER)
@@ -639,7 +664,7 @@ def main(argv):
     if reason := log_failure(text):
         fail(job, reason)
     if unsettled(text):
-        settle(job, outdir, args.engine, sources)
+        settle(job, outdir, args.engine, sources, args.text_timeout)
     else:
         (outdir / f"{job}.cycle").unlink(missing_ok=True)
     if not unsettled(text) and args.status != 0:
