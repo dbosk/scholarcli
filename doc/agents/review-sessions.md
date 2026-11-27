@@ -221,9 +221,15 @@ line whose category does not fit (`verdicts_without_a_fitting_category`,
 shared with `screen`), `--keep-trace` without `-c` and a line without
 confidence. After loading: unknown id exit 1, clash exit 2; in a
 session that `uses_categories`, every line of every source, a human's
-included, needs exactly one fitting category (exit 2, lines named); the
-one-verdict form (`--keep/--discard --tag`) and the TUI still let a
-human record a contradicting pair until #349.
+included, is complete (`verdicts_without_a_fitting_category`, shared
+with `sessions screen`): a keep names exactly one fitting category ("no
+category" otherwise); a discard names one, or no category and an
+exclusion criterion (a `reason_tags` tag; "no category and no
+exclusion criterion" otherwise: note tags only). Since #349 (author,
+2026-11-27) a bearing record excluded under a rule is a discard with
+its criterion and no category, by every source; before, every row
+needed a category. Then the fit rule for every way (below, "One
+procedure for a human").
 Per source: agent as `--reasons-file` (agent_reason/by/time/batch);
 human: `record_human_decision(via="decide", by=..., reason=row)`, the
 reason optional (`human_verdicts_layout()`: empty or `-` is none), a
@@ -253,11 +259,11 @@ record written (row reason as `human_reason` if given, row batch as
 `tags_after_decision`: the row's tags are appended, the old category
 dropped only when the row names one (so a same-category row moves the
 category behind the old themes: `[supports-claim, loops]` + row
-`supports-claim,recursion` → `[loops, supports-claim, recursion]`),
-and a row that changes only the category still counts as a
-confirmation (`machine_review_rows` follows `is_example`). Stated in
-the `--verdicts-file` help and docstring; behaviour unchanged since
-#347.
+`supports-claim,recursion` → `[loops, supports-claim, recursion]`).
+Since #349 part B a row (or `--keep/--discard`) that changes the
+category is a change (`is_example` True; it was a confirmation from
+#347 until then), see below. Stated in the `--verdicts-file` help and
+docstring.
 
 **One trace (#349, review.nw `sec:decision-trace`).**
 `review.decision_trace(d)` → `DecisionTrace(source, decider, machine,
@@ -288,3 +294,65 @@ words, b give only tags (themes or motivations) and c were decided
 without a reason (by source, in that order: human 0, 1 and 0 of 1;
 ..."); with no words anywhere it returns the old
 `agent_reasons_sentence` (or ""), so such reports are unchanged.
+
+**One procedure for a human (#349 part B, review.nw
+`sec:decision-rules`, tui.nw `sec:tui-human-decision`).** The three
+ways a human decides (verdicts-file row, one-record `decide`, TUI key)
+call the same functions of review.nw: `decision_tags(tags,
+status_changed, new_tags, removed_tags)` (= `tags_after_decision` +
+the new tags each once; decide computes it before recording and stores
+it, so checks see the stored tags); `unfitting_category(status, tags)`
+(the last category, `audit_category`, not in `STATUS_CATEGORIES`;
+None for pending or no category) and `category_misfit(decisions,
+status, tags)` (None when not `uses_categories(decisions)` before the
+decision); `category_misfit_message(category, status)` (one line: what
+fits, then `BEARING_EXCLUSION_ADVICE`); `changes_the_verdict(decision,
+status, tags)` (status or deciding category differs). **Category
+rule:** checked on the record AFTER the decision, every source, no
+category never a misfit. `decide`: chunk `<<refuse a decision whose
+category would not fit>>`, after the file's completeness check and
+after the ids are looked up (needs the session), every selected record
+(file rows and `--keep/--discard`), exit 2, "No changes saved. A stored
+category stays unless --untag removes it." (a same-status decision
+without a category keeps a stored misfit and is refused). The llm
+pre-load check of a named `--tag`/row category stays. Before, a human's
+or agent's one-record decide could store a bearing category on a
+discard (pinned by `TestRelayedVerdictFitsItsDecision`, now refused).
+Stored pairs are not rewritten; the audit table renders them as before.
+**Changed category (D3):** `mark_as_reviewed(user_agrees=not
+changes_the_verdict(...))` in decide and TUI; a decision without a
+category keeps the stored one (confirmation if same status); removing
+it (`--untag`, the TUI's quick keep, which clears all tags) is a
+change; other tags or the human's own reason with status and category
+as stored stay a confirmation (the author was asked about the category
+only). A change: `is_example` True, so `decision_trace(...).confirmed`
+False, the machine's reason no longer stands for it (counts as tags
+only without the human's words in `decision_reasons`), the report's
+confirmed/changed counts follow. **TUI:** the eight handlers (K, T, d,
+C on list and detail screen) call `PaperReviewApp.decide_as_human(d,
+status, tags)` (None = refused: notification, timeout
+`RULE_NOTICE_TIMEOUT` 15 s, nothing stored, detail screen stays; else
+whether a machine verdict changed) or `confirm_as_human(d,
+reason=None)` (refused on a stored misfit pair: it would become the
+human's; otherwise exactly as before, pinned field by field). Key `r`
+(both screens) → `ask_reason` → `ReasonModal`: the machine's reason
+(trace machine part), the human's present one, `earlier_reasons`
+(humans' `human_reason`, most used first, `REASON_CHOICES` = 5; Tab
+then Enter picks), an input (Enter; empty or Escape leaves the reason).
+Pending → "Decide first ..."; human/reviewed → new
+`record_human_decision(via="tui", by=reviewer, reason=, batch=kept)`;
+unreviewed machine → `confirm_as_human(reason=)`; hidden blind paper →
+refused like C. Opens by itself after a human changes a machine's
+status or category (Escape dismisses). Detail screen (outside blind
+review): "─── Decision ───", "Decided by: <source_label>[, confirmed|,
+changed]", "Reason (<kind> [name]): <decision_trace(d).reason>"
+(`decision_lines`); the blind review section reads its reason by
+`decision_trace` too. **Still different for a human:** the TUI keeps
+the stored source of an already reviewed decision when a human decides
+it again (decide sets `human`); the TUI's tag dialogs replace the tags
+whole, so a TUI keep can hold two categories (decide drops the old
+one, #195); a confidence is the machine's only; `sessions screen`'s
+human verdicts are not held to the completeness rule (machines only).
+Audit table: a discard with a criterion and no category is labelled by
+its criterion (`audit_exclusion_criterion`), sorted with the other
+rows (`AUDIT_ORDER_OTHER`) and counted per criterion in the caption.

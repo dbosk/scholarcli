@@ -142,7 +142,13 @@ via="tui", sample_id=sample_holding(session, d))` via
 `record_screening`, decision untouched, notification with
 `revealed_verdict(d)`), the detail screen stays and shows a "Blind
 review" block (both verdicts, the machine's reason); "own" → warning,
-nothing recorded. `blind_refuses_confirm`: C on a hidden paper refused.
+nothing recorded. `blind_refuses_confirm`: C on a hidden paper refused, and so is the
+reason key `r` (#349 part B: it would show the machine's reason). A
+revealed paper's K/T/d/C go through `decide_as_human` /
+`confirm_as_human` like any (category rule, changed category; the
+reason prompt opens after a change); a blind verdict
+(`record_blind_verdict`) is a screening, not a decision, and is not
+held to the category rule.
 After the reveal K/T/d/C are the normal paths (`mark_as_reviewed` +
 `record_human_decision(..., by=reviewer)`): the adjudication. Leaving
 between keeps the screening; the decision stays unreviewed and listed,
