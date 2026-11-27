@@ -68,7 +68,8 @@ twice); a second entry on one line is dropped. Reads the key on the
 next line, `@article(key, ...)`, and `title = "a { b"` (the old brace
 count swallowed every later block). `BIB_ENTRY_RE` and `_entry_end`
 are gone; fields are still `_extract_bib_fields`, one per line.
-Import/export now print bibtexparser's warning for a failed entry.
+Import/export now print bibtexparser's warning for a failed entry;
+its line numbers are 0-based, prov check's 1-based (left so).
 The prov readers (`_bib_spans`, `read_prov_bib`, `stray_prov_blocks`,
 the check command) parse with `_prov_bib_library`: the `@` of every
 line beginning with `%` is read as a space (same line count), since
@@ -99,7 +100,9 @@ Files are read as `utf-8-sig` (a BOM made the first entry blockless).
 `stray_prov_blocks` (every header on a `%` line outside the runs
 `_parse_bib_entries` attached and outside entry/control blocks read
 whole) reports each block no entry directly follows (end of file, above `@string` or
-`@comment`, cut off by a blank line) as an error with its line and
+`@comment`, cut off by a blank line; a header INSIDE `@comment{...}`
+is not reported since #355, the base reported it) as an error with its
+line and
 header key: `ProvStrayBlock`, text "  KEY (line L): provenance block
 with no entry directly below it", summary ", N blocks without an
 entry", JSON `unattached` list and `summary.unattached`. A header key
