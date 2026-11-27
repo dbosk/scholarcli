@@ -59,11 +59,25 @@ mutates its argument (DOI via `read_bibtex_verbatim`, URL as written).
 A `DuplicateBlockKeyBlock` (checked from `ignore_error_block`) and a
 `ParsingFailedBlock` are errors; `@comment/@preamble/@string` skipped.
 A block cut off by a blank line is missing (prov import skips it too).
+Files are read as `utf-8-sig` (a BOM made the first entry blockless).
+`stray_prov_blocks` (same line walk as `_parse_bib_entries`) reports
+each block no entry directly follows (end of file, above `@string` or
+`@comment`, cut off by a blank line) as an error with its line and
+header key: `ProvStrayBlock`, text "  KEY (line L): provenance block
+with no entry directly below it", summary ", N blocks without an
+entry", JSON `unattached` list and `summary.unattached`. A header key
+(`% === provenance: KEY ===`) other than the entry's key is an error
+naming both (prov import ignores the header key; bibtex+prov and prov
+export always write the entry's key, so no legitimate mismatch).
 Blocks: per block `prov_block_problems` over `PROV_REQUIRED_FIELDS`
 (CLAIM FOUND-VIA PICKED QUOTE VERIFIED COUNTER; ID and DATE not
-required): missing, empty, placeholder (`is_prov_placeholder`: `TODO`
-in capitals outside a double-quoted passage, `QUOTE_PATTERN`; or the
-whole value a `<...>` template; a location, `(<loc>)`, judged alike).
+required): missing, empty, placeholder (`is_prov_placeholder`: the value
+BEGINS with the word `TODO`, capitals, so `TODO: find it` is one and
+"keep the TODO list short" is not; or the whole value a `<...>`
+template; a location, `(<loc>)`, judged alike). A QUOTE passage, or a
+part of one between ellipses (`quote_parts`), with no letter and no
+digit (`prov_passage_has_words`) is a block error "holds no words",
+with or without `--quotes`, and is never looked up.
 Fields are found by the first word of the name (`prov_field_values`:
 `QUOTE (p.3)` -> location `p.3`). A name given twice in one block is
 an error (`repeated_prov_fields` counts the comment lines; the line
@@ -90,24 +104,34 @@ dropping the U+FFFE mark without the fold missed 2 resp. 3.
 `crossref.fetch_bibliographic(doi)` (side entry `("bibliographic",
 doi)` = `{title, subtitle, families, years}` written by
 `_remember_work`, built-in types, no `CURRENCY_CACHE_VERSION` bump; an
-older entry costs one request). Title: `metadata_fold` +
-`SequenceMatcher` >= 0.8 for any of {title, title before ":"} x
-{Crossref title, title: subtitle}; authors: sorted folded surnames
-(bibtexparser name parts, `and others` dropped), compared only when
+older entry costs one request; `families` holds `family`, else an
+organisation's `name`). Title (`metadata_title_result`, no threshold):
+`metadata_fold` (casefold, accents/TeX/braces dropped, `[\W_]` runs ->
+one space, any script kept) of the bib title must EQUAL Crossref's
+title or title + subtitle; bib title = Crossref title + ":" + a
+subtitle, Crossref holding none -> note "subtitle not in Crossref's
+record" (counted in `summary.metadata.notes`, summary ", N notes";
+the entry counts as agreeing); else differs. Authors: sorted folded
+surnames (bibtexparser name parts of the author decoded a second time
+with `keep_braced_groups=True`, so `{The Study Group}` is one name and
+meets Crossref's `name`; `and others` dropped), compared only when
 both sides have some; year (`year`, else `date`) in issued /
-published-print / published-online / created. Differ -> error; 404 ->
+published-print / published-online (not `created`/`deposited`; no
+`published` field read, unverified). Differ -> error; 404 ->
 not checked "DOI ... is not known to Crossref" (no DataCite); failure
 -> not checked with reason; no DOI -> not checked. Exit 1 on any error,
 else 0; 2 for an unknown `-f` (before reading); 1 with one line for an
-unreadable file (before any output). Text: "FILE: N entries", per
+unreadable file (before any check; with `-f json` stdout still holds
+`{"files": [... {"file", "error"}], "entries": [], "unattached": [],
+"summary": null}`). Text: "FILE: N entries", per
 finding "  key (line L[, block B]): [not checked: |note: ]message",
-summary "E entries, B blocks, X errors[, U entries without a block][;
-quotes: f found, m not found, u not checked][; metadata: a agree, d
-differ, u not checked]." JSON: `entries` (file, key, line, blocks,
-findings, `quotes`/`metadata` when asked) and `summary`
-(`prov_check_counts`). Left to the backing-claims skill: VERIFIED level
+summary "E entries, B blocks, X errors[, U entries without a block][,
+S blocks without an entry][; quotes: f found, m not found, u not
+checked][; metadata: a agree, d differ, u not checked[, n notes]]." JSON: `entries` (file, key, line, blocks,
+findings, `quotes`/`metadata` when asked), `files` (file, error
+null), `unattached` and `summary` (`prov_check_counts`). Left to the backing-claims skill: VERIFIED level
 words, causal/quantitative claims verified at abstract level, COUNTER
-wording and `see <key>`, header key mismatch, missing DATE, QUOTE
+wording and `see <key>`, missing DATE, QUOTE
 without a location. Tests: `RequestTargets.answer(path, body)`
 (conftest) serves a recorded body with status 200; `make_pdf` /
 `make_cli_pdf` take a list of lines.
