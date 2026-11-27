@@ -25,6 +25,10 @@ SRC_TEX+=	../src/scholar/tutorials/tiered-search.tex
 SRC_TEX+=	../src/scholar/tutorials/llm-synthesis.tex
 SRC_TEX+=	../src/scholar/tutorials/scholar-with-an-agent.tex
 
+# The part on the methods behind the defaults: plain LaTeX chapters, the
+# tables generated for them, and the bibliography they cite.
+METHODS_TEX=	$(wildcard methods/*.tex methods/tables/*.tex)
+
 .PHONY: all check clean distclean
 
 all: ${DOC}
@@ -32,10 +36,11 @@ all: ${DOC}
 # `make check` builds the PDF and checks the build (check.mk); what it
 # accepts: src/scholar/cli.nw, sec:woven-document.
 CHECK_JOB=	scholar
-CHECK_SOURCES=	scholar.tex preamble.tex ${SRC_TEX}
+CHECK_SOURCES=	scholar.tex preamble.tex ${SRC_TEX} ${METHODS_TEX} bibliography.bib
 
 scholar.pdf: scholar.tex preamble.tex
 scholar.pdf: ${SRC_TEX}
+scholar.pdf: ${METHODS_TEX} bibliography.bib
 # The woven .tex ask minted to load noweb's custom lexer; noweb.mk provides the
 # rule that copies it here from noweb's library directory.
 scholar.pdf: noweb_lexer.py
@@ -57,6 +62,14 @@ scholar.pdf: noweb_lexer.py
 INCLUDE_MAKEFILES=../makefiles
 include ${INCLUDE_MAKEFILES}/noweb.mk
 include check.mk
+
+# The document uses biblatex with biber.  When the .bbl is missing,
+# latexmk (run with -use-make) asks make for it, and the shared tex.mk
+# offers two pattern rules: the first, from the .aux, runs bibtexu, which
+# finds no \bibdata in a biblatex .aux and fails (#311).  This explicit
+# rule wins over both and runs biber on the .bcf.
+${TEX_OUTDIR}/scholar.bbl: ${TEX_OUTDIR}/scholar.bcf
+	${BIBLIOGRAPHY.bcf}
 
 clean:
 	${RM} ${DOC}
