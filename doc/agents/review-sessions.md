@@ -182,8 +182,10 @@ and error line numbers match an editor) is the selection (exit 2 with `--doi`/`-
 `--keep-trace` and no `-c` every line needs one. Usage errors (exit 2,
 before loading): `--reason`/`--reasons-file`/`--by` with `--source
 llm` (the classifier's reason is `llm classify`'s), `--reason`/
-`--reasons-file` with `human` (out of scope; `--by` alone is accepted
-for a human since #257, see "Human review record" in session-corrections.md), `--by` alone for an agent, any bad file line (all named:
+(`--reason`/`--reasons-file` with `human` are accepted since #347 and
+stored as `human_reason`, see "Human reason" in
+session-corrections.md; `--by` alone is accepted for a human since
+#257), `--by` alone for an agent, any bad file line (all named:
 `cli.parse_reasons_file`), empty or > `review.MAX_AGENT_REASON_CHARS`
 (2000, stripped, never truncated) reason. After loading: an unknown id
 exits 1 (like `--doi`), one paper given two different reasons or
@@ -197,3 +199,45 @@ the summary, `agent_reasons_sentence`: agent and agent_reviewed
 decisions with/without a reason). An older Scholar loads such files
 and drops the fields on its next save (checked with the installed
 pre-#249 pipx build).
+
+**Verdicts file (#347, cli.nw `sec:decide-verdicts-file`).** `decide
+S --verdicts-file F [--source agent|human|llm] [--by N] [-c C]
+[--sheet ...] [--batch ID] [--strict] [--strict-quotes] [--dry-run]
+[--force] [--all-copies] [--keep-trace]`: lines as `sessions screen
+--verdicts-file` reads them (`parse_verdicts_file`, `VERDICTS_LAYOUT`;
+`ID<TAB>kept|discarded<TAB>TAGS<TAB>REASON[<TAB>CONFIDENCE]`, `# batch:`
+lines). No second code path: the file is read into `reason_lines`
+where a reasons file is read (a `VerdictLine` has every `ReasonLine`
+field plus `status`, `tags`), selected by the same chunk (`trace_of`;
+messages say "verdicts-file line N"; two lines clash when
+`line_verdict` differs: every field but line, paper, batch), and the
+recording loop takes status and tags per decision from its line
+(`<<take the verdict for this decision>>`; `<<replace the tags of a
+changed decision>>` reads `given_tags`). Usage errors (exit 2, before
+loading): `--keep/--discard/--doi/--paper-id/--tag/--untag/--reason/
+--reasons-file` beside it (all named), agent or llm without `--by`, a
+bad line (discard without tag, two categories, bad verdict), an llm
+line whose category does not fit (`verdicts_without_a_fitting_category`,
+shared with `screen`), `--keep-trace` without `-c` and a line without
+confidence. After loading: unknown id exit 1, clash exit 2; in a
+session that `uses_categories`, every line of every source, a human's
+included, needs exactly one fitting category (exit 2, lines named); the
+one-verdict form (`--keep/--discard --tag`) and the TUI still let a
+human record a contradicting pair until #349.
+Per source: agent as `--reasons-file` (agent_reason/by/time/batch);
+human: `record_human_decision(via="decide", by=..., reason=row)`, the
+reason optional (`human_verdicts_layout()`: empty or `-` is none), a
+confidence dropped with one note; llm: `llm_model` =
+`--by`, `llm_reason` = `truncate_reason(row)`, `llm_decided_at` = run
+time, prompt version and truncation left None (the report's sentence
+now says "for k of them the prompt was not recorded" for decisions with
+a model and no version; `sessions show` shows no model for any
+classifier decision, as before); llm rows store no batch id (it is an
+agent field). With `--sheet`, `whole_sheet` makes a missing sheet row a
+gap: "A verdicts file answers its whole sheet ..." instead of "Missing
+rows are fine", counted in `unanswered` (shared with `screen`, which
+sets `whole_sheet = False`) and refused by `--strict`; rows given twice
+with the same verdict (`twice`, per paper) are listed and refused by
+`--strict` with or without a sheet (reasons files unchanged). Summary
+"Marked 6 kept, 4 discarded by agent N in session 'x'" (dry run "Would
+mark ...; nothing written.").
