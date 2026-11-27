@@ -17,7 +17,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-MORE_RUNS = 4
+MORE_RUNS = 8
 SHOWN = 20
 UNSETTLED = ("Label(s) may have changed", "Rerun to get")
 PYTHONTEX_MISSING = re.compile(
