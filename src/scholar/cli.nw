@@ -36416,9 +36416,11 @@ runs: its page with noweb's sub-page letter (\enquote{page 1865a or
 the numbers (\enquote{number 1, 2 or 0 on page 1}).
 A run that leaves the files as it found them, $p = 1$, is not taken
 as a cycle: the log asked for that run, so something the digest does
-not hold changed, and the same unseen file could break the argument
-for a longer period too; the check runs on and decides by what comes
-next.
+not hold changed, and the same unseen file breaks the argument for a
+longer period too.
+After such a run the check therefore passes no cycle at all; it runs
+on, since the build may still settle, and if it does not, the failure
+says that a run left the files as it found them.
 
 [[MORE_RUNS]] is four.
 A cycle of period $p$ shows itself after $p$ extra runs when the state
@@ -36436,12 +36438,16 @@ runs.
 Seeing a period of five would mean a fifth run for every document that
 fails; no such cycle has been seen.
 
-The cycle is remembered in \texttt{ltxobj/scholar.cycle}: the digests
-of all its states and the warning.
-A later check that starts from any of those states repeats the
-warning without running the engine, since from any state of the
-cycle the runs go round the same cycle.
-A settled run deletes the file.
+The cycle is remembered in \texttt{ltxobj/scholar.cycle}: a digest
+of the sources, the digests of all its states and the warning.
+A later check of the same sources that starts from any of those states
+repeats the warning without running the engine, since from any state
+of the cycle the runs go round the same cycle as long as the sources
+are the same; with other sources the same state can lead elsewhere, so
+a record of other sources is not used.
+A build that settles deletes the file, whether [[latexmk]] settled it
+or an extra run of the check, and a record that cannot be read is
+treated as none.
 Anything else that does not settle fails, saying that no earlier
 state came back within the four runs and that the layout may be
 converging slowly or cycling with a longer period.
@@ -36697,6 +36703,150 @@ def test_no_repeat_within_the_runs_fails(self, tmp_path, document):
             "came back") in result.stderr
     assert "converging slowly or cycling with a longer period" \
         in result.stderr
+@
+
+Some decisions of the check cannot be reached with a real document: a
+run that leaves the files as they were between two that change them, a
+record left by other sources, a record that is not what the check
+wrote.
+For those the engine is a stand-in, a script that writes the
+[[.aux]], the log and the PDF of each run from a list of states, and
+the check itself runs for real on what it leaves.
+These tests need no LaTeX and run with the ordinary suite.
+
+<<test functions>>=
+SCRIPTED_ENGINE = r'''
+import json, sys
+from pathlib import Path
+
+out = Path(sys.argv[1])
+plan = json.loads((out / "plan.json").read_text())
+value = plan["values"][min(plan["step"], len(plan["values"]) - 1)]
+plan["step"] += 1
+(out / "plan.json").write_text(json.dumps(plan))
+(out / "doc.aux").write_text("\\newlabel{runs}{{%s}{1}}\n" % value)
+(out / "doc.log").write_text(
+    "" if value == "settled"
+    else "LaTeX Warning: Label(s) may have changed. Rerun to get them.\n")
+(out / "doc.pdf").write_bytes(b"%PDF")
+'''
+
+
+class TestSettleCheckBySteps:
+    """What `check-settled.py` decides, on a scripted engine (#344)."""
+
+    <<settle check by steps test methods>>
+@
+
+[[_build]] stands for the build: it writes the sources and the plan
+and runs the engine once, which leaves the first state; [[_check]]
+runs the script as [[check.mk]] does.
+
+<<settle check by steps test methods>>=
+def _engine(self, tmp_path):
+    import sys
+
+    return [sys.executable, str(tmp_path / "engine.py"),
+            str(tmp_path / "ltxobj")]
+
+
+def _build(self, tmp_path, values, source="one"):
+    import subprocess
+
+    out = tmp_path / "ltxobj"
+    out.mkdir(exist_ok=True)
+    (tmp_path / "engine.py").write_text(SCRIPTED_ENGINE)
+    (tmp_path / "doc.tex").write_text(source)
+    (out / "plan.json").write_text(
+        json.dumps({"step": 0, "values": values}))
+    subprocess.run(self._engine(tmp_path), check=True)
+    return out / "doc.cycle"
+
+
+def _check(self, tmp_path):
+    import subprocess
+    import sys
+
+    return subprocess.run(
+        [sys.executable, str(REPOSITORY / "doc" / "check-settled.py"),
+         "--status", "0", "--sources", str(tmp_path / "doc.tex"),
+         "doc", str(tmp_path / "ltxobj"), *self._engine(tmp_path)],
+        capture_output=True, text=True, timeout=120)
+@
+
+The record of a cycle is good only for the sources it was seen with.
+A cycle is remembered by its states, and a changed document can pass
+through one of those states on its way somewhere else: with the old
+record it would pass without a run.
+So the record holds a digest of the sources, and a record of other
+sources is not used; and a build that settles removes the record,
+whether the build itself settled or an extra run of the check.
+
+<<settle check by steps test methods>>=
+def test_a_record_of_other_sources_is_not_used(self, tmp_path):
+    record = self._build(tmp_path, ["0", "1"] * 5)
+    first = self._check(tmp_path)
+    assert first.returncode == 0, first.stderr
+    assert "alternate between two states" in first.stderr
+    assert record.exists()
+    again = self._check(tmp_path)
+    assert again.returncode == 0 and "run 1 of" not in again.stderr
+    self._build(tmp_path, ["0", "1", "2", "3", "4"] * 3, source="two")
+    changed = self._check(tmp_path)
+    assert changed.returncode != 0, changed.stderr
+    assert "run 4 of 4" in changed.stderr
+    assert "no earlier state came back" in changed.stderr
+
+
+def test_a_settled_build_removes_the_record(self, tmp_path):
+    record = self._build(tmp_path, ["0", "1"] * 5)
+    assert self._check(tmp_path).returncode == 0 and record.exists()
+    self._build(tmp_path, ["settled"])
+    settled = self._check(tmp_path)
+    assert settled.returncode == 0, settled.stderr
+    assert not record.exists()
+@
+
+A record that the check cannot read is no record: it is ignored and
+replaced, never a traceback and never a pass.
+
+<<settle check by steps test methods>>=
+@pytest.mark.parametrize("content", ["garbage", "{}", "[1]", '{"states": 1}'])
+def test_an_unreadable_record_is_ignored(self, tmp_path, content):
+    record = self._build(tmp_path, ["0", "1"] * 5)
+    record.write_text(content)
+    result = self._check(tmp_path)
+    assert result.returncode == 0, result.stderr
+    assert "Traceback" not in result.stderr
+    assert "run 2 of 4" in result.stderr
+    assert "alternate between two states" in result.stderr
+    assert "sources" in json.loads(record.read_text())
+@
+
+A run that leaves the files as it found them, while the log still asks
+for another run, shows that something outside those files changes
+between runs.
+The argument for a cycle rests on the files holding everything a run
+depends on, so after such a run no repeat proves anything: the states
+0, 1, 1, 0 are not a cycle of three.
+The check runs on, since the build may still settle, but it passes no
+cycle, and it says why.
+
+<<settle check by steps test methods>>=
+def test_a_run_that_changes_nothing_proves_no_cycle(self, tmp_path):
+    self._build(tmp_path, ["0", "1", "1", "0", "1", "1", "0"])
+    result = self._check(tmp_path)
+    assert result.returncode != 0, result.stderr
+    assert "cycle through" not in result.stderr
+    assert "left the files that feed back as it found them" \
+        in result.stderr
+
+
+def test_it_may_still_settle_after_such_a_run(self, tmp_path):
+    self._build(tmp_path, ["0", "1", "1", "settled"])
+    result = self._check(tmp_path)
+    assert result.returncode == 0, result.stderr
+    assert "settled after 3 more run(s)" in result.stderr
 @
 
 The extra run must not wait at LaTeX's prompt.

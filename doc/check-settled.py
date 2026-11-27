@@ -156,20 +156,50 @@ def differences(states, sources):
     return lines
 
 
+def stood_still(states):
+    """Whether some run left the files that feed back as it found them."""
+    digests = [digest for digest, _ in states]
+    return any(one == next_ for one, next_ in zip(digests, digests[1:]))
+
+
 def period(states):
     """Return how many runs ago the last state was seen before, or None.
 
-    The run just before does not count: a run that left the files as it
-    found them while the log still asks for another run shows that
-    something the snapshot does not hold feeds back, so it proves no
-    cycle.
+    A run that left the files as it found them while the log still asks
+    for another run shows that something the snapshot does not hold
+    feeds back.  The argument for a cycle needs the snapshot to hold
+    everything a run depends on, so after such a run no repeat counts.
     """
-    last = states[-1][0]
-    if len(states) < 3 or states[-2][0] == last:
+    if len(states) < 3 or stood_still(states):
         return None
+    last = states[-1][0]
     for back in range(2, len(states)):
         if states[-1 - back][0] == last:
             return back
+    return None
+
+
+def sources_digest(sources):
+    digest = hashlib.sha256()
+    for path in sources:
+        digest.update(str(path).encode())
+        digest.update(path.read_bytes() if path.exists() else b"\0missing")
+    return digest.hexdigest()
+
+
+def remembered(known, state, sources):
+    """Return the warning of the recorded cycle that holds `state`, or None.
+
+    The record counts only for the sources it was written for, and a
+    record that cannot be read is no record.
+    """
+    try:
+        record = json.loads(known.read_text())
+        if (record["sources"] == sources_digest(sources)
+                and state in record["states"]):
+            return str(record["warning"])
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
     return None
 
 
@@ -193,11 +223,10 @@ def settle(job, outdir, engine, sources):
                        for ext in ("log", "aux", "cycle"))
     files = feedback_files(job, outdir)
     states = [snapshot(files, aux)]
-    if known.exists():
-        cycle = json.loads(known.read_text())
-        if states[0][0] in cycle["states"]:
-            print(cycle["warning"], file=sys.stderr)
-            return
+    if warning := remembered(known, states[0][0], sources):
+        print(warning, file=sys.stderr)
+        return
+    known.unlink(missing_ok=True)
     for run in range(1, MORE_RUNS + 1):
         print(f"check: the build did not settle; run {run} of {MORE_RUNS} "
               f"more: {' '.join(engine)}", file=sys.stderr)
@@ -217,10 +246,16 @@ def settle(job, outdir, engine, sources):
             cycle = states[-back:]
             warning = cycle_warning(job, cycle, sources)
             known.write_text(json.dumps(
-                {"states": [digest for digest, _ in cycle],
+                {"sources": sources_digest(sources),
+                 "states": [digest for digest, _ in cycle],
                  "warning": warning}))
             print(warning, file=sys.stderr)
             return
+    if stood_still(states):
+        fail(job, f"it did not settle after {MORE_RUNS} more runs, and a "
+             "run left the files that feed back as it found them while "
+             "the log still asked for another run: something outside "
+             "those files changes between runs, so no cycle can be shown")
     fail(job, f"it did not settle after {MORE_RUNS} more runs, and no "
          "earlier state came back, so it is not a cycle of at most "
          f"{MORE_RUNS} runs: the layout may be converging slowly or "
@@ -248,7 +283,9 @@ def main(argv):
         fail(job, reason)
     if unsettled(text):
         settle(job, outdir, args.engine, sources)
-    elif args.status != 0:
+    else:
+        (outdir / f"{job}.cycle").unlink(missing_ok=True)
+    if not unsettled(text) and args.status != 0:
         fail(job, f"the build rule ended with status {args.status} "
              "(see its output above), and the log does not show why")
     if not pdf.exists():
