@@ -308,8 +308,9 @@ OpenAlex pages of 200 against the metered budget.
 - Tutorials keep `-l 5` on every practice search, and every search
   step's required pattern has the lookahead
   `scholar\s+search(?=.*\s(?:-l\s*|--limit[\s=]+)[1-9])\s+...` (accepts
-  `-l5`, `--limit=5` and the limit first), so a learner who drops it fails
-  the step. `test_tutorial_searches_carry_a_limit` (any line running
+  `-l5`, `--limit=5` and the limit first; tiered-search writes
+  `(?:.|\\\n)*` for `.*`, so a continued line passes too), so a learner
+  who drops it fails the step. `test_tutorial_searches_carry_a_limit` (any line running
   `scholar search`/`rq`, wherever on the line) and
   `test_tutorial_search_steps_require_the_limit` (each search pattern
   matches the step's command, and not without its limit) check them.
@@ -4001,6 +4002,40 @@ alphabetically). An untangled checkout mounts nothing instead of failing.
   dependency lines), `TUTORIAL_FILES` in `cli.nw`, `SRC_TEX` in
   `doc/Makefile`, and an `\input` in `doc/scholar.tex`. The parametrised
   test in `cli.nw` then loads it with pytorial's parser.
+- **Lessons** (in order): first-search, reviewing-in-the-tui,
+  enrich-verify-export, `tiered-search` (#310: one wording and its
+  `--top 3` tier, a second wording, `sessions show`, a predicted then
+  exported tier of two answers (with and without `--top`),
+  `--rest-sample 2 --seed 7`, `sessions tier-sample --report` before and
+  after the sample is decided), llm-synthesis, scholar-with-an-agent.
+  OpenAlex, arXiv and HAL record `order: relevance`; Semantic Scholar
+  (key optional) records relevance, `citations` (limited bulk) or
+  `unknown` (unlimited) by `s2_order`, but its anonymous pool may refuse
+  a learner, and DBLP serves an anti-bot page, so tiered-search poses the
+  other-order contrast (S2 `citations`, IEEE `unknown`) as a question.
+  A search a step refuses still ran and saved a record: the search steps
+  say to `sessions retire-search tiers --record ID`. Pytorial's
+  plain-string patterns collapse white space (Rich's wrapping is
+  harmless); regex patterns do not, so multi-word regex anchors use
+  `\s+`. Command patterns: names end with `(?=\s|$)`, long options take
+  `[\s=]+`, lookaheads use `(?:.|\\\n)*` (continued lines);
+  `TestTieredSearchPatterns` (cli.nw) feeds accepted and refused
+  spellings. Tried live once (2026-11-23, two keyless OpenAlex requests).
+- **Help pointers** (#310): `search`, `sessions export` and `llm
+  classify` end their description with the lesson (`scholar tutorial
+  run tiered-search`) and "Searching and screening" in doc/scholar.pdf
+  (`TestHelpPointsToTheMethod`).
+- **README** (#310): one section per kind of work.
+  `TestReadmeCommands` (cli.nw, after the tutorial tests) parses every
+  `scholar` command of its code blocks with the command line's own
+  parser, every command of a line (split at `|`, `&&`, `||`, `;`, `&`
+  by `shlex` with punctuation characters; redirections dropped; `uv
+  run`, `env`, `VAR=...` prefixes taken off) (`make_context` down the
+  groups, as Click's `Group.invoke`;
+  Typer carries its own copy of Click, `typer._click`, so the test
+  catches `typer.TyperException` with exit code 2, not
+  `click.UsageError`), in a temp dir where the `.tsv`/`.bib` files a
+  line names exist; nothing runs. A README command line must parse.
 
 ### The methods part of the documentation (#310, #311)
 

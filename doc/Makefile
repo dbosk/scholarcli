@@ -21,6 +21,7 @@ SRC_TEX+=	../src/scholar/tui.tex
 SRC_TEX+=	../src/scholar/tutorials/first-search.tex
 SRC_TEX+=	../src/scholar/tutorials/reviewing-in-the-tui.tex
 SRC_TEX+=	../src/scholar/tutorials/enrich-verify-export.tex
+SRC_TEX+=	../src/scholar/tutorials/tiered-search.tex
 SRC_TEX+=	../src/scholar/tutorials/llm-synthesis.tex
 SRC_TEX+=	../src/scholar/tutorials/scholar-with-an-agent.tex
 
