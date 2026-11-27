@@ -49,23 +49,41 @@ first entry (`review.nonlatin_bib_preamble`; biber copies it to
 the .bbl; checked with pdflatex/xelatex/lualatex); no stderr hint.
 All round-trip code lives in `cli.nw`'s
 `<<formatter classes>>` and `<<prov command>>` chunks.
+Entry places (#355, `sec:prov-bib-layouts`): `_parse_bib_entries(text,
+library=None)` takes each entry's start/end line and key from
+bibtexparser (`_bib_spans`: `start_line`, end = start + newlines in
+`raw`; kinds entry/failed/control/failed control/text; a failed
+entry's key from `BIB_FAILED_KEY` on its first line, none -> not an
+entry); the comment run is walked UP from the entry over `%` lines,
+stopping at the end of the last entry/control block read whole (not at
+a failed one, whose `raw` runs on to the next `@`); a failed entry's
+end is clamped above the next entry's run (else export writes it
+twice); a second entry on one line is dropped. Reads the key on the
+next line, `@article(key, ...)`, and `title = "a { b"` (the old brace
+count swallowed every later block). `BIB_ENTRY_RE` and `_entry_end`
+are gone; fields are still `_extract_bib_fields`, one per line.
+Import/export now print bibtexparser's warning for a failed entry.
 
 **`scholar prov check FILE.bib ... [--quotes] [--metadata]
 [--allow-unbacked] [-f table|json]`** (#346, cli.nw `sec:prov-check`):
 read-only on the `.bib`, notes and sessions (tested byte-identical);
 no request except `--metadata`'s Crossref lookups. Reading
-(`read_prov_bib` -> `ProvCheckEntry`): the line reader of `prov import`
-(`_parse_bib_entries`: blocks, wrapped fields, stacked blocks, `ID`)
-joined with bibtexparser (entry fields whole, LaTeX-decoded) on the
-0-based start line (`ProvEntry.entry_start` == `Block.start_line`); DOI
+(`read_prov_bib(text, library)` -> `ProvCheckEntry`): the line reader of
+`prov import` (`_parse_bib_entries`: blocks, wrapped fields, stacked
+blocks, `ID`) joined with bibtexparser (entry fields whole,
+LaTeX-decoded) on the 0-based start line (`ProvEntry.entry_start` ==
+`Block.start_line`, equal by construction since #355; the command
+parses each file once and passes the library to `stray_prov_blocks`
+first, then `read_prov_bib`, which decodes entries in place); DOI
 and URL from the undecoded entry, read BEFORE `transform_entry`, which
 mutates its argument (DOI via `read_bibtex_verbatim`, URL as written).
 A `DuplicateBlockKeyBlock` (checked from `ignore_error_block`) and a
 `ParsingFailedBlock` are errors; `@comment/@preamble/@string` skipped.
 A block cut off by a blank line is missing (prov import skips it too).
 Files are read as `utf-8-sig` (a BOM made the first entry blockless).
-`stray_prov_blocks` (same line walk as `_parse_bib_entries`) reports
-each block no entry directly follows (end of file, above `@string` or
+`stray_prov_blocks` (every header on a `%` line outside the runs
+`_parse_bib_entries` attached and outside entry/control blocks read
+whole) reports each block no entry directly follows (end of file, above `@string` or
 `@comment`, cut off by a blank line) as an error with its line and
 header key: `ProvStrayBlock`, text "  KEY (line L): provenance block
 with no entry directly below it", summary ", N blocks without an

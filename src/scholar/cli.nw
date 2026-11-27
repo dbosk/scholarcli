@@ -34252,9 +34252,9 @@ has none of the glyphs.
 
 The preamble is written only when an entry uses the macro, once,
 before the first entry, so output without such text is byte for byte
-what it was.  It is a single line, which keeps it out of the way of
-the line scanner of the provenance commands (\cref{sec:prov-bibtex}),
-which reads entries, not a preamble.  The review module builds it
+what it was.  It is a single line, and the reader of the provenance
+commands takes it for a control entry, which holds no paper
+(\cref{sec:prov-bib-layouts}).  The review module builds it
 ([[nonlatin_bib_preamble]], \cref{sec:non-latin-definition}), for this
 formatter and for the [[.bib]] files that the session export and the
 synthesis write.  We print no hint on standard error: the marker in the
@@ -34737,12 +34737,11 @@ prose, which must never leak into the [[.bib]] nor be clobbered by an import; we
 make provenance blocks self-delimiting so everything else can be preserved
 verbatim.
 
-We parse the [[.bib]] ourselves rather than pulling in a BibTeX library: the
-provenance lines are \emph{comments} that any such library discards, so it would
-only help extract a handful of entry fields --- while the load-bearing work
-(associating each comment region with its entry and tracking line spans so an
-in-place rewrite does not reformat the file) is ours regardless.  The input is
-the format we emit, so a small line scanner is both sufficient and clearer.
+The provenance lines are \emph{comments}, which a BibTeX library discards, so
+reading the blocks, associating each comment region with its entry and tracking
+line spans so that an in-place rewrite does not reformat the file are ours.
+Where an entry begins and ends is BibTeX's syntax, though, and that we leave to
+bibtexparser, a dependency already (\cref{sec:prov-bib-layouts}).
 
 \subsection{Recognising a provenance block}
 
@@ -34759,7 +34758,6 @@ PROV_FIELD_NAMES = {
     "DATE",
 }
 PROV_HEADER_RE = re.compile(r"^\s*===\s*provenance:\s*(.*?)\s*===\s*$")
-BIB_ENTRY_RE = re.compile(r"^\s*@\w+\s*\{\s*([^,\s]+)\s*,")
 @
 
 A field line is recognised by the token before its first colon, so a value that
@@ -35011,11 +35009,11 @@ class TestProvMerge:
 
 \subsection{Parsing a BibTeX file}
 
-We scan the file once, remembering the start of any contiguous run of comment
-lines so that when an entry begins we can attach the block(s) directly above it.
-A blank or non-comment line resets that memory, so only comments \emph{immediately}
-above an entry count as its provenance --- which matches how the formatter emits
-them.  The entry's extent is found by brace depth.
+An entry's provenance is the run of comment lines \emph{immediately} above
+it: a blank or any other line ends the run, which matches how the formatter
+emits the blocks.  So the reader needs, for each entry, the line it starts
+on, the line it ends on and its key; the run above it is then found by
+walking up from its first line.
 
 <<formatter classes>>=
 @dataclass
@@ -35035,22 +35033,75 @@ class ProvEntry:
     repeated: list = dataclasses.field(default_factory=list)
 @
 
-An entry ends on the line where its brace depth returns to zero.  We only start
-counting once a brace has been seen, so a header line such as
-[[@article{key,]] is handled the same as a multi-line body.
+\label{sec:prov-bib-layouts}
+The lines of the entries come from bibtexparser, the reader of
+[[--cited-from]] (\cref{sec:audit-cited-from}).  An earlier version
+found them itself: an entry began on a line matching
+[[@type{key,]] and ended where the count of braces returned to zero.
+Three layouts BibTeX allows escaped it
+(\url{https://github.com/dbosk/scholarcli/issues/355}): the key on the
+line after [[@article{]], the parenthesis form [[@article(key, ...)]],
+and a quoted value holding a brace without a pair,
+[[title = "a { b"]], after which the count never returned to zero and
+the entry ran to the end of the file, taking every later block with
+it.  [[prov import]] skipped those blocks, and [[prov check]] called
+each entry unbacked.  Mending the scanner would have meant writing a
+second BibTeX splitter beside the one we have, quote marks, escapes
+and parentheses included, and the two could disagree on a file
+neither was tested on.  bibtexparser's splitter reads all three: a
+brace inside a quoted value does not count, a parenthesised entry
+ends at its [[)]], and a new [[@type{]] at the start of a line ends an
+entry it could not close, as a failed block.  Each block it returns
+carries the zero-based line it starts on ([[start_line]]) and its text
+([[raw]]), so it ends that many line breaks further down.  The
+line reader keeps the rest: the comment runs, the blocks in them, the
+fields one per line and the spans the rewriter needs.  Since
+[[prov check]] joins the two readers on the line an entry starts on
+(\cref{sec:prov-check}), they now agree on every entry by
+construction.
 
+[[_bib_spans]] lists every block bibtexparser finds with its lines and
+a kind: an entry (a duplicate key included, which bibtexparser still
+reads whole), a failed entry, a control entry ([[@comment]],
+[[@preamble]], [[@string]]), a failed control entry, or the text
+between them.  A failed entry keeps the key its first line names, when
+it names one, since that is how the author knows it.
+
+<<constants>>=
+BIB_FAILED_KEY = re.compile(r"\s*@\s*\w+\s*[{(]\s*([^,\s{}()]+)")
 <<formatter classes>>=
-def _entry_end(lines: list, start: int) -> int:
-    """Return the index of the line that closes the entry at ``start``."""
-    depth = 0
-    seen = False
-    for index in range(start, len(lines)):
-        depth += lines[index].count("{") - lines[index].count("}")
-        if "{" in lines[index]:
-            seen = True
-        if seen and depth <= 0:
-            return index
-    return len(lines) - 1
+def _bib_spans(text: str, library=None) -> list:
+    """`(start, end, kind, key)` of each block of a `.bib`, in order.
+
+    Lines are 0-based. `kind` is `entry`, `failed` (an entry that
+    bibtexparser cannot parse; `key` None when its first line names
+    none), `control`, `failed control` or `text`. `library` is
+    bibtexparser's parse of `text`, parsed here when not given.
+    """
+    import bibtexparser
+    from bibtexparser.model import (
+        DuplicateBlockKeyBlock, Entry, ImplicitComment, ParsingFailedBlock,
+    )
+
+    if library is None:
+        library = bibtexparser.parse_string(text)
+    spans = []
+    for block in sorted(library.blocks, key=lambda b: b.start_line):
+        end = block.start_line + block.raw.count("\n")
+        control = _bib_entry_type(text, block.start_line) in BIB_CONTROL_TYPES
+        key = None
+        if isinstance(block, (Entry, DuplicateBlockKeyBlock)):
+            kind, key = "entry", block.key
+        elif isinstance(block, ImplicitComment):
+            kind = "text"
+        elif isinstance(block, ParsingFailedBlock):
+            kind = "failed control" if control else "failed"
+            named = BIB_FAILED_KEY.match(block.raw)
+            key = named.group(1) if named and not control else None
+        else:
+            kind = "control"
+        spans.append((block.start_line, end, kind, key))
+    return spans
 @
 
 Field extraction is deliberately narrow: we only need the four fields that
@@ -35391,50 +35442,73 @@ def _kept_comment_lines(comment_lines: list) -> list:
     return kept
 @
 
-The scanner ties these together: it tracks the pending comment run, and on each
-entry records the bibkey, the identifying fields, the attached blocks, and the
-line spans the rewriter will need.
+The reader ties these together: for each entry of [[_bib_spans]], parsed
+or failed, it finds the comment run directly above, and records the
+bibkey, the identifying fields, the attached blocks and the line spans
+the rewriter will need.  A control entry is no paper, so it gets no
+blocks, and neither does a failed entry whose key cannot be read: the
+check names such an entry by its line, and the block above it is
+reported as one no entry follows.
 
 <<formatter classes>>=
-def _parse_bib_entries(text: str) -> list:
-    """Parse a ``.bib`` into entries with their provenance comment blocks."""
+def _parse_bib_entries(text: str, library=None) -> list:
+    """Parse a `.bib` into entries with their provenance comment blocks.
+
+    `library` is bibtexparser's parse of `text`, parsed when not given.
+    """
     lines = text.split("\n")
+    found = []
+    <<find each entry and the comment run directly above it>>
+    <<end a failed entry before the next entry's comment run>>
     entries = []
-    comment_start = None
-    index = 0
-    while index < len(lines):
-        line = lines[index]
-        if line.strip().startswith("%"):
-            if comment_start is None:
-                comment_start = index
-            index += 1
-            continue
-        match = BIB_ENTRY_RE.match(line)
-        if match:
-            entry_end = _entry_end(lines, index)
-            entry_text = "\n".join(lines[index:entry_end + 1])
-            blocks = (
-                _comment_prov_blocks(lines[comment_start:index])
-                if comment_start is not None else []
-            )
-            entries.append(ProvEntry(
-                key=match.group(1),
-                fields=_extract_bib_fields(entry_text),
-                prov_blocks=blocks,
-                comment_start=comment_start,
-                entry_start=index,
-                entry_end=entry_end,
-                repeated=(
-                    repeated_prov_fields(lines[comment_start:index])
-                    if comment_start is not None else []
-                ),
-            ))
-            comment_start = None
-            index = entry_end + 1
-            continue
-        comment_start = None
-        index += 1
+    for comment_start, start, end, key in found:
+        above = lines[comment_start:start] if comment_start is not None else []
+        entries.append(ProvEntry(
+            key=key,
+            fields=_extract_bib_fields("\n".join(lines[start:end + 1])),
+            prov_blocks=_comment_prov_blocks(above) if above else [],
+            comment_start=comment_start,
+            entry_start=start,
+            entry_end=end,
+            repeated=repeated_prov_fields(above),
+        ))
     return entries
+@
+
+The run is walked upwards from the line above the entry for as long as
+the lines are comments.  It never climbs into the block before: the walk
+stops at the last line of the last block bibtexparser read whole, an
+entry or a control entry, whose text it knows.  A failed entry is no
+such bound, since its text runs on to the next [[@]] and so takes in
+the comment run of the entry after it; the run belongs to that entry,
+as it did with the line scanner.  Two entries on one line share it, so
+only the first is taken, as the scanner took one entry per line; the
+rewriter could not put a block between them.
+
+<<find each entry and the comment run directly above it>>=
+bound = -1
+taken = -1
+for start, end, kind, key in _bib_spans(text, library):
+    if kind in ("entry", "failed") and key and start > taken:
+        comment = start
+        while comment - 1 > bound and lines[comment - 1].strip().startswith(
+            "%"
+        ):
+            comment -= 1
+        found.append([comment if comment < start else None, start, end, key])
+        taken = end
+    if kind in ("entry", "control"):
+        bound = max(bound, end)
+@
+
+A failed entry is cut short above the comment run of the entry after it,
+or above that entry, so that the spans do not overlap: the rewriter
+copies each span once, and an overlap would write the run twice.
+
+<<end a failed entry before the next entry's comment run>>=
+for here, after in zip(found, found[1:]):
+    next_start = after[0] if after[0] is not None else after[1]
+    here[2] = min(here[2], next_start - 1)
 @
 
 Let's verify the scanner attaches a stacked pair of blocks to the entry below
@@ -36545,10 +36619,12 @@ reads the blocks, with wrapped fields, several blocks per entry and the
 [[ID]] line; it reads entry fields only one per line, so a wrapped
 title or abstract is lost.  bibtexparser, which [[--cited-from]] uses
 (\cref{sec:audit-cited-from}), reads the fields whole and decodes their
-\LaTeX{}, but drops comments, so it sees no block.  Both record where
-an entry starts: the line reader the index of its line, bibtexparser
-the same zero-based line ([[start_line]]).  So the two are joined on
-that line, and neither is rewritten.  Whatever block [[prov import]]
+\LaTeX{}, but drops comments, so it sees no block.  The line reader
+takes the entries and their lines from bibtexparser
+(\cref{sec:prov-bib-layouts}), so both know an entry by the zero-based
+line it starts on ([[start_line]]), and the two are joined on that
+line.  The file is parsed once, and the line reader is given the parse
+before any entry of it is decoded.  Whatever block [[prov import]]
 would read, the check reads, and only that: a block cut from its entry
 by a blank line is not read by the import either, so it counts as
 missing.
@@ -36558,10 +36634,10 @@ second entry under a key already used into a duplicate block that
 still holds the entry.  Both are errors of the file: the first is not
 read by the [[--cited-from]] reader, the second is ambiguous for any
 citation of the key.  The duplicate is still checked, from the entry
-bibtexparser kept.  An entry the line reader finds where bibtexparser
-found none (it was swallowed by a failed block before it) is reported
-as unreadable too, and [[@comment]], [[@preamble]] and [[@string]] are
-not entries.
+bibtexparser kept.  [[@comment]], [[@preamble]] and [[@string]] are
+not entries.  An earlier version also reported an entry the line
+reader found where bibtexparser found none; since the line reader
+takes its entries from bibtexparser, there is none.
 
 The DOI and the URL are taken from the undecoded entry, as
 [[--cited-from]] takes the DOI: decoding would turn a [[--]] into a
@@ -36594,35 +36670,33 @@ class ProvCheckEntry:
     repeated: list = dataclasses.field(default_factory=list)
 
 
-def read_prov_bib(text: str) -> list[ProvCheckEntry]:
-    """Read the entries of a `.bib` with the blocks above them."""
+def read_prov_bib(text: str, library=None) -> list[ProvCheckEntry]:
+    """Read the entries of a `.bib` with the blocks above them.
+
+    `library` is bibtexparser's parse of `text`, parsed when not given;
+    its entries are decoded in place.
+    """
     import bibtexparser
     from bibtexparser import middlewares
     from bibtexparser.model import (
         DuplicateBlockKeyBlock, Entry, ParsingFailedBlock,
     )
 
-    by_line = {e.entry_start: e for e in _parse_bib_entries(text)}
-    raw = bibtexparser.parse_string(text)
+    raw = library if library is not None else bibtexparser.parse_string(text)
+    by_line = {e.entry_start: e for e in _parse_bib_entries(text, raw)}
     decoder = middlewares.LatexDecodingMiddleware(
         allow_inplace_modification=False
     )
     entries = []
     for block in sorted(raw.blocks, key=lambda b: b.start_line):
         <<read one bibtexparser block for [[prov check]]>>
-    for start, leftover in sorted(by_line.items()):
-        if _bib_entry_type(text, start) not in BIB_CONTROL_TYPES:
-            entries.append(ProvCheckEntry(
-                leftover.key, start + 1, leftover.prov_blocks, {},
-                "bibtexparser cannot read this entry",
-            ))
-    return sorted(entries, key=lambda e: e.line)
+    return entries
 @
 
 Each block of the file is an entry, a duplicate, a failed block or
 something else (a comment, a preamble, a string), which is passed over.
 A failed block carries no key, so its key comes from the line reader
-when that saw the entry, else it is named by its line.
+when that could read one, else it is named by its line.
 
 <<read one bibtexparser block for [[prov check]]>>=
 problem = None
@@ -36671,50 +36745,40 @@ follows: at the end of the file, above an [[@string]] or an
 [[@comment]], or cut from the next entry by a blank line.  The import
 skips such a block without a word, so the check must name it, or a
 block the author believes attached would back nothing.
-[[stray_prov_blocks]] walks the lines as [[_parse_bib_entries]] does,
-with its tests for a comment line and an entry line and skipping the
-body of each entry as it does, and returns the line and header key of
-every block in a run that ends otherwise than on an entry.  A run
-followed by a control entry counts as stray too: the line reader reads
-the block onto the [[@comment]], and [[read_prov_bib]] then passes the
-control entry over.
+[[stray_prov_blocks]] returns the line and header key of every block
+header on a comment line that is neither in the run the line reader
+attached to an entry nor inside an entry or a control entry
+bibtexparser read whole (a [[%]] line in an entry's body is the
+entry's text).  It takes the runs from [[_parse_bib_entries]] itself,
+so a block is stray exactly when the import does not read it.  A
+header in the text of a failed entry is not inside it, since
+bibtexparser's text of a failed entry runs on to the next entry, and
+so it is reported unless it is in the run of the entry after it.
 
 <<formatter classes>>=
-def stray_prov_blocks(text: str) -> list:
+def stray_prov_blocks(text: str, library=None) -> list:
     """`(line, header key)` of each block no entry directly follows.
 
-    Lines are 1-based.
+    Lines are 1-based. `library` is bibtexparser's parse of `text`,
+    parsed when not given.
     """
-    lines = text.split("\n")
+    import bibtexparser
+
+    if library is None:
+        library = bibtexparser.parse_string(text)
+    passed = set()
+    for entry in _parse_bib_entries(text, library):
+        if entry.comment_start is not None:
+            passed.update(range(entry.comment_start, entry.entry_start))
+    for start, end, kind, _ in _bib_spans(text, library):
+        if kind in ("entry", "control"):
+            passed.update(range(start, end + 1))
     stray = []
-    run = None
-    index = 0
-    while index < len(lines):
-        if lines[index].strip().startswith("%"):
-            run = index if run is None else run
-            index += 1
-            continue
-        entry = BIB_ENTRY_RE.match(lines[index])
-        control = entry and re.match(
-            r"\s*@\s*(\w+)", lines[index]
-        ).group(1).lower() in BIB_CONTROL_TYPES
-        if run is not None and (not entry or control):
-            stray += _prov_headers(lines, run, index)
-        run = None
-        index = _entry_end(lines, index) + 1 if entry else index + 1
-    if run is not None:
-        stray += _prov_headers(lines, run, len(lines))
+    for index, line in enumerate(text.split("\n")):
+        header = PROV_HEADER_RE.match(_strip_comment_prefix(line))
+        if header and index not in passed and line.strip().startswith("%"):
+            stray.append((index + 1, header.group(1)))
     return stray
-
-
-def _prov_headers(lines: list, start: int, end: int) -> list:
-    """`(line, key)` of the block headers among `lines[start:end]`."""
-    found = []
-    for index in range(start, end):
-        header = PROV_HEADER_RE.match(_strip_comment_prefix(lines[index]))
-        if header:
-            found.append((index + 1, header.group(1)))
-    return found
 
 
 def repeated_prov_fields(comment_lines: list) -> list:
@@ -37323,17 +37387,7 @@ def prov_check(
         except (OSError, UnicodeDecodeError) as error:
             <<report the file [[prov check]] cannot read>>
     <<open the Crossref client for [[prov check]]>>
-    checks = [
-        prov_entry_check(file, entry, quotes, metadata, allow_unbacked,
-                         crossref)
-        for file, text in texts.items()
-        for entry in read_prov_bib(text)
-    ]
-    stray = [
-        ProvStrayBlock(file, key, line)
-        for file, text in texts.items()
-        for line, key in stray_prov_blocks(text)
-    ]
+    <<read and check each file for [[prov check]]>>
     if output_format == "json":
         print(json.dumps(
             prov_check_data(checks, quotes, metadata, stray, list(texts)),
@@ -37363,6 +37417,30 @@ if output_format == "json":
         "entries": [], "unattached": [], "summary": None,
     }, indent=2, ensure_ascii=False))
 raise typer.Exit(1)
+@
+
+Each file is parsed by bibtexparser once, for the blocks without an
+entry and for the entries alike, so a failed entry's warning is printed
+once.  The blocks without an entry are found first: reading the entries
+decodes them in place, and the spans are taken from the parse as it
+came.
+
+<<read and check each file for [[prov check]]>>=
+import bibtexparser
+
+checks = []
+stray = []
+for file, text in texts.items():
+    library = bibtexparser.parse_string(text)
+    stray += [
+        ProvStrayBlock(file, key, line)
+        for line, key in stray_prov_blocks(text, library)
+    ]
+    checks += [
+        prov_entry_check(file, entry, quotes, metadata, allow_unbacked,
+                         crossref)
+        for entry in read_prov_bib(text, library)
+    ]
 @
 
 Let's check the command on invented files: a complete block passes;
@@ -37666,6 +37744,113 @@ def test_a_template_among_words_is_text(self, tmp_path, value):
   )
   result, _ = run_prov_check(tmp_path, block + PROV_ENTRY)
   assert result.exit_code == 0, result.output
+@
+
+The layouts the line reader once missed (\cref{sec:prov-bib-layouts})
+are read by both commands: an entry with its key on the next line, one
+in parentheses, and one whose quoted title holds a brace without a
+pair, each followed by a second entry with a block of its own, which
+the third used to swallow.  [[prov check]] passes the file, [[prov
+import]] imports both blocks into the test's own notes, and [[prov
+export]] writes each block once, above its entry.  An entry
+bibtexparser cannot parse is reported, the block of the entry after it
+is still read, and the export writes that block once although the
+failed entry's text ran over it.  The comment run of an entry stops at
+the last line of the block above, here an [[@comment]] whose last line
+begins with [[%]].
+
+<<test functions>>=
+PROV_LAYOUTS = {
+  "key on the next line": (
+    "@article{\n  KEY,\n  title = {Tracing Loops},\n"
+    "  author = {Lind, Eva},\n  doi = {10.5555/KEY},\n}\n"
+  ),
+  "parentheses": (
+    "@article(KEY,\n  title = {Tracing (Nested) Loops},\n"
+    "  author = {Lind, Eva},\n  doi = {10.5555/KEY},\n)\n"
+  ),
+  "a brace without a pair in quotes": (
+    '@article{KEY,\n  title = "Tracing { Loops",\n'
+    "  author = {Lind, Eva},\n  doi = {10.5555/KEY},\n}\n"
+  ),
+}
+
+
+def prov_layout_block(key, claim):
+  """`PROV_BLOCK` for `key` with `claim`, without its `ID` line."""
+  return "".join(
+    line for line in PROV_BLOCK.replace("ruiz2021", key).replace(
+      "Novices read recursion as a loop.", claim
+    ).splitlines(keepends=True)
+    if not line.startswith("% ID:")
+  )
+
+
+class TestProvBibLayouts:
+  """Both commands read the entries bibtexparser reads (#355)."""
+
+  def _file(self, layout):
+    return (prov_layout_block("lind2019", "First claim.")
+            + PROV_LAYOUTS[layout].replace("KEY", "lind2019")
+            + prov_layout_block("ruiz2021", "Second claim.")
+            + PROV_ENTRY)
+
+  @pytest.mark.parametrize("layout", list(PROV_LAYOUTS))
+  def test_check(self, tmp_path, layout):
+    result, _ = run_prov_check(tmp_path, self._file(layout))
+    assert result.exit_code == 0, result.output
+    assert "2 entries, 2 blocks, 0 errors." in result.output
+
+  @pytest.mark.parametrize("layout", list(PROV_LAYOUTS))
+  def test_import_and_export(self, tmp_path, monkeypatch, layout):
+    from scholar.notes import get_note
+
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path / "data"))
+    bib = tmp_path / "refs.bib"
+    bib.write_text(self._file(layout), encoding="utf-8")
+    result = CliRunner().invoke(app, ["prov", "import", str(bib)])
+    assert result.exit_code == 0, result.output
+    assert "Imported provenance for 2 entries" in result.output
+    for doi, claim in (("10.5555/lind2019", "First claim."),
+                       ("10.5555/prov-check", "Second claim.")):
+      note = get_note(Paper(title="T", authors=["A"], doi=doi))
+      assert f"CLAIM: {claim}" in note.note
+    result = CliRunner().invoke(app, ["prov", "export", str(bib)])
+    assert result.exit_code == 0, result.output
+    exported = result.stdout
+    assert exported.count("% CLAIM: ") == 2
+    assert exported.index("First claim.") < exported.index(
+      PROV_LAYOUTS[layout].replace("KEY", "lind2019")
+    ) < exported.index("Second claim.") < exported.index(PROV_ENTRY)
+
+  def test_an_entry_bibtexparser_cannot_parse(self, tmp_path, monkeypatch):
+    broken = PROV_LAYOUTS["key on the next line"].replace(
+      "KEY", "lind2019"
+    ).replace("{Tracing Loops}", "{Tracing { Loops}")
+    text = (prov_layout_block("lind2019", "First claim.") + broken
+            + prov_layout_block("ruiz2021", "Second claim.") + PROV_ENTRY)
+    result, bib = run_prov_check(tmp_path, text)
+    assert result.exit_code == 1, result.output
+    assert ("lind2019 (line 9): bibtexparser cannot read this entry"
+            in result.output)
+    assert "2 entries, 2 blocks, 1 error." in result.output
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path / "data"))
+    imported = CliRunner().invoke(app, ["prov", "import", str(bib)])
+    assert "Imported provenance for 2 entries" in imported.output
+    exported = CliRunner().invoke(app, ["prov", "export", str(bib)])
+    assert exported.stdout.count("% CLAIM: ") == 2
+
+  def test_the_run_stops_at_the_block_above(self):
+    text = (
+      "@comment{a note\n"
+      "% that ends here}\n"
+      "% === provenance: k ===\n"
+      "% CLAIM: c\n"
+      "@article{k, title = {T}}\n"
+    )
+    [entry] = _parse_bib_entries(text)
+    assert (entry.comment_start, entry.entry_start) == (2, 4)
+    assert stray_prov_blocks(text) == []
 @
 
 \subsection{Quotes in the source}
