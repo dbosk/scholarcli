@@ -186,6 +186,8 @@ KINDS = [
 LIST_HEAD, NUMBERS_ONLY = KINDS[0][0], KINDS[2][1]
 CHUNK_TAG = re.compile(r"^\d+[a-z]?$")
 WIDTH = 76           # longer lines are cut when shown
+HEADING_LINES = 3    # lines a heading may take in the text of the PDF
+ASCII_NUMBER = re.compile(r"^[0-9]+$")
 TEXT_TIMEOUT = 120   # seconds one pdftotext read may take (book: 14 s)
 PLACE_HEAD = "check: where the layouts first part"
 
@@ -454,28 +456,47 @@ def brace_groups(text):
     return groups
 
 
+def stands_among(forms, lines):
+    """Whether one of `forms` (alnum text) is printed on whole lines,
+    one line or up to HEADING_LINES consecutive ones, among `lines`."""
+    if not forms:
+        return False
+    longest = max(map(len, forms))
+    for start in range(len(lines)):
+        joined = ""
+        for line in lines[start:start + HEADING_LINES]:
+            joined += alnum(line)
+            if joined in forms:
+                return True
+            if len(joined) >= longest:
+                break
+    return False
+
+
 def nearest_section(toc, folio, above):
     """Return the heading of the .toc last begun before the place.
 
     The place is on page `folio` (an arabic page number), below the
     lines `above`; a heading on that page counts only if it stands
-    among those lines.
+    among those lines, on lines of its own.
     """
-    if folio is None or not folio.isdigit() or not toc.exists():
+    if folio is None or not ASCII_NUMBER.match(folio) or not toc.exists():
         return None
-    text_above = "".join(map(alnum, above))
     found = None
     for line in toc.read_text(encoding="latin-1").splitlines():
         groups = brace_groups(line)
         if (not line.startswith("\\contentsline") or len(groups) < 3
-                or not groups[2].isdigit() or int(groups[2]) > int(folio)):
+                or not ASCII_NUMBER.match(groups[2])
+                or int(groups[2]) > int(folio)):
             continue
         number = NUMBERLINE.search(groups[1])
         title = re.sub(r"\\[a-zA-Z@]+\s*|[{}]", "",
                        NUMBERLINE.sub("", groups[1])).strip()
-        if int(groups[2]) == int(folio) and alnum(title) not in text_above:
+        heading = f"{number.group(1)} {title}" if number else title
+        if int(groups[2]) == int(folio) and not stands_among(
+                {alnum(heading), alnum(title)} - {""}, above):
             continue
-        found = f"{number.group(1)} {title}" if number else title
+        found = heading
     return found
 
 
