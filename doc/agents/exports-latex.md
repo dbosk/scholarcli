@@ -46,6 +46,96 @@ the .bbl; checked with pdflatex/xelatex/lualatex); no stderr hint.
 All round-trip code lives in `cli.nw`'s
 `<<formatter classes>>` and `<<prov command>>` chunks.
 
+**`scholar prov check FILE.bib ... [--quotes] [--metadata]
+[--allow-unbacked] [-f table|json]`** (#346, cli.nw `sec:prov-check`):
+read-only on the `.bib`, notes and sessions (tested byte-identical);
+no request except `--metadata`'s Crossref lookups. Reading
+(`read_prov_bib` -> `ProvCheckEntry`): the line reader of `prov import`
+(`_parse_bib_entries`: blocks, wrapped fields, stacked blocks, `ID`)
+joined with bibtexparser (entry fields whole, LaTeX-decoded) on the
+0-based start line (`ProvEntry.entry_start` == `Block.start_line`); DOI
+and URL from the undecoded entry, read BEFORE `transform_entry`, which
+mutates its argument (DOI via `read_bibtex_verbatim`, URL as written).
+A `DuplicateBlockKeyBlock` (checked from `ignore_error_block`) and a
+`ParsingFailedBlock` are errors; `@comment/@preamble/@string` skipped.
+A block cut off by a blank line is missing (prov import skips it too).
+Files are read as `utf-8-sig` (a BOM made the first entry blockless).
+`stray_prov_blocks` (same line walk as `_parse_bib_entries`) reports
+each block no entry directly follows (end of file, above `@string` or
+`@comment`, cut off by a blank line) as an error with its line and
+header key: `ProvStrayBlock`, text "  KEY (line L): provenance block
+with no entry directly below it", summary ", N blocks without an
+entry", JSON `unattached` list and `summary.unattached`. A header key
+(`% === provenance: KEY ===`) other than the entry's key is an error
+naming both (prov import ignores the header key; bibtex+prov and prov
+export always write the entry's key, so no legitimate mismatch).
+Blocks: per block `prov_block_problems` over `PROV_REQUIRED_FIELDS`
+(CLAIM FOUND-VIA PICKED QUOTE VERIFIED COUNTER; ID and DATE not
+required): missing, empty, placeholder (`is_prov_placeholder`: the value
+BEGINS with the word `TODO`, capitals, so `TODO: find it` is one and
+"keep the TODO list short" is not; or the whole value a `<...>`
+template; a location, `(<loc>)`, judged alike). A QUOTE passage, or a
+part of one between ellipses (`quote_parts`), with no letter and no
+digit (`prov_passage_has_words`) is a block error "holds no words",
+with or without `--quotes`, and is never looked up.
+Fields are found by the first word of the name (`prov_field_values`:
+`QUOTE (p.3)` -> location `p.3`). A name given twice in one block is
+an error (`repeated_prov_fields` counts the comment lines; the line
+reader's dict keeps only the last, so prov import loses the others).
+No block: error; `--allow-unbacked` makes it a note (summary "N entries
+without a block"). `--quotes` (`prov_quote_checks`): passages via
+`quotes_in_reason` (double marks only; a QUOTE without one is not
+checked); VERIFIED starting `abstract` -> the entry's `abstract` field
+(none -> not checked), else full text from `pdf.cached_pdf_for(doi,
+url)` (DOI import keys `doi_pdf_paths`, the link of a cached Unpaywall
+answer `unpaywall.cached_pdf_link`, never a request, the `url` field's
+download; first readable wins); text `pdf.pdf_running_text` (pages
+joined, PDFium's U+FFFE line-end mark and `-` + line break kept as
+`-`, lines joined). Match: `normalized_for_quotes` +
+`fold_word_hyphens` (a hyphen between letters/digits removed on both
+sides) + `quote_parts`/`quote_occurs` (ellipsis parts in order); every
+passage checked, no 3-word minimum. A download resolved by Semantic
+Scholar or the landing page is not found (their answers are not
+cached). No cached PDF / unreadable / no text -> not checked (counted,
+printed, not an error). Measured 2026-11-27 on arXiv 1706.03762v7 and
+1810.04805v2: 6 of 6 quotes found, a misquote reported; keeping or
+dropping the U+FFFE mark without the fold missed 2 resp. 3.
+`--metadata` (`prov_metadata_checks`, `sec:prov-check-metadata`):
+`crossref.fetch_bibliographic(doi)` (side entry `("bibliographic",
+doi)` = `{title, subtitle, families, years}` written by
+`_remember_work`, built-in types, no `CURRENCY_CACHE_VERSION` bump; an
+older entry costs one request; `families` holds `family`, else an
+organisation's `name`). Title (`metadata_title_result`, no threshold):
+`metadata_fold` (casefold, accents/TeX/braces dropped, `[\W_]` runs ->
+one space, any script kept) of the bib title must EQUAL Crossref's
+title or title + subtitle; bib title = Crossref title + ":" + a
+subtitle, Crossref holding none -> note "subtitle not in Crossref's
+record" (counted in `summary.metadata.notes`, summary ", N notes";
+the entry counts as agreeing); else differs. Authors: sorted folded
+surnames (bibtexparser name parts of the author decoded a second time
+with `keep_braced_groups=True`, so `{The Study Group}` is one name and
+meets Crossref's `name`; `and others` dropped), compared only when
+both sides have some; year (`year`, else `date`) in issued /
+published-print / published-online (not `created`/`deposited`; no
+`published` field read, unverified). Differ -> error; 404 ->
+not checked "DOI ... is not known to Crossref" (no DataCite); failure
+-> not checked with reason; no DOI -> not checked. Exit 1 on any error,
+else 0; 2 for an unknown `-f` (before reading); 1 with one line for an
+unreadable file (before any check; with `-f json` stdout still holds
+`{"files": [... {"file", "error"}], "entries": [], "unattached": [],
+"summary": null}`). Text: "FILE: N entries", per
+finding "  key (line L[, block B]): [not checked: |note: ]message",
+summary "E entries, B blocks, X errors[, U entries without a block][,
+S blocks without an entry][; quotes: f found, m not found, u not
+checked][; metadata: a agree, d differ, u not checked[, n notes]]." JSON: `entries` (file, key, line, blocks,
+findings, `quotes`/`metadata` when asked), `files` (file, error
+null), `unattached` and `summary` (`prov_check_counts`). Left to the backing-claims skill: VERIFIED level
+words, causal/quantitative claims verified at abstract level, COUNTER
+wording and `see <key>`, missing DATE, QUOTE
+without a location. Tests: `RequestTargets.answer(path, body)`
+(conftest) serves a recorded body with status 200; `make_pdf` /
+`make_cli_pdf` take a list of lines.
+
 ## `search -f csv` rows (#300)
 
 `search -f csv` is tab-separated, written by Python's `csv` module
