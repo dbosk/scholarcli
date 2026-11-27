@@ -11,7 +11,11 @@ notes`:
 
 - `scholar prov import refs.bib` parses each entry's block(s) into that
   paper's note, **merging by `CLAIM`** (idempotent — re-importing never
-  duplicates) and preserving any personal note prose.
+  duplicates) and preserving any personal note prose. A block that
+  gives a field name twice (`ProvEntry.repeated`) is not imported
+  (#353): one stderr line "FILE: KEY (line L, block B): NAME is given
+  more than once; the block is not imported", the entry's other blocks
+  and the other entries are imported, exit 1 at the end.
 - `scholar prov export refs.bib` writes a paper's stored block(s) back above
   its entry; personal prose is never emitted. Prints to stdout (count on
   stderr) by default; `--in-place/-i` overwrites the file.
@@ -82,8 +86,9 @@ digit (`prov_passage_has_words`) is a block error "holds no words",
 with or without `--quotes`, and is never looked up.
 Fields are found by the first word of the name (`prov_field_values`:
 `QUOTE (p.3)` -> location `p.3`). A name given twice in one block is
-an error (`repeated_prov_fields` counts the comment lines; the line
-reader's dict keeps only the last, so prov import loses the others).
+an error (`repeated_prov_fields` counts the comment lines, kept as
+`ProvEntry.repeated` by the line reader; its dict keeps only the last,
+so prov import refuses the block too, see above).
 No block: error; `--allow-unbacked` makes it a note (summary "N entries
 without a block"). `--quotes` (`prov_quote_checks`): passages via
 `quotes_in_reason` (double marks only; a QUOTE without one is not
