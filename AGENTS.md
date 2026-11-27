@@ -278,8 +278,8 @@ LATEXFLAGS="-shell-escape -interaction=nonstopmode"` (between 7 and
 sets latexmk's `$max_repeat=10`) plus `doc/check-settled.py`: it fails
 on a missing or stale log, a LaTeX error, undefined references,
 missing PythonTeX output, or a non-zero build status, and passes a
-**cycle** of the references (a state that comes back within its 4
-extra runs: a two-state flip, or 3 or 4 states; remembered in
+**cycle** of the references (a state that comes back within its 8
+extra runs: a two-state flip, or up to 8 states; remembered in
 `ltxobj/scholar.cycle`) with the warning "the references alternate
 between two states and cannot settle" or "... cycle through N states
 ...". The full description is in cli.nw `sec:woven-document`
