@@ -309,7 +309,7 @@ set.
 | scopus | relevance: sends `sort=relevancy` on every page | Scopus Search API WADL (dev.elsevier.com/documentation/ScopusSearchAPI.wadl): `sort` options incl. `relevancy`; no default stated |
 | wos (both tiers) | relevance: sends `sortField=RS+D` | Starter OpenAPI (developer.clarivate.com/apis/wos-starter/swagger): supported fields list "RS - Relevance", example RS+D "Relevance (Descending)"; Expanded (…/apis/wos/swagger): no field list, RS rests on its example ("Relevance": RS+D) and the separator text ("'+' or ' '"); no default stated |
 | openalex, source-pinned, openalex-semantic | relevance (no `sort` sent) | help.openalex.org/api/searching/: "sorted by it (descending) by default" |
-| s2 | per endpoint (above) | swagger.json (#161) |
+| s2 | per endpoint (providers.md, "Semantic Scholar: relevance vs bulk search") | swagger.json (#161) |
 | arxiv | relevance (`sortBy=relevance&sortOrder=descending`) | info.arxiv.org/help/api/user-manual.html |
 | hal | relevance (`HAL_SORT` "score desc,docid asc") | api.archives-ouvertes.fr/docs/search: "Par défaut, les résultats sont triés par pertinence" |
 | ieee | unknown (no sort sent) | developer.ieee.org Sorting_and_Paging_Parameters: `sort_field` only article_number/article_title/publication_title, no default stated |

@@ -183,7 +183,7 @@ and error line numbers match an editor) is the selection (exit 2 with `--doi`/`-
 before loading): `--reason`/`--reasons-file`/`--by` with `--source
 llm` (the classifier's reason is `llm classify`'s), `--reason`/
 `--reasons-file` with `human` (out of scope; `--by` alone is accepted
-for a human since #257, below), `--by` alone for an agent, any bad file line (all named:
+for a human since #257, see "Human review record" in session-corrections.md), `--by` alone for an agent, any bad file line (all named:
 `cli.parse_reasons_file`), empty or > `review.MAX_AGENT_REASON_CHARS`
 (2000, stripped, never truncated) reason. After loading: an unknown id
 exits 1 (like `--doi`), one paper given two different reasons or

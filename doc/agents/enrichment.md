@@ -387,7 +387,7 @@ superseded, using Crossref's `updated-by` (Retraction-Watch-backed) and
 - `Paper.is_retracted` / `is_corrected` / `is_superseded` are convenience
   predicates; `crossref.currency_status(paper)` reduces these to one word
   (`retracted`/`corrected`/`superseded`/`preprint`/`ok`/`unknown`).
-  `preprint` means a deliberately adopted preprint (see below) whose only
+  `preprint` means a deliberately adopted preprint (see versions-copies-renames.md) whose only
   "newer version" is the recorded published DOI — info, not a warning.
 - `scholar verify "<session>"` reports per-paper status (with `--json`);
   `scholar enrich "<session>"` warns on issues as a side effect. Both

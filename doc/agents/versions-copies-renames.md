@@ -131,7 +131,7 @@ DOI decision but in none of those lists) are shown by `sessions show`
 (lines; foldable and possible copies counted, ids in JSON) and counted
 in the report. The pairs are DOI-less/DOI copy pairs plus two decided
 decisions under one id whose `decision_state` differs (`same_id_pairs`,
-any id, DOI too; #215: a store re-run can leave them, see below);
+any id, DOI too; #215: a store re-run can leave them, see review-sessions.md);
 conflicting if statuses differ, else alike; same state or a pending
 copy: not listed; `sessions reconcile` never folds them (no other id to
 fold to). Such a pair lasts (#228): `_build_previous_decision_lookup`

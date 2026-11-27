@@ -18,9 +18,9 @@ before it was split on 2026-11-27). The details of each area are in
   the same pull request.** A new area gets a new file and a row in the
   table. Do not add detail here: add a line to this file only when
   every session needs it.
-- A reference such as "see Search Limit" names a section. The table
-  says which file holds it, and
-  `grep -rn "^##* Search Limit" doc/agents/` finds it.
+- A reference such as "see Search Limit" names a section or a
+  paragraph that begins with that name in bold. The table says which
+  file holds it, and `grep -rn "Search Limit" doc/agents/` finds it.
 
 ## Architecture
 
@@ -125,17 +125,17 @@ In `doc/agents/`.
 |------|----------------------|----------|
 | `search-records.md` | `scholar.nw`'s data models, how a search is recorded in a session, `--limit`, `--in`, the order and places of answers, `prov found-via` | Data Models; Search Limit (#301); Order of answers (#303); Title-and-Abstract Search (`--in`); Search Provenance (`prov found-via`) |
 | `providers.md` | any provider in `providers.nw`: endpoints, errors and what a failed search records, health checks, DBLP, Scopus views, Semantic Scholar's two searches, the semantic check, the contact address | Semantic Scholar: relevance vs bulk search (#161); Preprint-Server Providers and Groups; Semantic Search Check (#136); Error Handling; Provider Health Checks; DBLP Query Sanitization; Scopus Empty Results; Scopus Views; Contact Email; Provider Text Cleaning |
-| `network-cache-ratelimits.md` | `network.nw`, `cache.nw`, `ratelimit.nw`: the proxy route and User-Agent, identifiers in URLs, what a cache may store and how it is saved, quotas and pacing | Network: proxy and User-Agent; Caching; Rate Limits and Quotas |
+| `network-cache-ratelimits.md` | `network.nw`, `cache.nw`, `ratelimit.nw`: the proxy route and User-Agent, identifiers in URLs, what a cache may store and how it is saved, quotas and pacing (Crossref's two pools in detail: `enrichment.md`) | Network: proxy and User-Agent; Caching; Rate Limits and Quotas |
 | `enrichment.md` | `pdf.nw`, `enrich.nw`, `unpaywall.nw`, `crossref.nw`, `europepmc.nw`: the PDF cache and `pdf import`, `scholar enrich` and its tallies, abstract sources, doubtful abstracts, retraction checks | PDF Cache and `scholar pdf import` (#296); Open-Access Lookup (Unpaywall); Abstracts from Crossref and Europe PMC (#260); Abstracts stored as paragraphs (#290); Doubtful Abstracts (#287); Currency / Retraction Checks |
-| `versions-copies-renames.md` | `preprint.nw`, deduplication, `sessions reconcile`, tombstones (`folded`) and rename records (`renamed`), DOI-less ids | Preprint Fallback (adopt a preprint when no PDF is found) |
-| `review-sessions.md` | `search -n` appends, `sessions show`, `sessions decide` (sources, `--force`, tags, `--untag`, `--keep-trace`, agent reasons), who decided as shown in outputs | Headless Review Sessions |
-| `decision-checks.md` | batch ids and `--sheet`, the quote check, the batch check and `sessions check-batches`, `--dry-run`/`--strict`, the line on records decided without an abstract | Checks on a batch of decisions |
-| `session-corrections.md` | `sessions relabel`, `sessions reset`, the human review record, `sessions set-abstract`, `sessions retire-search` | Correcting a session's record |
+| `versions-copies-renames.md` | `preprint.nw`, deduplication, `sessions reconcile`, tombstones (`folded`) and rename records (`renamed`), DOI-less ids | Preprint Fallback (adopt a preprint when no PDF is found), with Version-aware dedup, DOI-less copies and namesakes, Renames |
+| `review-sessions.md` | `search -n` appends, `sessions show`, `sessions decide` (sources, `--force`, tags, `--untag`, `--keep-trace`, agent reasons), who decided as shown in outputs | Headless Review Sessions (with Agent reasons, Unknown stored sources) |
+| `decision-checks.md` | batch ids and `--sheet`, the quote check, the batch check and `sessions check-batches`, `--dry-run`/`--strict`, the line on records decided without an abstract | Checks on a batch of decisions: Batch ids; Quote check; Batch check; Records decided without an abstract |
+| `session-corrections.md` | `sessions relabel`, `sessions reset`, the human review record, `sessions set-abstract`, `sessions retire-search` | Correcting a session's record: Correcting a source (relabel); `sessions reset`; Human review record; `sessions set-abstract`; `sessions retire-search` |
 | `screenings-agreement.md` | `ReviewDecision.screenings`, `sessions screen`, TUI blind review, `agreement.nw` (`sessions agreement`, `sessions conflicts`), the double-screening text of the report, synthesis summary and audit caption | Screenings: a second screener's verdicts (#253, part A); Agreement and conflicts (#253, part B); Double screen in the documents (#253, part E) |
-| `screen-sheets-tiers.md` | `sessions export -f screen-sheet` (`--batch-size`, `--pending`, `--top`, `--min-providers`, `--rest-sample`), `sessions tier-sample`, `llm classify --top/--tier-sample` | Screen sheets, the screening tier and the sample of the rest |
+| `screen-sheets-tiers.md` | `sessions export -f screen-sheet` (`--batch-size`, `--pending`, `--top`, `--min-providers`, `--rest-sample`), `sessions tier-sample`, `llm classify --top/--tier-sample` | Screen sheet; Screening tier; Sample of the rest |
 | `session-integrity.md` | how a session argument is resolved, `save_session` (merge, lock, refused saves, `sessions recover`), baselines, appends, notes locks, `sessions export`'s staged moves | Session Arguments; Session Integrity |
 | `exports-latex.md` | `bibtex+prov` and `scholar prov`, `search -f csv`, `--spreadsheet-safe`, the LaTeX escapers, cite keys, `.bib` field values, the report, the audit table and `--cited-from` | Provenance Round-Trip; `search -f csv` rows (#300); Spreadsheet-safe CSV (`--spreadsheet-safe`, #285); LaTeX Output: Standalone, Fragment, Audit Table |
-| `llm-screening.md` | `llm_review.nw`: the prompt and its pinned version, vocabulary and categories, the retry and run tally, the audit fields, `llm sample`, second screens, unknown models | Classifier Vocabulary; LLM Screening Record and Review Samples |
+| `llm-screening.md` | `llm_review.nw`: the prompt and its pinned version, vocabulary and categories, the retry and run tally, the audit fields, `llm sample`, second screens, unknown models | Classifier Vocabulary; LLM Screening Record and Review Samples (Samples, Second screen, First tier) |
 | `cli-and-documentation.md` | `cli.nw`'s lazy `snowball`/`tuxedo` loading, `scholar tutorial` and its lessons, the part "The methods behind the defaults" and `doc/bibliography.bib` | Snowball and Tuxedo Subcommands (lazy); Interactive Tutorials (`scholar tutorial`); The methods part of the documentation (#310, #311) |
 
 ## Testing

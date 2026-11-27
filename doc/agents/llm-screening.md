@@ -186,11 +186,11 @@ moved five places, `paper_id` stays last): empty when unset,
   abstract or the `--full-text` passages of this run
   (`LLMBatchResult.passages`, paper id -> passage texts, not stored).
   Nothing is withheld or retried for it. Later checks (`sessions show`,
-  report) see only title and abstract (see Headless Review Sessions).
+  report) see only title and abstract (see "Quote check" in decision-checks.md).
   Answers without a valid `paper_index` are skipped (never index 0).
 - **Sample of a tier's rest (#315).** `llm classify S --tier-sample ID`
-  classifies the pending papers of a `TierSample` (see Screening tier
-  in Headless Review Sessions); `sessions tier-sample S --report` gives
+  classifies the pending papers of a `TierSample` (see "Screening tier"
+  in screen-sheets-tiers.md); `sessions tier-sample S --report` gives
   the bearing rate with the same `modified_wilson_interval`, withheld
   while the draw is not fully screened.
 - **First tier (#302, cli.nw `sec:llm-classify-tier`).** `llm classify

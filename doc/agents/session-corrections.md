@@ -90,7 +90,7 @@ the CSV column `reset_from` (`status by source time [by NAME]; ...`,
 after the agent-trace and human-record columns, before
 `abstract_from`). Effects: audit table and
 report show pending; a sampled decision reset at or after the draw
-is gone from the sample (see Samples: `reset_since_draw`);
+is gone from the sample (see "Samples" in llm-screening.md: `reset_since_draw`);
 `first_made_by_llm` is False for any pending
 paper; after a full reset the classifier vocabulary (tags of decided
 papers) is empty, so pass `llm classify --tag`.
