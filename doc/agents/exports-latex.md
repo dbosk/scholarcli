@@ -121,7 +121,11 @@ both sides have some; year (`year`, else `date`) in issued /
 published-print / published-online (not `created`/`deposited`; no
 `published` field read, unverified). Differ -> error; 404 ->
 not checked "DOI ... is not known to Crossref" (no DataCite); failure
--> not checked with reason; no DOI -> not checked. Exit 1 on any error,
+(`last_lookup_error` set: 429, 5xx, connection, cooldown) -> result
+and finding level `lookup failed` (#356), "lookup failed: metadata:
+Crossref: <reason>", counted apart (`summary.metadata["lookup
+failed"]`, text ", N lookup failed" only when N > 0), not an error but
+exit 1; no DOI -> not checked. Exit 1 on any error or failed lookup,
 else 0; 2 for an unknown `-f` (before reading); 1 with one line for an
 unreadable file (before any check; with `-f json` stdout still holds
 `{"files": [... {"file", "error"}], "entries": [], "unattached": [],
@@ -129,13 +133,15 @@ unreadable file (before any check; with `-f json` stdout still holds
 finding "  key (line L[, block B]): [not checked: |note: ]message",
 summary "E entries, B blocks, X errors[, U entries without a block][,
 S blocks without an entry][; quotes: f found, m not found, u not
-checked][; metadata: a agree, d differ, u not checked[, n notes]]." JSON: `entries` (file, key, line, blocks,
+checked][; metadata: a agree, d differ, u not checked[, f lookup
+failed][, n notes]]." JSON: `entries` (file, key, line, blocks,
 findings, `quotes`/`metadata` when asked), `files` (file, error
 null), `unattached` and `summary` (`prov_check_counts`). Left to the backing-claims skill: VERIFIED level
 words, causal/quantitative claims verified at abstract level, COUNTER
 wording and `see <key>`, missing DATE, QUOTE
-without a location. Tests: `RequestTargets.answer(path, body)`
-(conftest) serves a recorded body with status 200; `make_pdf` /
+without a location. Tests: `RequestTargets.answer(path, body,
+status=200)` (conftest) serves a recorded body, or an injected status
+(a 429 for the failed lookup); `make_pdf` /
 `make_cli_pdf` take a list of lines.
 
 ## `search -f csv` rows (#300)
