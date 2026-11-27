@@ -162,7 +162,7 @@ def differences(states, sources):
 
 FOLIO = re.compile(r"^(\d+|[ivxlcdm]+)$")
 FOLIO_LINES = 3      # the folio is looked for among a page's first/last lines
-EDGE = 3             # lines that identify a page break on either side of it
+EDGE = 3             # last lines of a page that identify the break after it
 SHOWN_LINES = 8      # differing lines shown per state
 LOOK_BACK = 20       # pages searched back for the nearest chunk
 NUMBER = re.compile(r"\d+[a-z]?\b")
@@ -194,16 +194,16 @@ def masked(line):
 class Layout:
     """What one run's PDF shows, kept small.
 
-    Per page: its folio, the masked lines at its head and at its foot
-    (enough to tell whether a page break moved) and all its lines,
-    compressed, for the one page that is shown in the end.
+    Per page: its folio, the masked lines at its foot (enough to tell
+    whether the break after it moved) and all its lines, compressed,
+    for the one page that is shown in the end.
     """
 
     def __init__(self, text):
         pages = text.split("\f")
         if pages and not pages[-1].strip():
             pages.pop()
-        self.folios, self.heads, self.feet, self._packed = [], [], [], []
+        self.folios, self.feet, self._packed = [], [], []
         for page in pages:
             lines = [line.strip() for line in page.splitlines()
                      if line.strip()]
@@ -216,7 +216,6 @@ class Layout:
                     folio = lines.pop(index)
                     break
             self.folios.append(folio)
-            self.heads.append(tuple(map(masked, lines[:EDGE])))
             self.feet.append(tuple(map(masked, lines[-EDGE:])))
             self._packed.append(zlib.compress("\n".join(lines).encode()))
 
@@ -229,9 +228,8 @@ class Layout:
         return zlib.decompress(self._packed[page]).decode().split("\n")
 
     def break_after(self, page):
-        """What decides the break after `page`: its foot, the next head."""
-        return (self.feet[page] if page < len(self) else None,
-                self.heads[page + 1] if page + 1 < len(self) else None)
+        """What tells the break after `page`: the foot of that page."""
+        return self.feet[page] if page < len(self) else None
 
 
 def read_layout(pdf, timeout=TEXT_TIMEOUT):
