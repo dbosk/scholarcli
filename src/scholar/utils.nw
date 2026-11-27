@@ -2166,19 +2166,66 @@ caught between creating its staging directory and taking its lock, a
 few instructions, is reported as left over by mistake; the warning
 deletes nothing, so the cost is a wrong line.
 
+The export's own directories must never be among those reported, and
+the lock cannot be what keeps them out.  [[file_lock]] is reentrant
+within a process (\cref{sec:file-lock}): a thread that asks again for a
+lock it holds gets it at once.  For the scan, a lock that can be taken
+therefore means that no \emph{other} holder has it, and the one holder
+it cannot see is the export that scans: asked about its own staging
+directory, [[left_over]] takes the lock the export holds and calls the
+directory left over.  So the own directories are skipped by what they
+are before any lock is tried.  Comparing the paths as written is not
+enough (\url{https://github.com/dbosk/scholar/issues/335}): every
+export with a relative [[-o]] warned about its own staging directory,
+because [[tempfile.mkdtemp]] returns an absolute path
+(\url{https://docs.python.org/3/library/tempfile.html#tempfile.mkdtemp}:
+\enquote{Changed in version 3.12: mkdtemp() now always returns an
+absolute path, even if dir is relative}, read 2026-11-23) while
+iterating a relative directory gives relative entries, so the two never
+compared equal.  [[own_directory]] compares the resolved paths, which
+are absolute and free of [[.]], [[..]] and symbolic links
+([[Path.resolve]]: \enquote{Make the path absolute, resolving any
+symlinks}, and \enquote{[[..]] components are also eliminated},
+\url{https://docs.python.org/3/library/pathlib.html#pathlib.Path.resolve},
+read 2026-11-23), so every spelling of the output directory gives the
+same one.  Comparing device and inode numbers instead (as
+[[file_identity]] above does for files) would add only directories
+reached through two different mounts, and the staging directory and
+the scan always reach it through the one path the caller gave.
+
+The directory of replaced files cannot be among them: the placement
+makes it only after the scan.  The second guard is in [[left_over]]: a
+lock this thread already holds under the same path is reported as held,
+not taken again.  Spelt differently, the path gives another lock object
+(the locks are kept by absolute path, not resolved), which takes a
+lock of its own on the file; on POSIX the [[filelock]] package takes
+it with [[fcntl.flock]] (read in its source), and flock(2) says that
+\enquote{an attempt to lock the file using one of these file
+descriptors may be denied by a lock that the calling process has
+already placed via another file descriptor}
+(\url{https://man7.org/linux/man-pages/man2/flock.2.html}, read
+2026-11-23), so it is refused like another process's lock.  That is why
+spellings with [[..]] did not warn before the fix; a test below checks
+each spelling.
+
 <<warn about what an export that did not finish left>>=
-for leftover in leftover_directories(directory, own_staging):
+for leftover in leftover_directories(
+    directory, [own_staging] if own_staging is not None else []
+):
     logging.getLogger(__name__).warning("%s", leftover_warning(leftover))
 <<utils functions>>=
 def leftover_directories(
-    directory: Path, own: Path | None = None
+    directory: Path, own: Iterable[Path] = ()
 ) -> list[Path]:
     """Staging and replaced-file directories of exports that did not
-    finish. Call it holding `placing_lock(directory)`; `own` is the
-    caller's staging directory."""
+    finish. Call it holding `placing_lock(directory)`; `own` are the
+    caller's own directories, never reported, however they are spelt."""
+    own = list(own)
     found = []
     for entry in sorted(directory.iterdir()):
-        if entry == own or entry.is_symlink() or not entry.is_dir():
+        if entry.is_symlink() or not entry.is_dir():
+            continue
+        if own_directory(entry, own):
             continue
         if entry.name.startswith(KEPT_PREFIX) and left_over(
             entry, KEPT_LOCK_NAME
@@ -2191,9 +2238,19 @@ def leftover_directories(
     return found
 
 
+def own_directory(entry: Path, own: list[Path]) -> bool:
+    """Whether `entry` is one of the directories `own`, compared by
+    resolved path."""
+    resolved = entry.resolve()
+    return any(Path(path).resolve() == resolved for path in own)
+
+
 def left_over(directory: Path, lock_name: str) -> bool:
     """Whether no running export holds `directory`, judged by its lock
-    `lock_name` inside it."""
+    `lock_name` inside it. A lock this thread holds counts as held."""
+    held = _FILE_LOCKS.get(lock_path(directory / lock_name).absolute())
+    if held is not None and held.is_locked:
+        return False
     try:
         with file_lock(directory / lock_name, timeout=0, required=True):
             return True
@@ -2828,6 +2885,140 @@ def test_a_killed_export_is_reported_by_the_next(
         in warnings[0]
     assert "those of the latest export to finish" in warnings[0]
     assert kept.is_dir() and staging.is_dir() and live.is_dir()
+@
+
+An export reports no directory of its own, however its output directory
+is spelt (\url{https://github.com/dbosk/scholar/issues/335}): relative,
+with [[./]], with [[..]], through a symbolic link, relative or
+absolute.  The output directory holds earlier files, so the export also
+makes a directory of replaced files.  And with each spelling the true
+cases still hold: the staging and replaced-files directories a killed
+export left (made by hand here, as the killed child above leaves them,
+without a lock held) are reported, and the staging directory of an
+export that a real second process is running is not.  That process
+waits inside [[staged_outputs]] until the test lets it go, so its lock
+is held by another process, not by a thread of this one.
+
+<<test functions>>=
+class TestStagedOutputOwnDirectories:
+    """Each spelling of the directory: own directories never reported."""
+
+    SPELLINGS = ["out", "./out", "out/../out", "link", "{tmp}/link",
+                 "{tmp}/out/../out"]
+
+    @pytest.fixture
+    def spelt(self, tmp_path, monkeypatch, request):
+        out = tmp_path / "out"
+        out.mkdir()
+        (tmp_path / "link").symlink_to(out)
+        monkeypatch.chdir(tmp_path)
+        for name in ("a.csv", "b.tex"):
+            (out / name).write_text(f"old {name}")
+        return out, Path(request.param.format(tmp=tmp_path))
+
+    <<staged output own directories test methods>>
+
+<<staged output own directories test methods>>=
+WAITING_EXPORT = """
+import sys
+from pathlib import Path
+import scholar.utils as utils
+
+with utils.staged_outputs(Path(sys.argv[1])) as staging:
+    (staging / "c.txt").write_text("other c.txt")
+    print(staging, flush=True)
+    sys.stdin.readline()
+"""
+
+def _warnings(self, caplog):
+    return [r.getMessage() for r in caplog.records
+            if r.levelname == "WARNING"]
+
+@pytest.mark.parametrize("spelt", SPELLINGS, indirect=True)
+def test_its_own_directories_are_not_reported(self, spelt, caplog):
+    out, directory = spelt
+    outcome = {}
+    TestStagedOutputSafety()._export(directory, "new", outcome)
+    assert outcome["new"] is None
+    assert self._warnings(caplog) == []
+    assert {p.name: p.read_text() for p in out.iterdir()} == {
+        "a.csv": "new a.csv", "b.tex": "new b.tex"}
+
+@pytest.mark.parametrize("spelt", SPELLINGS, indirect=True)
+def test_left_and_running_directories_are_told_apart(self, spelt, caplog):
+    import subprocess
+    import sys
+    import textwrap
+
+    out, directory = spelt
+    kept = out / f"{KEPT_PREFIX}dead"
+    staging = out / f"{STAGING_PREFIX}dead"
+    for dead in (kept, staging):
+        dead.mkdir()
+        (dead / "a.csv").write_text("left a.csv")
+    child = subprocess.Popen(
+        [sys.executable, "-c", textwrap.dedent(self.WAITING_EXPORT),
+         str(out)],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, text=True,
+    )
+    try:
+        running = Path(child.stdout.readline().strip())
+        assert running.parent == out and running.is_dir()
+        outcome = {}
+        TestStagedOutputSafety()._export(directory, "new", outcome)
+    finally:
+        child.communicate("go\n", timeout=60)
+    assert child.returncode == 0
+    assert outcome["new"] is None
+    assert self._warnings(caplog) == [
+        leftover_warning(directory / kept.name),
+        leftover_warning(directory / staging.name),
+    ]
+    assert (out / "c.txt").read_text() == "other c.txt"
+    assert kept.is_dir() and staging.is_dir() and not running.exists()
+@
+
+Each of the two guards is enough for the export above, so each is
+also tested alone.  An own directory whose lock nobody holds is still
+not reported when it is given in another spelling than the scan finds
+it, so only the comparison keeps it out, both when the scan is asked
+directly and when [[place_staged_files]] is told it is its staging
+directory; and a directory whose lock this thread holds is held, not
+left over, so only the second guard answers.
+
+<<staged output own directories test methods>>=
+@pytest.mark.parametrize("spelt", SPELLINGS, indirect=True)
+def test_an_own_directory_is_skipped_by_what_it_is(self, spelt):
+    out, directory = spelt
+    own = out / f"{STAGING_PREFIX}own"
+    other = out / f"{STAGING_PREFIX}other"
+    own.mkdir()
+    other.mkdir()
+    assert leftover_directories(directory, [own]) == [
+        directory / other.name]
+    assert leftover_directories(directory, [directory / own.name]) == [
+        directory / other.name]
+
+@pytest.mark.parametrize("spelt", SPELLINGS, indirect=True)
+def test_the_placement_skips_the_staging_it_is_given(self, spelt, caplog):
+    out, directory = spelt
+    staging = out / f"{STAGING_PREFIX}given"
+    staging.mkdir()
+    (staging / "a.csv").write_text("new a.csv")
+    place_staged_files(directory, [directory / staging.name / "a.csv"],
+                       own_staging=staging)
+    assert self._warnings(caplog) == []
+    assert (out / "a.csv").read_text() == "new a.csv"
+
+@pytest.mark.parametrize("spelt", SPELLINGS, indirect=True)
+def test_a_lock_this_thread_holds_counts_as_held(self, spelt):
+    out, directory = spelt
+    staging = out / f"{STAGING_PREFIX}held"
+    staging.mkdir()
+    with file_lock(staging / STAGING_LOCK_NAME):
+        assert not left_over(directory / staging.name, STAGING_LOCK_NAME)
+    assert left_over(directory / staging.name, STAGING_LOCK_NAME)
 @
 
 SIGTERM in the middle of the moves is undone like Ctrl-C: the test sends
