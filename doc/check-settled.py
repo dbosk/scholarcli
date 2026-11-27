@@ -160,8 +160,12 @@ def differences(states, sources):
     return lines
 
 
-FOLIO = re.compile(r"^(\d+|[ivxlcdm]+)$")
-FOLIO_LINES = 3      # the folio is looked for among a page's first/last lines
+FOLIO = re.compile(r"^([0-9]+|[ivxlcdm]+)$")
+ROMAN = re.compile(r"^m{0,3}(cm|cd|d?c{0,3})(xc|xl|l?x{0,3})(ix|iv|v?i{0,3})$")
+ROMAN_DIGITS = {"i": 1, "v": 5, "x": 10, "l": 50, "c": 100, "d": 500,
+                "m": 1000}
+FOLIO_LINES = 10     # the folio is looked for among a page's first/last lines
+FOLIO_RUN = 10       # pages on either side whose folios a folio must fit
 EDGE = 3             # last lines of a page that identify the break after it
 SHOWN_LINES = 8      # differing lines shown per state
 LOOK_BACK = 20       # pages searched back for the nearest chunk
@@ -191,6 +195,53 @@ def masked(line):
     return FILLER.sub(" ", NUMBER.sub("0", line)).strip()
 
 
+def folio_value(text):
+    """Return what a printed page number counts in, and its value."""
+    if text.isdigit():
+        return "arabic", int(text)
+    if not ROMAN.match(text):
+        return None
+    digits = [ROMAN_DIGITS[letter] for letter in text]
+    return "roman", sum(-digit if digit < after else digit
+                        for digit, after in zip(digits, digits[1:] + [0]))
+
+
+def page_lines(page):
+    return [line.strip() for line in page.splitlines() if line.strip()]
+
+
+def folio_candidates(number, lines):
+    """Return the lone numbers among the first and last lines of page
+    `number` (from 1), as (index, (kind, offset from the PDF's page))."""
+    ends = list(range(min(FOLIO_LINES, len(lines))))
+    ends += range(max(len(lines) - FOLIO_LINES, len(ends)), len(lines))
+    found = []
+    for index in ends:
+        if FOLIO.match(lines[index]) and (value := folio_value(lines[index])):
+            kind, counted = value
+            found.append((index, (kind, number - counted)))
+    return found
+
+
+def folio_indices(candidates):
+    """Return per page the index of its folio line, or None.
+
+    The folio is the candidate whose offset the most pages within
+    FOLIO_RUN pages share, and at least one page besides its own.
+    """
+    offsets = [{key for _, key in own} for own in candidates]
+    chosen = []
+    for page, own in enumerate(candidates):
+        near = offsets[max(page - FOLIO_RUN, 0):page + FOLIO_RUN + 1]
+        best, support = None, 1
+        for index, key in own:
+            count = sum(key in other for other in near)
+            if count > support:
+                best, support = index, count
+        chosen.append(best)
+    return chosen
+
+
 class Layout:
     """What one run's PDF shows, kept small.
 
@@ -204,18 +255,11 @@ class Layout:
         if pages and not pages[-1].strip():
             pages.pop()
         self.folios, self.feet, self._packed = [], [], []
-        for page in pages:
-            lines = [line.strip() for line in page.splitlines()
-                     if line.strip()]
-            folio = None
-            ends = list(range(min(FOLIO_LINES, len(lines))))
-            ends += range(max(len(lines) - FOLIO_LINES, len(ends)),
-                          len(lines))
-            for index in ends:
-                if FOLIO.match(lines[index]):
-                    folio = lines.pop(index)
-                    break
-            self.folios.append(folio)
+        indices = folio_indices([folio_candidates(number, page_lines(page))
+                                 for number, page in enumerate(pages, 1)])
+        for page, index in zip(pages, indices):
+            lines = page_lines(page)
+            self.folios.append(None if index is None else lines.pop(index))
             self.feet.append(tuple(map(masked, lines[-EDGE:])))
             self._packed.append(zlib.compress("\n".join(lines).encode()))
 
