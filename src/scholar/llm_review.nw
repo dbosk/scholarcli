@@ -1,44 +1,44 @@
 \chapter{LLM-Assisted Paper Review}
 \label{llm-review-module}
 
-Screening hundreds of papers is exhausting.
-A comprehensive search on \enquote{privacy-preserving machine learning} might
-return a thousand results; reviewing each abstract takes thirty seconds;
-the arithmetic is discouraging.
-Yet systematic reviews demand exactly this thoroughness---missing a relevant
-paper undermines the entire methodology.
+A search can return thousands of records ([[sessions show]] gives each
+answer's total as the database reports it, \enquote{100 of 6,405}), and
+a systematic review needs a decision on every record it keeps.
 
-Large language models offer a way to scale human judgment without replacing
-it.
-The key insight is that after reviewing a few dozen papers, a researcher has
-implicitly defined relevance criteria through their decisions.
-An LLM can learn these criteria from examples and apply them to remaining
-papers, dramatically reducing the screening burden while preserving human
-oversight.
+This chapter shows a language model the decisions a researcher has made
+or confirmed, as examples, and asks it to decide the remaining papers.
+Each of its decisions is stored as unreviewed until a human confirms or
+changes it, and the record says which of the two every decision is.
 
 This chapter implements \emph{LLM-assisted classification}: a round-based
 workflow where the LLM suggests decisions based on human-tagged examples,
 and the researcher reviews (and corrects) these suggestions.
-Each correction refines the training set for the next round, creating a
-feedback loop that improves accuracy over time.
+A tagged decision the researcher confirms or corrects can be one of the
+examples of the next round, which holds at most [[MAX_KEPT_EXAMPLES]]
+kept and [[MAX_DISCARDED_EXAMPLES]] discarded decisions, corrections
+first.
 
-The design prioritizes transparency.
-Every LLM decision includes a confidence score (0.0--1.0), enabling reviewers
-to prioritize uncertain classifications.
-Decisions track their source (human, LLM-unreviewed, LLM-reviewed), ensuring
-the audit trail distinguishes machine suggestions from human judgments.
+Every LLM decision records the confidence the model states (0.0--1.0);
+a review sample can be drawn by it ([[llm sample]] with
+[[--min-confidence]] or [[--bands]], \cref{sec:llm-sample}), and the
+number is the model's own, which Scholar does not check.
+Decisions record their source (human, LLM-unreviewed, LLM-reviewed), so
+the record keeps the machine's suggestions apart from human decisions.
 
 \section{Design Goals}
 
 \begin{description}
-\item[Round-based learning] LLM decisions are reviewed by humans; corrections
-  become training examples for future rounds.
-\item[Confidence-based prioritization] Reviewers focus on uncertain
-  classifications first, maximizing impact of limited human attention.
+\item[Rounds of examples] LLM decisions are reviewed by humans; a
+  tagged decision they confirm or correct can be an example in later
+  rounds (at most [[MAX_KEPT_EXAMPLES]] kept and
+  [[MAX_DISCARDED_EXAMPLES]] discarded, corrections first).
+\item[Recorded confidence] Each decision keeps the confidence the model
+  stated, by which a sample of decisions for review can be drawn.
 \item[Source tracking] Decisions record whether they are human-made,
   LLM-suggested, or LLM-suggested-and-reviewed.
-\item[Automatic enrichment] Papers without abstracts are enriched before
-  classification, ensuring the LLM has sufficient context.
+\item[Automatic enrichment] Papers to classify that lack an abstract are first looked up
+  as [[scholar enrich]] does; the prompt shows what those lookups
+  return.
 \item[Model flexibility] Uses Simon Willison's [[llm]] package, supporting
   OpenAI, Anthropic, local models, and other providers.
 \end{description}
@@ -51,7 +51,8 @@ The typical LLM-assisted review workflow:
 \item User sets a research context describing the review's focus
 \item User invokes LLM classification on a batch of pending papers
 \item LLM classifies papers based on examples, returning confidence scores
-\item User reviews LLM decisions, prioritizing low-confidence ones
+\item User reviews LLM decisions (all of them, or a seeded sample drawn
+  with [[llm sample]], by confidence if wanted)
 \item Corrections become new training examples for the next round
 \item Repeat until all papers are reviewed
 \end{enumerate}
@@ -64,7 +65,7 @@ The typical LLM-assisted review workflow:
 LLM-assisted paper classification for systematic reviews.
 
 Provides functions for classifying papers using large language models,
-learning from human-tagged examples in a round-based workflow.
+showing the model human-tagged decisions as examples, in rounds.
 """
 <<llm review imports>>
 <<llm review constants>>
@@ -133,7 +134,7 @@ logger = logging.getLogger(__name__)
 @
 
 <<llm review constants>>=
-# Minimum requirements for LLM classification
+# The examples Scholar asks for (its own choice, not a measured need)
 MIN_TOTAL_EXAMPLES = 5
 MIN_KEPT_EXAMPLES = 1
 MIN_DISCARDED_EXAMPLES = 1
@@ -144,6 +145,30 @@ DEFAULT_BATCH_SIZE = 10
 # Maximum examples to include in prompt (to manage token limits)
 MAX_KEPT_EXAMPLES = 10
 MAX_DISCARDED_EXAMPLES = 10
+@
+
+Two texts state these limits in words, for readers who never see this
+chapter: the introduction of this document and the [[llm-synthesis]]
+lesson (\enquote{at most ten kept and ten discarded}).
+They cannot name the constants, so a test reads both and checks that
+their numbers are these.
+
+<<test functions>>=
+EXAMPLE_LIMIT_TEXTS = ("doc/introduction.tex",
+                       "src/scholar/tutorials/llm-synthesis.nw")
+NUMBER_WORDS = {5: "five", 10: "ten", 15: "fifteen", 20: "twenty"}
+
+
+def test_texts_state_the_example_limits():
+    """The limits written out in words are the constants' values."""
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    stated = (f"{NUMBER_WORDS[MAX_KEPT_EXAMPLES]} kept and "
+              f"{NUMBER_WORDS[MAX_DISCARDED_EXAMPLES]} discarded")
+    for name in EXAMPLE_LIMIT_TEXTS:
+        text = " ".join((root / name).read_text(encoding="utf-8").split())
+        assert stated in text, f"{name} does not say {stated!r}"
 @
 
 
@@ -289,8 +314,8 @@ class TestDataStructures:
 \label{sec:example-gathering}
 
 Before invoking the LLM, we need training examples---papers that humans have
-already classified with tags. The quality of examples directly impacts
-classification accuracy.
+already classified with tags. This section decides which decisions those
+are; the prompt shows the model no others.
 
 \subsection{What Makes a Good Example}
 
@@ -389,7 +414,7 @@ then withholds the model's answer when it follows the example.
 Such a record is left out of the examples rather than shown without
 its category.  Shown without one, it would break the other half of
 the rule, exactly one category per paper; and the reason a human
-excluded a bearing paper is usually a criterion of the review, which
+excluded a bearing paper can be a criterion of the review, which
 the prompt tells the model to leave to a human.  The record's
 category is the one the audit table reads, its last category tag
 ([[audit_category]]), so a record whose status change appended a
@@ -517,11 +542,14 @@ def get_example_decisions(
 @
 
 
-\subsection{Computing the Recommended Example Minimum}
+\subsection{The example minimum}
 
-A small set of examples gives the LLM enough context to make reasonable
-decisions, so we compute a recommended minimum. This check is advisory, not a
-gate: [[classify_papers_with_llm]] uses a failed check to warn the user rather
+Scholar asks for a minimum of examples, [[MIN_TOTAL_EXAMPLES]] in all
+with at least [[MIN_KEPT_EXAMPLES]] kept and [[MIN_DISCARDED_EXAMPLES]]
+discarded.  The numbers are Scholar's own choice: nothing in Scholar
+measures what fewer examples do to the model's decisions, so the message
+states only the counts, how many examples the prompt will show against
+the minimum asked for.  This check is advisory, not a gate: [[classify_papers_with_llm]] uses a failed check to warn the user rather
 than to block classification, so a review with too few (or no) examples still
 runs.
 
@@ -547,27 +575,16 @@ def validate_examples(
         Tuple of (is_valid, error_message)
         If valid, error_message is empty string.
     """
-    total = len(kept_examples) + len(discarded_examples)
-
-    if total < min_total:
-        return False, (
-            f"Need at least {min_total} tagged examples, "
-            f"but only have {total}."
-        )
-
-    if len(kept_examples) < min_kept:
-        return False, (
-            f"Need at least {min_kept} kept example(s) with tags, "
-            f"but only have {len(kept_examples)}."
-        )
-
-    if len(discarded_examples) < min_discarded:
-        return False, (
-            f"Need at least {min_discarded} discarded example(s) with tags, "
-            f"but only have {len(discarded_examples)}."
-        )
-
-    return True, ""
+    kept, discarded = len(kept_examples), len(discarded_examples)
+    if (kept + discarded >= min_total and kept >= min_kept
+            and discarded >= min_discarded):
+        return True, ""
+    return False, (
+        f"The prompt will show {kept + discarded} tagged example(s) "
+        f"({kept} kept, {discarded} discarded); Scholar asks for at "
+        f"least {min_total}, with at least {min_kept} kept and "
+        f"{min_discarded} discarded."
+    )
 @
 
 
@@ -704,7 +721,11 @@ class TestExampleGathering:
         is_valid, error = validate_examples(kept, discarded)
 
         assert is_valid is False
-        assert "at least 5" in error
+        assert error == (
+            "The prompt will show 2 tagged example(s) (1 kept, 1 discarded); "
+            "Scholar asks for at least 5, with at least 1 kept and 1 "
+            "discarded."
+        )
 
     def test_validate_examples_no_kept(self):
         """Validation fails with no kept examples."""
@@ -714,7 +735,11 @@ class TestExampleGathering:
         is_valid, error = validate_examples(kept, discarded)
 
         assert is_valid is False
-        assert "kept" in error.lower()
+        assert error == (
+            "The prompt will show 5 tagged example(s) (0 kept, 5 discarded); "
+            "Scholar asks for at least 5, with at least 1 kept and 1 "
+            "discarded."
+        )
 
     def test_validate_examples_no_discarded(self):
         """Validation fails with no discarded examples."""
@@ -724,7 +749,11 @@ class TestExampleGathering:
         is_valid, error = validate_examples(kept, discarded)
 
         assert is_valid is False
-        assert "discarded" in error.lower()
+        assert error == (
+            "The prompt will show 5 tagged example(s) (5 kept, 0 discarded); "
+            "Scholar asks for at least 5, with at least 1 kept and 1 "
+            "discarded."
+        )
 
 @
 
@@ -1000,8 +1029,8 @@ The prompt is critical for effective classification. We structure it to:
 We format paper examples to show the key information the LLM should consider.
 For the papers being classified, [[_format_paper_to_classify]] can also append
 \emph{supporting passages} drawn from the paper's full text.
-The abstract alone often cannot settle whether a paper belongs to a theme; a
-sentence from the methodology or results can.
+Where the abstract does not settle whether a paper belongs to a theme, a
+sentence from the methodology or results may.
 When the caller supplies quotes (see \cref{sec:fulltext-classification}), the
 classifier therefore assigns labels on evidence the abstract never carried.
 
@@ -1998,11 +2027,11 @@ def get_papers_needing_enrichment(
 This is the primary entry point for LLM classification. It coordinates
 example gathering, prompt construction, LLM invocation, and response parsing.
 
-By default, we ground the LLM with a small set of human-reviewed example
-papers, which increases consistency. These examples are a help, not a
-precondition: early-stage workflows (e.g., research-question driven searches)
-often have nothing tagged yet, and forcing the user to hand-label a quota
-before any automation can run defeats the purpose of the automation. So when
+By default, the prompt shows the model a small set of human-reviewed
+example papers. These examples are not a precondition: a session started
+from a research question ([[scholar rq]]) has nothing tagged yet, and a
+quota of hand-labelled papers would keep the classifier from running on
+it at all. So when
 the available examples fall below the threshold in [[validate_examples]] we
 emit a warning and proceed with whatever examples exist, degrading smoothly
 from few-shot to zero-shot rather than refusing to run.
@@ -2113,14 +2142,13 @@ def classify_papers_with_llm(
             visible, include_unreviewed=include_llm_examples
         )
 
-        # Below-threshold examples are a quality concern, not a hard stop:
-        # warn and continue with whatever was gathered (possibly none) so
-        # classification still runs early in a review.
+        # Fewer examples than asked for is no hard stop: warn with the
+        # counts and continue with whatever was gathered (possibly none),
+        # so classification still runs early in a review.
         is_valid, error = validate_examples(kept_examples, discarded_examples)
         if not is_valid:
             logger.warning(
-                f"{error} Proceeding with the available examples; "
-                "classification quality may be reduced."
+                f"{error} Proceeding with the available examples."
             )
     else:
         kept_examples = []
@@ -2606,7 +2634,7 @@ The fix keeps each kind in its place. Note tags record a judgement
 about a \emph{record}---this is a reprint, that one a duplicate---which
 the model cannot make from an abstract, so they are human annotations:
 they are never offered (not in the lists and not on the examples' tag
-lines, where the model would learn to copy them) and are dropped like
+lines, where the model might copy them) and are dropped like
 any out-of-vocabulary tag if the model returns one anyway, whatever the
 language of the table they are named for. The audit categories, when
 the session uses any, are presented apart as a choice of exactly one,
@@ -4179,6 +4207,8 @@ class TestExamplesOptional:
 
         assert "Papers to Classify" in prompt
         assert "Proceeding with the available examples" in caplog.text
+        assert "The prompt will show 0 tagged example(s)" in caplog.text
+        assert "quality" not in caplog.text
 @
 
 \subsection{Testing LLM Interaction}
@@ -8211,8 +8241,8 @@ punctuation, or whose first author is another, and that no version
 link joins, can still be an example with its verdict.  The examples are confirmed decisions only:
 [[--include-llm-examples]] is refused with a second screen (in the CLI
 module), because it would show the model unreviewed machine verdicts of
-other papers, often the first screener's own, and the second screener
-would learn from the screener it is checked against.  Each screening
+other papers, possibly the first screener's own, and the second screener
+would be shown the verdicts of the screener it is checked against.  Each screening
 records this as [[blind]] on the ground [[prompt]].
 
 \paragraph{Which papers.}

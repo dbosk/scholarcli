@@ -1,455 +1,258 @@
 # Scholar
 
-A command-line tool for conducting structured literature searches across multiple academic databases, with built-in support for systematic literature reviews.
+A command-line tool for literature searches across many bibliographic
+databases, and for the record of a systematic review built on them:
+which searches were run, what each returned, who decided what about
+each paper and why, and how the decisions can be checked.
 
-## Features
+Scholar searches, keeps every search and decision in a named review
+session, and writes the session out as a report, an audit table, a
+CSV or BibTeX with provenance. Every command takes `--help`; the
+interactive tutorials (`scholar tutorial list`) walk through the work
+in order, and `doc/scholar.pdf` documents the method and the code
+(a literate program: the documentation and the implementation are one
+text).
 
-### Multi-Database Search
-
-Search across fifteen academic databases with a single query:
-
-- **Semantic Scholar** - AI-powered research database with 200M+ papers
-- **OpenAlex** - Open catalog of 250M+ scholarly works
-- **DBLP** - Computer science bibliography
-- **Web of Science** - Comprehensive citation index (requires API key)
-- **IEEE Xplore** - IEEE technical literature (requires API key)
-- **Scopus** - Elsevier's abstract and citation database (requires API key)
-- **arXiv** - Preprints in physics, math, CS (no API key)
-- **HAL** - The French national open archive (no API key)
-- **Preprint servers** - SSRN, bioRxiv, medRxiv, ChemRxiv, Research
-  Square, Preprints.org, and the IACR Cryptology ePrint Archive, each
-  searched through OpenAlex pinned to that server (none of them offers
-  a usable search API of its own)
-
-The preprint-server providers are opt-in: a default search already finds
-their papers through OpenAlex, so they run only when you name them —
-either individually (`-p ssrn` scopes a search to SSRN) or all at once
-with the `preprints` group.
-
-```bash
-# Search specific providers
-scholar search "federated learning" -p s2 -p openalex
-
-# Scope a search to one preprint server
-scholar search "corporate governance" -p ssrn
-
-# All preprint servers at once (arXiv, HAL, SSRN, bioRxiv, medRxiv, ...)
-scholar search "diffusion models" -p preprints
-
-# Start from a research question (LLM generates provider-specific queries)
-scholar rq "How can privacy-preserving ML be evaluated?" \
-  --provider openalex --provider dblp \
-  --count 20
-```
-
-### Interactive Review Interface
-
-Review search results in a terminal-based interface with vim-style navigation:
-
-```bash
-scholar search "neural networks" --review
-```
-
-The TUI supports:
-- **Keep/Discard decisions** with mandatory motivations for discards
-- **Theme tagging** for organizing kept papers
-- **Note-taking** with your preferred editor
-- **PDF viewing** with automatic download and caching
-- **Abstract enrichment** for papers missing abstracts
-- **LLM-assisted classification** to help review large result sets
-- **Sorting and filtering** by various criteria
-
-### Output Formats
-
-Export results in multiple formats:
-
-```bash
-# Pretty table (default for terminal)
-scholar search "query"
-
-# Machine-readable formats
-scholar search "query" -f json
-scholar search "query" -f csv
-scholar search "query" -f bibtex
-```
-
-### Session Management
-
-Save and resume review sessions:
-
-```bash
-# List saved sessions
-scholar sessions list
-
-# Resume a session
-scholar sessions resume "machine learning"
-
-# Export session to reports
-scholar sessions export "machine learning" -f all
-
-# LaTeX report as an \input-able fragment (writes review.tex + review.bib)
-scholar sessions export "machine learning" -f latex --no-standalone -o review
-
-# Audit table for a backing appendix (one row per paper with the reason;
-# always a fragment; --lang en|sv, --theme TAG=NAME gives themes readable names)
-scholar sessions export "machine learning" -f table --lang sv --label sok-A \
-    --track "sökspår 1" --theme ml=maskininlärning -o review-full
-# ... listing only the cited/supporting/qualifying rows, the rest as counts
-scholar sessions export "machine learning" -f table --bearing-only -o review-bearing
-```
-
-### Paper Notes
-
-Manage notes across all reviewed papers:
-
-```bash
-# Browse papers with notes
-scholar notes
-
-# List papers with notes
-scholar notes list
-
-# Export/import notes
-scholar notes export notes.json
-scholar notes import notes.json
-```
-
-### Caching
-
-Search results are cached to avoid redundant API calls:
-
-```bash
-scholar cache info    # Show cache statistics
-scholar cache clear   # Delete cached results (keeps paid LLM output;
-                      # add --include-llm to delete that too)
-scholar cache path    # Print cache directory
-```
-
-PDF downloads are also cached for offline viewing.
-
-### Rate-Limit and Quota Tracking
-
-Provider rate limits and daily quotas (e.g. IEEE's 200 requests/day) are
-tracked persistently across invocations: a provider whose budget is spent
-is skipped with a warning naming the reset time instead of firing doomed
-requests.
-
-```bash
-scholar providers limits              # Show usage, remaining budget, reset times
-scholar providers limits --reset ieee # Clear tracked state for one provider
-```
-
-## Quickstart
-
-### Install
+## Install
 
 ```bash
 pipx install scholarcli
 ```
 
-### Configure LLM access (optional, for `scholar rq` and LLM-assisted review)
+Or with `pip install scholarcli`, or `uv pip install scholarcli`.
+Scholar needs Python 3.12 or later.
 
-Scholar uses the [`llm`](https://llm.datasette.io/) package for model selection
-and API key configuration.
-
-If you want to configure it via the `llm` CLI, install it as well (or install
-`scholarcli` with `pipx --include-deps` so the dependency CLIs are exposed):
+## A first search
 
 ```bash
-pipx install llm
-# Or: pipx install --include-deps scholarcli
+scholar search "literate programming" -p openalex -l 20
+scholar tutorial run first-search
 ```
 
-Then configure at least one provider (examples):
+The first line searches OpenAlex and prints the first 20 results. The
+second starts the first lesson: each step opens a shell, you type the
+command the step asks for, and Scholar checks the transcript before the
+lesson moves on. Every lesson runs in its own workspace, so practice
+sessions never appear among your own.
+
+| Lesson | What it covers |
+|---|---|
+| `first-search` | search, providers, output formats, saving a session |
+| `reviewing-in-the-tui` | recording decisions in the review screen |
+| `enrich-verify-export` | abstracts and open access, retractions, exports |
+| `tiered-search` | a search screened in tiers, a sample of the rest |
+| `llm-synthesis` | setting up `llm`, LLM classification, an overview |
+| `scholar-with-an-agent` | what an agent does with Scholar, and how to check it |
 
 ```bash
-llm install llm-openai-plugin
-llm keys set openai
+scholar tutorial list                       # the lessons and your progress
+scholar tutorial run --restart first-search # start a lesson over
+scholar tutorial review first-search        # read back what you typed
+```
 
-# Or:
-llm install llm-anthropic
+## Searching
+
+```bash
+scholar search "federated learning" -p openalex -p s2 -l 200
+scholar search "literate programming" -p openalex --in title-abstract -l 50
+scholar syntax
+scholar providers check
+```
+
+A search fetches every result unless `-l N` limits each provider to N;
+`scholar syntax` lists what an unlimited search costs per provider, and
+an unlimited search says on stderr when a provider reports 10,000
+records or more for it. `--in title-abstract` matches the query in titles and
+abstracts only, where the provider can (OpenAlex and its preprint
+servers, Scopus, Web of Science); Semantic Scholar, DBLP, IEEE, arXiv
+and HAL ignore it with a warning, and the OpenAlex semantic search
+refuses it, as it refuses every filter.
+`scholar providers check` probes each configured provider once and
+exits 1 when one of them fails, so it can stand before a long search.
+
+| Provider | Name | Needs |
+|---|---|---|
+| Semantic Scholar | `s2` | `S2_API_KEY` optional |
+| OpenAlex | `openalex` | `OPENALEX_API_KEY` optional (a key raises the daily budget OpenAlex grants), `SCHOLAR_EMAIL` optional |
+| OpenAlex semantic search | `openalex-semantic` | as OpenAlex; opt-in, at most 50 ranked results |
+| DBLP | `dblp` | nothing |
+| arXiv | `arxiv` | nothing |
+| HAL | `hal` | nothing |
+| Web of Science | `wos` | `WOS_EXPANDED_API_KEY` or `WOS_STARTER_API_KEY` |
+| IEEE Xplore | `ieee` | `IEEE_API_KEY` |
+| Scopus | `scopus` | `SCOPUS_API_KEY`; `SCOPUS_INST_TOKEN` and `SCOPUS_VIEW` optional |
+| SSRN, bioRxiv, medRxiv, ChemRxiv, Research Square, Preprints.org, IACR ePrint | `ssrn`, `biorxiv`, `medrxiv`, `chemrxiv`, `researchsquare`, `preprintsorg`, `iacr` | as OpenAlex (searched through OpenAlex, pinned to the server) |
+
+Without `-p`, a search asks every available provider except the
+semantic search and the preprint servers, whose papers a default search
+already reaches through OpenAlex; `-p preprints` names arXiv, HAL and
+all the preprint servers at once. `SCHOLAR_EMAIL` is the contact address for
+the services that ask for one (OpenAlex, Crossref, Unpaywall, which
+requires it). Scopus serves abstracts and full author lists only in its
+COMPLETE view, which it grants to the subscribing institution's network
+or with `SCOPUS_INST_TOKEN`; Scholar asks for it and falls back by
+itself, and `scholar providers check` says which view you get.
+`scholar --proxy socks5h://127.0.0.1:1081 search ...` (or
+`SCHOLAR_PROXY`) routes the requests through a proxy, for example an
+SSH tunnel to that network. Searches are cached without expiry
+(`scholar cache info`, `scholar cache clear`), and the quotas of the
+providers that have one (IEEE's requests a day, Scopus's weekly quota,
+OpenAlex's daily budget) are tracked across runs
+(`scholar providers limits`).
+
+## Sessions
+
+```bash
+scholar search "literate programming" -p openalex -l 100 -n my-review
+scholar sessions show my-review
+scholar sessions decide my-review --source human --keep --doi 10.5555/example.1
+scholar sessions decide my-review --source human --discard --tag off-topic --doi 10.5555/example.2
+scholar sessions resume my-review
+```
+
+`-n` saves a search in a named session; another search with the same
+name adds to it, and a paper found again keeps its decision.
+`sessions show` lists each search with its outcome ("100 of 6,405
+(capped at 100)"), the order its answer came in and the command that
+repeats it, then the papers by status with their ids. `sessions decide`
+records decisions without the interactive screen; `--source` says who
+decided (`human`, `agent` or `llm`), and a discard needs a tag.
+`sessions resume` opens the review screen (lesson
+`reviewing-in-the-tui`).
+
+## Screening in tiers
+
+```bash
+scholar sessions export my-review -f screen-sheet --pending --top 50 -o tier1
+scholar sessions export my-review -f screen-sheet --pending --top 50 --rest-sample 60 --seed 7 -o rest
+scholar sessions tier-sample my-review --report
+```
+
+A large search can be screened in tiers: `--top 50` lists the pending
+papers at place 50 or better in an answer ordered by relevance
+(`--min-providers N` and `--provider P` are other conditions), as a
+tab-separated sheet, and writes the counts of what was and was not
+selected to `tier1-tier.json`. `--rest-sample 60 --seed 7` draws a
+seeded random sample of the pending papers the tier leaves out and
+records the draw in the session. Once the sample is screened,
+`sessions tier-sample --report` gives the share of the sampled records
+that bear on the question, with a 95% interval, and a sentence for a
+method section; before that, it gives no rate. Lesson `tiered-search`.
+
+## The classifier and second screens
+
+```bash
+scholar llm context my-review "Does literate programming improve program documentation?"
+scholar llm classify my-review --top 50 --count 20
+scholar llm classify my-review --second-screen --over machine
+scholar sessions screen my-review --as human --by "a colleague" --verdicts-file verdicts.tsv
+scholar sessions agreement my-review
+scholar sessions conflicts my-review --unresolved
+scholar llm sample my-review --discarded -n 30 --seed 7
+scholar llm sample my-review --report
+```
+
+`llm classify` asks a language model (through the
+[`llm`](https://llm.datasette.io/) package and its default model) to
+decide pending papers, with the human decisions as examples. Each
+decision stores the model, the time, a prompt version, the model's
+reason and its confidence, and is marked unreviewed until a human
+confirms or changes it. `--second-screen` has the model screen decided
+papers again and stores each answer as a screening beside the decision;
+`sessions screen` stores a second screener's verdicts the same way.
+`sessions agreement` gives the agreement between two screeners (with
+Cohen's kappa and the prevalence and bias indices), and
+`sessions conflicts` lists the papers they disagree on. `llm sample`
+draws a seeded random sample of the model's unreviewed decisions for a
+human to check, and `--report` gives how many of them the human changed,
+with a 95% interval.
+
+The model packages for OpenAI, Anthropic, Gemini, Mistral, Azure,
+GitHub Copilot and GPT4All are installed with Scholar. To set keys and
+the default model with the `llm` command of Scholar's own environment,
+install with `pipx install --include-deps scholarcli`, then:
+
+```bash
 llm keys set anthropic
+llm models                  # the models the installed packages offer
+llm models default MODEL    # MODEL: one of those
 ```
 
-Set a default model for Scholar to use:
+Lesson `llm-synthesis`; `scholar llm synthesize` writes an overview of
+the kept papers.
+
+## Provenance
 
 ```bash
-llm models
-llm models default gpt-4o-mini
+scholar search "literate programming" -p openalex -l 20 -n my-review -f bibtex+prov > refs.bib
+scholar prov import refs.bib
+scholar prov export refs.bib --in-place
+scholar prov found-via doi:10.5555/example.1
 ```
 
-### First run
+`-f bibtex+prov` writes each BibTeX entry under a comment block that
+records the search that found it (`FOUND-VIA`, a command that repeats
+it) and has fields for the claim the entry backs, why it was picked, a
+quote and how it was verified. `prov import` keeps those blocks in
+`scholar notes`, and `prov export` writes them back above the entries.
+`prov found-via` prints, for each saved session that returned a paper,
+the `scholar search` command that repeats the search. Lesson `scholar-with-an-agent`.
+
+## Full texts
 
 ```bash
-# Search directly
-scholar search "machine learning privacy"
-
-# Start from a research question (LLM generates provider-specific queries)
-scholar rq "How do LLMs support novice programming?" --count 20
+scholar pdf quote https://arxiv.org/pdf/2301.00001.pdf --claim "Literate programs are easier to maintain."
+scholar pdf import paper.pdf --doi 10.5555/example.1 --from "the publisher's site, by hand"
 ```
 
-### Tutorials
+`pdf quote` downloads a PDF (or uses the cached copy) and lists the
+passages that best match a claim, ranked by words and then by the
+language model. Where a publisher answers scripts with a bot check,
+Scholar stops; `pdf import` puts a PDF you fetched yourself in the cache
+under its DOI or URL, where `pdf quote` and `llm classify --full-text`
+find it.
 
-Scholar ships interactive tutorials (built on
-[pytorial](https://github.com/dbosk/pytorial)): each step opens a shell,
-you type the command the step asks for, and the transcript is checked
-before the lesson moves on.
+## What protects a session
+
+Every save of a session merges with what another process saved
+meanwhile, under a lock, and keeps the previous file as
+`<name>.json.bak`. Commands that change many decisions at once
+(`enrich`, `sessions reset`, `sessions relabel`, `sessions screen`, the
+rest sample, ...) first keep a copy, `<name>.json.pre-<command>-<time>.bak`,
+the newest three per command. When a save cannot take the lock, the
+session is kept beside it as `<name>.json.unsaved-<time>-...`, and
 
 ```bash
-scholar tutorial list                 # the lessons and your progress
-scholar tutorial run first-search     # start or resume a lesson
-scholar tutorial run --restart first-search
-scholar tutorial review first-search  # read back what you typed
+scholar sessions recover my-review.json.unsaved-20261123T101500Z-ab12cd
 ```
 
-The lessons, in order: `first-search` (search, providers, output formats,
-saving a session), `reviewing-in-the-tui` (recording decisions),
-`enrich-verify-export` (abstracts and open access, retractions, CSV and
-LaTeX exports), `llm-synthesis` (setting up the `llm` command, LLM
-classification, a literature overview) and `scholar-with-an-agent` (what
-an agent running the `backing-claims` skill does with Scholar, and how to
-audit it). Every lesson runs in its own workspace with its own session
-store, so practice sessions never appear in your real `scholar sessions
-list`.
+merges it back (`--discard` deletes it instead).
 
-## Installation
-
-If you don't use `pipx`, you can install with `pip`:
+## Exports
 
 ```bash
-pip install scholarcli
+scholar sessions export my-review -f all
+scholar sessions export my-review -f table --lang en --label my-review -o audit
+scholar sessions export my-review -f table --cited-from refs.bib -o audit
+scholar sessions export my-review -f csv --spreadsheet-safe -o decisions
 ```
 
-Or with [uv](https://github.com/astral-sh/uv):
-
-```bash
-uv pip install scholarcli
-```
-
-## Configuration
-
-Set `SCHOLAR_EMAIL` to a contact address: OpenAlex (and thus every
-preprint-server provider), Crossref, and the polite pools use it for
-faster responses, and Unpaywall (open-access lookup during
-`scholar enrich` and `scholar pdf open <doi>`) requires it. `OPENALEX_EMAIL`
-and `CROSSREF_MAILTO` are still honoured as per-service overrides.
-
-OpenAlex meters requests against a daily budget (a search costs $0.001,
-reset at midnight UTC). A free API key from
-[openalex.org/settings/api](https://openalex.org/settings/api) raises the
-budget tenfold; set it as `OPENALEX_API_KEY` and it is used by the
-`openalex` provider and every preprint-server provider. `scholar
-providers check` then shows how much of the day's budget is left, and a
-search that hits the spent budget reports the reset time instead of a
-bare 429.
-
-Some providers require API keys set as environment variables:
-
-| Provider | Environment Variable | Required | How to Get |
-|----------|---------------------|----------|------------|
-| Semantic Scholar | `S2_API_KEY` | No | [api.semanticscholar.org](https://api.semanticscholar.org) |
-| OpenAlex | `OPENALEX_API_KEY`, `SCHOLAR_EMAIL` | No | [openalex.org/settings/api](https://openalex.org/settings/api) (10x daily budget); any email (polite pool) |
-| DBLP | - | No | No key needed |
-| arXiv | - | No | No key needed |
-| HAL | - | No | No key needed |
-| SSRN, bioRxiv, medRxiv, ChemRxiv, Research Square, Preprints.org, IACR | `SCHOLAR_EMAIL` | No | Any email (they search via OpenAlex) |
-| Web of Science | `WOS_EXPANDED_API_KEY` or `WOS_STARTER_API_KEY` | Yes | [developer.clarivate.com](https://developer.clarivate.com) |
-| IEEE Xplore | `IEEE_API_KEY` | Yes | [developer.ieee.org](https://developer.ieee.org) |
-| Scopus | `SCOPUS_API_KEY` | Yes | [dev.elsevier.com](https://dev.elsevier.com). Searching works from any network, but abstracts, keywords and full author lists come only with Scopus's COMPLETE view, which is bound to the institution's IP range (or `SCOPUS_INST_TOKEN`). scholar asks for it and falls back by itself (`scholar providers check` tells which view you get); `SCOPUS_VIEW=standard` or `complete` overrides. A 400 "Error translating query" on *every* query is an Elsevier-side refusal, not a query error: it has cleared by itself before, so retry later |
-
-View provider status:
-
-```bash
-scholar providers
-```
-
-### Network: proxy and User-Agent
-
-To reach subscriber-only content from off campus (Scopus's COMPLETE
-view, a publisher that admits the institution's IP range), route
-scholar's requests through a proxy on that network, for example an SSH
-SOCKS tunnel:
-
-```bash
-ssh -D 127.0.0.1:1081 -N you@login.your-university.example &
-scholar --proxy socks5h://127.0.0.1:1081 search "..."
-export SCHOLAR_PROXY=socks5h://127.0.0.1:1081   # or for every command
-scholar providers check --show-ip                # route, exit IP, health
-```
-
-`--proxy URL` (a global option, before the command) wins over
-`SCHOLAR_PROXY`; with neither, the standard `HTTP(S)_PROXY`/`ALL_PROXY`
-variables apply as usual. Use `socks5h://` rather than `socks5://` so
-host names are resolved by the proxy, on the far side of the tunnel.
-SOCKS needs the PySocks package (`pipx inject scholarcli PySocks`);
-scholar refuses a SOCKS proxy without it rather than failing every
-request. `scholar providers check` always prints the route; `--show-ip`
-also asks api.ipify.org for the exit address (a third-party request, so
-only on demand).
-
-Requests identify themselves as
-`scholar/<version> (+https://github.com/dbosk/scholarcli)`. Your
-`SCHOLAR_EMAIL` is not in it, so publishers never see the address; only
-the services that ask for one (OpenAlex, Crossref, Unpaywall) get it,
-through their own parameters. Set `SCHOLAR_USER_AGENT` to replace it. Scholar does not imitate a browser: a Cloudflare challenge
-or a login page from a publisher means the PDF is not available to
-scripts, and scholar stops there.
-
-## Usage Examples
-
-### Basic Search
-
-```bash
-# Search with default providers (Semantic Scholar, OpenAlex, DBLP);
-# without -l every result is fetched (a notice on stderr when that is many)
-scholar search "differential privacy"
-
-# Limit results per provider
-scholar search "blockchain" -l 50
-```
-
-`scholar syntax` lists what a search without a limit costs per provider.
-
-### Systematic Review Workflow
-
-```bash
-# 1. Search and review interactively
-scholar search "privacy-preserving machine learning" --review --name "privacy-ml-review"
-
-# 2. Add more searches to the same session
-scholar search "federated learning privacy" --review --name "privacy-ml-review"
-
-# 3. Resume reviewing later
-scholar sessions resume "privacy-ml-review"
-
-# 4. Generate reports
-scholar sessions export "privacy-ml-review" -f all
-
-# 5. Synthesise the kept papers (needs a research context); the LaTeX
-#    document ends with the decision record as an appendix
-scholar llm context "privacy-ml-review" "How is privacy preserved in ML?"
-scholar llm synthesize "privacy-ml-review" -f latex -o synthesis.tex
-
-# ... or as a fragment to \input into a thesis chapter (also writes
-#     synthesis.bib; add \addbibresource{synthesis.bib} to the preamble)
-scholar llm synthesize "privacy-ml-review" -f latex --no-standalone -o synthesis.tex
-```
-
-### Enriching Results
-
-Some providers (like DBLP) don't include abstracts. Fetch them from other sources:
-
-```bash
-# Enrich during search
-scholar search "query" --enrich
-
-# Enrich an existing session
-scholar enrich "session-name"
-```
-
-When no PDF can be found for a paper, enrichment falls back to preprint
-versions: authoritative links (OpenAlex's alternate locations and
-Crossref's `has-preprint` relation) are always followed, and with
-`--preprint-search` the preprint servers are additionally searched by
-title and authors (exact match only). An adopted preprint *replaces*
-the entry — its DOI, venue, and PDF — so exported citations point at
-the version you actually read; the published DOI is kept on the entry
-for provenance, and `scholar verify` reports such entries as
-`preprint of <doi>` rather than superseded.
-
-```bash
-# Also search preprint servers for papers without a PDF
-scholar enrich "session-name" --preprint-search
-scholar search "query" --enrich --preprint-search
-```
-
-### PDF Management
-
-```bash
-# Download and open a PDF
-scholar pdf open "https://arxiv.org/pdf/2301.00001.pdf"
-
-# View PDF cache
-scholar pdf info
-scholar pdf clear
-```
-
-## Keybindings (Review TUI)
-
-| Key | Action |
-|-----|--------|
-| `j`/`k` | Navigate up/down |
-| `Enter` | View paper details |
-| `K` | Keep paper (quick) |
-| `T` | Keep with themes |
-| `d` | Discard (requires motivation) |
-| `n` | Edit notes |
-| `p` | Open PDF |
-| `e` | Enrich (fetch abstract) |
-| `L` | LLM-assisted classification |
-| `s` | Sort papers |
-| `f` | Filter by status |
-| `q` | Quit |
-
-## LLM-Assisted Review
-
-For large result sets, Scholar can use LLMs to assist with paper classification:
-
-```bash
-# In the TUI, press 'L' to invoke LLM classification
-# Or use the CLI command directly
-scholar llm classify "session-name" --count 10
-
-# Constrain the tags to a vocabulary (tags already in the session count too)
-scholar llm classify "session-name" -t supports-claim -t qualifies-claim \
-    -t adjacent-subtopic -t off-topic-false-hit
-# ... or let the model add tags of its own when none of them fits
-scholar llm classify "session-name" --allow-new-tags
-```
-
-### How It Works
-
-1. **Tag some papers manually** (recommended) - Examples help the LLM learn your criteria. Tagging ~5 papers (themes for kept, motivations for discarded) improves quality, but classification will still run — with a warning — if you have fewer or none.
-
-2. **Set research context** (optional) - Describe your review's focus to help the LLM understand relevance criteria.
-
-3. **Invoke LLM classification** - The LLM classifies pending papers based on your examples, returning confidence scores.
-
-4. **Review LLM decisions** - Prioritize low-confidence classifications. Accept correct ones, correct wrong ones.
-
-5. **Iterate** - Corrections become training examples for the next round.
-
-### Requirements
-
-Install and configure the `llm` command (Scholar uses `llm`'s configuration and
-default model):
-
-```bash
-pipx install llm
-
-llm install llm-openai-plugin
-llm keys set openai
-
-# Pick a default model (used by `scholar rq` and `scholar llm classify`)
-llm models
-llm models default gpt-4o-mini
-```
-
-If you installed Scholar with `pipx install scholarcli` and want the `llm` CLI
-available from that same environment, you can alternatively install Scholar
-with `pipx install --include-deps scholarcli`.
-
-The LLM integration supports models available through Simon Willison's `llm`
-package (OpenAI, Anthropic, local models, etc.).
-
-Note: `scholar llm classify` learns from your existing labeled examples (typically
-~5 tagged papers). `scholar rq` can start without examples by using the research
-question as context.
+`-f all` writes a CSV with one row per decision and a LaTeX report with
+its BibTeX file. `-f table` writes an audit table, a LaTeX fragment
+with one row per work and the reason it was kept or excluded; with
+`--cited-from` a row counts as cited when the text's `.bib` cites the
+work. `--spreadsheet-safe` puts a `'` in front of every CSV cell that
+begins with `=`, `+`, `-`, `@`, a tab, a carriage return or a line feed,
+the full-width forms of `= + - @`, or `'` itself (the list of OWASP's
+page on CSV injection); numbers in the numeric columns are left as
+they are, and the default CSV holds the stored text, for scripts. Lesson `enrich-verify-export`.
 
 ## Documentation
 
-Full documentation is available in the `doc/` directory as a literate program combining documentation and implementation.
+`doc/scholar.pdf` is built from the literate sources in `src/scholar`
+(`make -C doc`): the tutorials' design, the method ("Searching and
+screening"), and every module with its tests.
 
 ## License
 
-MIT License - see [LICENSE](LICENSE) for details.
+MIT License, see [LICENSE](LICENSE).
