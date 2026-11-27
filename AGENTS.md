@@ -4142,7 +4142,30 @@ declaring each, checked by a `latex`-marked test). Write CJK, Cyrillic,
 U+2028, U+FEFF and the like in code chunks as Python escapes
 (`"\u5b66"`), as
 most non-Latin tests already did; name them in the prose if the reader
-needs to know. The full build is `make -C doc check
+needs to know; (c) a TeX special character standing bare in the prose
+of a documentation chunk or of `doc/scholar.tex`/`doc/introduction.tex`
+(`documentation_problems`, a small tokeniser over whole chunks, since
+quotes run over line ends; `doc/preamble.tex` is left out): `#`
+outside a `\newcommand`-family body, `&` outside an alignment
+environment, `_`/`^` outside math, inline math not closed in its
+paragraph, `}` without `{` or `{` not closed in its chunk, `%` right
+after a number (`50%`: the rest of the line is silently dropped), a
+`[[` never closed, and `\verb` (or a `#`/`%` in `\url`, `\path`,
+`\href`, `\mintinline`) inside another command's braced argument.
+Legitimate places it knows: code chunks, `[[...]]` quotes (also over
+line ends), `verbatim`/`minted`/`lstlisting` and kin, `\verb`,
+`\mintinline`, `\url`, `\path`, `\href`'s URL, math (`$`, `\(`, `\[`,
+equation/align...), name arguments (`\label`, refs, cites, file
+names), escapes and comments. `\texttt` protects nothing. It cannot
+see: `~` (always legal), a backslash before an unknown word, a `$`
+pair around prose (`$5 and $6` prints "5and6"), a `%` comment that
+was meant as text after a non-number, a misplaced but counted brace,
+verbatim in a bracketed argument (`\item[...]`), undefined macros.
+Weaving a file without error proves nothing: noweave runs no TeX
+(#318/#319 written bare stopped the book after the changed files wove
+cleanly). New environments or commands with verbatim or name
+arguments go in the lists in cli.nw `sec:woven-document`. The full
+build is `make -C doc check
 LATEXFLAGS="-shell-escape -interaction=nonstopmode"` (between 7 and
 26 minutes on the machines tried, longer under load; 2692 pages at
 6b9d135). `check` is `doc/check.mk` (included by `doc/Makefile`; it
