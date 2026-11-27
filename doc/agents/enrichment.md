@@ -73,6 +73,44 @@ and caches under whichever delivered.
   `--list-imported` lists `list_imported_pdfs()`. `scholar cache clear`
   deletes only top-level `*.pkl` files and never touches `pdfs/`
   (tested).
+- **Fetch** (#345, pdf.nw `sec:pdf-fetch`/`sec:pdf-text`, cli.nw
+  `sec:pdf-fetch-cli`): `scholar pdf fetch [SOURCE ...] [--text] [-f
+  tsv|json]` → `fetch_pdf(source, text=, progress_callback=)` →
+  `PDFFetch(source, path, error, text)`, never raises for the source:
+  `source_problem` (not `extract_doi` and not an http(s) URL with a
+  host → row error "neither a DOI nor an http or https URL", no
+  request), else `get_pdf` (same DOI resolution, import first, route as
+  open/quote); `PDFDownloadError` → `one_line` (lines joined by "; "),
+  `OSError` → its strerror. No viewer. The `pdf` command's positional is
+  now `arguments: Optional[list[str]]` (metavar URL); `<<take the URL
+  from the positional arguments>>` sets `url = arguments[0]`, and any
+  other action given a second one prints Click's "Error: Got unexpected
+  extra argument (...)" on stderr and exits 2 (a `click.UsageError`
+  raised in the command exited 1). No argument: stdin lines
+  (`fetch_sources_from_stdin`: blank and `#` lines dropped; a terminal
+  is not read); none at all → exit 2, as is a `-f` other than tsv/json
+  (checked first). Rows in input order, `csv.writer` tab, `\n`, no
+  header, flushed per source: source, path or `-`, `OK` | `ERROR:
+  reason`, with `--text` the text path or `-` (`fetch_row`); `-f json`
+  objects `source, path|null, status OK|ERROR, error|null[, text]`
+  (`fetch_object`), printed at the end. Exit 1 if any row failed (a
+  text not written counts, path kept). Progress on stderr.
+- **Text** (`--text`): `write_pdf_text(pdf)` → `<hash>.txt`
+  (`pdf_text_path`), PDFium via `extract_pdf_pages` (not `pdftotext`,
+  which the old skill script ran: not a dependency), `\r\n`/`\r` → `\n`,
+  each page + `PAGE_END` "\n\f" (pdftotext's page break). Kept when not
+  older than the PDF (`text_is_current`, mtime_ns >=); else extracted
+  outside the lock and written (`atomic_write_text`) under
+  `pdf_cache_lock` only if `file_identity(pdf)` is unchanged, up to
+  `TEXT_ATTEMPTS` 3, then `PDFTextError`. `clear_pdf_cache` deletes
+  `orphaned_texts()` (no `.pdf` beside) after its deletions, which
+  takes the deleted PDFs' texts too; an imported PDF kept keeps its
+  text; `get_pdf_cache_info` adds
+  `text_files`, `text_bytes`, `orphaned_texts` (`pdf info` rows "Text
+  files", "Orphaned text files" when > 0); `import_pdf` deletes the
+  text under the lock before renaming a new file in ("unchanged" and
+  "recorded" keep it). A download that replaces an unusable cached file
+  deletes the old text under the lock too.
 - Test PDFs are written by hand (`make_pdf` in pdf.nw, `make_cli_pdf` in
   cli.nw: optional text line, optional `/Encrypt`); in a code chunk
   every `<<` of PDF syntax must be written `@<<`.

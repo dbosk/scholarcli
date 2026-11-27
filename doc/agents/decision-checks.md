@@ -42,7 +42,9 @@ no batch; several sheets must each have a distinct batch id, else exit
 not compared with any sheet", refused under `--strict` as
 `sheet_uncompared`);
 stderr "NAME (batch B): returned R of N; M missing: …", "K id(s) not on
-the sheet: …", "Missing rows are fine …"; ids not on the sheet set
+the sheet: …", "Missing rows are fine …" (a `decide --verdicts-file`
+answers its whole sheet: missing rows are gaps, refused under `--strict`,
+#347, review-sessions.md); ids not on the sheet set
 `sheet_extras`, refused under `--strict` in `<<check the batch as a
 whole>>`. `sessions reset --batch ID` (repeatable, `read_batch_id`;
 alone or narrowing like `--source`) selects decisions by

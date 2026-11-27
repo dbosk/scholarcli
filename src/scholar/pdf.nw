@@ -51,7 +51,9 @@ PDFs are cached separately from search results for several reasons:
 PDF download and caching for academic papers.
 
 Provides functions to download, cache, and open PDFs from paper URLs.
-The cache is content-addressed using SHA-256 hashes of URLs. The module
+The cache is content-addressed using SHA-256 hashes of URLs. A batch
+of sources can be fetched without a viewer (`fetch_pdf`), and the text
+of a cached PDF written beside it (`write_pdf_text`). The module
 also extracts candidate supporting passages from a cached PDF given a
 claim (see the Quote Extraction section).
 """
@@ -64,6 +66,8 @@ claim (see the Quote Extraction section).
 <<doi resolution functions>>
 <<pdf download functions>>
 <<pdf import functions>>
+<<pdf text functions>>
+<<pdf fetch functions>>
 <<pdf open functions>>
 <<quote extraction functions>>
 @
@@ -107,7 +111,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from urllib.parse import unquote
+from urllib.parse import unquote, urlsplit
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 
@@ -119,6 +123,7 @@ from scholar.ratelimit import get_limiter, limiter_for
 from scholar.unpaywall import resolve_pdf_url
 from scholar.utils import (
     atomic_write_text,
+    file_identity,
     file_lock,
     utc_now_iso,
 )
@@ -270,6 +275,13 @@ however long it runs; an hour without a single write is not a
 download in progress.
 [[info]] counts them.
 
+The text file that [[pdf fetch --text]] writes beside a PDF
+(\cref{sec:pdf-text}) belongs to its PDF: after its deletions,
+[[clear]] deletes every text whose PDF is gone, which takes the texts
+of the PDFs it has just deleted and those of PDFs deleted by other
+means, and leaves the text of an imported PDF that it keeps; [[info]]
+counts the texts and those orphans.
+
 <<pdf constants>>=
 PDF_CACHE_LOCK_NAME = "import"
 STALE_TEMP_SECONDS = 3600
@@ -306,6 +318,8 @@ def clear_pdf_cache(include_imported: bool = False) -> int:
                 logger.warning("Failed to delete %s: %s", pdf_file.name, e)
         for record in orphaned_import_records():
             record.unlink(missing_ok=True)
+        for text in orphaned_texts():
+            text.unlink(missing_ok=True)
         for leftover in stale_temporary_files():
             leftover.unlink(missing_ok=True)
     logger.info("Deleted %d cached PDF files", count)
@@ -337,6 +351,15 @@ def orphaned_import_records() -> list[Path]:
     return orphans
 
 
+def orphaned_texts() -> list[Path]:
+    """Text files (`pdf fetch --text`) whose PDF is gone."""
+    return [
+        text
+        for text in get_pdf_cache_dir().glob(f"*{PDF_TEXT_SUFFIX}")
+        if not text.with_suffix(".pdf").exists()
+    ]
+
+
 def get_pdf_cache_info() -> dict[str, int]:
     """
     Get information about the PDF cache.
@@ -346,7 +369,9 @@ def get_pdf_cache_info() -> dict[str, int]:
         (total size); 'imported' and 'imported_bytes' for the part of
         them imported by hand; 'orphaned_records' for import records
         that mark no file; 'stale_temporary_files' for leftovers of
-        interrupted writes that a clear deletes.
+        interrupted writes that a clear deletes; 'text_files' and
+        'text_bytes' for the texts `pdf fetch --text` wrote, and
+        'orphaned_texts' for those whose PDF is gone.
     """
     cache_dir = get_pdf_cache_dir()
     info = {"count": 0, "size_bytes": 0, "imported": 0, "imported_bytes": 0}
@@ -362,6 +387,14 @@ def get_pdf_cache_info() -> dict[str, int]:
             info["imported_bytes"] += size
     info["orphaned_records"] = len(orphaned_import_records())
     info["stale_temporary_files"] = len(stale_temporary_files())
+    info["text_files"] = info["text_bytes"] = 0
+    for text in cache_dir.glob(f"*{PDF_TEXT_SUFFIX}"):
+        info["text_files"] += 1
+        try:
+            info["text_bytes"] += text.stat().st_size
+        except OSError:
+            pass
+    info["orphaned_texts"] = len(orphaned_texts())
     return info
 @
 
@@ -1426,6 +1459,9 @@ The lock is held for that look and the rename only, never during the
 transfer, which could otherwise keep an import waiting for minutes.
 An import that starts after the rename finds the download in place and
 needs [[--replace]], as for any download.
+A text file written for the file that is being replaced
+(\cref{sec:pdf-text}) goes first, under the same lock, as an import
+removes it: it would otherwise stand beside a PDF it does not describe.
 
 <<put the download in place unless an import is there>>=
 with pdf_cache_lock():
@@ -1434,6 +1470,7 @@ with pdf_cache_lock():
             "Keeping the PDF imported for %s; discarding the download", url
         )
     else:
+        pdf_text_path(cache_path).unlink(missing_ok=True)
         os.replace(tmp, cache_path)
 @
 
@@ -1628,7 +1665,7 @@ stand-in responses of the download tests serve these bytes too
 
 <<test functions>>=
 def make_pdf(path, width=200, text=None, encrypted=False):
-  """Write a real one-page PDF, optionally with a line of `text`."""
+  """Write a real one-page PDF, optionally with `text`: a line, or lines."""
   path.write_bytes(pdf_document(width, text, encrypted))
   return path
 
@@ -1637,7 +1674,10 @@ def pdf_document(width=200, text=None, encrypted=False):
   """The bytes of a real one-page PDF, as `make_pdf` writes them."""
   content = b""
   if text:
-    content = b"BT /F1 12 Tf 20 100 Td (%s) Tj ET" % text.encode()
+    lines = [text] if isinstance(text, str) else text
+    content = b"BT /F1 12 Tf 20 100 Td %s ET" % b" 0 -14 Td ".join(
+      b"(%s) Tj" % line.encode() for line in lines
+    )
   objects = [
     b"@<< /Type /Catalog /Pages 2 0 R >>",
     b"@<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
@@ -2192,6 +2232,7 @@ def import_pdf(
             atomic_write_text(
                 record_path, json.dumps(record, indent=2) + "\n"
             )
+            pdf_text_path(cache_path).unlink(missing_ok=True)
             os.replace(tmp, cache_path)
     logger.info("Imported %s as %s", record["file_name"], cache_path.name)
     return PDFImport(cache_path, record, status, warnings)
@@ -2248,6 +2289,10 @@ if not pdf_has_text(tmp):
 
 The comparison hashes the cached copy under the lock, so it judges the
 copy the rename would replace.
+When the import does put its file in place, it deletes the text of the
+file it replaces first, under the same lock (\cref{sec:pdf-text}): that
+text is no longer the text of the PDF under the key.
+An import of the same content returns before, and keeps the text.
 
 <<compare with the copy already cached>>=
 status = "imported"
@@ -2851,6 +2896,402 @@ class TestDownloadMeetsImport:
     self.assert_the_import_remains(imported)
 @
 
+\section{The text of a cached PDF}
+\label{sec:pdf-text}
+
+A reader who checks a quotation wants to search the whole text of the
+source, with [[grep]] or an editor, not only the passages [[pdf quote]]
+ranks.
+[[scholar pdf fetch --text]] (\cref{sec:pdf-fetch-cli}) therefore
+writes the text of a cached PDF to a file beside it,
+[[<hash>.txt]] beside [[<hash>.pdf]].
+
+\paragraph{Which extractor.}
+The script that the command replaces ran [[pdftotext -layout]] from
+Poppler.
+We extract with PDFium instead, through [[extract_pdf_pages]]
+(\cref{sec:quote-extraction}), for two reasons.
+PDFium is a dependency of scholar ([[pypdfium2]] in
+[[pyproject.toml]]), so the text can be had wherever scholar runs,
+while [[pdftotext]] is a separate program that need not be installed;
+the script wrote no text where it was missing.
+And it is the text [[pdf quote]] and the full-text classification read,
+so a passage found in the file is one that those find too.
+What we give up is Poppler's layout mode, which keeps columns side by
+side; the file holds PDFium's reading order instead.
+
+Two details of the format follow [[pdftotext]], so that readers and
+tools used to its files need not change.
+Each page ends with a form feed (the page break [[pdftotext]] inserts
+unless given [[-nopgbrk]], per its manual page), so the page of a match
+is one more than the number of form feeds before it.
+PDFium ends lines with a carriage return and a line feed (checked on a
+two-line page written by [[make_pdf]]: it returned
+[[one\r\ntwo]]), which we write as a plain line feed, since a
+carriage return before the end of every line would defeat a search
+anchored at the end of a line.
+
+<<pdf constants>>=
+PDF_TEXT_SUFFIX = ".txt"
+PAGE_END = "\n\f"
+<<pdf text functions>>=
+def pdf_text_path(pdf_path: Path) -> Path:
+    """Where the text of a cached PDF is kept: `<hash>.txt` beside it."""
+    return pdf_path.with_suffix(PDF_TEXT_SUFFIX)
+
+
+def pdf_text(pdf_path: Path) -> str:
+    """
+    The text of a PDF as `pdf fetch --text` writes it.
+
+    Lines end in a line feed and every page ends in a form feed, as in
+    `pdftotext`'s output.
+
+    Raises:
+        PDFTextError: If PDFium cannot read the file.
+    """
+    import pypdfium2 as pdfium
+
+    try:
+        pages = extract_pdf_pages(pdf_path)
+    except pdfium.PdfiumError as error:
+        raise PDFTextError(f"PDFium cannot read it ({error})") from error
+    return "".join(
+        page.replace("\r\n", "\n").replace("\r", "\n") + PAGE_END
+        for page in pages
+    )
+@
+
+\paragraph{The file must not outlive its PDF.}
+A text file is only useful as long as it is the text of the PDF beside
+it.
+Three things keep it so.
+First, it is written atomically ([[atomic_write_text]]), so a reader
+never finds half a text; a writer killed in the middle leaves a hidden
+[[.<hash>.txt.<random>.tmp]], which the stale-file rule of
+[[clear]] (\cref{sec:pdf-cache-imports}) deletes like the other
+leftovers.
+Second, an existing file is used again only if it is not older than
+the PDF: extracting a long PDF takes a while, and a batch that is run
+again should not pay for it twice, but a PDF downloaded again (after
+the cached copy turned out unreadable) is newer than the text of the
+old one.
+Not older rather than strictly newer, because a file system with
+coarse time stamps can give a text written right after its PDF the same
+time.
+Third, the processes that replace or delete a PDF delete its text under
+the lock that import and clear share: [[clear]] deletes every text
+whose PDF is gone, its own deletions' and others' (such as one the old
+script left beside a PDF deleted by hand), and an import or a download
+that puts a new file in place deletes the text of the file it replaces.
+
+Comparing times alone could not cover that last case.
+An import keeps the time of its temporary copy, which it wrote before
+it took the lock, so a text extracted from the old PDF and written
+after the copy would count as current.
+So the writer takes the lock too, for its rename only (the extraction
+runs outside it, since it can take seconds and would hold up imports
+and downloads meanwhile), and writes only if the PDF is still the file
+it read: the same device, inode, size and modification time
+([[file_identity]] of the utilities).
+If the PDF changed meanwhile, the text is extracted again, up to
+[[TEXT_ATTEMPTS]] times; a PDF that was deleted meanwhile ends the
+attempt with the [[OSError]] of the next look.
+
+<<pdf constants>>=
+TEXT_ATTEMPTS = 3
+<<pdf text functions>>=
+class PDFTextError(Exception):
+    """The text of a cached PDF could not be written; the message says why."""
+
+
+def text_is_current(text_path: Path, pdf_path: Path) -> bool:
+    """Whether `text_path` exists and is not older than `pdf_path`."""
+    try:
+        return text_path.stat().st_mtime_ns >= pdf_path.stat().st_mtime_ns
+    except FileNotFoundError:
+        return False
+
+
+def write_pdf_text(pdf_path: Path) -> Path:
+    """
+    Write the text of a cached PDF beside it, unless already there.
+
+    An existing text file not older than the PDF is kept. Returns the
+    path of the text file.
+
+    Raises:
+        PDFTextError: If PDFium cannot read the PDF, or the PDF kept
+            changing while its text was extracted.
+        OSError: If the PDF is gone or the text cannot be written.
+    """
+    text_path = pdf_text_path(pdf_path)
+    for _ in range(TEXT_ATTEMPTS):
+        if text_is_current(text_path, pdf_path):
+            return text_path
+        before = file_identity(pdf_path)
+        text = pdf_text(pdf_path)
+        with pdf_cache_lock():
+            if file_identity(pdf_path) == before:
+                atomic_write_text(text_path, text)
+                return text_path
+        logger.info("%s changed while its text was extracted", pdf_path)
+    raise PDFTextError("the PDF kept changing while its text was extracted")
+@
+
+Let's verify the format first, on a page of two lines and a PDF
+without text: a line feed ends each line, a form feed each page, and a
+page without text is a form feed alone, so the page count stays right.
+
+<<test functions>>=
+class TestPdfText:
+  """The text file beside a cached PDF (`pdf fetch --text`)."""
+
+  <<pdf text test methods>>
+@
+
+<<pdf text test methods>>=
+def test_lines_and_pages(self, tmp_path):
+  pdf = make_pdf(tmp_path / "a.pdf", text="one) Tj 0 -20 Td (two")
+  text_path = write_pdf_text(pdf)
+  assert text_path == tmp_path / "a.txt"
+  assert text_path.read_bytes() == b"one\ntwo\n\f"
+  assert write_pdf_text(make_pdf(tmp_path / "b.pdf")).read_text() == "\n\f"
+@
+
+A text file that is not older than its PDF is kept as it is, which the
+test sees by putting other words into it; one older than its PDF is
+written again.
+
+<<pdf text test methods>>=
+def test_a_current_text_is_kept_an_older_one_rewritten(self, tmp_path):
+  import os
+
+  pdf = make_pdf(tmp_path / "a.pdf", text="Fresh words")
+  text_path = write_pdf_text(pdf)
+  text_path.write_text("kept as it is")
+  assert write_pdf_text(pdf).read_text() == "kept as it is"
+  stamp = pdf.stat().st_mtime_ns
+  os.utime(text_path, ns=(stamp - 10**9, stamp - 10**9))
+  assert write_pdf_text(pdf).read_text() == "Fresh words\n\f"
+@
+
+The race the lock settles is shown with an extractor that replaces the
+PDF while it reads it, the way a concurrent import would, and returns
+the old text that first time.
+A stand-in rather than a second process (an injected interleaving),
+since a real import would have to land between two statements of
+[[write_pdf_text]].
+The text written must be the new PDF's; and an extractor that replaces
+the PDF every time must end in an error, not in the text of a PDF that
+is no longer there.
+
+<<pdf text test methods>>=
+def test_a_pdf_replaced_during_extraction_is_read_again(
+  self, tmp_path, monkeypatch
+):
+  pdf = make_pdf(tmp_path / "a.pdf", text="Old words")
+  real_extract = scholar.pdf.extract_pdf_pages
+  calls = []
+
+  def replacing_extract(path):
+    calls.append(path)
+    pages = real_extract(path)
+    if len(calls) == 1:
+      make_pdf(tmp_path / "new.pdf", width=300, text="New words")
+      (tmp_path / "new.pdf").replace(pdf)
+    return pages
+
+  monkeypatch.setattr(scholar.pdf, "extract_pdf_pages", replacing_extract)
+  assert write_pdf_text(pdf).read_text() == "New words\n\f"
+  assert len(calls) == 2
+
+def test_a_pdf_that_keeps_changing_is_an_error(self, tmp_path, monkeypatch):
+  pdf = make_pdf(tmp_path / "a.pdf", text="Words")
+  real_extract = scholar.pdf.extract_pdf_pages
+  widths = iter(range(300, 400))
+
+  def replacing_extract(path):
+    pages = real_extract(path)
+    make_pdf(tmp_path / "new.pdf", width=next(widths), text="Words")
+    (tmp_path / "new.pdf").replace(pdf)
+    return pages
+
+  monkeypatch.setattr(scholar.pdf, "extract_pdf_pages", replacing_extract)
+  with pytest.raises(PDFTextError, match="kept changing"):
+    write_pdf_text(pdf)
+  assert not pdf_text_path(pdf).exists()
+@
+
+A download can replace a cached PDF too: a cached file that can no
+longer be read is ignored and fetched again (\cref{sec:pdf-import-check}),
+and what the server sends then need not be what it sent before.
+The text beside the old file would then describe another PDF until the
+next [[--text]], and a reader who searches the text files directly
+would quote from a file that is gone.
+The stand-in for the server is the one the download tests above use.
+
+<<pdf text test methods>>=
+def test_a_download_that_replaces_a_pdf_removes_its_text(
+  self, tmp_path, monkeypatch
+):
+  monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path))
+  url = "https://pub.example/a.pdf"
+  cached = get_cached_pdf_path(url)
+  cached.write_bytes(make_pdf(tmp_path / "old.pdf", text="Old words").read_bytes())
+  assert write_pdf_text(cached).read_text() == "Old words\n\f"
+  cached.write_bytes(cached.read_bytes()[:200])
+  new = make_pdf(tmp_path / "new.pdf", width=300, text="New words").read_bytes()
+  response = MagicMock()
+  response.headers = {"content-type": "application/pdf"}
+  response.iter_content.return_value = [new]
+  with patch("scholar.pdf.requests.get", return_value=response):
+    assert download_pdf(url).read_bytes() == new
+  assert not pdf_text_path(cached).exists()
+  assert write_pdf_text(cached).read_text() == "New words\n\f"
+@
+
+Clear, info and import treat the text as part of its PDF.
+[[clear]] deletes a download's text with it, keeps an imported PDF's
+text with the imported PDF, and deletes a text whose PDF is gone;
+[[info]] counts the texts and those without a PDF; an import that
+replaces a PDF deletes the old PDF's text, while an import of the same
+content (\enquote{unchanged}) keeps it.
+
+<<pdf text test methods>>=
+def test_clear_and_info(self, tmp_path, monkeypatch):
+  monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path / "cache"))
+  downloaded = make_pdf(get_cached_pdf_path("https://pub.example/a.pdf"),
+                        text="Downloaded")
+  imported = import_pdf(make_pdf(tmp_path / "b.pdf", text="Imported"),
+                        url="https://pub.example/b.pdf").path
+  write_pdf_text(downloaded)
+  write_pdf_text(imported)
+  stray = get_cached_pdf_path("https://pub.example/gone.pdf")
+  pdf_text_path(stray).write_text("left by the old script")
+  info = get_pdf_cache_info()
+  assert (info["text_files"], info["orphaned_texts"]) == (3, 1)
+  assert info["text_bytes"] == sum(
+    p.stat().st_size for p in get_pdf_cache_dir().glob("*.txt")
+  )
+  clear_pdf_cache()
+  assert not pdf_text_path(downloaded).exists()
+  assert not pdf_text_path(stray).exists()
+  assert pdf_text_path(imported).read_text() == "Imported\n\f"
+  clear_pdf_cache(include_imported=True)
+  assert list(get_pdf_cache_dir().glob("*.txt")) == []
+
+def test_an_import_that_replaces_drops_the_text(self, tmp_path, monkeypatch):
+  monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path / "cache"))
+  first = make_pdf(tmp_path / "first.pdf", text="First")
+  url = "https://pub.example/a.pdf"
+  text_path = write_pdf_text(import_pdf(first, url=url).path)
+  assert import_pdf(first, url=url).status == "unchanged"
+  assert text_path.exists()
+  second = make_pdf(tmp_path / "second.pdf", width=300, text="Second")
+  assert import_pdf(second, url=url, replace=True).status == "replaced"
+  assert not text_path.exists()
+@
+
+\section{Fetching a batch of sources}
+\label{sec:pdf-fetch}
+
+[[scholar pdf fetch]] (\cref{sec:pdf-fetch-cli}) downloads a list of
+sources into the cache without opening a viewer, for scripts and agent
+sessions, which used to import [[get_pdf]] from the installed package
+and broke whenever it changed.
+[[fetch_pdf]] does the work for one source and never raises for a
+failure of that source: a batch reports each source's outcome and goes
+on, so one dead link does not cost the rest.
+
+It hands the source to [[get_pdf]], the function behind [[pdf open]]
+and [[pdf quote]], so a source is resolved exactly as those resolve it:
+a DOI (bare or as a [[doi.org]] URL) through the PDF imported for it
+first, then its candidate URLs, any other URL as itself, all through
+the network route of \cref{ch:network}.
+Only one thing is checked before: that the source is a DOI or an
+[[http]] or [[https]] URL.
+Anything else would reach [[requests]] as a URL and come back as an
+error about a missing schema; the row says plainly what is wrong
+instead, and no request is made.
+
+A failure's message can span lines ([[download_doi_pdf]] lists every
+source it tried, [[download_pdf]] adds the URL on a line of its own);
+[[one_line]] joins them with semicolons, since the outcome is a cell
+of one row.
+An [[OSError]] (a full disk while the download is written, a text file
+that cannot be written) is a failure of that source too, by its
+[[strerror]].
+Any other exception is a bug and is not caught.
+
+<<pdf fetch functions>>=
+@dataclass
+class PDFFetch:
+    """
+    The outcome of `fetch_pdf` for one source.
+
+    `path` is the cached PDF (None when none was had), `error` the
+    reason of a failure (None when the source was fetched), `text` the
+    text file written with `text=True`.
+    """
+
+    source: str
+    path: Path | None = None
+    error: str | None = None
+    text: Path | None = None
+
+
+def source_problem(source: str) -> str | None:
+    """Why `source` is neither a DOI nor an http(s) URL, or None."""
+    if extract_doi(source):
+        return None
+    parts = urlsplit(source)
+    if parts.scheme.lower() in FETCH_SCHEMES and parts.netloc:
+        return None
+    return "neither a DOI nor an http or https URL"
+
+
+def one_line(message: str) -> str:
+    """The non-empty lines of `message`, joined by semicolons."""
+    return "; ".join(
+        line.strip() for line in message.splitlines() if line.strip()
+    )
+
+
+def fetch_pdf(
+    source: str,
+    *,
+    text: bool = False,
+    progress_callback: Callable[[str], None] | None = None,
+) -> PDFFetch:
+    """
+    Fetch one source (a PDF URL or a DOI) into the cache, as `get_pdf`.
+
+    With `text`, also write the PDF's text beside it (`write_pdf_text`).
+    A failure is returned in `error`, never raised.
+    """
+    problem = source_problem(source)
+    if problem:
+        return PDFFetch(source, error=problem)
+    try:
+        path = get_pdf(source, progress_callback)
+    except PDFDownloadError as error:
+        return PDFFetch(source, error=one_line(str(error)))
+    except OSError as error:
+        return PDFFetch(source, error=error.strerror or str(error))
+    outcome = PDFFetch(source, path=path)
+    if text:
+        try:
+            outcome.text = write_pdf_text(path)
+        except PDFTextError as error:
+            outcome.error = f"text not written: {error}"
+        except OSError as error:
+            outcome.error = f"text not written: {error.strerror or error}"
+    return outcome
+<<pdf constants>>=
+FETCH_SCHEMES = ("http", "https")
+@
+
 \section{Opening PDFs}
 
 We provide a cross-platform function to open PDFs with the system default
@@ -3162,6 +3603,149 @@ class TestSegmentPassages:
         passages = segment_passages(pages)
         assert len(passages) == 1
         assert all(len(p.text) >= MIN_PASSAGE_CHARS for p in passages)
+@
+
+\subsection{The whole text, for checking a quote}
+\label{sec:pdf-running-text}
+
+[[scholar prov check --quotes]] (\cref{sec:prov-check} in the CLI)
+asks a different question of a PDF than [[pdf quote]] does: not which
+passages fit a claim, but whether a passage someone typed occurs in the
+text at all.  For that the text is wanted whole, as one run, since a
+quote may cross a line, a sentence or a page.
+
+PDFium decides what a line-end hyphen is, and it does not tell a word
+broken at a line end from a compound that happens to end a line.  In
+two arXiv PDFs typeset with \LaTeX{} (1706.03762v7 and 1810.04805v2,
+fetched through [[download_pdf]] on 2026-11-27) a hyphen at a line
+end in running text came back as U+FFFE with the line break removed,
+whether it broke a word or ended a compound: \enquote{transduc}
+U+FFFE \enquote{tion} beside \enquote{sequence} U+FFFE
+\enquote{aligned} and \enquote{pre} U+FFFE \enquote{trained}, 16 and
+332 times; a plain hyphen before a line break remained in 8 and 13
+places.  [[_reflow_text]] drops the mark, which is right for
+\enquote{transduction} and wrong for \enquote{sequence-aligned}.  Here
+the mark becomes a hyphen instead, so nothing is lost, and the quote
+check folds a hyphen between two letters away on both sides
+(\cref{sec:prov-check-quotes} in the CLI); a plain hyphen before a
+line break is joined the same way.  The lines end in a carriage return
+and a line feed, so the pattern allows both.  The extracted text of
+neither PDF held a ligature character; NFKC in the quote check folds
+those another PDF may give.
+
+<<quote extraction functions>>=
+def pdf_running_text(path: Path) -> str:
+    """The text of a PDF as one run, white space collapsed.
+
+    A hyphen at a line end, which PDFium returns as U+FFFE or as a
+    hyphen before the line break, is kept as a hyphen and the line
+    joined. Raises what PDFium raises for an unreadable file.
+    """
+    text = "\n".join(extract_pdf_pages(path))
+    text = text.replace("\ufffe", "-").replace("\u00ad", "")
+    text = LINE_END_HYPHEN.sub("-", text)
+    return " ".join(text.split())
+<<quote extraction constants>>=
+LINE_END_HYPHEN = re.compile(r"-[ \t]*\r?\n\s*")
+@
+
+Let's check both forms: a PDF with three lines, two of them ending in
+a hyphen (PDFium returns both as U+FFFE), and extracted text with a
+plain hyphen before a line break.  The second test stands in for
+PDFium: in the hand-written PDF of the first, PDFium joins both lines,
+and a PDF whose extraction keeps the hyphen and the line break would
+take a PDF writer we do not have.
+
+<<test functions>>=
+class TestPdfRunningText:
+    """`pdf_running_text` keeps a line-end hyphen and joins the line."""
+
+    def test_line_end_hyphens_become_hyphens(self, tmp_path):
+        pdf = make_pdf(tmp_path / "p.pdf", width=300, text=[
+            "Most students treated recur-", "sion as a first-",
+            "year topic.",
+        ])
+        assert pdf_running_text(pdf) == (
+            "Most students treated recur-sion as a first-year topic."
+        )
+
+    def test_a_hyphen_before_a_line_break_joins_too(self, tmp_path):
+        from unittest.mock import patch
+        with patch("scholar.pdf.extract_pdf_pages",
+                   return_value=["Trans-\r\n  former", "next page"]):
+            assert pdf_running_text(tmp_path / "x.pdf") == (
+                "Trans-former next page"
+            )
+@
+
+Which PDF is the work's, without a request?  An import by DOI is filed
+under the DOI (\cref{sec:pdf-import-key}), and a download by URL under
+that URL.  A download by DOI is filed under the URL the resolver named,
+which follows from the DOI only through the resolver.  Unpaywall's
+answer is cached, so its link can be read back without a request
+([[cached_pdf_link]] in the Unpaywall module) and the PDF it names
+found.  A PDF that Semantic Scholar or the publisher's page named is
+not found this way: their answers are not kept.  The first readable
+file wins; when none is readable, the first that exists is returned, so
+that the caller can say what is wrong with it rather than that there is
+none.
+
+<<quote extraction functions>>=
+def cached_pdf_for(doi: str | None = None,
+                   url: str | None = None) -> Path | None:
+    """The cached PDF of a work, found without any request.
+
+    Looks for a PDF imported for `doi`, one downloaded from the link a
+    cached Unpaywall answer names for it, and one downloaded from
+    `url`. Returns the first readable one, else the first that exists,
+    else None.
+    """
+    from scholar.unpaywall import cached_pdf_link
+
+    candidates = []
+    if doi:
+        candidates += doi_pdf_paths(doi)
+        link = cached_pdf_link(doi)
+        if link:
+            candidates.append(get_cached_pdf_path(link))
+    if url:
+        candidates.append(get_cached_pdf_path(url))
+    existing = [path for path in candidates if path.exists()]
+    for path in existing:
+        if usable_cached_pdf(path, warn=False):
+            return path
+    return existing[0] if existing else None
+@
+
+Let's check each source and the preference for a readable file, on
+real PDFs in a cache directory of the test's own:
+
+<<test functions>>=
+class TestCachedPdfFor:
+    """`cached_pdf_for` finds a work's PDF by DOI, Unpaywall link or URL."""
+
+    def test_each_source(self, tmp_path, monkeypatch):
+        from scholar import unpaywall
+        monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path))
+        assert cached_pdf_for("10.5555/none", "https://x.example/n") is None
+        imported = make_pdf(get_cached_doi_pdf_path("10.5555/a"))
+        assert cached_pdf_for("10.5555/A") == imported
+        link = "https://oa.example/b.pdf"
+        monkeypatch.setitem(unpaywall._client._cache, ("oa", "10.5555/b"),
+                            {"pdf_url": link})
+        linked = make_pdf(get_cached_pdf_path(link))
+        assert cached_pdf_for("10.5555/b") == linked
+        by_url = make_pdf(get_cached_pdf_path("https://x.example/c"))
+        assert cached_pdf_for(None, "https://x.example/c") == by_url
+
+    def test_a_readable_file_wins(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path))
+        broken = get_cached_doi_pdf_path("10.5555/d")
+        broken.write_bytes(b"%PDF-1.4 truncated")
+        assert cached_pdf_for("10.5555/d") == broken
+        url = "https://x.example/d"
+        readable = make_pdf(get_cached_pdf_path(url))
+        assert cached_pdf_for("10.5555/d", url) == readable
 @
 
 \subsection{Lexical ranking}

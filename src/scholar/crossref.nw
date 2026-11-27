@@ -64,7 +64,8 @@ Looks up a paper's DOI in the Crossref REST API and reports retraction or
 correction notices ("updated-by") and superseding-version relations. Used by
 ``scholar verify`` and ``scholar enrich`` to warn against citing withdrawn or
 stale work. The same response gives ``scholar enrich`` the work's abstract,
-when the publisher deposited one. Results are cached per DOI; no API key is
+when the publisher deposited one, and ``scholar prov check --metadata`` its
+title, authors and years. Results are cached per DOI; no API key is
 required.
 """
 
@@ -76,6 +77,7 @@ required.
 <<abstract normalization helpers>>
 <<module-level currency interface>>
 <<module-level abstract interface>>
+<<bibliographic record>>
 @
 
 
@@ -516,20 +518,23 @@ class TestCrossrefDoiInPath:
         ]
 @
 
-A 404 leaves [[None]] in both entries: Crossref has no record, so it
-holds neither notices nor an abstract for the DOI.
+A 404 leaves [[None]] in each entry: Crossref has no record, so it
+holds neither notices nor an abstract for the DOI.  The third entry,
+title, authors and years, is described in
+\cref{sec:crossref-bibliographic}.
 The abstract entry keeps the text as Crossref sent it, markup and all,
 and the text is cleaned when it is read (\cref{sec:crossref-abstract});
 how it is cleaned can then change without asking Crossref again.
 
 <<crossref client methods>>=
 def _remember_work(self, doi: str, message: dict | None) -> None:
-    """Cache the currency result and the raw abstract of `doi`'s record.
+    """Cache the currency result, raw abstract and bibliographic record.
 
     `message` is the work record, or None when Crossref has none.
     """
     currency = None
     abstract = None
+    bibliographic = None
     if message is not None:
         currency = {
             "updated_by": _normalize_updated_by(message),
@@ -538,8 +543,10 @@ def _remember_work(self, doi: str, message: dict | None) -> None:
         }
         raw = message.get("abstract")
         abstract = raw if isinstance(raw, str) and raw.strip() else None
+        bibliographic = bibliographic_record(message)
     self._cache[("currency", CURRENCY_CACHE_VERSION, doi)] = currency
     self._cache[abstract_cache_key(doi)] = abstract
+    self._cache[bibliographic_cache_key(doi)] = bibliographic
 @
 
 Let's verify the happy path, the encoding requirement, and each
@@ -1274,6 +1281,177 @@ class TestCrossrefAbstract:
         with self._recorded() as get:
             assert fetch_abstract(self.DOI)
         assert get.call_count == 1
+@
+
+
+\section{Title, authors and years}
+\label{sec:crossref-bibliographic}
+
+[[scholar prov check --metadata]] (\cref{sec:prov-check-metadata} in
+the CLI) compares an entry of a [[.bib]] with the work its DOI names:
+title, author surnames and year.  The same work record holds them, so
+they come from the request the currency check makes, kept in a third
+side entry beside the currency result and the abstract, for the reasons
+the abstract got one (\cref{sec:crossref-abstract}): bumping
+[[CURRENCY_CACHE_VERSION]] would make every enrichment ask Crossref
+again for every DOI, while a side entry costs one request only for a
+DOI whose record was cached before it existed, and only when a check
+asks for it.  An older scholar reads the cache file as before: the
+entry is one more key of the plain dictionary, its value a dictionary
+of strings, lists of strings and lists of numbers, which nothing in an
+older version looks up.
+
+The entry keeps what the comparison reads and no more: the first title
+and the first subtitle (Crossref lists both, and gives the subtitle
+apart from the title), each author's [[family]] name, or the [[name]]
+of an author that is an organisation, in the record's order, and the
+years of the record's publication dates [[issued]], [[published-print]]
+and [[published-online]], since a print year and an online year often
+differ and either may be the one a [[.bib]] gives.  The dates
+[[created]] and [[deposited]] say when the DOI was registered and when
+its metadata was last sent, not when the work came out, and are left
+out; an earlier version took [[created]] too, and no released version
+wrote the entry, so no cached entry holds such a year.  A date
+part Crossref leaves [[null]] is no year.  The subtitle is a list
+beside the title; in the recorded response of the CLI's test
+([[10.1038/nature14539]]) it is an empty list, which gives [[None]].
+The CLI reads a subtitle the entry lacks as none, so an entry cached
+without the field would need no new version either.  A 404 stores [[None]], as
+for the other two entries: Crossref has no record.  The fields are
+those of the work record in Crossref's REST API description
+(\url{https://api.crossref.org/swagger-docs}, read 2026-11-20 for the
+abstract) and of the recorded response of the CLI's test (2026-11-27).
+
+<<bibliographic record>>=
+def bibliographic_cache_key(doi: str) -> tuple:
+    """The cache key of the title, authors and years of `doi`'s record."""
+    return ("bibliographic", doi)
+
+
+def bibliographic_record(message: dict) -> dict:
+    """Title, subtitle, author family names and years of a work record."""
+
+    def first(name):
+        values = message.get(name) or []
+        return values[0] if values and isinstance(values[0], str) else None
+
+    families = [
+        author.get("family") or author.get("name")
+        for author in message.get("author") or []
+        if isinstance(author, dict)
+        and (author.get("family") or author.get("name"))
+    ]
+    years = set()
+    for name in ("issued", "published-print", "published-online"):
+        parts = (message.get(name) or {}).get("date-parts") or [[None]]
+        year = parts[0][0] if parts and parts[0] else None
+        if isinstance(year, int):
+            years.add(year)
+    return {
+        "title": first("title"),
+        "subtitle": first("subtitle"),
+        "families": families,
+        "years": sorted(years),
+    }
+
+
+def fetch_bibliographic(doi: str | None) -> dict | None:
+    """Look up the title, authors and years of a DOI (see CrossrefClient)."""
+    return _client.fetch_bibliographic(doi)
+@
+
+The lookup is [[fetch_abstract]]'s: a cached entry is the answer, else
+the record is fetched, which refreshes all three entries.
+
+<<crossref client methods>>=
+def fetch_bibliographic(self, doi: str | None) -> dict | None:
+    """Return the title, authors and years Crossref holds for `doi`.
+
+    A dict with `title`, `subtitle`, `families` and `years`; None when
+    there is no DOI, Crossref has no record for it, or the lookup
+    failed, which sets `last_lookup_error`.
+    """
+    self.last_lookup_error = None
+    if not doi:
+        return None
+    key = bibliographic_cache_key(doi)
+    if key not in self._cache and not self._fetch_work(doi):
+        return None
+    return self._cache.get(key)
+@
+
+Let's check it on a record shaped as Crossref sends them: an
+organisation as author, a subtitle, a [[null]] year, a registration
+and a deposit year that are not taken, one request
+serving the currency check too, an older currency entry costing one
+request, a 404 as a cached [[None]], and a cache entry of built-in
+types only.
+
+<<test functions>>=
+class TestCrossrefBibliographic:
+    """Title, authors and years come from the currency check's response."""
+
+    DOI = "10.5555/biblio"
+    RECORD = {
+        "DOI": DOI,
+        "title": ["Misconceptions of recursion"],
+        "subtitle": ["A study of novices"],
+        "author": [
+            {"given": "Ana", "family": "Ruiz"},
+            {"name": "The Study Group"},
+            {"given": "No family"},
+        ],
+        "issued": {"date-parts": [[2021, 3]]},
+        "published-print": {"date-parts": [[2022]]},
+        "published-online": {"date-parts": [[None]]},
+        "created": {"date-parts": [[2020, 12, 30]]},
+        "deposited": {"date-parts": [[2023, 1, 5]]},
+    }
+
+    def _recorded(self, message=RECORD):
+        return patch.object(
+            _client._session, "get",
+            return_value=_mock_response(200, message),
+        )
+
+    def test_record_and_one_request(self):
+        with self._recorded() as get:
+            record = fetch_bibliographic(self.DOI)
+            fetch_currency(self.DOI)
+        assert record == {
+            "title": "Misconceptions of recursion",
+            "subtitle": "A study of novices",
+            "families": ["Ruiz", "The Study Group"],
+            "years": [2021, 2022],
+        }
+        assert get.call_count == 1
+
+    def test_older_currency_entry_costs_one_request(self):
+        _client._cache[("currency", CURRENCY_CACHE_VERSION, self.DOI)] = {
+            "updated_by": [], "newer_versions": [], "preprints": [],
+        }
+        with self._recorded() as get:
+            assert fetch_bibliographic(self.DOI)["years"] == [2021, 2022]
+            assert fetch_bibliographic(self.DOI)["families"]
+        assert get.call_count == 1
+
+    def test_not_found_is_a_cached_none(self):
+        with patch.object(
+            _client._session, "get", return_value=_mock_response(404)
+        ) as get:
+            assert fetch_bibliographic("10.1/missing") is None
+            assert last_lookup_error() is None
+            assert fetch_bibliographic("10.1/missing") is None
+        assert get.call_count == 1
+
+    def test_failure_sets_the_reason(self):
+        with patch.object(
+            _client._session, "get",
+            side_effect=requests.exceptions.ConnectionError("down"),
+        ):
+            assert fetch_bibliographic(self.DOI) is None
+        assert last_lookup_error() == "connection failed (ConnectionError)"
+        assert bibliographic_cache_key(self.DOI) not in _client._cache
 @
 
 
