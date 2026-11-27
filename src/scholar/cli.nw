@@ -36169,7 +36169,57 @@ line reader's own tests for a header, a field line and a continuation,
 so that a block counts exactly as [[_split_note_segments]] reads it.
 This counts and reads no value; it is no third reader.
 
+The line reader forgets a run of comment lines that no entry directly
+follows: at the end of the file, above an [[@string]] or an
+[[@comment]], or cut from the next entry by a blank line.  The import
+skips such a block without a word, so the check must name it, or a
+block the author believes attached would back nothing.
+[[stray_prov_blocks]] walks the lines as [[_parse_bib_entries]] does,
+with its tests for a comment line and an entry line and skipping the
+body of each entry as it does, and returns the line and header key of
+every block in a run that ends otherwise than on an entry.  A run
+followed by a control entry counts as stray too: the line reader reads
+the block onto the [[@comment]], and [[read_prov_bib]] then passes the
+control entry over.
+
 <<formatter classes>>=
+def stray_prov_blocks(text: str) -> list:
+    """`(line, header key)` of each block no entry directly follows.
+
+    Lines are 1-based.
+    """
+    lines = text.split("\n")
+    stray = []
+    run = None
+    index = 0
+    while index < len(lines):
+        if lines[index].strip().startswith("%"):
+            run = index if run is None else run
+            index += 1
+            continue
+        entry = BIB_ENTRY_RE.match(lines[index])
+        control = entry and re.match(
+            r"\s*@\s*(\w+)", lines[index]
+        ).group(1).lower() in BIB_CONTROL_TYPES
+        if run is not None and (not entry or control):
+            stray += _prov_headers(lines, run, index)
+        run = None
+        index = _entry_end(lines, index) + 1 if entry else index + 1
+    if run is not None:
+        stray += _prov_headers(lines, run, len(lines))
+    return stray
+
+
+def _prov_headers(lines: list, start: int, end: int) -> list:
+    """`(line, key)` of the block headers among `lines[start:end]`."""
+    found = []
+    for index in range(start, end):
+        header = PROV_HEADER_RE.match(_strip_comment_prefix(lines[index]))
+        if header:
+            found.append((index + 1, header.group(1)))
+    return found
+
+
 def repeated_prov_fields(comment_lines: list) -> list:
     """`(block, field name)` for each name a block gives more than once.
 
@@ -36422,6 +36472,14 @@ def _shortened(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[:limit - 1] + "\u2026"
 @
 
+A block's header names a key, [[% === provenance: KEY ===]].  The
+import does not read it (it finds the paper by the entry's fields),
+and [[bibtex+prov]] and [[prov export]] both write the key of the
+entry below; so a header that names another key is a block copied or
+moved from another entry, or an entry renamed after the block was
+written, and either way the reader of the [[.bib]] cannot tell which
+work the block backs.  It is an error naming both keys.
+
 An entry without a block is an error by default: the file is handed to
 the command to show that its citations are backed, and an entry
 nothing backs is what it is there to find (the skill's checker treats
@@ -36431,6 +36489,7 @@ reasons, a software package, a data set, passes with
 the summary still says how many entries no block backs.
 
 <<constants>>=
+PROV_STRAY_MESSAGE = "provenance block with no entry directly below it"
 PROV_ERROR = "error"
 PROV_NOT_CHECKED = "not checked"
 PROV_NOTE = "note"
@@ -36460,7 +36519,12 @@ def prov_block_findings(entry: ProvCheckEntry,
             findings.append(ProvFinding(
                 PROV_ERROR, "no provenance block directly above the entry",
             ))
-    for number, (_, fields) in enumerate(entry.blocks, 1):
+    for number, (key, fields) in enumerate(entry.blocks, 1):
+        if key != entry.key:
+            findings.append(ProvFinding(
+                PROV_ERROR, f"the block's header names {key}, the entry "
+                f"below it is {entry.key}", number,
+            ))
         findings += [
             ProvFinding(PROV_ERROR, problem, number)
             for problem in prov_block_problems(fields)
@@ -36478,15 +36542,31 @@ def prov_block_findings(entry: ProvCheckEntry,
 \subsection{The command}
 
 Every file is read before anything is checked, so an unreadable file
-stops the command with one line and exit 1 before any output, and a
-usage error (a format other than [[table]] and [[json]]) exits 2 before
-a file is read.  Then each entry gets its findings: the blocks, then
+stops the command with one line on standard error and exit 1 before
+any check, and a usage error (a format other than [[table]] and
+[[json]]) exits 2 before a file is read.  With [[-f json]] the standard
+output still holds a report, which names each file read and the one
+that could not be, with its error, and has no entries and no summary:
+a program reading the output finds the reason there, not an empty
+stream.  The files are read as [[utf-8-sig]], which drops a byte order
+mark at the start; read as [[utf-8]], the mark stood before the first
+block's [[%]], the line was no comment, and the first entry had no
+block.  Then each entry gets its findings: the blocks, then
 the quotes with [[--quotes]], then the metadata with [[--metadata]].
 The exit status is 1 when any finding is an error, else 0; a quote or
 an entry that was not checked is printed and counted, and is no error
 on its own, since the author may not have the source at hand.
 
 <<formatter classes>>=
+@dataclass
+class ProvStrayBlock:
+    """A provenance block that no entry directly follows."""
+
+    file: str
+    key: str
+    line: int
+
+
 @dataclass
 class ProvEntryCheck:
     """All that `prov check` found on one entry."""
@@ -36528,19 +36608,25 @@ def _quote_label(check: "ProvQuote") -> str:
 @
 
 The text lists, per file, each entry that has a finding, one line per
-finding, with the entry's key, its line and the block; then one summary
-line over all files.  The stored strings (keys, passages) are printed
+finding, with the entry's key, its line and the block, and each block
+without an entry, with its header key and line, all in the order of
+their lines; then one summary line over all files.  The stored strings (keys, passages) are printed
 as plain text, never as Rich markup, and lines are not wrapped, so a
 key or a passage can be copied from the terminal.
 
 <<formatter classes>>=
 def prov_check_lines(checks: list, files: list, quotes: bool,
-                     metadata: bool) -> list[str]:
+                     metadata: bool, stray: list = ()) -> list[str]:
     """The text report of `prov check`."""
     lines = []
     for file in files:
         mine = [c for c in checks if c.file == file]
         lines.append(f"{file}: {_counted(len(mine), 'entry', 'entries')}")
+        found = [
+            (block.line, f"  {block.key} (line {block.line}): "
+             f"{PROV_STRAY_MESSAGE}")
+            for block in stray if block.file == file
+        ]
         for check in mine:
             for finding in check.findings:
                 place = f"line {check.entry.line}"
@@ -36550,23 +36636,26 @@ def prov_check_lines(checks: list, files: list, quotes: bool,
                     "" if finding.level == PROV_ERROR
                     else f"{finding.level}: "
                 )
-                lines.append(
-                    f"  {check.entry.key} ({place}): {prefix}"
-                    f"{finding.message}"
-                )
-    lines.append(prov_check_summary(checks, quotes, metadata))
+                found.append((check.entry.line,
+                              f"  {check.entry.key} ({place}): {prefix}"
+                              f"{finding.message}"))
+        lines += [text for _, text in
+                  sorted(found, key=lambda item: item[0])]
+    lines.append(prov_check_summary(checks, quotes, metadata, stray))
     return lines
 
 
-def prov_check_counts(checks: list) -> dict:
+def prov_check_counts(checks: list, stray: list = ()) -> dict:
     """The counts the summary line and the JSON report give."""
     findings = [f for c in checks for f in c.findings]
     quotes = [q for c in checks for q in c.quotes]
     return {
         "entries": len(checks),
         "blocks": sum(len(c.entry.blocks) for c in checks),
-        "errors": sum(f.level == PROV_ERROR for f in findings),
+        "errors": sum(f.level == PROV_ERROR for f in findings)
+        + len(stray),
         "unbacked": sum(not c.entry.blocks for c in checks),
+        "unattached": len(stray),
         "quotes": {
             result: sum(q.result == result for q in quotes)
             for result in (PROV_FOUND, PROV_NOT_FOUND, PROV_NOT_CHECKED)
@@ -36575,9 +36664,10 @@ def prov_check_counts(checks: list) -> dict:
     }
 
 
-def prov_check_summary(checks: list, quotes: bool, metadata: bool) -> str:
+def prov_check_summary(checks: list, quotes: bool, metadata: bool,
+                       stray: list = ()) -> str:
     """One line: entries, blocks, errors, and the quotes and metadata."""
-    counts = prov_check_counts(checks)
+    counts = prov_check_counts(checks, stray)
     line = ", ".join([
         _counted(counts["entries"], "entry", "entries"),
         _counted(counts["blocks"], "block", "blocks"),
@@ -36587,6 +36677,11 @@ def prov_check_summary(checks: list, quotes: bool, metadata: bool) -> str:
         line += (
             f", {_counted(counts['unbacked'], 'entry', 'entries')} "
             "without a block"
+        )
+    if counts["unattached"]:
+        line += (
+            f", {_counted(counts['unattached'], 'block', 'blocks')} "
+            "without an entry"
         )
     if quotes:
         q = counts["quotes"]
@@ -36598,9 +36693,10 @@ def prov_check_summary(checks: list, quotes: bool, metadata: bool) -> str:
     return line + "."
 @
 
-The JSON report holds the same as data: per entry the file, key, line,
-the number of blocks, the findings, and the quote and metadata checks
-when asked for; then the counts.
+The JSON report holds the same as data: the files read; per entry the
+file, key, line, the number of blocks, the findings, and the quote and
+metadata checks when asked for; the blocks without an entry; then the
+counts.
 
 <<formatter classes>>=
 def _counted(count: int, singular: str, plural: str) -> str:
@@ -36608,7 +36704,8 @@ def _counted(count: int, singular: str, plural: str) -> str:
     return f"{count} {singular if count == 1 else plural}"
 
 
-def prov_check_data(checks: list, quotes: bool, metadata: bool) -> dict:
+def prov_check_data(checks: list, quotes: bool, metadata: bool,
+                    stray: list = (), files: list = ()) -> dict:
     """The JSON report of `prov check`."""
     entries = []
     for check in checks:
@@ -36628,7 +36725,12 @@ def prov_check_data(checks: list, quotes: bool, metadata: bool) -> dict:
             item["metadata"] = [dataclasses.asdict(m)
                                 for m in check.metadata]
         entries.append(item)
-    return {"entries": entries, "summary": prov_check_counts(checks)}
+    return {
+        "files": [{"file": file, "error": None} for file in files],
+        "entries": entries,
+        "unattached": [dataclasses.asdict(block) for block in stray],
+        "summary": prov_check_counts(checks, stray),
+    }
 @
 
 <<prov command>>=
@@ -36692,13 +36794,9 @@ def prov_check(
     texts = {}
     for bib_file in bib_files:
         try:
-            texts[str(bib_file)] = bib_file.read_text(encoding="utf-8")
+            texts[str(bib_file)] = bib_file.read_text(encoding="utf-8-sig")
         except (OSError, UnicodeDecodeError) as error:
-            Console(stderr=True).print(
-                f"[red]Cannot read {escape(str(bib_file))}: "
-                f"{escape(str(error))}[/red]", soft_wrap=True,
-            )
-            raise typer.Exit(1)
+            <<report the file [[prov check]] cannot read>>
     <<open the Crossref client for [[prov check]]>>
     checks = [
         prov_entry_check(file, entry, quotes, metadata, allow_unbacked,
@@ -36706,15 +36804,39 @@ def prov_check(
         for file, text in texts.items()
         for entry in read_prov_bib(text)
     ]
+    stray = [
+        ProvStrayBlock(file, key, line)
+        for file, text in texts.items()
+        for line, key in stray_prov_blocks(text)
+    ]
     if output_format == "json":
-        print(json.dumps(prov_check_data(checks, quotes, metadata),
-                         indent=2, ensure_ascii=False))
+        print(json.dumps(
+            prov_check_data(checks, quotes, metadata, stray, list(texts)),
+            indent=2, ensure_ascii=False,
+        ))
     else:
         console = Console(highlight=False, soft_wrap=True)
-        for line in prov_check_lines(checks, list(texts), quotes, metadata):
+        for line in prov_check_lines(checks, list(texts), quotes, metadata,
+                                     stray):
             console.print(Text(line))
-    if any(f.level == PROV_ERROR for c in checks for f in c.findings):
+    if stray or any(
+        f.level == PROV_ERROR for c in checks for f in c.findings
+    ):
         raise typer.Exit(1)
+@
+
+<<report the file [[prov check]] cannot read>>=
+Console(stderr=True).print(
+    f"[red]Cannot read {escape(str(bib_file))}: "
+    f"{escape(str(error))}[/red]", soft_wrap=True,
+)
+if output_format == "json":
+    print(json.dumps({
+        "files": [{"file": file, "error": None} for file in texts]
+        + [{"file": str(bib_file), "error": str(error)}],
+        "entries": [], "unattached": [], "summary": None,
+    }, indent=2, ensure_ascii=False))
+raise typer.Exit(1)
 @
 
 Let's check the command on invented files: a complete block passes;
@@ -36722,8 +36844,11 @@ each missing field, each kind of placeholder (the stub as
 [[bibtex+prov]] writes it among them) and an empty field is an error;
 the second of two blocks is named; an entry without a block, or cut
 from it by a blank line, is an error unless [[--allow-unbacked]]; a
-duplicate key is an error; the JSON report holds the same; a usage
-error exits 2 and an unreadable file 1, both with one line.  Every
+block that no entry follows is an error, and so is a header key that is
+not the entry's; a byte order mark changes nothing; a duplicate key is
+an error; the JSON report holds the same; a usage error exits 2 and an
+unreadable file 1, both with one line, and the JSON report names the
+unreadable file.  Every
 test goes through the real readers and the command, on files in
 [[tmp_path]].
 
@@ -36891,6 +37016,37 @@ def test_a_blank_line_cuts_the_block_off(self, tmp_path):
   assert result.exit_code == 1
   assert "no provenance block directly above" in result.output
 
+@pytest.mark.parametrize("text, line, key", [
+  (PROV_BLOCK + PROV_ENTRY + PROV_BLOCK.replace("ruiz2021", "late2020"),
+   16, "late2020"),
+  (PROV_BLOCK.replace("ruiz2021", "str2020") + '@string{jn = "J"}\n'
+   + PROV_BLOCK + PROV_ENTRY, 1, "str2020"),
+  (PROV_BLOCK.replace("ruiz2021", "lost2020") + "\n" + PROV_BLOCK
+   + PROV_ENTRY, 1, "lost2020"),
+  (PROV_BLOCK.replace("ruiz2021", "com2020") + "@comment{x, y}\n"
+   + PROV_BLOCK + PROV_ENTRY, 1, "com2020"),
+])
+def test_a_block_without_an_entry(self, tmp_path, text, line, key):
+  result, _ = run_prov_check(tmp_path, text)
+  assert result.exit_code == 1, result.output
+  assert (f"{key} (line {line}): provenance block with no entry "
+          "directly below it") in result.output
+  assert "ruiz2021" not in result.output
+  assert ("1 entry, 1 block, 1 error, 1 block without an entry."
+          in result.output)
+
+def test_a_header_key_not_the_entry_key(self, tmp_path):
+  block = PROV_BLOCK.replace("provenance: ruiz2021", "provenance: ruiz2020")
+  result, _ = run_prov_check(tmp_path, block + PROV_ENTRY)
+  assert result.exit_code == 1, result.output
+  assert ("ruiz2021 (line 10, block 1): the block's header names "
+          "ruiz2020, the entry below it is ruiz2021") in result.output
+
+def test_a_byte_order_mark(self, tmp_path):
+  result, _ = run_prov_check(tmp_path, "\ufeff" + PROV_BLOCK + PROV_ENTRY)
+  assert result.exit_code == 0, result.output
+  assert "1 entry, 1 block, 0 errors." in result.output
+
 def test_a_duplicate_key(self, tmp_path):
   text = PROV_BLOCK + PROV_ENTRY + PROV_BLOCK + PROV_ENTRY
   result, _ = run_prov_check(tmp_path, text)
@@ -36910,7 +37066,10 @@ def test_json(self, tmp_path):
     "quotes": {"found": 0, "not found": 0, "not checked": 0},
     "metadata": {"agrees": 0, "differs": 0, "not checked": 0,
                  "notes": 0},
+    "unattached": 0,
   }
+  assert data["files"] == [{"file": str(bib), "error": None}]
+  assert data["unattached"] == []
   [entry] = data["entries"]
   assert (entry["file"], entry["key"], entry["line"], entry["blocks"]) == (
     str(bib), "ruiz2021", 19, 2,
@@ -36931,6 +37090,21 @@ def test_usage_and_unreadable_files(self, tmp_path):
   )
   assert result.exit_code == 1
   assert "Cannot read" in result.output
+  assert "Traceback" not in result.output
+
+def test_json_names_an_unreadable_file(self, tmp_path):
+  good = tmp_path / "good.bib"
+  good.write_text(PROV_BLOCK + PROV_ENTRY, encoding="utf-8")
+  missing = tmp_path / "missing.bib"
+  result = CliRunner().invoke(
+    app, ["prov", "check", str(good), str(missing), "-f", "json"],
+  )
+  assert result.exit_code == 1
+  data = json.loads(result.stdout)
+  assert [f["file"] for f in data["files"]] == [str(good), str(missing)]
+  assert data["files"][0]["error"] is None
+  assert "missing.bib" in data["files"][1]["error"]
+  assert data["entries"] == [] and data["summary"] is None
   assert "Traceback" not in result.output
 @
 
