@@ -46,6 +46,72 @@ the .bbl; checked with pdflatex/xelatex/lualatex); no stderr hint.
 All round-trip code lives in `cli.nw`'s
 `<<formatter classes>>` and `<<prov command>>` chunks.
 
+**`scholar prov check FILE.bib ... [--quotes] [--metadata]
+[--allow-unbacked] [-f table|json]`** (#346, cli.nw `sec:prov-check`):
+read-only on the `.bib`, notes and sessions (tested byte-identical);
+no request except `--metadata`'s Crossref lookups. Reading
+(`read_prov_bib` -> `ProvCheckEntry`): the line reader of `prov import`
+(`_parse_bib_entries`: blocks, wrapped fields, stacked blocks, `ID`)
+joined with bibtexparser (entry fields whole, LaTeX-decoded) on the
+0-based start line (`ProvEntry.entry_start` == `Block.start_line`); DOI
+and URL from the undecoded entry, read BEFORE `transform_entry`, which
+mutates its argument (DOI via `read_bibtex_verbatim`, URL as written).
+A `DuplicateBlockKeyBlock` (checked from `ignore_error_block`) and a
+`ParsingFailedBlock` are errors; `@comment/@preamble/@string` skipped.
+A block cut off by a blank line is missing (prov import skips it too).
+Blocks: per block `prov_block_problems` over `PROV_REQUIRED_FIELDS`
+(CLAIM FOUND-VIA PICKED QUOTE VERIFIED COUNTER; ID and DATE not
+required): missing, empty, placeholder (`is_prov_placeholder`: `TODO`
+in capitals outside a double-quoted passage, `QUOTE_PATTERN`; or the
+whole value a `<...>` template; a location, `(<loc>)`, judged alike).
+Fields are found by the first word of the name (`prov_field_values`:
+`QUOTE (p.3)` -> location `p.3`). A name given twice in one block is
+an error (`repeated_prov_fields` counts the comment lines; the line
+reader's dict keeps only the last, so prov import loses the others).
+No block: error; `--allow-unbacked` makes it a note (summary "N entries
+without a block"). `--quotes` (`prov_quote_checks`): passages via
+`quotes_in_reason` (double marks only; a QUOTE without one is not
+checked); VERIFIED starting `abstract` -> the entry's `abstract` field
+(none -> not checked), else full text from `pdf.cached_pdf_for(doi,
+url)` (DOI import keys `doi_pdf_paths`, the link of a cached Unpaywall
+answer `unpaywall.cached_pdf_link`, never a request, the `url` field's
+download; first readable wins); text `pdf.pdf_running_text` (pages
+joined, PDFium's U+FFFE line-end mark and `-` + line break kept as
+`-`, lines joined). Match: `normalized_for_quotes` +
+`fold_word_hyphens` (a hyphen between letters/digits removed on both
+sides) + `quote_parts`/`quote_occurs` (ellipsis parts in order); every
+passage checked, no 3-word minimum. A download resolved by Semantic
+Scholar or the landing page is not found (their answers are not
+cached). No cached PDF / unreadable / no text -> not checked (counted,
+printed, not an error). Measured 2026-11-27 on arXiv 1706.03762v7 and
+1810.04805v2: 6 of 6 quotes found, a misquote reported; keeping or
+dropping the U+FFFE mark without the fold missed 2 resp. 3.
+`--metadata` (`prov_metadata_checks`, `sec:prov-check-metadata`):
+`crossref.fetch_bibliographic(doi)` (side entry `("bibliographic",
+doi)` = `{title, subtitle, families, years}` written by
+`_remember_work`, built-in types, no `CURRENCY_CACHE_VERSION` bump; an
+older entry costs one request). Title: `metadata_fold` +
+`SequenceMatcher` >= 0.8 for any of {title, title before ":"} x
+{Crossref title, title: subtitle}; authors: sorted folded surnames
+(bibtexparser name parts, `and others` dropped), compared only when
+both sides have some; year (`year`, else `date`) in issued /
+published-print / published-online / created. Differ -> error; 404 ->
+not checked "DOI ... is not known to Crossref" (no DataCite); failure
+-> not checked with reason; no DOI -> not checked. Exit 1 on any error,
+else 0; 2 for an unknown `-f` (before reading); 1 with one line for an
+unreadable file (before any output). Text: "FILE: N entries", per
+finding "  key (line L[, block B]): [not checked: |note: ]message",
+summary "E entries, B blocks, X errors[, U entries without a block][;
+quotes: f found, m not found, u not checked][; metadata: a agree, d
+differ, u not checked]." JSON: `entries` (file, key, line, blocks,
+findings, `quotes`/`metadata` when asked) and `summary`
+(`prov_check_counts`). Left to the backing-claims skill: VERIFIED level
+words, causal/quantitative claims verified at abstract level, COUNTER
+wording and `see <key>`, header key mismatch, missing DATE, QUOTE
+without a location. Tests: `RequestTargets.answer(path, body)`
+(conftest) serves a recorded body with status 200; `make_pdf` /
+`make_cli_pdf` take a list of lines.
+
 ## `search -f csv` rows (#300)
 
 `search -f csv` is tab-separated, written by Python's `csv` module

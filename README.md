@@ -187,6 +187,7 @@ the kept papers.
 scholar search "literate programming" -p openalex -l 20 -n my-review -f bibtex+prov > refs.bib
 scholar prov import refs.bib
 scholar prov export refs.bib --in-place
+scholar prov check refs.bib --quotes --metadata
 scholar prov found-via doi:10.5555/example.1
 ```
 
@@ -195,6 +196,10 @@ records the search that found it (`FOUND-VIA`, a command that repeats
 it) and has fields for the claim the entry backs, why it was picked, a
 quote and how it was verified. `prov import` keeps those blocks in
 `scholar notes`, and `prov export` writes them back above the entries.
+`prov check` reports blocks with a field missing or left as a
+placeholder, quotes not found in the cached full text or abstract
+(`--quotes`), and entries whose title, authors or year differ from
+Crossref (`--metadata`); it changes nothing.
 `prov found-via` prints, for each saved session that returned a paper,
 the `scholar search` command that repeats the search. Lesson `scholar-with-an-agent`.
 
