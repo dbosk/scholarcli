@@ -22,8 +22,10 @@ unreviewed llm/agent → kind llm/agent named by `llm_model`/`agent_by`
 with its confidence, reason, time; `human`/`llm_reviewed`/
 `agent_reviewed` → kind `human`, `name` = `human_by`, `at` =
 `human_decided_at`, `confirmed_from` llm/agent/None, `confirmed_name`
-model/`agent_by` (no machine confidence or reason); unknown source →
-all None. `counted_screenings` = valid entries (`is_valid_screening`:
+model/`agent_by` (no machine confidence or reason; since #349 the
+human's own `human_reason` and `human_batch`, None when not given);
+unknown source → all None. Read from `decision_trace` (#349), so an
+llm snapshot also takes `llm_batch`. `counted_screenings` = valid entries (`is_valid_screening`:
 dict with `id` and kept/discarded status), not marked `set_aside_at`,
 recorded strictly after the last reset's `at`; malformed entries are kept verbatim, skipped, one
 WARNING per file (`warn_about_malformed_screenings`).

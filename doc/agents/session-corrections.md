@@ -170,7 +170,15 @@ None, with one both are stored. `reason_quote_checks` reads it as kind
 `reason_quotes` (now with a `human` key) count it; the report's
 sentence reads only the machine kinds (unchanged). `sessions show`
 prints "reason (human, NAME): ..." under the agent's line
-(`human_reason_line`). Report and audit table unchanged. The build of
+(`human_reason_line`). Report and audit table unchanged. **Batch and
+fold (#349).** 5th field `human_batch` (see decision-checks.md "Batch
+ids"). A fold keeps the newer record whole; when it has no reason and
+the other copy's record has one, `warn_about_a_dropped_reason` logs one
+WARNING "<old id>: the reason the human gave on this copy was not kept;
+it was folded with <id>, whose newer record of the review has no
+reason. The reason was: <text>" (the tombstone is an id map, so the
+text goes into the warning; `sessions reconcile` prints it, also on
+`--dry-run`; tested with the real command). The build of
 main 18eda86 loads only its three fields by name
 (`dec_data.get(name)`), so it ignores the field and drops it on save
 (read, not run).

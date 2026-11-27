@@ -9,14 +9,25 @@ apply to `sessions screen` too.
 
 **Batch ids (#292, cli.nw `sec:batch-ids-in-files`,
 `sec:batch-against-sheet`, `sec:sheet-batches`; review.nw
-`sec:stored-batches`).** `agent_batch` is the 4th field of
+`sec:stored-batches`).** Since #349 every source stores it:
+`human_batch` (5th of `HUMAN_AUDIT_FIELDS`, set by
+`record_human_decision(batch=)`, cleared by a later human record
+without one) and `llm_batch` (6th of `LLM_AUDIT_FIELDS`, the only one
+of them saved only when set: `llm_audit_data`,
+`LLM_AUDIT_FIELDS_SAVED_WHEN_SET`; in `MACHINE_AUDIT_FIELDS`, kept by
+`--keep-trace`, in a reset's trace; `llm classify` leaves it None); CSV
+columns `llm_batch` after `llm_abstract_truncated`, `human_batch` after
+`human_reason`; `show -f json` per decision `human_batch` and
+`llm_batch` (`null` when unset). The 18eda86 build reads its own
+registries by name, so it ignores both and drops them on save (read).
+`agent_batch` is the 4th field of
 `AGENT_AUDIT_FIELDS` (so load, save-when-set, `decision_state`, merge,
 `is_unscreened`, `clear_machine_audit`, the reset trace, `show -f
 json`, and the CSV column right after `agent_decided_at` all handle it;
 not in the text listing). A screening has key `batch` (in
 `SCREENING_KEYS` after `sample_id`, `new_screening(batch=)`; a
-snapshot takes `agent_batch` via `SNAPSHOT_FIELDS`/`verdict_screener`
-for agent verdicts). `parse_tab_file` entries are 4-tuples `(line, id,
+snapshot takes the decider's batch via `SNAPSHOT_FIELDS`/
+`verdict_screener`: agent, llm or human batch). `parse_tab_file` entries are 4-tuples `(line, id,
 values, batch)`: a comment line `# batch: ID` (`BATCH_LINE`, `batch`
 any case) gives the lines after it that id until the next one (several
 batches concatenated; lines before the first: None); `ReasonLine`/
@@ -48,10 +59,14 @@ answers its whole sheet: missing rows are gaps, refused under `--strict`,
 `sheet_extras`, refused under `--strict` in `<<check the batch as a
 whole>>`. `sessions reset --batch ID` (repeatable, `read_batch_id`;
 alone or narrowing like `--source`) selects decisions by
-`agent_batch`, never screenings; an id no decision carries is a stderr
-note (a reset clears it). `stored_batch_check` → also
+`decision_trace(d).batches` (any source's batch, #349), never
+screenings; a human or reviewed decision among them still refuses the
+run (help says so); an id no decision carries is a stderr note (a
+reset clears it). `stored_batch_check` → also
 `StoredBatchCheck.batches` (`stored_batches`: rows with a batch id per
-(what, kind, name, batch), `batch_findings` whole, confidence included,
+(what, kind, name, batch), what = agent decisions, human decisions,
+screenings, or `classifier decisions` (llm parts with `llm_batch`,
+`_relayed_batch_rows`; relayed reasons are not in runs), `batch_findings` whole, confidence included,
 one-reason runs NOT pooled; `stored_batch_findings`: a batch whose rows
 all share one reason over >= `SHARED_REASON_MIN_RECORDS` works gets one
 `one-reason` note "one reason for all N records of batch X: a rule given
@@ -154,8 +169,12 @@ and refusal with the real exit codes, records in memory only, prints
 written." (`<<report or save the decisions>>`), never saves (decide
 keeps no pre-run copy anyway). **`scholar sessions check-batches S
 [-f table|json]`**: read-only, exit 0; `review.stored_batch_check` →
-`StoredBatchCheck(shared, runs)`: runs group decisions with an
-`agent_reason` by (`agent_by`, `agent_decided_at`) and screenings with
+`StoredBatchCheck(shared, runs)`: runs group the trace parts with a
+reason (`_stored_run_rows` over `decision_trace(d).parts`: agent parts
+by (`agent_by`, `agent_decided_at`), since #349 human parts by
+(`human_by`, `human_decided_at`) as "human decisions", row confidence
+= the part's, so None for a human and for an agent part on a
+human-source decision) and screenings with
 `origin` "screen" (snapshots left out) by (kind, name, `recorded_at`);
 a run of two or more works (title keys) whose rows all share one
 reason gets a `one-reason` note and counts as ONE pooled record (a row
@@ -165,12 +184,17 @@ one-row run is an ordinary row (a per-record `decide --paper-id X
 --reason R` loop adds up); the text adds `ONE_REASON_RUN_NOTE` (a file
 with one reason on every line is a shared reason at decide/screen time
 and `--strict` refuses it); shared reasons are looked for
-session-wide over the pooled rows, agent reasons and screening reasons
-apart (`shared["agent decisions"]`, `shared["screenings"]`), since a
+session-wide over the pooled rows, agent, human and screening reasons
+apart (`shared["agent decisions"]`, `shared["human decisions"]`,
+`shared["screenings"]`), since a
 stored run is neither a screener's batch nor a superset of one; flat
 confidence is not judged from runs, only per stored batch id (#292,
-above). Text:
-counts line, session-wide shared reasons, runs with one reason, stored
+above; a human's batch has no confidence, so never flat). The
+incoming checks of `decide`/`screen` already read a human's file
+(`TestHumanReasonsAreChecked`; a human's file confidences are dropped
+before the check). Text:
+counts line ("N agent reasons, H human reasons and M screenings in K
+stored run(s)."), session-wide shared reasons, runs with one reason, stored
 batches, then what a stored run is and that flat confidence is judged
 per batch only. JSON:
 `shared_reasons`, `runs`, `batches`, `flat_confidence`. The help states the
