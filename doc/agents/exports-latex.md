@@ -53,8 +53,9 @@ Entry places (#355, `sec:prov-bib-layouts`): `_parse_bib_entries(text,
 library=None)` takes each entry's start/end line and key from
 bibtexparser (`_bib_spans`: `start_line`, end = start + newlines in
 `raw`; kinds entry/failed/control/failed control/text; a failed
-entry's key from `BIB_FAILED_KEY` on its first line, none -> not an
-entry); the comment run is walked UP from the entry over `%` lines,
+entry's key from `BIB_FAILED_KEY`: after the `{`/`(`, also on the next
+line, and only if a comma follows, so `@article{` + `title = ...` has
+none; none -> not an entry); the comment run is walked UP from the entry over `%` lines,
 stopping at the end of the last entry/control block read whole (not at
 a failed one, whose `raw` runs on to the next `@`); a failed entry's
 end is clamped above the next entry's run (else export writes it
