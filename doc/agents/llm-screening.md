@@ -100,6 +100,12 @@ was typed) to choose the papers the model has not screened. Tests use the real
 package with `get_model_aliases`/`get_async_model_aliases` patched to
 `{}` (resolving a model asks every plugin; llm-gpt4all fetches its list
 over the network) and a long model name, so a wrapped line would fail.
+llm-ollama (a dependency since #367; its chat models call `set_usage`)
+asks the server at `OLLAMA_HOST` (default `localhost:11434`) for its
+models whenever a model is resolved, and registers none, silently, when
+it cannot reach it. `isolate_cache` sets `OLLAMA_HOST=127.0.0.1:1` for
+non-live tests, so a developer's local Ollama (loopback passes
+`block_network`) never shows in a test; see cache.nw.
 
 Tag kinds: note tags (`NOTE_TAGS`, the union of every language's
 `AUDIT_STRINGS[lang]["notes"]`) are human-only, never offered (not even

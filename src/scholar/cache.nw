@@ -1590,6 +1590,7 @@ def isolate_cache(tmp_path, monkeypatch, request):
         for var in PROVIDER_CREDENTIAL_VARS:
             monkeypatch.delenv(var, raising=False)
         <<clear the keys that the registered providers hold>>
+        <<point the Ollama plugin at nothing>>
 @
 
 Unsetting the variables is not enough for [[pyalex]].
@@ -1696,6 +1697,184 @@ def test_keys_read_at_import_are_cleared_in_tests(tmp_path):
     )
     assert run.returncode == 0, run.stdout[-2000:]
     assert "1 passed" in run.stdout
+@
+
+\subsubsection{No local Ollama in a test}
+
+The [[llm-ollama]] plugin
+(\url{https://github.com/dbosk/scholar/issues/367}) brings a server of
+its own into the picture.
+Whenever the [[llm]] package resolves a model, the plugin asks the
+Ollama server named by [[OLLAMA_HOST]] for its models and registers one
+for each; when the server cannot be asked it registers none, without a
+word (read in version~0.20.0, [[get_ollama_models]] in
+[[llm_ollama/registry.py]]).
+The network guard below lets loopback through, and an Ollama on the
+developer's machine listens on loopback, so a test that resolves a
+model would see that developer's models, and the same test could pass
+on one machine and fail on another.
+The plugin also writes the capabilities of each model it has not seen
+before into its cache under [[llm]]'s user directory, which is the
+developer's real one.
+
+So the fixture points the plugin at an address where nothing answers.
+Unsetting [[OLLAMA_HOST]] would not do: the [[ollama]] client then uses
+its default, [[127.0.0.1:11434]], which is exactly where a local Ollama
+listens.
+Port~0 would not do either: the client reads a port of~0 as no port and
+puts the default one in its place (both read and tried in [[ollama]]
+0.6.3, [[_parse_host]]).
+An address outside the machine would meet the network guard, which
+fails the test, and without the guard the plugin would wait its connect
+timeout of a second for every resolution.
+Port~1 on loopback is refused at once, and only a privileged process can
+listen there (on Linux, below
+[[net.ipv4.ip_unprivileged_port_start]], 1024 by default), so no tool a
+developer starts can occupy it.
+Live tests keep the developer's setting, as they keep the keys.
+
+<<point the Ollama plugin at nothing>>=
+monkeypatch.setenv("OLLAMA_HOST", UNREACHABLE_OLLAMA_HOST)
+<<[[conftest.py]]>>=
+
+
+UNREACHABLE_OLLAMA_HOST = "127.0.0.1:1"
+@
+
+The tests need a server that answers, and the developer's own Ollama
+must play no part in them, so they start a stand-in on a free loopback
+port.
+It knows the two requests the plugin makes to list models: the list
+itself ([[/api/tags]]) and one model's capabilities ([[/api/show]]).
+Its bodies are written by hand, holding only the fields the plugin and
+the [[ollama]] client read (the client refuses a [[/api/show]] answer
+without [[model_info]]), for an invented model; recording the real
+server would mean using the developer's Ollama, and its list differs
+from machine to machine.
+The stand-in keeps the path of each request it gets.
+
+<<test functions>>=
+class OllamaStandIn:
+    """A loopback stand-in for an Ollama server with one invented model."""
+
+    MODEL = "invented-model:7b"
+
+    def __init__(self):
+        import http.server
+        import json
+
+        self.paths = []
+        stand_in = self
+        bodies = {
+            "/api/tags": {"models": [
+                {"model": self.MODEL, "digest": "0" * 64},
+            ]},
+            "/api/show": {"capabilities": ["completion"], "model_info": {}},
+        }
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def answer(self):
+                stand_in.paths.append(self.path)
+                length = int(self.headers.get("Content-Length") or 0)
+                self.rfile.read(length)
+                body = json.dumps(bodies.get(self.path, {})).encode()
+                self.send_response(200 if self.path in bodies else 404)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            do_GET = do_POST = answer
+
+            def log_message(self, *args):
+                pass
+
+        self.server = http.server.ThreadingHTTPServer(
+            ("127.0.0.1", 0), Handler
+        )
+        self.host = f"127.0.0.1:{self.server.server_address[1]}"
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+@pytest.fixture
+def ollama_stand_in():
+    """Serve one invented Ollama model on a free loopback port."""
+    stand_in = OllamaStandIn()
+    yield stand_in
+    stand_in.close()
+@
+
+The model a test resolves is the one the plugin registers, so the tests
+ask the plugin itself, found in [[llm]]'s plugin registry, for the
+models it would register.
+Asking every plugin, as [[llm.get_model]] does, would also run the
+other plugins, and one of them fetches its list over the network.
+
+<<test functions>>=
+def ollama_model_ids():
+    """Return the ids of the models the llm-ollama plugin registers now."""
+    from llm.plugins import load_plugins, pm
+
+    load_plugins()
+    registered = []
+    pm.get_plugin("ollama").register_models(
+        lambda *models, aliases=(): registered.extend(
+            model.model_id for model in models
+        )
+    )
+    return registered
+@
+
+First, a test sees no Ollama model, whatever server there may be.
+On its own this proves little where no Ollama runs, so the second test
+runs it in a separate pytest process whose environment names the
+stand-in in [[OLLAMA_HOST]], as a developer's shell might, and checks
+that the stand-in was never asked.
+The inner process gets a user directory of its own for [[llm]]
+([[LLM_USER_PATH]]), so that if the fixture failed, the plugin's cache
+write would land there and not in the developer's configuration.
+The same test then shows that the stand-in is a server the plugin does
+use: with [[OLLAMA_HOST]] naming it inside a test, the invented model
+is registered (twice: a synchronous and an asynchronous model), so the
+first check could have failed.
+Here the plugin's cache is moved into [[tmp_path]] for the same reason.
+What the stand-in does not cover is the rest of Ollama's interface:
+nothing here generates text.
+
+<<test functions>>=
+def test_a_test_sees_no_ollama_model():
+    """The llm-ollama plugin registers no model during a test."""
+    assert ollama_model_ids() == []
+
+
+def test_a_developers_ollama_stays_out_of_tests(
+    tmp_path, monkeypatch, ollama_stand_in
+):
+    """An `OLLAMA_HOST` in the environment does not reach a test."""
+    env = dict(os.environ)
+    env["OLLAMA_HOST"] = ollama_stand_in.host
+    env["LLM_USER_PATH"] = str(tmp_path / "llm")
+    env["TMPDIR"] = str(tmp_path)
+    project = Path(__file__).resolve().parent.parent
+    run = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
+          "tests/test_cache.py::test_a_test_sees_no_ollama_model"],
+        cwd=project, env=env, capture_output=True, text=True, timeout=300,
+    )
+    assert run.returncode == 0, run.stdout[-2000:]
+    assert "1 passed" in run.stdout
+    assert ollama_stand_in.paths == []
+
+    from llm_ollama import registry
+
+    monkeypatch.setattr(registry.cache, "cache_dir", tmp_path)
+    monkeypatch.setenv("OLLAMA_HOST", ollama_stand_in.host)
+    assert ollama_model_ids() == [f"ollama/{OllamaStandIn.MODEL}"] * 2
+    assert ollama_stand_in.paths == ["/api/tags", "/api/show"]
 @
 
 \subsection{Isolating import time and exit time}
