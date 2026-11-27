@@ -311,8 +311,11 @@ def guarded(find, *args):
         return f"{type(error).__name__}: {error}"
 
 
-def not_found(reason):
-    return [f"{PLACE_HEAD} could not be found: {reason}"]
+def not_found(reason, known):
+    """Say why the place could not be found, and how to look again: a
+    remembered cycle repeats this warning until the sources change."""
+    return [f"{PLACE_HEAD} could not be found: {reason}; to look again, "
+            f"remove {known}"]
 
 
 def first_parting(layouts):
@@ -421,7 +424,8 @@ def chunk_source(name, tag, labels, sources):
     chunk is first looked up by its tag: the .aux gives the noweb label
     that reads that tag, and the woven source that sets that label is
     the one.  Without a tag or a label, the first source that defines a
-    chunk of that name is taken.
+    chunk of that name is taken, a guess; the second value says whether
+    the source was guessed so.
     """
     keys = {key for key, value in labels.items() if value == ("", tag)}
     marks = [f"\\sublabel{{{key}}}" for key in keys]
@@ -435,11 +439,12 @@ def chunk_source(name, tag, labels, sources):
             by_name = source
             if not marks:
                 break
+    guessed = found is None
     found = found or by_name
     if found is None:
-        return None
+        return None, False
     nw = found.with_suffix(".nw")
-    return nw if nw.exists() else found
+    return (nw if nw.exists() else found), guessed
 
 
 def brace_groups(text):
@@ -510,9 +515,6 @@ def counted(count):
 
 def place(layouts, labels, sources, toc):
     """Say where the layouts of a cycle's states first part."""
-    reasons = [layout for layout in layouts if isinstance(layout, str)]
-    if reasons:
-        return not_found(reasons[0])
     page = first_parting(layouts)
     if page is None:
         return [f"{PLACE_HEAD}: no page break differs between the states; "
@@ -551,10 +553,10 @@ def place(layouts, labels, sources, toc):
     nearest = []
     chunk, tag = nearest_chunk(layouts[variants[0][0] - 1], page, cause)
     if chunk:
-        source = chunk_source(chunk, tag, labels[variants[0][0] - 1],
-                              sources)
-        nearest.append(f"chunk <<{chunk}>>"
-                       + (f" ({source})" if source else ""))
+        source, guessed = chunk_source(
+            chunk, tag, labels[variants[0][0] - 1], sources)
+        nearest.append(f"chunk <<{chunk}>>" + (
+            f" ({'probably ' * guessed}{source})" if source else ""))
     if section := nearest_section(toc, folio, pages[0][:cause]):
         nearest.append(f"section {section}")
     if nearest:
@@ -687,10 +689,13 @@ def settle(job, outdir, engine, sources, text_timeout=TEXT_TIMEOUT):
         layouts.append(guarded(read_layout, pdf, text_timeout))
         if back := period(states):
             cycle = states[-back:]
-            where = guarded(place, layouts[-back:],
-                            [labels for _, labels in cycle], sources, toc)
+            reasons = [layout for layout in layouts[-back:]
+                       if isinstance(layout, str)]
+            where = reasons[0] if reasons else guarded(
+                place, layouts[-back:], [labels for _, labels in cycle],
+                sources, toc)
             if isinstance(where, str):
-                where = not_found(where)
+                where = not_found(where, known)
             warning = cycle_warning(job, cycle, where, sources)
             known.write_text(json.dumps(
                 {"sources": sources_digest(sources),
