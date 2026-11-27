@@ -74,7 +74,9 @@ Blocks: per block `prov_block_problems` over `PROV_REQUIRED_FIELDS`
 required): missing, empty, placeholder (`is_prov_placeholder`: the value
 BEGINS with the word `TODO`, capitals, so `TODO: find it` is one and
 "keep the TODO list short" is not; or the whole value a `<...>`
-template; a location, `(<loc>)`, judged alike). A QUOTE passage, or a
+template, bare or as the whole of one pair of double marks,
+`"<verbatim passage>"` (`QUOTE_PATTERN.fullmatch`, #359; `--quotes`
+skips it like `TODO`); a location, `(<loc>)`, judged alike). A QUOTE passage, or a
 part of one between ellipses (`quote_parts`), with no letter and no
 digit (`prov_passage_has_words`) is a block error "holds no words",
 with or without `--quotes`, and is never looked up.
