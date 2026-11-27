@@ -179,6 +179,9 @@ KINDS = [
      "a line of the table of contents"),
     (None, re.compile(r"^[0\W]*(and[0\W]*)?$"), "a line of numbers"),
 ]
+LIST_HEAD, NUMBERS_ONLY = KINDS[0][0], KINDS[2][1]
+CHUNK_TAG = re.compile(r"^\d+[a-z]?$")
+WIDTH = 76           # longer lines are cut when shown
 
 
 def masked(line):
@@ -270,8 +273,9 @@ def kind(line):
 
 def changed_lines(first, other):
     """Return the lines of two versions of a page that differ in more
-    than numbers, as (index in `first` or None, side, line); a line
-    that only went over the page break at the foot is left out."""
+    than numbers, as (index in `first`, side, index in its page, line),
+    side 0 for `first` and 1 for `other`; a line that only went over
+    the page break at the foot is left out."""
     ours, theirs = list(map(masked, first)), list(map(masked, other))
     found = []
     matcher = difflib.SequenceMatcher(None, ours, theirs, autojunk=False)
@@ -279,41 +283,96 @@ def changed_lines(first, other):
         at_foot = i2 == len(ours) and j2 == len(theirs)
         if tag == "equal" or (at_foot and tag in ("insert", "delete")):
             continue
-        found += [(i, 0, first[i]) for i in range(i1, i2)]
-        found += [(i1, 1, other[j]) for j in range(j1, j2)]
+        found += [(i, 0, i, first[i]) for i in range(i1, i2)]
+        found += [(i1, 1, j, other[j]) for j in range(j1, j2)]
+    return found
+
+
+def lists_on(lines):
+    """Return noweb's lists on a page as {key: (first line, lines)}.
+
+    A list is a line that begins one, with the lines of nothing but
+    numbers that continue it; numbers at the top of a page continue a
+    list from the page before.  The key is what the list is of (its
+    first words, which name the identifier or chunk) and how many lists
+    of that stand before it on the page, so that the same list is found
+    in every state however its lines wrap.
+    """
+    found, seen, index = {}, {}, 0
+    while index < len(lines):
+        line, end = lines[index], index + 1
+        if LIST_HEAD.search(line):
+            what = re.sub(r"chunks\b", "chunk", masked(line).split(" 0")[0])
+        elif index == 0 and NUMBERS_ONLY.search(masked(line)):
+            what = "(continued from the page before)"
+        else:
+            index = end
+            continue
+        while (end < len(lines) and not LIST_HEAD.search(lines[end])
+               and NUMBERS_ONLY.search(masked(lines[end]))):
+            end += 1
+        found[(what, seen.get(what, 0))] = (line, range(index, end))
+        seen[what] = seen.get(what, 0) + 1
+        index = end
     return found
 
 
 def nearest_chunk(layout, page, before):
-    """Return the name of the chunk last defined before line `before`
-    of `page`, looking back up to LOOK_BACK pages."""
+    """Return the name and the tag ("209a") of the chunk last defined
+    before line `before` of `page`, looking back up to LOOK_BACK pages."""
     for back in range(page, max(page - LOOK_BACK, 0) - 1, -1):
         lines = layout.lines(back)
         if back == page:
             lines = lines[:before + 1]
-        for line in reversed(lines):
-            if m := CHUNK_LINE.search(line):
-                return CHUNK_PAGES.sub("", m.group(1)).strip()
-    return None
+        for index in range(len(lines) - 1, -1, -1):
+            if m := CHUNK_LINE.search(lines[index]):
+                tag = lines[index - 1] if index else ""
+                return (CHUNK_PAGES.sub("", m.group(1)).strip(),
+                        tag if CHUNK_TAG.match(tag) else None)
+    return None, None
 
 
 def alnum(text):
     return re.sub(r"\\(code|edoc)\{\}|[^0-9a-z]", "", text.lower())
 
 
-def chunk_source(name, sources):
-    """Return the source (the .nw if there is one) that defines `name`."""
+def read_sources(sources):
     for source in sources:
         if source.suffix != ".tex":
             continue
         try:
-            text = source.read_text(encoding="utf-8", errors="replace")
+            yield source, source.read_text(encoding="utf-8",
+                                           errors="replace")
         except OSError:
             continue
-        if any(alnum(found) == alnum(name) for found in MODDEF.findall(text)):
-            nw = source.with_suffix(".nw")
-            return nw if nw.exists() else source
-    return None
+
+
+def chunk_source(name, tag, labels, sources):
+    """Return the source (the .nw if there is one) of a chunk.
+
+    Many files define a chunk of the same name (<<functions>>), so the
+    chunk is first looked up by its tag: the .aux gives the noweb label
+    that reads that tag, and the woven source that sets that label is
+    the one.  Without a tag or a label, the first source that defines a
+    chunk of that name is taken.
+    """
+    keys = {key for key, value in labels.items() if value == ("", tag)}
+    marks = [f"\\sublabel{{{key}}}" for key in keys]
+    found = by_name = None
+    for source, text in read_sources(sources):
+        if any(mark in text for mark in marks):
+            found = source
+            break
+        if by_name is None and any(alnum(defined) == alnum(name)
+                                   for defined in MODDEF.findall(text)):
+            by_name = source
+            if not marks:
+                break
+    found = found or by_name
+    if found is None:
+        return None
+    nw = found.with_suffix(".nw")
+    return nw if nw.exists() else found
 
 
 def brace_groups(text):
@@ -330,24 +389,40 @@ def brace_groups(text):
     return groups
 
 
-def nearest_section(toc, folio):
-    """Return the heading of the .toc last begun on or before page
-    `folio` (an arabic page number), or None."""
+def nearest_section(toc, folio, above):
+    """Return the heading of the .toc last begun before the place.
+
+    The place is on page `folio` (an arabic page number), below the
+    lines `above`; a heading on that page counts only if it stands
+    among those lines.
+    """
     if folio is None or not folio.isdigit() or not toc.exists():
         return None
+    text_above = "".join(map(alnum, above))
     found = None
     for line in toc.read_text(encoding="latin-1").splitlines():
-        if not line.startswith("\\contentsline"):
-            continue
         groups = brace_groups(line)
-        if len(groups) >= 3 and groups[2].isdigit() \
-                and int(groups[2]) <= int(folio):
-            title = NUMBERLINE.sub(r"\1 ", groups[1])
-            found = re.sub(r"\\[a-zA-Z@]+\s*|[{}]", "", title).strip()
+        if (not line.startswith("\\contentsline") or len(groups) < 3
+                or not groups[2].isdigit() or int(groups[2]) > int(folio)):
+            continue
+        number = NUMBERLINE.search(groups[1])
+        title = re.sub(r"\\[a-zA-Z@]+\s*|[{}]", "",
+                       NUMBERLINE.sub("", groups[1])).strip()
+        if int(groups[2]) == int(folio) and alnum(title) not in text_above:
+            continue
+        found = f"{number.group(1)} {title}" if number else title
     return found
 
 
-def place(layouts, sources, toc):
+def cut(line):
+    return line if len(line) <= WIDTH else line[:WIDTH - 3] + "..."
+
+
+def counted(count):
+    return "none" if count == 0 else f"{count} line" + "s" * (count > 1)
+
+
+def place(layouts, labels, sources, toc):
     """Say where the layouts of a cycle's states first part."""
     head = "check: where the layouts first part"
     reasons = [layout for layout in layouts if isinstance(layout, str)]
@@ -372,39 +447,57 @@ def place(layouts, sources, toc):
                layout.break_after(page))
         variants.setdefault(key, []).append(number)
     variants = list(variants.values())
-    first = layouts[variants[0][0] - 1].lines(page)
-    changes, cause = [], len(first)
-    for numbers in variants[1:]:
-        other = layouts[numbers[0] - 1].lines(page)
-        for index, side, line in changed_lines(first, other):
+    pages = [layouts[numbers[0] - 1].lines(page) for numbers in variants]
+    changes, cause = [], len(pages[0])
+    for other in range(1, len(variants)):
+        for index, side, own, line in changed_lines(pages[0], pages[other]):
             cause = min(cause, index)
-            changes.append((variants[0] if side == 0 else numbers, line))
+            changes.append((0 if side == 0 else other, own, line))
+    lists = [lists_on(text) for text in pages]
+    grown = [key for key in dict.fromkeys(k for found in lists for k in found)
+             if len({len(found[key][1]) if key in found else 0
+                     for found in lists}) > 1]
+    in_grown = {(variant, index) for variant, found in enumerate(lists)
+                for key in grown if key in found
+                for index in found[key][1]}
     nearest = []
-    if chunk := nearest_chunk(layouts[variants[0][0] - 1], page, cause):
-        source = chunk_source(chunk, sources)
+    chunk, tag = nearest_chunk(layouts[variants[0][0] - 1], page, cause)
+    if chunk:
+        source = chunk_source(chunk, tag, labels[variants[0][0] - 1],
+                              sources)
         nearest.append(f"chunk <<{chunk}>>"
                        + (f" ({source})" if source else ""))
-    if section := nearest_section(toc, folio):
+    if section := nearest_section(toc, folio, pages[0][:cause]):
         nearest.append(f"section {section}")
     if nearest:
         lines.append(f"  nearest before it: {', '.join(nearest)}")
-    for numbers in variants:
+    for numbers, text in zip(variants, pages):
         verb = "ends" if len(numbers) == 1 else "end"
         lines.append(f"  {named_states(numbers)} {verb} that page with:")
-        lines += [f"    | {line}"
-                  for line in layouts[numbers[0] - 1].lines(page)[-EDGE:]]
+        lines += [f"    | {cut(line)}" for line in text[-EDGE:]]
+    if grown:
+        lines.append("  noweb's lists on that page whose length differs:")
+    for key in grown:
+        first = next(found[key][0] for found in lists if key in found)
+        lengths = ", ".join(
+            f"{counted(len(found[key][1]) if key in found else 0)} in "
+            f"{named_states(numbers)}"
+            for numbers, found in zip(variants, lists))
+        lines.append(f'    "{cut(first)}": {lengths}')
+    changes = [(variant, line) for variant, own, line in changes
+               if (variant, own) not in in_grown]
     if changes:
-        lines.append("  lines of that page whose text differs in more "
-                     "than numbers:")
+        lines.append("  other lines of that page whose text differs in "
+                     "more than numbers:")
     shown, per_state = set(), {}
-    for numbers, line in changes:
-        states = named_states(numbers)
+    for variant, line in changes:
+        states = named_states(variants[variant])
         if (states, line) in shown:
             continue
         shown.add((states, line))
         per_state[states] = per_state.get(states, 0) + 1
         if per_state[states] <= SHOWN_LINES:
-            lines.append(f"    {states}: {line}{kind(line)}")
+            lines.append(f"    {states}: {cut(line)}{kind(line)}")
     lines += [f"    {states}: ... and {count - SHOWN_LINES} more lines"
               for states, count in per_state.items()
               if count > SHOWN_LINES]
@@ -505,7 +598,8 @@ def settle(job, outdir, engine, sources):
         layouts.append(read_layout(pdf))
         if back := period(states):
             cycle = states[-back:]
-            where = place(layouts[-back:], sources, toc)
+            where = place(layouts[-back:], [labels for _, labels in cycle],
+                          sources, toc)
             warning = cycle_warning(job, cycle, where, sources)
             known.write_text(json.dumps(
                 {"sources": sources_digest(sources),
