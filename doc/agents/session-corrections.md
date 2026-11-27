@@ -108,7 +108,9 @@ in a reset's `trace`). Set only by `review.record_human_decision(d,
 via, by=None, at=None)` (raises unless decided with a source in
 `REVIEWED_BY_A_HUMAN` = human/llm_reviewed/agent_reviewed; `at`
 defaults to `_utcnow`), called by the TUI's keep/themes/discard/confirm
-in both screens (after `mark_as_reviewed`; `by=app.reviewer`, set by
+in both screens, all through `PaperReviewApp.decide_as_human` /
+`confirm_as_human` since #349 part B (after `mark_as_reviewed`;
+`by=app.reviewer`, set by
 `sessions resume --by` or the blind-mode name dialog, else None) and by `sessions decide`
 with a human source (`--source human` or the terminal default; one
 `utc_now_iso()` per run; `--by NAME` now accepted with human). The
@@ -154,11 +156,17 @@ change is merged; not in `decision_verdict`, so copies decided alike
 with two reasons still fold and the fold keeps the newer record's
 reason; cleared by `clear_human_record`; kept in a relabel record's
 `"human"`; CSV column `human_reason` right after `human_by`; `show -f
-json` per decision, `null` when unset). Set only by
-`record_human_decision(..., reason=None)`, through
+json` per decision, `null` when unset). Set by
+`record_human_decision(..., reason=None)` and, for words added to a
+decision that is already a human's, by `set_human_reason(decision,
+reason)` (changes nothing else of the record), both through
 `checked_human_reason` (stripped, blank -> None, over
 `MAX_AGENT_REASON_CHARS` -> ValueError before anything is written); a
-later human record without a reason clears it; the TUI passes none.
+later human record without a reason clears it. The TUI passes one
+since #349 part B: key `r` and the prompt that opens after a human
+changes a decided record's status or category (`ReasonModal`, see
+review-sessions.md "One procedure for a human"); a TUI decision that
+keeps a human's own status and category keeps the reason.
 `sessions decide --source human` takes `--reason`, `--reasons-file`
 and a verdicts file's REASON (optional there: empty or `-`); a
 confidence in a human's file is read, then dropped with one note

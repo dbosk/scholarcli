@@ -112,6 +112,7 @@ from simple widgets to complex screens, culminating in the main application:
 <<tui sort modal>>
 <<tui filter modal>>
 <<tui reviewer name modal>>
+<<tui reason modal>>
 <<tui search filters modal>>
 <<tui main app>>
 <<tui report generation>>
@@ -389,7 +390,8 @@ then returning to the list (dismiss).
 
 The abstract screen provides several actions:
 \begin{description}
-\item[Keep (\texttt{K})] Quick keep---mark paper as kept without themes, return to list
+\item[Keep (\texttt{K})] Quick keep---mark paper as kept, return to list; a
+  paper kept already keeps its themes, any other gets none
 \item[Themes (\texttt{T})] Keep with themes---open theme selection modal, then return
 \item[Discard (\texttt{d})] Open motivation selection modal, then return
 \item[Notes (\texttt{n})] Open external editor for paper notes
@@ -527,6 +529,7 @@ class AbstractScreen(Screen[None]):
         Binding("n", "edit_notes", "Notes"),
         Binding("e", "enrich", "Enrich"),
         Binding("C", "confirm_llm", "Confirm"),
+        Binding("r", "give_reason", "Reason"),
         Binding("a", "add_references", "+Refs"),
         Binding("A", "add_citations", "+Cites"),
         Binding("j", "scroll_down", "Down", show=False),
@@ -619,6 +622,7 @@ class AbstractScreen(Screen[None]):
                     yield Static("[bold yellow]─── Tags ───[/bold yellow]")
                 tags_text = ", ".join(self.decision.tags)
                 yield Static(tags_text, markup=False)
+            <<show who decided the paper and why>>
             <<show the blind review of the paper>>
             
             # Show references if paper has them
@@ -883,7 +887,7 @@ class AbstractScreen(Screen[None]):
         self.notify(f"Added {added} new papers from citations", severity="information")
 
     def action_keep(self) -> None:
-        """Quick keep---mark paper as kept without themes."""
+        """Quick keep---keep the paper; a kept one keeps its themes."""
         if not self.review_mode:
             self.notify("Keep/discard disabled in notes mode", severity="warning")
             return
@@ -891,26 +895,7 @@ class AbstractScreen(Screen[None]):
                                   ask_tags=False, done=self._after_blind):
             return
 
-        # Check if changing an LLM decision
-        was_llm = self.decision.source.is_unreviewed
-        was_discarded = self.decision.status == DecisionStatus.DISCARDED
-
-        self.decision.status = DecisionStatus.KEPT
-        self.decision.clear_tags()
-        self.session._invalidate_cache()  # Status changed
-
-        # Mark as reviewed if it was an LLM decision
-        if was_llm:
-            from scholar.llm_review import mark_as_reviewed
-            mark_as_reviewed(
-                self.decision,
-                user_agrees=not was_discarded,
-                new_status=DecisionStatus.KEPT,
-                new_tags=[],
-            )
-        record_human_decision(self.decision, "tui", by=self.app.reviewer)
-
-        self.dismiss(None)
+        self._decide(DecisionStatus.KEPT, quick_keep_tags(self.decision))
     
     def action_keep_with_themes(self) -> None:
         """Keep with themes---open theme selection modal."""
@@ -921,28 +906,9 @@ class AbstractScreen(Screen[None]):
                                   ask_tags=True, done=self._after_blind):
             return
 
-        # Capture LLM state before modal opens
-        was_llm = self.decision.source.is_unreviewed
-        was_discarded = self.decision.status == DecisionStatus.DISCARDED
-
         def handle_themes(result: list[str] | None) -> None:
             if result is not None:  # None means cancelled
-                self.decision.status = DecisionStatus.KEPT
-                self.decision.tags = result
-                self.session._invalidate_cache()  # Status changed
-
-                # Mark as reviewed if it was an LLM decision
-                if was_llm:
-                    from scholar.llm_review import mark_as_reviewed
-                    mark_as_reviewed(
-                        self.decision,
-                        user_agrees=not was_discarded,
-                        new_status=DecisionStatus.KEPT,
-                        new_tags=result,
-                    )
-                record_human_decision(self.decision, "tui", by=self.app.reviewer)
-
-                self.dismiss(None)
+                self._decide(DecisionStatus.KEPT, result)
 
         self.app.push_screen(
             TagSelectionModal(
@@ -964,28 +930,9 @@ class AbstractScreen(Screen[None]):
                                   ask_tags=True, done=self._after_blind):
             return
 
-        # Capture LLM state before modal opens
-        was_llm = self.decision.source.is_unreviewed
-        was_kept = self.decision.status == DecisionStatus.KEPT
-
         def handle_discard(result: list[str] | None) -> None:
             if result is not None:  # None means cancelled
-                self.decision.status = DecisionStatus.DISCARDED
-                self.decision.tags = result
-                self.session._invalidate_cache()  # Status changed
-
-                # Mark as reviewed if it was an LLM decision
-                if was_llm:
-                    from scholar.llm_review import mark_as_reviewed
-                    mark_as_reviewed(
-                        self.decision,
-                        user_agrees=not was_kept,
-                        new_status=DecisionStatus.DISCARDED,
-                        new_tags=result,
-                    )
-                record_human_decision(self.decision, "tui", by=self.app.reviewer)
-
-                self.dismiss(None)
+                self._decide(DecisionStatus.DISCARDED, result)
 
         self.app.push_screen(
             TagSelectionModal(
@@ -1009,16 +956,31 @@ class AbstractScreen(Screen[None]):
             return
         if self.app.blind_refuses_confirm(self.decision):
             return
+        if self.app.confirm_as_human(self.decision):
+            self.dismiss(None)
 
-        # Mark as reviewed without changing the decision
-        from scholar.llm_review import mark_as_reviewed
-        machine = machine_name(self.decision.source)
-        mark_as_reviewed(self.decision, user_agrees=True)
-        record_human_decision(self.decision, "tui", by=self.app.reviewer)
-        self.notify(
-            f"Confirmed {machine} decision: {self.decision.status.value}"
+    def action_give_reason(self) -> None:
+        """Give the human's reason for this paper's decision."""
+        if not self.review_mode:
+            self.notify("Keep/discard disabled in notes mode", severity="warning")
+            return
+        self.app.ask_reason(
+            self.decision, done=lambda: self.refresh(recompose=True)
         )
+
+    def _decide(self, status: DecisionStatus, tags: list[str]) -> None:
+        """Store the human's decision through the app, then leave.
+
+        A refused decision leaves the screen open; a changed machine
+        decision opens the reason prompt over the paper list.
+        """
+        decision = self.decision
+        changed = self.app.decide_as_human(decision, status, tags)
+        if changed is None:
+            return
         self.dismiss(None)
+        if changed:
+            self.app.ask_reason(decision)
 
     def _after_blind(self) -> None:
         """Show the paper again, its verdict revealed."""
@@ -2143,6 +2105,7 @@ class PaperReviewApp(App):
         Binding("T", "keep_with_themes", "Themes"),
         Binding("d", "discard", "Discard"),
         Binding("C", "confirm_llm", "Confirm"),
+        Binding("r", "give_reason", "Reason"),
         Binding("s", "sort", "Sort"),
         Binding("f", "filter", "Filter"),
         Binding("F", "search_filters", "Search"),
@@ -2240,6 +2203,7 @@ class PaperReviewApp(App):
     <<app methods for unreadable notes>>
 
     <<app methods for blind review>>
+    <<app methods for a human's decision>>
 
     def _refresh_list(self) -> None:
         """Refresh the paper list display."""
@@ -2363,7 +2327,7 @@ class PaperReviewApp(App):
             self._refresh_list()
     
     def action_keep(self) -> None:
-        """Quick keep---mark current paper as kept without themes."""
+        """Quick keep---keep the current paper; a kept one keeps its themes."""
         if not self.review_mode:
             self.notify("Keep/discard disabled in notes mode", severity="warning")
             return
@@ -2372,27 +2336,8 @@ class PaperReviewApp(App):
             if self.blind_verdict(decision, DecisionStatus.KEPT,
                                   ask_tags=False, done=self._after_blind):
                 return
-            # Check if changing an LLM decision
-            was_llm = decision.source.is_unreviewed
-            was_discarded = decision.status == DecisionStatus.DISCARDED
-
-            decision.status = DecisionStatus.KEPT
-            decision.clear_tags()
-            self.session._invalidate_cache()  # Status changed
-
-            # Mark as reviewed if it was an LLM decision
-            if was_llm:
-                from scholar.llm_review import mark_as_reviewed
-                mark_as_reviewed(
-                    decision,
-                    user_agrees=not was_discarded,
-                    new_status=DecisionStatus.KEPT,
-                    new_tags=[],
-                )
-            record_human_decision(decision, "tui", by=self.reviewer)
-
-            self._refresh_list()
-            self._update_status()
+            self._decide_in_list(decision, DecisionStatus.KEPT,
+                                 quick_keep_tags(decision))
     
     def action_keep_with_themes(self) -> None:
         """Keep with themes---open theme selection modal."""
@@ -2420,25 +2365,7 @@ class PaperReviewApp(App):
         if result is not None:  # None means cancelled
             decision = self.get_current_decision()
             if decision:
-                # Check if this is changing an LLM decision
-                was_llm = decision.source.is_unreviewed
-                was_discarded = decision.status == DecisionStatus.DISCARDED
-
-                decision.status = DecisionStatus.KEPT
-                decision.tags = result
-                self.session._invalidate_cache()  # Status changed
-
-                # Mark as reviewed if it was an LLM decision
-                if was_llm:
-                    from scholar.llm_review import mark_as_reviewed
-                    # User changed it if it was discarded, or agrees if already kept
-                    mark_as_reviewed(
-                        decision,
-                        user_agrees=not was_discarded,
-                        new_status=DecisionStatus.KEPT,
-                        new_tags=result,
-                    )
-                record_human_decision(decision, "tui", by=self.reviewer)
+                self._decide_in_list(decision, DecisionStatus.KEPT, result)
         self._refresh_list()
         self._update_status()
         self.query_one("#paper-list", ListView).focus()
@@ -2469,25 +2396,8 @@ class PaperReviewApp(App):
         if result is not None:  # None means cancelled
             decision = self.get_current_decision()
             if decision:
-                # Check if this is changing an LLM decision
-                was_llm = decision.source.is_unreviewed
-                was_kept = decision.status == DecisionStatus.KEPT
-
-                decision.status = DecisionStatus.DISCARDED
-                decision.tags = result
-                self.session._invalidate_cache()  # Status changed
-
-                # Mark as reviewed if it was an LLM decision
-                if was_llm:
-                    from scholar.llm_review import mark_as_reviewed
-                    # User changed it if it was kept, or agrees if already discarded
-                    mark_as_reviewed(
-                        decision,
-                        user_agrees=not was_kept,
-                        new_status=DecisionStatus.DISCARDED,
-                        new_tags=result,
-                    )
-                record_human_decision(decision, "tui", by=self.reviewer)
+                self._decide_in_list(decision, DecisionStatus.DISCARDED,
+                                     result)
         self._refresh_list()
         self._update_status()
         self.query_one("#paper-list", ListView).focus()
@@ -2506,15 +2416,27 @@ class PaperReviewApp(App):
             return
         if self.blind_refuses_confirm(decision):
             return
+        if self.confirm_as_human(decision):
+            self._refresh_list()
+            self._update_status()
 
-        # Mark as reviewed without changing the decision
-        from scholar.llm_review import mark_as_reviewed
-        machine = machine_name(decision.source)
-        mark_as_reviewed(decision, user_agrees=True)
-        record_human_decision(decision, "tui", by=self.reviewer)
-        self.notify(f"Confirmed {machine} decision: {decision.status.value}")
+    def action_give_reason(self) -> None:
+        """Give the human's reason for the current paper's decision."""
+        if not self.review_mode:
+            self.notify("Keep/discard disabled in notes mode", severity="warning")
+            return
+        decision = self.get_current_decision()
+        if decision:
+            self.ask_reason(decision)
+
+    def _decide_in_list(self, decision: ReviewDecision,
+                        status: DecisionStatus, tags: list[str]) -> None:
+        """Store the human's decision from the list and redraw it."""
+        changed = self.decide_as_human(decision, status, tags)
         self._refresh_list()
         self._update_status()
+        if changed:
+            self.ask_reason(decision)
 
     async def action_add_all_references(self) -> None:
         """Add references from all kept papers to session for review."""
@@ -2808,6 +2730,752 @@ class TestHumanRecordInTheTUI:
         decision = self.run([])
         assert decision.human_decided_at is None
 @
+
+\subsection{A human's decision: one procedure}
+\label{sec:tui-human-decision}
+
+A human decides in three ways: a row of a verdicts file, the
+one-record [[sessions decide]], and a key in the TUI.  Screening a
+record is one job whoever does it and however, so the three follow one
+set of rules, stated once in the review module
+(\cref{sec:decision-rules} there) and called from here as from the
+CLI (\url{https://github.com/dbosk/scholarcli/issues/349}).  The TUI
+used to repeat its own version of the procedure in each of its eight
+handlers: keep, keep with themes, discard and confirm, once on the
+paper list and once on the detail screen.  Each set the status and the
+tags, asked [[mark_as_reviewed]] whether the human agreed with a
+machine's decision (by the status alone), and wrote the record of the
+review.  The handlers now only collect the human's verdict, the status
+and the tags chosen in the dialog, and hand it to one method of the
+application, [[decide_as_human]], which both screens reach (the detail
+screen through [[self.app]]).  It applies the two rules:
+\begin{description}
+\item[One category, and it fits its status.]  The tags the human
+  chose must hold at most one category, and in a session that uses
+  categories it must not contradict the verdict ([[decision_refusal]]):
+  a discard does not take [[supports-claim]] or [[qualifies-claim]], a
+  keep does not take [[off-topic-false-hit]].  The tag dialogs
+  preselect the record's tags and return the whole set, so discarding
+  a record kept under [[supports-claim]] and accepting the dialog as it
+  opens would store exactly that pair, and ticking
+  [[off-topic-false-hit]] as well would store both categories.  The
+  decision is then not stored at all, and the TUI says why the way it
+  says everything, in a notification: the words of [[sessions decide]]
+  for two categories (the human unticks one; the TUI does not guess
+  which was meant), or which categories fit and that a record bearing
+  on the claim but excluded is discarded with the exclusion criterion
+  and no category.  The detail screen stays open, so the
+  human can try again.  It shows for a little longer than the default,
+  since it asks the reader to act.
+\item[A changed category is a change.]  On an unreviewed machine
+  decision, the human confirms it only when the status and the category
+  stay ([[changes_the_verdict]]), so keeping a machine's keep under
+  another category is a correction, an example, as a changed status
+  is.  The quick keep of a record already kept leaves its tags (below),
+  so on a machine keep it is a confirmation.
+\end{description}
+The return value says what happened: [[None]] for a refusal, otherwise
+whether a verdict was changed, which opens the reason prompt (below).
+
+A human who decides again a decision that is already the human's, with
+the same status and the same category, has not changed it: the reason
+in words stays, as the tags do, since it still explains the decision
+that stands.  It used to be cleared, because [[record_human_decision]]
+writes a new record and a reason not given is none, and no prompt
+opened to give it back.  A changed status or category is a new
+decision, so the old reason goes, as before, and the prompt opens as it
+does for a machine's changed decision: it is the same code path, the
+[[changed]] flag, now raised for any decided record and not only a
+machine's.  A pending paper decided for the first time is not a change
+of anything and opens no prompt.  The words belong to whoever wrote
+them, so when another named human made the decision ([[r]]'s rule,
+below), deciding it again does not take them over.
+
+<<app methods for a human's decision>>=
+def decide_as_human(self, decision: ReviewDecision, status: DecisionStatus,
+                    tags: list[str]) -> bool | None:
+    """Store a human's decision of `status` with `tags` on `decision`.
+
+    Returns None when the category rule refuses it (nothing stored, the
+    user told why), else whether it changed the status or the category
+    of a decision that was made (a machine's or a human's), which asks
+    for a reason. A human's decision decided again unchanged keeps its
+    reason, unless another named human made it.
+    """
+    refusal = decision_refusal(self.session.decisions, status, tags,
+                               named_by="the chosen tags name")
+    if refusal is not None:
+        self.notify(refusal, severity="error", timeout=RULE_NOTICE_TIMEOUT)
+        return None
+    was_machine = decision.source.is_unreviewed
+    changed = decision.is_decided and \
+        changes_the_verdict(decision, status, tags)
+    keeps_words = decision.is_decided and not was_machine \
+        and not changed and not self.decided_by_another(decision)
+    reason = decision.human_reason if keeps_words else None
+    decision.status = status
+    decision.tags = list(tags)
+    self.session._invalidate_cache()
+    if was_machine:
+        from scholar.llm_review import mark_as_reviewed
+
+        mark_as_reviewed(decision, user_agrees=not changed,
+                         new_status=status, new_tags=list(tags))
+    record_human_decision(decision, "tui", by=self.reviewer, reason=reason)
+    return changed
+<<tui imports>>=
+from scholar.review import (
+    REVIEWED_BY_A_HUMAN,
+    changes_the_verdict,
+    decision_refusal,
+    set_human_reason,
+    decision_trace,
+    source_label,
+)
+<<tui data structures>>=
+RULE_NOTICE_TIMEOUT = 15  # seconds; the default of 5 is short for advice
+@
+
+The quick keep ([[K]]) used to clear the tags whatever the record held.
+On a pending paper that is nothing, and on a discard it drops the
+motivations, which do not describe a keep; both stay so.  On a record
+that is already kept it now leaves the tags as they are.  Clearing
+them there made [[K]] say something the human did not mean: on an
+unreviewed machine keep it removed the category, so under the rule
+above every agreeing [[K]] counted as a change, set [[is_example]] and
+opened the reason prompt, and the report read each such paper as
+\enquote{changed}.  The human who presses [[K]] on a keep agrees that
+it is kept; with the tags left, that is a confirmation, stored exactly
+as [[C]] stores it.  A human who wants other themes uses [[T]].
+
+<<tui data structures>>=
+def quick_keep_tags(decision: ReviewDecision) -> list[str]:
+    """The tags a quick keep leaves: a kept record's own, else none."""
+    if decision.status == DecisionStatus.KEPT:
+        return list(decision.tags)
+    return []
+@
+
+Confirming ([[C]]) stores nothing new about the verdict: the status and
+the tags stay, the source becomes the reviewed one, [[is_example]] is
+cleared, and the human's record of the review is written.  What it
+does store is the human's word that the machine's verdict is right.  A
+machine's discard under a bearing category (an agent's one-record
+decision could make one before \#349) would become a pair that a human
+stands behind, which the rule refuses to a human's own decision; so
+confirming such a decision is refused the same way, and the human keeps
+it ([[K]]) or discards it with its criterion ([[d]]).  A decision that
+holds two categories (stored before the rule, \cref{sec:decision-rules}
+in the review module) is refused for the same reason, until the human
+decides it again with one.  The pair stays
+as stored, and displayable, until then.  Everything else is the
+confirmation as it was, key for key, which the tests below pin.
+
+<<app methods for a human's decision>>=
+def confirm_as_human(self, decision: ReviewDecision,
+                     reason: str | None = None) -> bool:
+    """Confirm an unreviewed machine decision as the human's; say so.
+
+    Refused, with a notification, when the decision holds a category
+    that does not fit its status. `reason` is the human's, if given.
+    """
+    refusal = decision_refusal(self.session.decisions, decision.status,
+                               decision.tags, named_by="it holds")
+    if refusal is not None:
+        self.notify("Confirming would make this decision yours. "
+                    + refusal, severity="error",
+                    timeout=RULE_NOTICE_TIMEOUT)
+        return False
+    from scholar.llm_review import mark_as_reviewed
+
+    machine = machine_name(decision.source)
+    mark_as_reviewed(decision, user_agrees=True)
+    record_human_decision(decision, "tui", by=self.reviewer, reason=reason)
+    self.notify(f"Confirmed {machine} decision: {decision.status.value}")
+    return True
+@
+
+\paragraph{A reason in words.}
+A decision's reason is its tags together with a reason in words when
+one is given (the author's rule, \cref{sec:decision-trace} in the
+review module): expected and counted, never forced.  [[sessions
+decide]] takes the human's words with [[--reason]] or in a file's
+column, and stores them as [[human_reason]] through
+[[record_human_decision]]; the TUI had no way to give them.  The key
+[[r]] (free on both screens) now opens a prompt for the current record,
+[[ReasonModal]], whose words go through the same function into the same
+field.  It shows what a reviewer needs to word a reason: the machine's
+reason when the record has a machine's part (the trace's machine,
+whether the human has reviewed it or not), the human's present reason,
+and the session's earlier reasons in words to pick from.  The earlier
+reasons are the humans' ([[human_reason]]), most used first, at most
+[[REASON_CHOICES]] of them: a reason worth picking is one a reviewer
+gives to many records (\enquote{bears on the claim, but a workshop
+paper}), while a classifier's or an agent's reason is written for its
+one record and would only crowd the list.  An empty entry, or Escape,
+leaves the reason as it was.
+
+What the words are attached to depends on the record:
+\begin{description}
+\item[A pending record] has no decision to give a reason for; the key
+  says so.  Its decision with tags needs no prompt: its tags are a
+  reason.
+\item[A human's or a reviewed decision] gets the words and nothing
+  else ([[set_human_reason]], \cref{sec:human-reason} in the review
+  module): adding words to a decision is not deciding again, so who
+  decided, when, through what and from which batch stay as stored.
+  The words are the decider's, though, so when the TUI has a
+  reviewer's name and the decision another's, the key refuses and says
+  who decided; to give a reason of one's own, one decides again.  A
+  record without a name, or a TUI without one, cannot tell two people
+  apart and takes the words.
+\item[An unreviewed machine decision] is confirmed with the words: a
+  reason of the human's own, with the status and category as stored,
+  is a confirmation, so the key refuses where [[C]] refuses.  The
+  prompt says so in one line before the words are typed
+  ([[confirms]], the status being confirmed), since a reviewer who
+  only meant to note something would otherwise learn from the
+  notification afterwards that the decision is now theirs; Escape
+  still leaves it unconfirmed.
+\end{description}
+When a human changes a machine's decision (its status or its
+category), the prompt opens by itself, since the change is the
+decision a reader of the report will most want explained; one key,
+Escape, dismisses it.  One-key confirmation ([[C]]) opens no prompt.
+In blind mode, a hidden decision gets no prompt, which would show the
+machine's reason.
+
+<<tui data structures>>=
+REASON_CHOICES = 5
+<<tui imports>>=
+from collections import Counter
+<<tui blind review helpers>>=
+def earlier_reasons(decisions, limit: int = REASON_CHOICES) -> list[str]:
+    """The humans' reasons in words among `decisions`, most used first.
+
+    Ties keep the order in which the reasons first occur; at most
+    `limit` are returned.
+    """
+    counts = Counter(
+        d.human_reason for d in decisions if d.is_decided and d.human_reason
+    )
+    return [reason for reason, _ in counts.most_common(limit)]
+@
+
+The prompt is reached from the list and from the detail screen; the
+detail screen passes [[done]], its own redraw, since the paper list is
+not the screen on top then and cannot be redrawn.
+
+<<app methods for a human's decision>>=
+def ask_reason(self, decision: ReviewDecision, done=None) -> None:
+    """Open the reason prompt for `decision`, then store the words."""
+    if not decision.is_decided:
+        self.notify("Decide first (K, T or d): a reason belongs to a "
+                    "decision", severity="warning")
+        return
+    if self.blind_refuses_confirm(decision):
+        return
+    if decision.source.is_unreviewed and decision_refusal(
+            self.session.decisions, decision.status, decision.tags):
+        self.confirm_as_human(decision)
+        return
+    if self.decided_by_another(decision):
+        self.notify(f"Decided by {decision.human_by}: to give your own "
+                    "reason, decide it again (K, T or d)",
+                    severity="warning", markup=False)
+        return
+    machine = decision_trace(decision).machine
+    self.push_screen(
+        ReasonModal(
+            title=decision.paper.title or "",
+            machine=machine_name(decision.source),
+            machine_reason=machine.reason if machine else None,
+            current=decision.human_reason,
+            choices=earlier_reasons(self.session.decisions),
+            confirms=decision.status.value
+            if decision.source.is_unreviewed else None,
+        ),
+        lambda words: self._take_reason(decision, words, done),
+    )
+
+def decided_by_another(self, decision: ReviewDecision) -> bool:
+    """Whether a named human other than the TUI's reviewer decided it."""
+    return bool(self.reviewer and decision.human_by
+                and decision.human_by != self.reviewer)
+
+def _take_reason(self, decision: ReviewDecision, words: str | None,
+                 done) -> None:
+    """Store the human's `words` for `decision`; None leaves it."""
+    if words is None:
+        return
+    try:
+        if decision.source.is_unreviewed:
+            if not self.confirm_as_human(decision, reason=words):
+                return
+        else:
+            set_human_reason(decision, words)
+            self.notify("Reason recorded")
+    except ValueError as error:
+        self.notify(f"Reason not recorded: {error}", severity="error")
+        return
+    if done is not None:
+        done()
+    else:
+        self._refresh_list()
+        self._update_status()
+@
+
+The prompt itself is a small dialog: the record's title, the machine's
+and the human's present reasons, the earlier reasons in an
+[[OptionList]] and an input that has the focus.  Enter on the input
+gives its text, stripped (an empty one is [[None]]); Tab moves to the
+list, where Enter picks the highlighted reason; Escape gives [[None]].
+Stored strings are shown as plain text, never as markup, as everywhere
+else in the TUI.
+
+<<tui reason modal>>=
+class ReasonModal(ModalScreen[str | None]):
+    """Ask the human's reason in words for a decision."""
+
+    BINDINGS = [Binding("escape", "cancel", "Skip")]
+
+    DEFAULT_CSS = """
+    ReasonModal {
+        align: center middle;
+    }
+    #reason-dialog {
+        width: 80;
+        height: auto;
+        border: thick $primary;
+        background: $surface;
+        padding: 1 2;
+    }
+    #reason-choices {
+        height: auto;
+        max-height: 8;
+    }
+    """
+
+    def __init__(self, title: str, machine: str, machine_reason: str | None,
+                 current: str | None, choices: list[str],
+                 confirms: str | None = None) -> None:
+        super().__init__()
+        self.confirms = confirms
+        self.title_text = title
+        self.machine = machine
+        self.machine_reason = machine_reason
+        self.current = current
+        self.choices = choices
+
+    def compose(self) -> ComposeResult:
+        with Container(id="reason-dialog"):
+            yield Static(Text(f"Reason: {self.title_text}", style="bold"))
+            if self.confirms:
+                yield Static(Text(
+                    f"Giving a reason confirms the {self.machine}'s "
+                    f"decision ({self.confirms}) as yours."))
+            if self.machine_reason:
+                yield Static(Text(
+                    f"The {self.machine}'s reason: {self.machine_reason}"))
+            if self.current:
+                yield Static(Text(f"Your reason now: {self.current}"))
+            if self.choices:
+                yield Static("Earlier reasons (Tab, then Enter, to pick one):")
+                yield OptionList(*(Text(c) for c in self.choices),
+                                 id="reason-choices")
+            yield Input(placeholder="Your reason (Enter; Escape skips)",
+                        id="reason-input")
+
+    def on_mount(self) -> None:
+        self.query_one("#reason-input", Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self.dismiss(event.value.strip() or None)
+
+    def on_option_list_option_selected(
+        self, event: OptionList.OptionSelected
+    ) -> None:
+        self.dismiss(self.choices[event.option_index])
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+@
+
+\paragraph{Who decided, and why.}
+The detail screen showed the tags, and the machine's reason only in a
+blind review.  It now shows, for a decided record outside a blind
+review, who decided ([[source_label]], the wording of [[sessions show]]
+and the report; for a reviewed machine decision whether the human
+confirmed or changed it) and the reason that stands, read by
+[[decision_trace]]: the decider's words, or, for a confirmed machine
+decision whose human gave none, the machine's.  A human's, an agent's
+and a classifier's reason therefore read the same, with whose it is.
+A blind review shows its own section instead (\cref{sec:tui-blind-review}),
+which reads the reason the same way.
+
+<<tui blind review helpers>>=
+def decision_lines(decision: ReviewDecision) -> list[str]:
+    """Who decided `decision` and the reason that stands, as plain lines."""
+    if not decision.is_decided:
+        return []
+    trace = decision_trace(decision)
+    label = source_label(decision.source)
+    if trace.machine is not None and decision.source in REVIEWED_BY_A_HUMAN:
+        label += ", confirmed" if trace.confirmed else ", changed"
+    lines = [f"Decided by: {label}"]
+    if trace.reason:
+        part = trace.decider if trace.decider is not None \
+            and trace.decider.reason else trace.machine
+        kind = {"llm": "LLM"}.get(part.kind, part.kind)
+        who = kind if part.name is None else f"{kind} {part.name}"
+        lines.append(f"Reason ({who}): {trace.reason}")
+    return lines
+<<show who decided the paper and why>>=
+lines = decision_lines(self.decision) if blind is None else []
+if lines:
+    yield Static("")
+    yield Static("[bold]─── Decision ───[/bold]")
+    for line in lines:
+        yield Static(line, markup=False)
+@
+
+\paragraph{Testing the procedure.}
+The tests drive the real application headless, through
+[[TestBlindReview.run]] (\cref{sec:tui-blind-review}) without blind
+mode, on a session that uses categories: an agent's keep under
+[[supports-claim]] with a reason, a pending paper and a human's discard
+with a reason in words.  They check the refused pair on both screens
+(nothing stored, the notification, the screen kept), the refused
+confirmation of a stored pair, a changed category as a change with the
+prompt opening by itself and dismissed with Escape, a reason typed and
+one picked from the earlier ones, the key on a pending paper, the
+detail screen's lines, and a session without categories.  One-key
+confirmation is pinned field by field: the decision differs from the
+one before only in the fields a confirmation always set (the source and
+the record of the review, with the reviewer's name that [[run]] gives).
+
+<<test functions>>=
+class TestHumanDecisionInTheTUI:
+  """One procedure for a human's decision in the TUI (#349)."""
+
+  <<human decision in the TUI test methods>>
+<<human decision in the TUI test methods>>=
+@staticmethod
+def session(categories=True):
+  from scholar.review import record_human_decision as record
+
+  machine = ReviewDecision(
+    paper=Paper(title="Paper 0", authors=["Ada Lovelace"],
+                doi="10.5555/human-0"),
+    provider="openalex", status=DecisionStatus.KEPT,
+    tags=["supports-claim", "loops"] if categories else ["loops"],
+    source=ReviewSource.AGENT_UNREVIEWED, llm_confidence=0.8,
+    agent_reason="Interviews novices about loops.", agent_by="agent-1")
+  pending = ReviewDecision(
+    paper=Paper(title="Paper 1", authors=["Ada Lovelace"],
+                doi="10.5555/human-1"), provider="openalex")
+  human = ReviewDecision(
+    paper=Paper(title="Paper 2", authors=["Ada Lovelace"],
+                doi="10.5555/human-2"), provider="openalex",
+    status=DecisionStatus.DISCARDED, tags=["workshop-paper"])
+  record(human, "decide", reason="Bears on it, but a workshop paper.")
+  return ReviewSession(
+    query="q", providers=["openalex"], timestamp=datetime(2026, 11, 27),
+    decisions=[machine, pending, human])
+
+@classmethod
+def run(cls, keys, session=None, inspect=None, reviewer="alice"):
+  return TestBlindReview.run(keys, session=session or cls.session(),
+                             inspect=inspect, blind=False,
+                             reviewer=reviewer)
+
+def test_a_misfit_is_refused_on_both_screens(self):
+  typed = ["d", "tab", *"supports", "minus", *"claim", "enter", "enter"]
+  for keys in (typed, ["enter", *typed]):
+    screens = []
+    app, decision = self.run(keys, inspect=lambda app: screens.append(
+      type(app.screen).__name__))
+    assert (decision.status, decision.source) \
+      == (DecisionStatus.KEPT, ReviewSource.AGENT_UNREVIEWED), keys
+    assert decision.human_decided_at is None, keys
+    assert any("Category supports-claim does not fit a discarded "
+               "decision" in str(n) for n in app.notices), keys
+  assert screens == ["AbstractScreen"]
+
+def test_two_categories_are_refused(self):
+  for source in (ReviewSource.AGENT_UNREVIEWED, ReviewSource.HUMAN):
+    for keys, status, category in (
+        (["d", "tab", *"off", "minus", *"topic", "minus", *"false",
+          "minus", *"hit", "enter", "enter"],
+         DecisionStatus.DISCARDED, "off-topic-false-hit"),
+        (["T", "tab", *"qualifies", "minus", *"claim", "enter", "enter"],
+         DecisionStatus.KEPT, "qualifies-claim")):
+      session = self.session()
+      session.decisions[0].source = source
+      session.decisions[2].tags.append("supports-claim")
+      app, decision = self.run(keys, session=session)
+      assert (decision.status, decision.tags, decision.source) \
+        == (DecisionStatus.KEPT, ["supports-claim", "loops"], source), \
+        (source, keys)
+      assert decision.human_decided_at is None, (source, keys)
+      assert any(str(n).startswith("A paper holds one category, but "
+                                   "the chosen tags name ")
+                 and category in str(n) for n in app.notices), \
+        (source, keys)
+
+def test_a_stored_pair_of_categories_is_shown_and_left_one(self):
+  session = self.session()
+  stored = session.decisions[0]
+  stored.source = ReviewSource.HUMAN
+  stored.tags = ["supports-claim", "qualifies-claim"]
+  seen = []
+  app, decision = self.run(["enter"], session=session,
+                           inspect=lambda app: seen.append(
+                             TestBlindReview.text(app)))
+  assert "supports-claim" in seen[0] and "qualifies-claim" in seen[0]
+  app, decision = self.run(["T", "enter"], session=session)
+  assert decision.tags == ["supports-claim", "qualifies-claim"]
+  assert decision.human_decided_at is None
+  app, decision = self.run(["T", "space", "enter"], session=session)
+  assert len([t for t in decision.tags
+              if t in ("supports-claim", "qualifies-claim")]) == 1
+
+def test_a_stored_misfit_of_ones_own(self):
+  import copy
+  import dataclasses
+  from scholar.review import record_human_decision as record
+
+  def paired():
+    session = self.session()
+    human = session.decisions[2]
+    human.tags = ["supports-claim", "workshop-paper"]
+    record(human, "decide", by="alice", reason="Old words.")
+    session.decisions.reverse()
+    return session
+
+  for keys in (["d", "enter"], ["enter", "d", "enter"]):
+    session = paired()
+    before = copy.deepcopy(session.decisions[0])
+    app, decision = self.run(keys, session=session)
+    assert decision == before, keys
+    assert any("Category supports-claim does not fit a discarded "
+               "decision" in str(n) for n in app.notices), keys
+  session = paired()
+  before = copy.deepcopy(session.decisions[0])
+  _, decision = self.run(["r", *"new", "enter"], session=session)
+  changed = {f.name for f in dataclasses.fields(decision)
+             if getattr(before, f.name) != getattr(decision, f.name)}
+  assert (changed, decision.human_reason) == ({"human_reason"}, "new")
+  _, kept = self.run(["K", "escape"], session=paired())
+  assert (kept.status, kept.tags) == (DecisionStatus.KEPT, [])
+
+def test_a_stored_pair_cannot_be_confirmed(self):
+  session = self.session()
+  session.decisions[0].status = DecisionStatus.DISCARDED
+  for keys in (["C"], ["r"]):
+    app, decision = self.run(keys, session=session)
+    assert decision.source == ReviewSource.AGENT_UNREVIEWED, keys
+    assert any(str(n).startswith("Confirming would make this decision "
+                                 "yours.") for n in app.notices), keys
+
+def test_one_key_confirmation_is_unchanged(self):
+  import copy
+  import dataclasses
+
+  session = self.session()
+  before = copy.deepcopy(session.decisions[0])
+  app, decision = self.run(["C"], session=session)
+  changed = {f.name for f in dataclasses.fields(decision)
+             if getattr(before, f.name) != getattr(decision, f.name)}
+  assert changed == {"source", "human_decided_at", "human_decided_via",
+                     "human_by"}
+  assert (decision.source, decision.is_example, decision.human_by,
+          decision.human_reason, decision.tags) \
+    == (ReviewSource.AGENT_REVIEWED, False, "alice", None,
+        ["supports-claim", "loops"])
+  assert "Confirmed agent decision: kept" in app.notices
+
+def test_a_changed_category_is_a_change_and_asks_why(self):
+  session = self.session()
+  session.decisions[0].tags = ["supports-claim"]
+  app, decision = self.run(
+    ["T", "space", "tab", *"qualifies", "minus", *"claim", "enter",
+     "enter", "escape"], session=session)
+  assert (decision.status, decision.tags) \
+    == (DecisionStatus.KEPT, ["qualifies-claim"])
+  assert (decision.source, decision.is_example) \
+    == (ReviewSource.AGENT_REVIEWED, True)
+  assert decision.human_reason is None
+  assert decision.agent_reason == "Interviews novices about loops."
+
+def test_a_quick_keep_of_a_machine_keep_is_a_confirmation(self):
+  import dataclasses
+
+  for keys in (["K"], ["enter", "K"]):
+    screens = []
+    _, quick = self.run(keys, inspect=lambda app: screens.append(
+      type(app.screen).__name__))
+    _, confirmed = self.run(["C"])
+    differ = {f.name for f in dataclasses.fields(quick)
+              if getattr(quick, f.name) != getattr(confirmed, f.name)}
+    assert differ <= {"human_decided_at"}, keys
+    assert (quick.source, quick.is_example, quick.tags) \
+      == (ReviewSource.AGENT_REVIEWED, False,
+          ["supports-claim", "loops"]), keys
+    assert screens != ["ReasonModal"], keys
+
+def test_a_quick_keep_of_a_discard_or_a_pending_paper_has_no_tags(self):
+  session = self.session()
+  session.decisions[0].status = DecisionStatus.DISCARDED
+  session.decisions[0].tags = ["workshop-paper"]
+  _, overturned = self.run(["K", "escape"], session=session)
+  assert (overturned.status, overturned.tags, overturned.is_example) \
+    == (DecisionStatus.KEPT, [], True)
+  kept = []
+  self.run(["j", "K"], inspect=lambda app: kept.append(
+    app.session.decisions[1]))
+  assert (kept[0].status, kept[0].tags) == (DecisionStatus.KEPT, [])
+
+@classmethod
+def discarded(cls):
+  session = cls.session()
+  session.decisions[0].status = DecisionStatus.DISCARDED
+  session.decisions[0].tags = ["workshop-paper"]
+  return session
+
+def test_a_reason_typed_and_one_picked(self):
+  _, typed = self.run(["K", *"tutors", "enter"], session=self.discarded())
+  assert typed.human_reason == "tutors"
+  assert typed.human_decided_via == "tui"
+  _, picked = self.run(["K", "tab", "enter"], session=self.discarded())
+  assert picked.human_reason == "Bears on it, but a workshop paper."
+  _, confirmed = self.run(["r", *"agreed", "enter"])
+  assert (confirmed.source, confirmed.is_example,
+          confirmed.human_reason) \
+    == (ReviewSource.AGENT_REVIEWED, False, "agreed")
+  _, left = self.run(["r", "enter"])
+  assert left.source == ReviewSource.AGENT_UNREVIEWED
+
+def test_words_added_to_a_human_decision_change_only_the_reason(self):
+  import copy
+  import dataclasses
+  from scholar.review import record_human_decision as record
+
+  for source in (ReviewSource.HUMAN, ReviewSource.AGENT_REVIEWED):
+    for reviewer in (None, "bob"):
+      session = self.session()
+      human = session.decisions[2]
+      human.source = source
+      record(human, "decide", by="bob", at="2026-11-26T09:00:00+00:00",
+             reason="First words.", batch="b-1")
+      session.decisions.reverse()
+      before = copy.deepcopy(human)
+      _, decision = self.run(["r", *"later", "enter"], session=session,
+                             reviewer=reviewer)
+      changed = {f.name for f in dataclasses.fields(decision)
+                 if getattr(before, f.name) != getattr(decision, f.name)}
+      assert changed == {"human_reason"}, (source, reviewer)
+      assert (decision.human_reason, decision.human_batch,
+              decision.human_by, decision.human_decided_via) \
+        == ("later", "b-1", "bob", "decide"), (source, reviewer)
+
+def test_words_on_another_reviewers_decision_are_refused(self):
+  import copy
+  from scholar.review import record_human_decision as record
+
+  session = self.session()
+  record(session.decisions[2], "decide", by="bob", reason="Bob's words.")
+  session.decisions.reverse()
+  before = copy.deepcopy(session.decisions[0])
+  screens = []
+  app, decision = self.run(["r"], session=session,
+                           inspect=lambda app: screens.append(
+                             type(app.screen).__name__))
+  assert decision == before
+  assert screens != ["ReasonModal"]
+  assert ("Decided by bob: to give your own reason, decide it again "
+          "(K, T or d)") in app.notices
+
+def test_the_prompt_says_when_words_confirm(self):
+  seen = []
+  self.run(["r"], inspect=lambda app: seen.append(
+    TestBlindReview.text(app)))
+  assert ("Giving a reason confirms the agent's decision (kept) as "
+          "yours.") in seen[0]
+  seen.clear()
+  self.run(["j", "j", "r"], inspect=lambda app: seen.append(
+    TestBlindReview.text(app)))
+  assert "Reason: Paper 2" in seen[0]
+  assert "Giving a reason confirms" not in seen[0]
+
+def test_deciding_ones_own_decision_again(self):
+  def human_first(by=None):
+    session = self.session()
+    if by is not None:
+      session.decisions[2].human_by = by
+    session.decisions.reverse()
+    return session
+
+  words = "Bears on it, but a workshop paper."
+  for keys in (["d", "enter"], ["enter", "d", "enter"]):
+    screens = []
+    _, same = self.run(keys, session=human_first(),
+                       inspect=lambda app: screens.append(
+                         type(app.screen).__name__))
+    assert (same.status, same.tags, same.human_reason) \
+      == (DecisionStatus.DISCARDED, ["workshop-paper"], words), keys
+    assert same.human_decided_via == "tui", keys
+    assert screens != ["ReasonModal"], keys
+  screens = []
+  _, kept = self.run(["K"], session=human_first(),
+                     inspect=lambda app: screens.append(
+                       type(app.screen).__name__))
+  assert (kept.status, kept.human_reason, screens) \
+    == (DecisionStatus.KEPT, None, ["ReasonModal"])
+  _, other = self.run(["d", "enter"], session=human_first(by="bob"))
+  assert (other.human_by, other.human_reason) == ("alice", None)
+
+def test_the_reason_key_on_a_pending_paper(self):
+  app, _ = self.run(["j", "r"])
+  assert "Decide first (K, T or d): a reason belongs to a decision" \
+    in app.notices
+
+def test_the_detail_screen_says_who_decided_and_why(self):
+  seen = []
+  self.run(["enter"], inspect=lambda app: seen.append(
+    TestBlindReview.text(app)))
+  assert "Decided by: agent, unreviewed" in seen[0]
+  assert "Reason (agent agent-1): Interviews novices about loops." \
+    in seen[0]
+  seen.clear()
+  self.run(["j", "j", "enter"], inspect=lambda app: seen.append(
+    TestBlindReview.text(app)))
+  assert "Decided by: human" in seen[0]
+  assert "Reason (human): Bears on it, but a workshop paper." in seen[0]
+  for keys, outcome in ((["C"], "confirmed"),
+                        (["d", "tab", *"venue", "enter", "enter", "escape"],
+                         "changed")):
+    seen.clear()
+    self.run([*keys, "enter"], inspect=lambda app: seen.append(
+      TestBlindReview.text(app)))
+    assert f"Decided by: agent, reviewed by a human, {outcome}" in seen[0]
+  assert "Reason (agent agent-1)" not in seen[0]
+
+def test_the_earlier_reasons_most_used_first(self):
+  decisions = self.session().decisions
+  decisions[0].human_reason = "Second."
+  decisions[1].human_reason = "Pending, not counted."
+  assert earlier_reasons(decisions + decisions[2:], limit=2) \
+    == ["Bears on it, but a workshop paper.", "Second."]
+
+def test_a_session_without_categories_is_not_bound(self):
+  session = self.session(categories=False)
+  _, decision = self.run(["d", "tab", *"supports", "minus", *"claim",
+                          "enter", "enter", "escape"], session=session)
+  assert decision.status == DecisionStatus.DISCARDED
+  assert "supports-claim" in decision.tags
+@
+
 
 \subsection{A notes file that cannot be read}
 \label{sec:tui-unreadable-notes}
@@ -4055,7 +4723,7 @@ if blind == "revealed":
     )
     yield Static(f"The decision: {revealed_verdict(self.decision)}",
                  markup=False)
-    reason = self.decision.llm_reason or self.decision.agent_reason
+    reason = decision_trace(self.decision).reason
     if reason:
         yield Static(f"Reason: {reason}", markup=False)
     yield Static("[dim]Press [bold yellow]C[/bold yellow] to confirm the "
@@ -4205,6 +4873,15 @@ in its row; the status bar's counts leave it out.  Without blind mode
 the same row and counts show it.
 
 <<blind review test methods>>=
+def test_the_reason_key_keeps_a_hidden_verdict_hidden(self):
+  screens = []
+  app, decision = self.run(["r"], inspect=lambda app: screens.append(
+    type(app.screen).__name__))
+  assert screens != ["ReasonModal"]
+  assert decision.source == ReviewSource.LLM_UNREVIEWED
+  assert ("Give your own verdict first (K, T or d): blind mode hides "
+          "this decision") in app.notices
+
 def test_the_row_and_the_counts_hide_the_verdict(self):
   seen = {}
 

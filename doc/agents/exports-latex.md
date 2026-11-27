@@ -11,10 +11,19 @@ notes`:
 
 - `scholar prov import refs.bib` parses each entry's block(s) into that
   paper's note, **merging by `CLAIM`** (idempotent — re-importing never
-  duplicates) and preserving any personal note prose.
+  duplicates) and preserving any personal note prose. A block that
+  gives a field name twice (`ProvEntry.repeated`) is not imported
+  (#353): one stderr line "FILE: KEY (line L, block B): NAME is given
+  more than once; the block is not imported", the entry's other blocks
+  and the other entries are imported, exit 1 at the end.
 - `scholar prov export refs.bib` writes a paper's stored block(s) back above
   its entry; personal prose is never emitted. Prints to stdout (count on
-  stderr) by default; `--in-place/-i` overwrites the file.
+  stderr) by default; `--in-place/-i` overwrites the file. A block
+  import refuses (`ProvEntry.repeated`) is kept byte for byte among the
+  kept comment lines (`_kept_comment_lines(lines, refused)`, above the
+  regenerated blocks; before, export deleted it), with one stderr line
+  per block "FILE: KEY (line L, block B): NAME is given more than once;
+  the block is kept as written, not exported"; exit status unchanged.
 
 A note is parsed into ordered segments — `personal` (verbatim) or `prov`
 (a parsed block) — by `_split_note_segments`. Entries are keyed by
@@ -45,24 +54,55 @@ first entry (`review.nonlatin_bib_preamble`; biber copies it to
 the .bbl; checked with pdflatex/xelatex/lualatex); no stderr hint.
 All round-trip code lives in `cli.nw`'s
 `<<formatter classes>>` and `<<prov command>>` chunks.
+Entry places (#355, `sec:prov-bib-layouts`): `_parse_bib_entries(text,
+library=None)` takes each entry's start/end line and key from
+bibtexparser (`_bib_spans`: `start_line`, end = start + newlines in
+`raw`; kinds entry/failed/control/failed control/text; a failed
+entry's key from `BIB_FAILED_KEY`: after the `{`/`(`, also on the next
+line, and only if a comma follows, so `@article{` + `title = ...` has
+none; none -> not an entry); the comment run is walked UP from the entry over `%` lines,
+stopping at the end of the last entry/control block read whole (not at
+a failed one, whose `raw` runs on to the next `@`); a failed entry's
+end is clamped above the next entry's run (else export writes it
+twice); a second entry on one line is dropped. Reads the key on the
+next line, `@article(key, ...)`, and `title = "a { b"` (the old brace
+count swallowed every later block). `BIB_ENTRY_RE` and `_entry_end`
+are gone; fields are still `_extract_bib_fields`, one per line.
+Import/export now print bibtexparser's warning for a failed entry;
+its line numbers are 0-based, prov check's 1-based (left so).
+The prov readers (`_bib_spans`, `read_prov_bib`, `stray_prov_blocks`,
+the check command) parse with `_prov_bib_library`: the `@` of every
+line beginning with `%` is read as a space (same line count), since
+bibtexparser knows no `%` comments and read `@smith (2019)` in a QUOTE
+as an entry (key 2019) and `@misc{zz, here}` in a CLAIM as a failed
+one, cutting the block. `--cited-from` still parses the raw text.
 
 **`scholar prov check FILE.bib ... [--quotes] [--metadata]
 [--allow-unbacked] [-f table|json]`** (#346, cli.nw `sec:prov-check`):
 read-only on the `.bib`, notes and sessions (tested byte-identical);
 no request except `--metadata`'s Crossref lookups. Reading
-(`read_prov_bib` -> `ProvCheckEntry`): the line reader of `prov import`
-(`_parse_bib_entries`: blocks, wrapped fields, stacked blocks, `ID`)
-joined with bibtexparser (entry fields whole, LaTeX-decoded) on the
-0-based start line (`ProvEntry.entry_start` == `Block.start_line`); DOI
+(`read_prov_bib(text, library)` -> `ProvCheckEntry`): the line reader of
+`prov import` (`_parse_bib_entries`: blocks, wrapped fields, stacked
+blocks, `ID`) joined with bibtexparser (entry fields whole,
+LaTeX-decoded) on the 0-based start line (`ProvEntry.entry_start` ==
+`Block.start_line`, equal by construction since #355; the command
+parses each file once (`_prov_bib_library`) and runs the line reader
+once (`_parse_bib_entries`), passing both to `stray_prov_blocks`
+first, then `read_prov_bib`, which decodes entries in place;
+`TestProvCheckReadsOnce` counts; `_bib_entry_type(lines, i)` takes the
+lines split once, as splitting per block made 2000 entries take 10 s); DOI
 and URL from the undecoded entry, read BEFORE `transform_entry`, which
 mutates its argument (DOI via `read_bibtex_verbatim`, URL as written).
 A `DuplicateBlockKeyBlock` (checked from `ignore_error_block`) and a
 `ParsingFailedBlock` are errors; `@comment/@preamble/@string` skipped.
 A block cut off by a blank line is missing (prov import skips it too).
 Files are read as `utf-8-sig` (a BOM made the first entry blockless).
-`stray_prov_blocks` (same line walk as `_parse_bib_entries`) reports
-each block no entry directly follows (end of file, above `@string` or
-`@comment`, cut off by a blank line) as an error with its line and
+`stray_prov_blocks` (every header on a `%` line outside the runs
+`_parse_bib_entries` attached and outside entry/control blocks read
+whole) reports each block no entry directly follows (end of file, above `@string` or
+`@comment`, cut off by a blank line; a header INSIDE `@comment{...}`
+is not reported since #355, the base reported it) as an error with its
+line and
 header key: `ProvStrayBlock`, text "  KEY (line L): provenance block
 with no entry directly below it", summary ", N blocks without an
 entry", JSON `unattached` list and `summary.unattached`. A header key
@@ -74,14 +114,17 @@ Blocks: per block `prov_block_problems` over `PROV_REQUIRED_FIELDS`
 required): missing, empty, placeholder (`is_prov_placeholder`: the value
 BEGINS with the word `TODO`, capitals, so `TODO: find it` is one and
 "keep the TODO list short" is not; or the whole value a `<...>`
-template; a location, `(<loc>)`, judged alike). A QUOTE passage, or a
+template, bare or as the whole of one pair of double marks,
+`"<verbatim passage>"` (`QUOTE_PATTERN.fullmatch`, #359; `--quotes`
+skips it like `TODO`); a location, `(<loc>)`, judged alike). A QUOTE passage, or a
 part of one between ellipses (`quote_parts`), with no letter and no
 digit (`prov_passage_has_words`) is a block error "holds no words",
 with or without `--quotes`, and is never looked up.
 Fields are found by the first word of the name (`prov_field_values`:
 `QUOTE (p.3)` -> location `p.3`). A name given twice in one block is
-an error (`repeated_prov_fields` counts the comment lines; the line
-reader's dict keeps only the last, so prov import loses the others).
+an error (`repeated_prov_fields` counts the comment lines, kept as
+`ProvEntry.repeated` by the line reader; its dict keeps only the last,
+so prov import refuses the block too, see above).
 No block: error; `--allow-unbacked` makes it a note (summary "N entries
 without a block"). `--quotes` (`prov_quote_checks`): passages via
 `quotes_in_reason` (double marks only; a QUOTE without one is not
@@ -119,7 +162,11 @@ both sides have some; year (`year`, else `date`) in issued /
 published-print / published-online (not `created`/`deposited`; no
 `published` field read, unverified). Differ -> error; 404 ->
 not checked "DOI ... is not known to Crossref" (no DataCite); failure
--> not checked with reason; no DOI -> not checked. Exit 1 on any error,
+(`last_lookup_error` set: 429, 5xx, connection, cooldown) -> result
+and finding level `lookup failed` (#356), "lookup failed: metadata:
+Crossref: <reason>", counted apart (`summary.metadata["lookup
+failed"]`, text ", N lookup failed" only when N > 0), not an error but
+exit 1; no DOI -> not checked. Exit 1 on any error or failed lookup,
 else 0; 2 for an unknown `-f` (before reading); 1 with one line for an
 unreadable file (before any check; with `-f json` stdout still holds
 `{"files": [... {"file", "error"}], "entries": [], "unattached": [],
@@ -127,13 +174,15 @@ unreadable file (before any check; with `-f json` stdout still holds
 finding "  key (line L[, block B]): [not checked: |note: ]message",
 summary "E entries, B blocks, X errors[, U entries without a block][,
 S blocks without an entry][; quotes: f found, m not found, u not
-checked][; metadata: a agree, d differ, u not checked[, n notes]]." JSON: `entries` (file, key, line, blocks,
+checked][; metadata: a agree, d differ, u not checked[, f lookup
+failed][, n notes]]." JSON: `entries` (file, key, line, blocks,
 findings, `quotes`/`metadata` when asked), `files` (file, error
 null), `unattached` and `summary` (`prov_check_counts`). Left to the backing-claims skill: VERIFIED level
 words, causal/quantitative claims verified at abstract level, COUNTER
 wording and `see <key>`, missing DATE, QUOTE
-without a location. Tests: `RequestTargets.answer(path, body)`
-(conftest) serves a recorded body with status 200; `make_pdf` /
+without a location. Tests: `RequestTargets.answer(path, body,
+status=200)` (conftest) serves a recorded body, or an injected status
+(a 429 for the failed lookup); `make_pdf` /
 `make_cli_pdf` take a list of lines.
 
 ## `search -f csv` rows (#300)
