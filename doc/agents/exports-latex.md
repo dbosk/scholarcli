@@ -63,6 +63,12 @@ next line, `@article(key, ...)`, and `title = "a { b"` (the old brace
 count swallowed every later block). `BIB_ENTRY_RE` and `_entry_end`
 are gone; fields are still `_extract_bib_fields`, one per line.
 Import/export now print bibtexparser's warning for a failed entry.
+The prov readers (`_bib_spans`, `read_prov_bib`, `stray_prov_blocks`,
+the check command) parse with `_prov_bib_library`: the `@` of every
+line beginning with `%` is read as a space (same line count), since
+bibtexparser knows no `%` comments and read `@smith (2019)` in a QUOTE
+as an entry (key 2019) and `@misc{zz, here}` in a CLAIM as a failed
+one, cutting the block. `--cited-from` still parses the raw text.
 
 **`scholar prov check FILE.bib ... [--quotes] [--metadata]
 [--allow-unbacked] [-f table|json]`** (#346, cli.nw `sec:prov-check`):
