@@ -1,5 +1,7 @@
 # check.mk: `make check` builds ${CHECK_JOB}.pdf and checks what the
-# build left with check-settled.py (beside this file).  Include it after
+# build left with check-settled.py (beside this file), which passes a
+# cycle of the references (a state that comes back within a few extra
+# runs) with a warning and fails what does not settle.  Include it after
 # the shared tex.mk (or noweb.mk), with CHECK_JOB set to the job name and
 # CHECK_SOURCES to the files the document is built from.  What it accepts
 # and why: src/scholar/cli.nw, section "Keeping the woven document

@@ -278,11 +278,14 @@ LATEXFLAGS="-shell-escape -interaction=nonstopmode"` (between 7 and
 sets latexmk's `$max_repeat=10`) plus `doc/check-settled.py`: it fails
 on a missing or stale log, a LaTeX error, undefined references,
 missing PythonTeX output, or a non-zero build status, and passes a
-**two-state flip** (references alternating between two layouts) with
-the warning "the references alternate between two states and cannot
-settle". The full description is in cli.nw `sec:woven-document`
-("What the check accepts", "Two-state flips"); `TestDocumentCheck`
-(latex marker, about a minute) tests it on small documents. The root
+**cycle** of the references (a state that comes back within its 4
+extra runs: a two-state flip, or 3 or 4 states; remembered in
+`ltxobj/scholar.cycle`) with the warning "the references alternate
+between two states and cannot settle" or "... cycle through N states
+...". The full description is in cli.nw `sec:woven-document`
+("What the check accepts", "Cycles of the references");
+`TestDocumentCheck` (latex marker, about a minute and a half) tests it
+on small documents. The root
 `doc/scholar.pdf` target (used by `publish-github`) runs `check`.
 `doc/Makefile`'s rules for `../src/scholar/%.tex` name the `.nw`, so a
 changed source is re-woven (before, a stale woven chapter was used).
