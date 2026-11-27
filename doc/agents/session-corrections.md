@@ -147,6 +147,33 @@ compare one decision with itself across file versions. Wording: "without a recor
 review", never "not human" (old decisions have none). The default
 source stays `human` (an undecided paper's). Checked 2026-11-20: the
 pipx build of 4ba7a23 loads such a file and drops the fields on save.
+**Human reason (#347, review.nw `sec:human-reason`).** 4th field
+`human_reason`, the last of `HUMAN_AUDIT_FIELDS`, so every rule above
+applies (saved only when set; in `decision_state`, so a concurrent
+change is merged; not in `decision_verdict`, so copies decided alike
+with two reasons still fold and the fold keeps the newer record's
+reason; cleared by `clear_human_record`; kept in a relabel record's
+`"human"`; CSV column `human_reason` right after `human_by`; `show -f
+json` per decision, `null` when unset). Set only by
+`record_human_decision(..., reason=None)`, through
+`checked_human_reason` (stripped, blank -> None, over
+`MAX_AGENT_REASON_CHARS` -> ValueError before anything is written); a
+later human record without a reason clears it; the TUI passes none.
+`sessions decide --source human` takes `--reason`, `--reasons-file`
+and a verdicts file's REASON (optional there: empty or `-`); a
+confidence in a human's file is read, then dropped with one note
+counting the lines. A human's confirmation of an unreviewed machine
+call keeps the machine's trace: without a reason `human_reason` stays
+None, with one both are stored. `reason_quote_checks` reads it as kind
+`human` (`REASON_FIELDS`), so the decide quote check, `--strict-quotes`,
+`sessions show`'s "Reasons:" line and marks and the JSON
+`reason_quotes` (now with a `human` key) count it; the report's
+sentence reads only the machine kinds (unchanged). `sessions show`
+prints "reason (human, NAME): ..." under the agent's line
+(`human_reason_line`). Report and audit table unchanged. The build of
+main 18eda86 loads only its three fields by name
+(`dec_data.get(name)`), so it ignores the field and drops it on save
+(read, not run).
 **`scholar sessions set-abstract S (--paper-id ID | --doi D) --file F
 --from TEXT [--by NAME] [--replace] [--dry-run]`**, or `--abstracts-file
 F` (lines `ID<TAB>FROM<TAB>ABSTRACT`, split at the first two tabs, so
