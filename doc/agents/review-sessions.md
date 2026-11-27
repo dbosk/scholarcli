@@ -182,8 +182,10 @@ and error line numbers match an editor) is the selection (exit 2 with `--doi`/`-
 `--keep-trace` and no `-c` every line needs one. Usage errors (exit 2,
 before loading): `--reason`/`--reasons-file`/`--by` with `--source
 llm` (the classifier's reason is `llm classify`'s), `--reason`/
-`--reasons-file` with `human` (out of scope; `--by` alone is accepted
-for a human since #257, see "Human review record" in session-corrections.md), `--by` alone for an agent, any bad file line (all named:
+(`--reason`/`--reasons-file` with `human` are accepted since #347 and
+stored as `human_reason`, see "Human reason" in
+session-corrections.md; `--by` alone is accepted for a human since
+#257), `--by` alone for an agent, any bad file line (all named:
 `cli.parse_reasons_file`), empty or > `review.MAX_AGENT_REASON_CHARS`
 (2000, stripped, never truncated) reason. After loading: an unknown id
 exits 1 (like `--doi`), one paper given two different reasons or
@@ -223,9 +225,9 @@ included, needs exactly one fitting category (exit 2, lines named); the
 one-verdict form (`--keep/--discard --tag`) and the TUI still let a
 human record a contradicting pair until #349.
 Per source: agent as `--reasons-file` (agent_reason/by/time/batch);
-human: `record_human_decision(via="decide", by=...)`, a human's line
-has no reason or confidence (`human_verdicts_layout()`, `-` allowed;
-otherwise a bad line plus `HUMAN_REASON_NOTE`); llm: `llm_model` =
+human: `record_human_decision(via="decide", by=..., reason=row)`, the
+reason optional (`human_verdicts_layout()`: empty or `-` is none), a
+confidence dropped with one note; llm: `llm_model` =
 `--by`, `llm_reason` = `truncate_reason(row)`, `llm_decided_at` = run
 time, prompt version and truncation left None (the report's sentence
 now says "for k of them the prompt was not recorded" for decisions with
