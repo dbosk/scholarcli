@@ -109,8 +109,8 @@ and caches under whichever delivered.
   `text_files`, `text_bytes`, `orphaned_texts` (`pdf info` rows "Text
   files", "Orphaned text files" when > 0); `import_pdf` deletes the
   text under the lock before renaming a new file in ("unchanged" and
-  "recorded" keep it). A download replacing an unusable cached file
-  does not delete the old text; the mtime rule makes it stale.
+  "recorded" keep it). A download that replaces an unusable cached file
+  deletes the old text under the lock too.
 - Test PDFs are written by hand (`make_pdf` in pdf.nw, `make_cli_pdf` in
   cli.nw: optional text line, optional `/Encrypt`); in a code chunk
   every `<<` of PDF syntax must be written `@<<`.
