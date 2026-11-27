@@ -873,6 +873,30 @@ identity of every outgoing request:
   on request; skipped with `--offline`).
 - Not done: per-provider proxy selection (e.g. only Scopus and PDF
   downloads through the tunnel).
+- **Identifiers in URL paths** (#304): never paste a DOI or id into a
+  URL; a `#` cut it at the fragment, a `?` started a query. Query
+  strings go to `requests`/the client as a mapping. One encoder,
+  `network.quote_identifier` (network.nw `sec:identifier-in-path`):
+  encodes `# ? %`, space, C0/DEL, non-ASCII, `< > " { } | \ ^`, the
+  backtick and `[ ]`; keeps `/ : @ ! $ & ' ( ) * + , ; =` literal. Rule:
+  an identifier that worked before goes out exactly as before (DOI
+  Handbook 4.7 would encode an inner slash, Crossref says not to;
+  scholar always sent it literal). Used by
+  `providers.s2_paper_url(paper_id, relation=None)` (DOI lookup,
+  citations/references, `pdf.resolve_doi_s2`) and
+  `pdf.doi_resolver_url(doi)`. `pdf.extract_doi` decodes a pasted
+  doi.org URL once (`...CO;2-%23` was sent as `%2523`); a raw DOI is
+  never decoded. The PDF cache key `get_cached_doi_pdf_path` stays
+  unencoded (never requested). Already encoded, left as they were:
+  Crossref and Unpaywall (`quote(doi, safe='')`, the `%2F` form is
+  answered), OpenAlex (pyalex `quote_plus`s the whole
+  `https://doi.org/...`; a space becomes `+`, unchecked whether
+  OpenAlex reads it as a space), Europe PMC, IEEE, WoS, Scopus (query
+  parameters), arXiv (library). Tests: conftest's `request_targets`
+  (loopback stand-in for named hosts, rewrites in `HTTPAdapter.send`,
+  keeps raw request targets; `paths()`/`queries()` decode),
+  `awkward_doi` (`10.5555/a#b?c%d e<f>g`), and request lines pinned to
+  what the code before #304 sent (`TestDoiInRequestPaths`).
 
 ### PDF Cache and `scholar pdf import` (#296)
 
@@ -2908,7 +2932,101 @@ caller's enrichment run or search append), raising only on write
 errors; a refused notes lock is skipped the same way (#319, see
 `sec:notes-lock` above). `notes export` also writes atomically (no `.bak`).
 `sessions export` stages all its files with `utils.staged_outputs` and
-moves them into place only if every format succeeded (#83).
+moves them into place only if every format succeeded (#83). The moves
+are a transaction (#320, utils.nw `sec:staged-outputs`,
+`place_staged_files`): every target is checked first
+(`output_target_problem`: a directory there, an unwritable directory,
+the sticky-bit rule of rename(2)); then each existing target is moved
+aside into `.scholar-replaced-*` before the new file goes in, and a
+failure part-way undoes the moves (old file back, new file without a
+predecessor removed). Removals (`staged_outputs(dir, remove=[names])`,
+the screen sheet's stale `BASE-tier.json`) are moves aside in the same
+transaction, made after every file is in place. The moves run under
+`placing_lock(dir)`: `file_lock` (required, `PLACING_LOCK_TIMEOUT` 5 s)
+on `<cache dir>/locks/.export-<16 hex of sha256(resolved dir)>.lock`
+(`placing_lock_path`, via `cache.get_cache_dir`, so
+`SCHOLAR_CACHE_DIR` applies; `locks/` made on demand; `cache
+clear`/`cache info` look only at top-level `*.pkl`, tested). Nothing
+of the lock lies in the output directory (exports go into paper
+repositories). A lock another export holds fails the export with one
+line ("another export is moving files into DIR"), moving nothing; a
+cache directory that cannot hold the lock (`OSError`, or a lock file
+that cannot be made) gives one WARNING ("Moving the files into DIR
+without a lock ...") and the export goes on. Limit: processes with
+different cache directories (agents with their own
+`SCHOLAR_CACHE_DIR`) do not exclude each other; the identity check
+then still keeps every export from removing or overwriting on undo a
+file it did not place, so the worst case is files of two exports mixed
+(as before #320), never a deleted file (tested with two cache dirs).
+The undo removes
+or overwrites a placed file only while it still is that file:
+`file_identity` = lstat `(st_dev, st_ino, st_size, st_mtime_ns)` of the
+staged file just before its rename (after `copymode`, which changes
+ctime, not mtime; a rename keeps all four). Any write, a delete and
+re-create (ext4 reuses inode numbers) and a mere touch (safe side)
+count as another program's file: left in place, earlier version kept,
+listed in `others` ("Replaced by another program meanwhile"). NOT
+detected: a writer that restores size and mtime exactly; little to
+compare on a file system without inode numbers and with coarse times.
+SIGINT and SIGTERM are HELD BACK for the whole transaction
+(`utils.InterruptHeldBack(HELD_SIGNALS)`, moved from review.nw, which
+imports it and still holds only SIGINT for the session keep; main
+thread only, elsewhere it does nothing): a signal is noted, the loop
+checks the note between moves (never inside one), then undoes with the
+signals still held, so a second or third signal changes nothing; the
+outcome is raised once as `MovesInterrupted` (a `KeyboardInterrupt`
+with `.failure`; `None` = the note came during the commit, every file
+in place). Each move records its intent before the rename
+(`pending_aside`, `placing`) and the undo settles a pending step from
+the file system (`_settle_pending`: earlier version found in the
+replaced-files directory = moved aside; target with the staged
+identity = placed), so an exception between a rename and its record
+(not only a signal) loses nothing. The replaced-files directory is
+deleted after an undo only when nothing in it is unaccounted
+(`strays`; else it stays and the error names the files, "Earlier
+versions left, not put back"). Restore errors go into the one message
+("Could not put back: ..."), not WARNING lines. The export prints one
+line for Ctrl-C and SIGTERM alike ("Export stopped by an interrupt and
+was rolled back: no files were written or changed.", or the lists when
+a
+restore failed) and exits 130. A replaced file's mode is kept
+(`shutil.copymode` onto the staged file). Each export holds
+`file_lock(staging / "staging")` (`.staging.lock` INSIDE the staging
+directory) and, while its moves run, `file_lock(kept / "replaced")`
+(`.replaced.lock` inside the `.scholar-replaced-*` directory); both go
+with their directory and stay, unlocked, in a directory a killed
+export (or a failed restore) leaves. Under the directory lock
+`leftover_directories` reports each `.scholar-replaced-*` and
+`.scholar-staging-*` whose own lock is free (`left_over`), so a live
+export of another cache directory is never reported; one WARNING each
+(`leftover_warning`; the replaced-files one says it holds the versions
+from before the unfinished export and that the files in the directory
+are the latest finished export's), deleting nothing. The export's own
+staging directory is skipped BEFORE any lock is tried (#335:
+`file_lock` is reentrant, so `left_over` took the export's own lock,
+and a relative `-o` made `mkdtemp`'s absolute path differ from the
+relative entries): `leftover_directories(dir, own=[...])` compares
+`Path.resolve()` (`own_directory`), and `left_over` also answers held
+for a lock this thread holds under that path (`is_locked`). The
+replaced-files directory is made after the scan. Tested with relative,
+`./`, `..` and symlinked spellings (`TestStagedOutputOwnDirectories`,
+`TestExportRelativeOutput`). A failure raises
+`OutputsNotPlaced` (`new`/`old`/`missing`/`not_written`/`others`, `kept`,
+`rolled_back`, `changed`); `cli.export_failure_text` words the message
+from it: "no files were written or changed" (with "and was rolled
+back" when files had moved) only when `not changed`, else "Export
+failed part-way and could not be rolled back" plus one line per kind
+naming where an earlier version is kept (that directory is then left).
+The rest-sample export says "None of the exported files was written or
+changed" and "the screen sheet was not written" unless a restore
+failed, then "... after the draw was recorded and could not be rolled
+back" with the list. Limits (in the prose): several renames are not
+one atomic step; between the move aside and the move in the name holds
+no file; SIGKILL or a power loss undoes nothing: the moved files stay,
+the earlier versions are in `.scholar-replaced-*` under their own names
+(move them back, then delete both hidden directories), the unmoved new
+files in `.scholar-staging-*`; the check is a forecast (`os.access`
+caveats), the undo is the guard.
 `sessions list` warns on stderr about sessions with records but no
 decisions and no context (`needs_check` in the JSON). The paper registry
 is process-global, so tests that load sessions should use unique DOIs or
@@ -3221,6 +3339,76 @@ fixture has a quoted query, a `[`-row, `ĸ`, `CO₂`, a ligature. About
   and journal go through `escape_bibtex` like the export's `.bib`
   (#230; before, raw `& % $ # _` and symbols stopped pdfLaTeX); the
   layout, field order and DOI (verbatim in biblatex) are unchanged.
+  Every field of both writers (`format_bibtex_entry`, the search
+  formatter's `_format_paper`) goes through `review.bibtex_field(name,
+  value)` (#304, review.nw `sec:bibtex-field-values`). `doi`/`url`
+  (`BIBTEX_VERBATIM_FIELDS`, `bibtex_verbatim_value`): as given except
+  an unpaired brace (`unpaired_braces`, counted as biber counts), a
+  backslash before a brace or at the end, and C0 controls, which are
+  percent-encoded (`%7B %7D %5C %00`..`%1F`); `read_bibtex_verbatim`
+  is the exact inverse and is applied to the DOI by both readers
+  (`_cited_bib_papers` for `--cited-from`, `_paper_from_entry` for
+  `prov import`) and to the `% ID:` line (`bibtex+prov` and `prov
+  export` write it encoded, `_recorded_id` decodes; a line break in a
+  DOI split the line and lost the entry). Exactly invertible: a `%`
+  followed by zero or more `25` and then a writer code (`7B 7D 5C
+  00`..`1F`, `BIBTEX_BEFORE_CODE`) is written `%25`; the reader decodes
+  a code and such a `%25` (`BIBTEX_VERBATIM_ESCAPE`), nothing else, so
+  `%20` stays and the DOIs `10.5555/a%7Db` (written `a%257Db`) and
+  `10.5555/a}b` (written `a%7Db`) stay two papers (table
+  `tab:bibtex-verbatim-escapes`; inversion tested on a generated set
+  with every code after 0 to 3 `%25`). The `%25` rule is for the DOI
+  and the ID line only (`exact=`): the `url` field keeps round 2's
+  encoding, so a URL's own `%7B` stays and its link is unchanged
+  (checked with `pdfinfo -url`). Old `.bib` files (DOI holding the text
+  `%7D`): `prov import` keeps the DOI as written when the block's `ID`
+  is that DOI's id (`<<keep the DOI as written when the recorded id
+  names it>>`); `--cited-from` tries the decoded DOI, then the DOI as
+  written for entries not matched by DOI (`_cited_bib_papers` returns
+  `as_written_dois`), naming those on stderr. Other provenance fields carry no
+  line break (placeholders, dates, fields parsed line by line), except
+  FOUND-VIA's query (#323, left open: a shell command). Text fields (`bibtex_text_value`): tab
+  and line breaks -> space, other C0 dropped (biber 2.21 core-dumps on
+  a NUL); then `escape_bibtex` (review.nw `sec:latex-titles`): a value
+  with a backslash is read as LaTeX by pylatexenc (declared dependency
+  since #304; bibtexparser 2 depends on it) and written as its Unicode
+  text only if every command is on the allow-list: accents
+  (`LATEX_ACCENTS`, not `\d \b \t`), letters (`LATEX_LETTERS`), font
+  commands and switches, escaped specials, `\textendash
+  \textemdash \ ` (`LATEX_TEXT_ALLOWED`), and inside math only the
+  decoder's one-character no-argument symbol macros plus the math
+  alphabets (`_math_allowed`). Anything else (`\cite \url \href
+  \footnote \ref \input`, environments, unknown) -> literal. Also
+  required: strict parse, every backslash starts an allowed macro, at
+  most `LATEX_DECODE_MAX_CHARS` 4000 characters (longest real title
+  2042) and `LATEX_DECODE_MAX_DEPTH` 8, every decoded character
+  settable (`_settable`: Latin in T1 or mapped by the escaper; math
+  alphanumerics U+1D400-1D7FF NFKC-folded), non-empty, and no exception
+  (any `Exception` -> literal; `\href` raised IndexError, deep nesting
+  RecursionError). Only command nodes are decoded; a math span without
+  a command (`$x^2$`) stays as written. `^` is now escaped
+  (`\textasciicircum{}`; outside math it stopped pdfLaTeX, checked on
+  main; `escape_latex` always escaped it). Fuzz in the suite: every
+  macro the decoder knows x 10 shapes, seeded, 5 s cap. `\{`/`\}`
+  decode to `LatexBrace` ->
+  `\textbraceleft{}`/`\textbraceright{}`. Anything else: every backslash
+  -> `\textbackslash{}` (`BIBTEX_SPECIALS`), a still-escaped `\{`/`\}`
+  -> brace commands. Printed (main / every backslash escaped / now):
+  `Caf\'e` Café / Caf\'e / Café; `The \textit{wolf}` The *wolf* / The
+  \textitwolf / The wolf; `{\em x}` *x* / \em x / x; `$\alpha$-stable`
+  stops / $\alpha$-stable / α-stable; `x\y`, `C:\dir\new` stop / literal
+  / literal (table `tab:latex-titles`). The report's `escape_latex`
+  still prints titles as stored; ingest-time cleaning is #329. Values
+  without a backslash never reach the parser (byte-identical). Then an
+  unpaired brace -> the same commands. No output
+  value holds a backslash before a brace or at its end (bibtexparser
+  then loses the entry, biber does not). Paired braces stay. 3 of 6,594
+  papers of two copied real sessions write differently (2 titles with
+  a backslash, 1 with a control character); keys never change.
+  bibtexparser 2.1's writer was tried and not used: it encloses values
+  unchecked and doubles braces on a second write. Biber counts `\{`
+  as a brace, so there is no BibTeX escape for an unpaired one.
+  `TestAwkwardBibCompiles` (latex marker) compiles such a report.
   `prov import/export`
   match entries by `Paper.id`, never by key, so old `.bib` files still
   round-trip.
