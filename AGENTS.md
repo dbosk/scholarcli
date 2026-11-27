@@ -274,7 +274,9 @@ arguments go in the lists in cli.nw `sec:woven-document`. The full
 build is `make -C doc check
 LATEXFLAGS="-shell-escape -interaction=nonstopmode"` (between 7 and
 26 minutes on the machines tried, longer under load; 2692 pages at
-6b9d135). `check` is `doc/check.mk` (included by `doc/Makefile`; it
+6b9d135). `doc/Makefile` exports `extra_mem_top` (10,000,000 words on
+top of TeX's default 5,000,000 of main memory, which the book outgrew,
+#368; a `pdflatex` run by hand must set it). `check` is `doc/check.mk` (included by `doc/Makefile`; it
 sets latexmk's `$max_repeat=10`) plus `doc/check-settled.py`: it fails
 on a missing or stale log, a LaTeX error, undefined references,
 missing PythonTeX output, or a non-zero build status, and passes a

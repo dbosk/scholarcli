@@ -38,6 +38,12 @@ all: ${DOC}
 CHECK_JOB=	scholar
 CHECK_SOURCES=	scholar.tex preamble.tex ${SRC_TEX} ${METHODS_TEX} bibliography.bib
 
+# The book needs more than the 5,000,000 words of main memory that TeX
+# gets by default (#368; src/scholar/cli.nw, sec:woven-document, "The
+# book's memory").  extra_mem_top is added when TeX starts and is read
+# from the environment; ?= lets the environment ask for more.
+export extra_mem_top?=	10000000
+
 scholar.pdf: scholar.tex preamble.tex
 scholar.pdf: ${SRC_TEX}
 scholar.pdf: ${METHODS_TEX} bibliography.bib
