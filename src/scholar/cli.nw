@@ -16296,9 +16296,10 @@ def sessions_decide(
                  "--sheet, a sheet row without a verdict is missing; "
                  "--strict refuses missing rows, rows given twice and "
                  "rows not on the sheet. A human's row with the status "
-                 "of an unreviewed agent or classifier decision confirms "
-                 "it (agent_reviewed, llm_reviewed; the machine's trace "
-                 "kept); its tags are added.",
+                 "and category of an unreviewed agent or classifier "
+                 "decision confirms it (agent_reviewed, llm_reviewed; "
+                 "the machine's trace kept); its tags are added. "
+                 "Another category is a change, as another status is.",
             exists=True, dir_okay=False, readable=True,
         ),
     ] = None,
@@ -16461,20 +16462,30 @@ def sessions_decide(
     record of the review and is optional (leave the column empty or
     write -), and a human's confidence is not stored. A bad line, an unknown id, or one paper
     given two different verdicts aborts unsaved. When the session uses
-    categories (supports-claim, ...), every line needs exactly one that
-    fits its verdict, whoever decided. The checks of a reasons file run over the whole
+    categories (supports-claim, ...), every line needs one that fits
+    its verdict, whoever decided; a discard may instead name no category
+    and an exclusion criterion. The checks of a reasons file run over the whole
     file and per batch. With --sheet, the file answers its whole sheet:
     a sheet row without a verdict is listed as missing, and --strict
     refuses missing rows, rows given twice and rows not on the sheet.
 
-    A human's row on an unreviewed agent or classifier decision with the
-    same status confirms that decision: its source becomes
-    agent_reviewed or llm_reviewed, the machine's reason, confidence and
-    batch stay, and it is not a training example. The row's tags are
-    added to the decision's (a category in the row replaces the old
-    one), and a reason in the row is stored as the human's beside the
-    machine's. A row with the other status changes the decision, which
-    then is an example.
+    A human's decision (a row, or --keep/--discard) on an unreviewed
+    agent or classifier decision with the same status and category
+    confirms that decision: its source becomes agent_reviewed or
+    llm_reviewed, the machine's reason, confidence and batch stay, and
+    it is not a training example. The tags are added to the decision's
+    (a category given replaces the old one; none keeps it), and a
+    reason given is stored as the human's beside the machine's. Another
+    status or another category (or the category removed) changes the
+    decision, which then is an example.
+
+    When the session uses categories, the category a record holds after
+    the decision must fit its status, whoever decides and however: a
+    discard does not hold supports-claim or qualifies-claim, a keep
+    does not hold off-topic-false-hit. A record that bears on the claim
+    but is excluded under a rule of the review is discarded with the
+    exclusion criterion as its tag and no category (--untag removes a
+    stored category); the reason may say that it bears.
 
     An agent or LLM decision on records without an abstract prints one
     line counting them, with what the last `scholar enrich` found.
@@ -16507,9 +16518,11 @@ def sessions_decide(
     """
     from scholar.review import (
         AGENT_AUDIT_FIELDS, AUDIT_CATEGORIES, CopyConflict, DecisionStatus,
-        ReviewSource, clear_human_record, clear_machine_audit,
-        copy_conflict_line, record_human_decision, same_id_pairs,
-        save_session, tags_after_decision,
+        ReviewSource, categories_held, changes_the_verdict,
+        clear_human_record, clear_machine_audit, copy_conflict_line,
+        decision_refusal, decision_tags, one_category_message,
+        record_human_decision,
+        same_id_pairs, save_session,
     )
     from scholar.llm_review import mark_as_reviewed
     from scholar.utils import utc_now_iso
@@ -16524,6 +16537,7 @@ def sessions_decide(
 
     <<select decisions by doi and paper id>>
     <<refuse verdicts without a fitting category>>
+    <<refuse a decision whose category would not fit>>
     <<refuse to decide copies decided apart>>
     <<refuse to let a machine replace a human decision>>
     saving = not dry_run
@@ -16576,13 +16590,11 @@ if discard and not tag:
         "[red]--discard requires at least one --tag (motivation).[/red]"
     )
     raise typer.Exit(1)
-categories_given = [
-    t for t in dict.fromkeys(tag or []) if t in AUDIT_CATEGORIES
-]
+categories_given = categories_held(tag or [])
 if len(categories_given) > 1:
     console.print(
-        "[red]A paper holds one category, but --tag names "
-        f"{escape(', '.join(categories_given))}.[/red]"
+        f"[red]{escape(one_category_message(categories_given, '--tag names'))}"
+        "[/red]"
     )
     raise typer.Exit(2)
 <<refuse a relayed verdict whose category does not fit>>
@@ -16608,12 +16620,13 @@ category must fit its decision: a discard does not take
 classifier withholds such an answer, so a relayed one must not slip
 in through [[decide]]: it is a usage error (status~2), refused with
 the other options before the session is loaded, naming the
-categories that fit.  A human's or an agent's decision is free to
-pair them, since the audit table shows a discarded bearing category
-on purpose, as excluded (issue~\#89): a reviewer may exclude a
-relevant hit under a rule of the review.  The rule's table lives with
-the classifier, so it is imported only when a relayed verdict names a
-category.
+categories that fit.  A human's or an agent's decision is held to
+the same fit since \#349, but on the record after the decision, which
+needs the session ([[<<refuse a decision whose category would not
+fit>>]], with the verdicts file's rows); this check is the classifier's
+older one, on the named category alone, and it comes first because it
+needs nothing loaded.  The rule's table lives with the classifier, so
+it is imported only when a relayed verdict names a category.
 
 <<refuse a relayed verdict whose category does not fit>>=
 if source == "llm" and categories_given:
@@ -16632,8 +16645,9 @@ if source == "llm" and categories_given:
 @
 
 Let's check that each contradiction is refused, before the session is
-even looked up, and that a fitting relayed verdict and the other
-sources' free pairs are recorded:
+even looked up, and that a fitting relayed verdict is recorded.  The
+other sources' pairs, which this test once showed recorded, are refused
+since \#349, after the session is read:
 
 <<test functions>>=
 class TestRelayedVerdictFitsItsDecision:
@@ -16658,25 +16672,25 @@ class TestRelayedVerdictFitsItsDecision:
         ])
         assert result.exit_code == 2
 
-    def test_fitting_verdicts_and_other_sources_are_recorded(
+    def test_fitting_verdicts_are_recorded_and_pairs_refused(
         self, tmp_path, monkeypatch
     ):
         from scholar.review import load_session
 
         TestSessionsDecideCommand()._make_session(tmp_path, monkeypatch)
-        for source, args in (
-            ("llm", ["--discard", "--tag", "adjacent-subtopic"]),
-            ("llm", ["--keep", "--tag", "adjacent-subtopic"]),
-            ("agent", ["--discard", "--tag", "supports-claim"]),
-            ("human", ["--discard", "--tag", "qualifies-claim"]),
+        for source, args, status in (
+            ("llm", ["--discard", "--tag", "adjacent-subtopic"], 0),
+            ("llm", ["--keep", "--tag", "adjacent-subtopic"], 0),
+            ("agent", ["--discard", "--tag", "supports-claim"], 2),
+            ("human", ["--discard", "--tag", "qualifies-claim"], 2),
         ):
             result = runner.invoke(app, [
                 "sessions", "decide", "headless", "--source", source,
                 "--doi", "10.1/withdoi", *args,
             ])
-            assert result.exit_code == 0, (source, result.output)
-        decision = load_session("headless").discarded_papers()[0]
-        assert decision.tags[-1] == "qualifies-claim"
+            assert result.exit_code == status, (source, result.output)
+        decision = load_session("headless").kept_papers()[0]
+        assert decision.tags[-1] == "adjacent-subtopic"
 @
 
 The source is settled first, before anything else is checked:
@@ -16700,11 +16714,19 @@ classifier run cleared ([[clear_machine_audit]],
 replaced, unless [[--keep-trace]] asks to keep them for a correction
 made on top of that run (below). A human decision on an unreviewed machine
 decision is a review and is delegated to [[mark_as_reviewed]];
-agreement means the status stands. Any other human decision simply
-overwrites status and source.
+agreement means that the status and the category stand
+([[changes_the_verdict]], \cref{sec:decision-rules} in the review
+module: a changed category is a change, \#349), read from the tags the
+decision leaves, [[decision_tags]], which are computed first and stored
+below. Any other human decision simply overwrites status and source.
 
 <<record one decision with its source>>=
-previous_status = decision.status
+tags_after = decision_tags(
+    decision.tags,
+    status_changed=decision.status != status,
+    new_tags=given_tags,
+    removed_tags=untag or [],
+)
 if source in MACHINE_DECISION_SOURCES:
     decision.status = status
     decision.source = ReviewSource(source)
@@ -16716,7 +16738,7 @@ if source in MACHINE_DECISION_SOURCES:
 elif decision.source.is_unreviewed:
     mark_as_reviewed(
         decision,
-        user_agrees=decision.status == status,
+        user_agrees=not changes_the_verdict(decision, status, tags_after),
         new_status=status,
     )
 else:
@@ -16959,8 +16981,11 @@ that re-decides [[--keep -t qualifies-claim]] on a record kept as
 rule hid that the record held two classifications
 ([[tags_after_decision]], \cref{sec:audit-table}, which explains the
 rule and why nothing else is removed). A same-status decision without a category
-refines the record and the tags accumulate. [[add_tag]] is idempotent,
-so a repeated tag is not doubled.
+refines the record and the tags accumulate. The tags are computed
+before the decision is recorded, by [[decision_tags]] (which adds the
+new ones as the idempotent [[add_tag]] would, so a repeated tag is not
+doubled), because the review of a machine's decision and the category
+rule both read them; here they are stored.
 
 Nothing else removes a tag, and an exclusion criterion such as
 [[no-abstract]] left on a record that was discarded and then kept reads
@@ -16986,16 +17011,8 @@ line, whatever [[--untag]] leaves on the record: the motivation is
 what the discarder states now.
 
 <<replace the tags of a changed decision>>=
-held = set(decision.tags)
-untag_seen.update(t for t in untag or [] if t in held)
-decision.tags = tags_after_decision(
-    decision.tags,
-    status_changed=decision.status != previous_status,
-    new_tags=given_tags,
-    removed_tags=untag or [],
-)
-for t in given_tags:
-    decision.add_tag(t)
+untag_seen.update(t for t in untag or [] if t in decision.tags)
+decision.tags = tags_after
 @
 
 <<note the tags no paper had>>=
@@ -21281,22 +21298,25 @@ decision.llm_batch = entry.batch if entry is not None else batch
 @
 
 A session that uses categories (any decision holds one of
-[[AUDIT_CATEGORIES]]) asks of a machine's screening that it carry
-exactly one category fitting its verdict ([[STATUS_CATEGORIES]]), so
-that the audit table can place every row; [[sessions screen]] refuses
-an agent's or a classifier's verdicts that do not.  A verdicts file is
-held to it whoever wrote it, a human included: every row, with the same
-function and message, every offending line named, status~2 and nothing
-saved.  A file of verdicts is a screen, and a screen's rows are what
-the rule was made for; a row that a screener left without a category,
-or with one that contradicts its verdict, is a gap in the screen, not
-a deliberate exclusion.  The one-verdict form is not held to it, which
-stays as it was: an agent or a human may exclude a bearing record under
-a rule of the review (\cref{sec:audit-table} in the review module) with
-[[--keep]] or [[--discard]] and a [[--tag]], one record at a time,
-deliberately, and so may a human in the TUI (a relayed [[--tag]] only
-has to fit when given).  The check needs the session, so it runs after
-the ids are looked up, and an unknown id (status~1) is reported first.
+[[AUDIT_CATEGORIES]]) asks of a screen that the audit table can place
+every row, so [[sessions screen]] refuses an agent's or a classifier's
+verdicts whose category does not fit or is missing
+([[verdicts_without_a_fitting_category]], with that command).  A
+verdicts file is held to it whoever wrote it, a human included: every
+row, with the same function and message, every offending line named,
+status~2 and nothing saved.  A keep names its fitting category; a
+discard names one, or no category and the criterion that excludes it.
+The second form is the author's decision of 2026-11-27 on issue~\#349:
+a record that bears on the claim but is excluded under a rule of the
+review is discarded with the exclusion criterion as its tag and no
+category, by every source alike, and a file of verdicts is how agents
+and classifiers screen, so it must be able to say so.  Until then a row
+without a category was refused as a gap in the screen and such an
+exclusion had to go through the one-verdict form under a bearing
+category, which the rule of the review module now refuses there too
+(\cref{sec:decision-rules} there).  The
+check needs the session, so it runs after the ids are looked up, and an
+unknown id (status~1) is reported first.
 
 <<refuse verdicts without a fitting category>>=
 if verdicts_file is not None:
@@ -21317,6 +21337,188 @@ if verdicts_file is not None:
             soft_wrap=True,
         )
         raise typer.Exit(2)
+@
+
+The rows' check above is the file's completeness, and it is the only
+one a file has that a single verdict lacks.  The fit of a category to
+its status is one rule for every way to decide
+([[category_misfit]], \cref{sec:decision-rules} in the review module),
+and it is checked on the record as the decision will leave it, for
+every selected record, whatever the source and whether the verdict
+came from a file row or from [[--keep]]/[[--discard]] with
+[[--tag]]: the tags are those [[decision_tags]] computes, which are
+the tags the recording stores below.  So it also refuses a decision
+that names no category but leaves a stored one that does not fit,
+such as a discard of a record discarded before under
+[[supports-claim]]; [[--untag]] of the category removes it.  A file row
+cannot meet that case unnoticed either: it names a fitting category,
+which replaces the stored one, or none, and then this check reads the
+stored one.  Before \#349 the one-record form let a human or an agent
+store such a pair on purpose, the way to record a bearing record
+excluded under a rule of the review; that is now a discard with the
+criterion and no category, which the message says.  The check needs the
+session's records, so it runs here, after the ids are looked up and
+after the file's check, with the same status~2 and nothing saved.
+[[status]] and [[given_tags]] come from the chunk the recording loop
+uses, so the check cannot read another verdict than the one recorded.
+The check is the shared rule, [[decision_refusal]], so it also holds
+the record to one category: a record stored with two (the TUI could
+leave two before \#349) and decided again with the same status and no
+category of its own would keep both, and is refused until a category
+is given, which replaces them, or [[--untag]] removes one.
+
+<<refuse a decision whose category would not fit>>=
+misfits = []
+for decision in selected.values():
+    <<take the verdict for this decision>>
+    refusal = decision_refusal(session.decisions, status, decision_tags(
+        decision.tags, decision.status != status, given_tags, untag or [],
+    ))
+    if refusal is not None:
+        misfits.append((decision, refusal))
+for decision, refusal in misfits:
+    console.print(
+        f"[red]{escape(decision.paper.id)}: {escape(refusal)}[/red]",
+        soft_wrap=True,
+    )
+if misfits:
+    console.print(
+        "[yellow]No changes saved. A stored category stays unless "
+        "--untag removes it.[/yellow]",
+        soft_wrap=True,
+    )
+    raise typer.Exit(2)
+@
+
+Let's check the rule in the one-record form: a human's discard naming
+a bearing category is refused with the advice and the session file
+unchanged, an agent's keep naming a false hit too; a same-status
+discard that keeps a stored bearing category is refused until
+[[--untag]] removes it; a discard of a bearing keep drops the category
+and passes; and a session without categories is not bound.
+
+<<test functions>>=
+class TestOneRecordCategoryRule:
+  """The category rule in the one-record `decide` (#349)."""
+
+  <<one-record category rule test methods>>
+<<one-record category rule test methods>>=
+def _make_session(self, tmp_path, monkeypatch, categories=True):
+  monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+  from scholar.review import (
+    DecisionStatus, ReviewDecision, ReviewSession, ReviewSource,
+    save_session, session_file_path,
+  )
+
+  def paper(n):
+    return Paper(title=f"Rule Work {n}", authors=["A"],
+                 doi=f"10.1/rule-{n}")
+
+  bearing = ["supports-claim"] if categories else ["loops"]
+  session = ReviewSession(
+    query="q", providers=["openalex"], timestamp=datetime(2026, 11, 27),
+    name="rules", decisions=[
+      ReviewDecision(paper=paper(0), provider="openalex",
+                     status=DecisionStatus.KEPT, tags=list(bearing),
+                     source=ReviewSource.AGENT_UNREVIEWED),
+      ReviewDecision(paper=paper(1), provider="openalex"),
+      ReviewDecision(paper=paper(2), provider="openalex",
+                     status=DecisionStatus.DISCARDED,
+                     tags=list(bearing) + ["workshop-paper"],
+                     source=ReviewSource.AGENT_UNREVIEWED),
+    ])
+  save_session(session)
+  return session_file_path(session)
+
+def _decide(self, source, *args):
+  extra = ["-c", "0.5", "--by", "agent-1"] if source == "agent" else []
+  return runner.invoke(app, [
+    "sessions", "decide", "rules", "--source", source, *extra, *args])
+
+def test_a_misfit_is_refused_before_anything_is_saved(
+    self, tmp_path, monkeypatch):
+  path = self._make_session(tmp_path, monkeypatch)
+  before = path.read_bytes()
+  human = self._decide("human", "--discard", "--doi", "10.1/rule-1",
+                       "--tag", "supports-claim")
+  assert human.exit_code == 2, human.output
+  flat = " ".join(human.output.split())
+  assert ("doi:10.1/rule-1: Category supports-claim does not fit a "
+          "discarded decision (discarded takes adjacent-subtopic, "
+          "off-topic-false-hit).") in flat
+  assert "discard it with the exclusion criterion as its tag" in flat
+  assert "No changes saved." in flat
+  agent = self._decide("agent", "--keep", "--doi", "10.1/rule-1",
+                       "--tag", "off-topic-false-hit")
+  assert agent.exit_code == 2, agent.output
+  assert path.read_bytes() == before
+
+def test_a_stored_misfit_stays_until_untagged(self, tmp_path, monkeypatch):
+  from scholar.review import load_session
+
+  path = self._make_session(tmp_path, monkeypatch)
+  before = path.read_bytes()
+  again = self._decide("human", "--discard", "--doi", "10.1/rule-2",
+                       "--tag", "venue-rule")
+  assert again.exit_code == 2, again.output
+  assert "--untag removes it" in " ".join(again.output.split())
+  assert path.read_bytes() == before
+  untagged = self._decide("human", "--discard", "--doi", "10.1/rule-2",
+                          "--untag", "supports-claim", "--tag", "venue-rule")
+  assert untagged.exit_code == 0, untagged.output
+  overturned = self._decide("human", "--discard", "--doi", "10.1/rule-0",
+                            "--tag", "workshop-paper",
+                            "--reason", "Bears on the claim; a workshop.")
+  assert overturned.exit_code == 0, overturned.output
+  stored = {d.paper.doi: d for d in load_session("rules").decisions}
+  assert stored["10.1/rule-2"].tags == ["workshop-paper", "venue-rule"]
+  assert stored["10.1/rule-0"].tags == ["workshop-paper"]
+
+def test_a_humans_stored_misfit_stays_until_untagged(
+    self, tmp_path, monkeypatch):
+  from scholar.review import ReviewSource, load_session, save_session
+
+  path = self._make_session(tmp_path, monkeypatch)
+  session = load_session("rules")
+  session.decisions[2].source = ReviewSource.HUMAN
+  save_session(session)
+  before = path.read_bytes()
+  again = self._decide("human", "--discard", "--doi", "10.1/rule-2",
+                       "--tag", "venue-rule")
+  assert again.exit_code == 2, again.output
+  assert ("doi:10.1/rule-2: Category supports-claim does not fit a "
+          "discarded decision") in " ".join(again.output.split())
+  assert path.read_bytes() == before
+  untagged = self._decide("human", "--discard", "--doi", "10.1/rule-2",
+                          "--untag", "supports-claim", "--tag", "venue-rule")
+  assert untagged.exit_code == 0, untagged.output
+
+def test_a_stored_pair_of_categories_must_leave_one(
+    self, tmp_path, monkeypatch):
+  from scholar.review import ReviewSource, load_session, save_session
+
+  self._make_session(tmp_path, monkeypatch)
+  session = load_session("rules")
+  session.decisions[0].tags = ["supports-claim", "qualifies-claim"]
+  session.decisions[0].source = ReviewSource.HUMAN
+  save_session(session)
+  again = self._decide("human", "--keep", "--doi", "10.1/rule-0",
+                       "--tag", "loops")
+  assert again.exit_code == 2, again.output
+  assert ("doi:10.1/rule-0: A paper holds one category, but the "
+          "decision would leave supports-claim, qualifies-claim.") \
+    in " ".join(again.output.split())
+  untagged = self._decide("human", "--keep", "--doi", "10.1/rule-0",
+                          "--untag", "qualifies-claim")
+  assert untagged.exit_code == 0, untagged.output
+  assert load_session("rules").decisions[0].tags == ["supports-claim"]
+
+def test_a_session_without_categories_is_not_bound(
+    self, tmp_path, monkeypatch):
+  self._make_session(tmp_path, monkeypatch, categories=False)
+  result = self._decide("human", "--discard", "--doi", "10.1/rule-1",
+                        "--tag", "supports-claim")
+  assert result.exit_code == 0, result.output
 @
 
 \subparagraph{The whole sheet.}
@@ -21609,7 +21811,7 @@ A human's verdicts file may answer records a machine has decided and
 nobody has reviewed.  The recording loop treats a human's row there as
 it treats [[--keep]] or [[--discard]] from a human: a review
 ([[mark_as_reviewed]], [[<<record one decision with its source>>]]).
-So a row with the machine's status \emph{confirms} the decision: its
+So a row with the machine's status and category \emph{confirms} the decision: its
 source becomes [[agent_reviewed]] or [[llm_reviewed]], the machine's
 trace (reason, name, time, confidence, batch) stays, [[is_example]]
 stays clear (the human did not correct the machine), and the human's
@@ -21625,16 +21827,28 @@ category goes only when the row names a category.  So a row with the
 same category and a theme the machine did not give adds the theme (the
 category is dropped and added again, so it moves behind the old
 themes), and a row whose only difference is the category replaces the
-category, and still counts as a confirmation: the status is what a
-review confirms, and the category is a tag.  The report's
+category.  Until \#349 such a row still counted as a confirmation, the
+status being what a review confirmed; the author decided on 2026-11-27
+that a changed category is a change ([[changes_the_verdict]],
+\cref{sec:decision-rules} in the review module), so it is now a
+correction, an example, like a changed status.  The report's
 confirmed/changed counts ([[machine_review_rows]]) follow
-[[is_example]] and so count it as confirmed.
+[[is_example]], and so does the trace: the decision is no longer
+\enquote{confirmed}, the machine's reason no longer stands for it
+([[DecisionTrace.reason]]), and without a reason of the human's it
+counts as decided with tags only.  A row with the machine's category,
+or with none (which leaves the stored one), and other tags or a reason
+of the human's own, still confirms.
 
 Let's check each case on a session that uses categories: an agent's
 keep confirmed by a row without a reason, a classifier's discard
 confirmed with a reason of the human's, an agent's keep confirmed with
-an added theme, one whose row changes only the category, and one whose
-row changes the status.
+an added theme, one whose row changes only the category (a change,
+with the counts of [[sessions show -f json]]), and one whose row
+changes the status.  A file row in such a session names a category, so
+the one-record form shows the rest of the rule: a keep with another
+theme and no category confirms, one with another category or one that
+removes the category ([[--untag]]) changes.
 
 <<test functions>>=
 class TestConfirmingByAFileRow:
@@ -21672,6 +21886,8 @@ class TestConfirmingByAFileRow:
                 ["supports-claim", "loops"], **agent),
         machine(4, ReviewSource.AGENT_UNREVIEWED, kept,
                 ["supports-claim", "loops"], **agent),
+        machine(5, ReviewSource.AGENT_UNREVIEWED, kept,
+                ["supports-claim", "loops"], **agent),
       ])
     save_session(session)
     return session_file_path(session)
@@ -21696,7 +21912,7 @@ class TestConfirmingByAFileRow:
     for n in (0, 2, 3):
       stored = saved[f"10.1/conf-{n}"]
       assert (stored["source"], stored["is_example"]) \
-        == ("agent_reviewed", False), n
+        == ("agent_reviewed", n == 3), n
       assert (stored["agent_reason"], stored["agent_by"],
               stored["agent_batch"], stored["llm_confidence"]) \
         == ("Interviews novices.", "a-1", "a-b", 0.7), n
@@ -21706,6 +21922,10 @@ class TestConfirmingByAFileRow:
     assert saved["10.1/conf-2"]["tags"] \
       == ["loops", "supports-claim", "recursion"]
     assert saved["10.1/conf-3"]["tags"] == ["loops", "qualifies-claim"]
+    shown = runner.invoke(app, ["sessions", "show", "confirm", "-f", "json"])
+    assert shown.exit_code == 0, shown.output
+    assert json.loads(shown.stdout)["decision_reasons"]["agent_reviewed"] \
+      == {"decided": 4, "in_words": 3, "tags_only": 1, "without_reason": 0}
     classifier = saved["10.1/conf-1"]
     assert (classifier["source"], classifier["is_example"]) \
       == ("llm_reviewed", False)
@@ -21714,6 +21934,27 @@ class TestConfirmingByAFileRow:
     corrected = saved["10.1/conf-4"]
     assert (corrected["source"], corrected["is_example"],
             corrected["status"]) == ("agent_reviewed", True, "discarded")
+
+  def test_the_one_record_form_follows_the_same_rule(self, tmp_path,
+                                                      monkeypatch):
+    path = self._session(tmp_path, monkeypatch)
+    for doi, args in (
+      ("10.1/conf-5", ["--tag", "recursion"]),
+      ("10.1/conf-0", ["--tag", "qualifies-claim"]),
+      ("10.1/conf-2", ["--untag", "supports-claim"]),
+    ):
+      result = runner.invoke(app, [
+        "sessions", "decide", "confirm", "--source", "human", "--keep",
+        "--doi", doi, *args])
+      assert result.exit_code == 0, result.output
+    saved = {d["paper"]["doi"]: d for d in json.loads(
+      path.read_text(encoding="utf-8"))["decisions"]}
+    assert [saved[f"10.1/conf-{n}"]["is_example"] for n in (5, 0, 2)] \
+      == [False, True, True]
+    assert saved["10.1/conf-5"]["tags"] \
+      == ["supports-claim", "loops", "recursion"]
+    assert {saved[f"10.1/conf-{n}"]["source"] for n in (5, 0, 2)} \
+      == {"agent_reviewed"}
 @
 
 A row missing from its sheet, a row given twice and a row not on the
@@ -21772,8 +22013,10 @@ A bad line is refused before the session is read (a session that does
 not exist gives status~2, not \enquote{not found}): a discard without a
 tag, two categories, a verdict that is neither.  An unknown id exits~1
 and one record given two verdicts~2, both unsaved.  In a session that
-uses categories, a line without one and a line whose category does not
-fit its verdict are named, a human's as an agent's; the same file is
+uses categories, a keep without one, a discard with neither a category
+nor an exclusion criterion (a note tag alone) and a line whose category
+does not fit its verdict are named, a human's as an agent's, while a
+discard with only its criterion passes (\#349); the same file is
 recorded in a session that uses none.
 
 <<decide verdicts file test methods>>=
@@ -21805,7 +22048,9 @@ def test_bad_lines_unknown_ids_and_clashes(self, tmp_path, monkeypatch):
 def test_categories_must_fit(self, tmp_path, monkeypatch):
   lines = ["10.1/verdict-0\tkept\tloops\tWork 0 is ours.",
            "10.1/verdict-1\tkept\toff-topic-false-hit\tWork 1 is ours.",
-           "10.1/verdict-2\tdiscarded\tadjacent-subtopic\tNear."]
+           "10.1/verdict-2\tdiscarded\tadjacent-subtopic\tNear.",
+           "10.1/verdict-4\tdiscarded\tthesis-of-cited-source\tA thesis.",
+           "10.1/verdict-5\tdiscarded\tworkshop-paper\tBears, excluded."]
   path = self._make_session(tmp_path, monkeypatch, categories=True)
   before = path.read_bytes()
   result = self._decide("--verdicts-file", self._file(tmp_path, lines))
@@ -21815,15 +22060,28 @@ def test_categories_must_fit(self, tmp_path, monkeypatch):
   assert ("verdicts-file line 2: category off-topic-false-hit does not "
           "fit a kept verdict") in output
   assert "line 3" not in output
-  assert "an agent's verdict carries exactly one" in output
+  assert ("verdicts-file line 4: no category and no exclusion criterion"
+          in output)
+  assert "line 5" not in output
+  assert ("an agent's verdict carries one that fits its verdict" in output)
+  assert ("or no category and an exclusion criterion as its tag"
+          in output)
   assert path.read_bytes() == before
   human = self._decide("--verdicts-file", self._file(tmp_path, [
     "10.1/verdict-3\tdiscarded\tsupports-claim"]), source="human")
   assert human.exit_code == 2, human.output
   assert ("verdicts-file line 1: category supports-claim does not fit a "
           "discarded verdict") in " ".join(human.output.split())
-  assert "a human's verdict carries exactly one" in human.output
+  assert "a human's verdict carries one" in human.output
   assert path.read_bytes() == before
+  excluded = self._decide("--verdicts-file", self._file(tmp_path, [
+    "10.1/verdict-3\tdiscarded\tworkshop-paper\tBears on the claim; "
+    "a workshop paper."]), source="human")
+  assert excluded.exit_code == 0, excluded.output
+  stored = self._saved(path)["10.1/verdict-3"]
+  assert (stored["status"], stored["tags"]) \
+    == ("discarded", ["workshop-paper"])
+  assert self._saved(path)["10.1/verdict-4"]["status"] == "pending"
   plain = tmp_path / "plain"
   plain.mkdir()
   self._make_session(plain, monkeypatch)
@@ -25883,7 +26141,8 @@ def sessions_screen(
     (--keep or --discard, --tag, --reason, -c), or a verdict per paper
     in --verdicts-file. A discard needs a tag. When the session uses
     category tags (supports-claim, ...), an agent's or classifier's
-    verdict must carry exactly one that fits its status. Any bad line,
+    verdict must carry one that fits its status (a discard may carry
+    an exclusion criterion and no category instead). Any bad line,
     any id not in the session or one paper given two verdicts aborts
     the batch unsaved.
 
@@ -26306,22 +26565,17 @@ def verdicts_without_a_fitting_category(given) -> list[str]:
     """The problems of verdicts without one category fitting them.
 
     `given` holds `(where, status, tags)` per verdict, `status` kept or
-    discarded; each verdict whose first category is missing or does not
-    fit its status gets one problem, naming `where`.
+    discarded; each verdict whose category does not fit its status, or
+    a keep without a category, or a discard with neither a category
+    nor an exclusion criterion, gets one problem, naming `where`.
     """
-    from scholar.llm_review import STATUS_CATEGORIES
-    from scholar.review import AUDIT_CATEGORIES
+    from scholar.review import (
+        AUDIT_CATEGORIES, DecisionStatus, reason_tags, unfitting_category,
+    )
 
     unfit: list[str] = []
     for where, status, verdict_tags in given:
-        categories = [t for t in verdict_tags if t in AUDIT_CATEGORIES]
-        if not categories:
-            unfit.append(f"{where}: no category")
-        elif categories[0] not in STATUS_CATEGORIES[status]:
-            unfit.append(
-                f"{where}: category {categories[0]} does not fit a "
-                f"{status} verdict"
-            )
+        <<find the problem of one verdict's category>>
     return unfit
 
 
@@ -26333,23 +26587,54 @@ def fitting_category_rule(whose: str, named: bool = False) -> str:
     without claiming that the session uses categories (the caller has
     not read the session).
     """
-    from scholar.llm_review import STATUS_CATEGORIES
-    from scholar.review import AUDIT_CATEGORIES
-
-    def fitting(status: str) -> str:
-        return ", ".join(sorted(
-            STATUS_CATEGORIES[status], key=AUDIT_CATEGORIES.get
-        ))
+    from scholar.review import fitting_categories
 
     lead = (
         f"{whose} that names a category names one"
         if named else
-        f"The session uses categories, so {whose} carries exactly one"
+        f"The session uses categories, so {whose} carries one"
+    )
+    rest = "" if named else (
+        ", or no category and an exclusion criterion as its tag"
     )
     return (
-        f"{lead} that fits its verdict: kept takes {fitting('kept')}; "
-        f"discarded takes {fitting('discarded')}."
+        f"{lead} that fits its verdict: kept takes "
+        f"{fitting_categories('kept')}; discarded takes "
+        f"{fitting_categories('discarded')}{rest}."
     )
+@
+
+A verdict is checked twice over.  Its category must fit its status, by
+[[unfitting_category]], the one rule every decision follows
+(\cref{sec:decision-rules} in the review module); a verdict holds at
+most one category (two are a bad line), so the category it names is
+the one the rule reads.  And a screen must be complete, so that the
+audit table can place every row: a keep names its category, since a
+keep without one could bear on the claim or not, and a discard names
+its category or the criterion that excludes it.  The second form is
+the author's decision of 2026-11-27 on issue~\#349: a record that bears
+on the claim and is excluded under a rule of the review is discarded
+with the exclusion criterion as its tag and no category, by every
+source alike, so a file must be able to say it.  A discard with
+neither, only note tags, says nothing about the work and is refused.
+The criterion is a tag that is neither a category nor a note tag
+([[reason_tags]], the tags that count as a reason, \cref{sec:decision-trace}).
+The audit table shows such a discard by its criterion
+([[audit_exclusion_criterion]]), ranked with the other exclusions
+([[AUDIT_ORDER_OTHER]]).
+
+<<find the problem of one verdict's category>>=
+categories = [t for t in verdict_tags if t in AUDIT_CATEGORIES]
+decided = DecisionStatus(status)
+misfit = unfitting_category(decided, categories)
+if misfit is not None:
+    unfit.append(
+        f"{where}: category {misfit} does not fit a {status} verdict"
+    )
+elif not categories and decided == DecisionStatus.KEPT:
+    unfit.append(f"{where}: no category")
+elif not categories and not reason_tags(verdict_tags):
+    unfit.append(f"{where}: no category and no exclusion criterion")
 @
 
 <<refuse to screen copies decided apart>>=
@@ -26698,7 +26983,9 @@ def test_the_quotes_of_the_reasons_are_checked(self, tmp_path,
 
 The category rule applies to a machine's screenings once the session
 uses categories, and not to a human's; a session without categories
-takes any tags.
+takes any tags.  A machine's discard with an exclusion criterion and no
+category passes, as it does in [[sessions decide --verdicts-file]]
+(\#349).
 
 <<sessions screen test methods>>=
 def test_machine_screenings_carry_a_fitting_category(self, tmp_path,
@@ -26726,6 +27013,17 @@ def test_machine_screenings_carry_a_fitting_category(self, tmp_path,
   assert result.exit_code == 0, result.output
   assert self._saved(path)["10.1/llm"]["screenings"][1]["tags"] \
     == ["compilers"]
+  criterion = self._file(tmp_path, (
+    "10.1/llm\tdiscarded\tworkshop-paper\tBears, but excluded.\n"
+  ))
+  result = self._screen("--as", "agent", "--by", "agent-3",
+                        "--verdicts-file", criterion)
+  assert result.exit_code == 0, result.output
+  screening = self._saved(path)["10.1/llm"]["screenings"][-1]
+  assert (screening["status"], screening["tags"], screening["kind"],
+          screening["name"], screening["reason"]) \
+    == ("discarded", ["workshop-paper"], "agent", "agent-3",
+        "Bears, but excluded.")
 @
 
 A sample must be the session's, named by its id or by the group id of
