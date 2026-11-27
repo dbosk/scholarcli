@@ -1628,7 +1628,7 @@ stand-in responses of the download tests serve these bytes too
 
 <<test functions>>=
 def make_pdf(path, width=200, text=None, encrypted=False):
-  """Write a real one-page PDF, optionally with a line of `text`."""
+  """Write a real one-page PDF, optionally with `text`: a line, or lines."""
   path.write_bytes(pdf_document(width, text, encrypted))
   return path
 
@@ -1637,7 +1637,10 @@ def pdf_document(width=200, text=None, encrypted=False):
   """The bytes of a real one-page PDF, as `make_pdf` writes them."""
   content = b""
   if text:
-    content = b"BT /F1 12 Tf 20 100 Td (%s) Tj ET" % text.encode()
+    lines = [text] if isinstance(text, str) else text
+    content = b"BT /F1 12 Tf 20 100 Td %s ET" % b" 0 -14 Td ".join(
+      b"(%s) Tj" % line.encode() for line in lines
+    )
   objects = [
     b"@<< /Type /Catalog /Pages 2 0 R >>",
     b"@<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
@@ -3162,6 +3165,149 @@ class TestSegmentPassages:
         passages = segment_passages(pages)
         assert len(passages) == 1
         assert all(len(p.text) >= MIN_PASSAGE_CHARS for p in passages)
+@
+
+\subsection{The whole text, for checking a quote}
+\label{sec:pdf-running-text}
+
+[[scholar prov check --quotes]] (\cref{sec:prov-check} in the CLI)
+asks a different question of a PDF than [[pdf quote]] does: not which
+passages fit a claim, but whether a passage someone typed occurs in the
+text at all.  For that the text is wanted whole, as one run, since a
+quote may cross a line, a sentence or a page.
+
+PDFium decides what a line-end hyphen is, and it does not tell a word
+broken at a line end from a compound that happens to end a line.  In
+two arXiv PDFs typeset with \LaTeX{} (1706.03762v7 and 1810.04805v2,
+fetched through [[download_pdf]] on 2026-11-27) a hyphen at a line
+end in running text came back as U+FFFE with the line break removed,
+whether it broke a word or ended a compound: \enquote{transduc}
+U+FFFE \enquote{tion} beside \enquote{sequence} U+FFFE
+\enquote{aligned} and \enquote{pre} U+FFFE \enquote{trained}, 16 and
+332 times; a plain hyphen before a line break remained in 8 and 13
+places.  [[_reflow_text]] drops the mark, which is right for
+\enquote{transduction} and wrong for \enquote{sequence-aligned}.  Here
+the mark becomes a hyphen instead, so nothing is lost, and the quote
+check folds a hyphen between two letters away on both sides
+(\cref{sec:prov-check-quotes} in the CLI); a plain hyphen before a
+line break is joined the same way.  The lines end in a carriage return
+and a line feed, so the pattern allows both.  The extracted text of
+neither PDF held a ligature character; NFKC in the quote check folds
+those another PDF may give.
+
+<<quote extraction functions>>=
+def pdf_running_text(path: Path) -> str:
+    """The text of a PDF as one run, white space collapsed.
+
+    A hyphen at a line end, which PDFium returns as U+FFFE or as a
+    hyphen before the line break, is kept as a hyphen and the line
+    joined. Raises what PDFium raises for an unreadable file.
+    """
+    text = "\n".join(extract_pdf_pages(path))
+    text = text.replace("\ufffe", "-").replace("\u00ad", "")
+    text = LINE_END_HYPHEN.sub("-", text)
+    return " ".join(text.split())
+<<quote extraction constants>>=
+LINE_END_HYPHEN = re.compile(r"-[ \t]*\r?\n\s*")
+@
+
+Let's check both forms: a PDF with three lines, two of them ending in
+a hyphen (PDFium returns both as U+FFFE), and extracted text with a
+plain hyphen before a line break.  The second test stands in for
+PDFium: in the hand-written PDF of the first, PDFium joins both lines,
+and a PDF whose extraction keeps the hyphen and the line break would
+take a PDF writer we do not have.
+
+<<test functions>>=
+class TestPdfRunningText:
+    """`pdf_running_text` keeps a line-end hyphen and joins the line."""
+
+    def test_line_end_hyphens_become_hyphens(self, tmp_path):
+        pdf = make_pdf(tmp_path / "p.pdf", width=300, text=[
+            "Most students treated recur-", "sion as a first-",
+            "year topic.",
+        ])
+        assert pdf_running_text(pdf) == (
+            "Most students treated recur-sion as a first-year topic."
+        )
+
+    def test_a_hyphen_before_a_line_break_joins_too(self, tmp_path):
+        from unittest.mock import patch
+        with patch("scholar.pdf.extract_pdf_pages",
+                   return_value=["Trans-\r\n  former", "next page"]):
+            assert pdf_running_text(tmp_path / "x.pdf") == (
+                "Trans-former next page"
+            )
+@
+
+Which PDF is the work's, without a request?  An import by DOI is filed
+under the DOI (\cref{sec:pdf-import-key}), and a download by URL under
+that URL.  A download by DOI is filed under the URL the resolver named,
+which follows from the DOI only through the resolver.  Unpaywall's
+answer is cached, so its link can be read back without a request
+([[cached_pdf_link]] in the Unpaywall module) and the PDF it names
+found.  A PDF that Semantic Scholar or the publisher's page named is
+not found this way: their answers are not kept.  The first readable
+file wins; when none is readable, the first that exists is returned, so
+that the caller can say what is wrong with it rather than that there is
+none.
+
+<<quote extraction functions>>=
+def cached_pdf_for(doi: str | None = None,
+                   url: str | None = None) -> Path | None:
+    """The cached PDF of a work, found without any request.
+
+    Looks for a PDF imported for `doi`, one downloaded from the link a
+    cached Unpaywall answer names for it, and one downloaded from
+    `url`. Returns the first readable one, else the first that exists,
+    else None.
+    """
+    from scholar.unpaywall import cached_pdf_link
+
+    candidates = []
+    if doi:
+        candidates += doi_pdf_paths(doi)
+        link = cached_pdf_link(doi)
+        if link:
+            candidates.append(get_cached_pdf_path(link))
+    if url:
+        candidates.append(get_cached_pdf_path(url))
+    existing = [path for path in candidates if path.exists()]
+    for path in existing:
+        if usable_cached_pdf(path, warn=False):
+            return path
+    return existing[0] if existing else None
+@
+
+Let's check each source and the preference for a readable file, on
+real PDFs in a cache directory of the test's own:
+
+<<test functions>>=
+class TestCachedPdfFor:
+    """`cached_pdf_for` finds a work's PDF by DOI, Unpaywall link or URL."""
+
+    def test_each_source(self, tmp_path, monkeypatch):
+        from scholar import unpaywall
+        monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path))
+        assert cached_pdf_for("10.5555/none", "https://x.example/n") is None
+        imported = make_pdf(get_cached_doi_pdf_path("10.5555/a"))
+        assert cached_pdf_for("10.5555/A") == imported
+        link = "https://oa.example/b.pdf"
+        monkeypatch.setitem(unpaywall._client._cache, ("oa", "10.5555/b"),
+                            {"pdf_url": link})
+        linked = make_pdf(get_cached_pdf_path(link))
+        assert cached_pdf_for("10.5555/b") == linked
+        by_url = make_pdf(get_cached_pdf_path("https://x.example/c"))
+        assert cached_pdf_for(None, "https://x.example/c") == by_url
+
+    def test_a_readable_file_wins(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path))
+        broken = get_cached_doi_pdf_path("10.5555/d")
+        broken.write_bytes(b"%PDF-1.4 truncated")
+        assert cached_pdf_for("10.5555/d") == broken
+        url = "https://x.example/d"
+        readable = make_pdf(get_cached_pdf_path(url))
+        assert cached_pdf_for("10.5555/d", url) == readable
 @
 
 \subsection{Lexical ranking}
