@@ -18,7 +18,12 @@ notes`:
   and the other entries are imported, exit 1 at the end.
 - `scholar prov export refs.bib` writes a paper's stored block(s) back above
   its entry; personal prose is never emitted. Prints to stdout (count on
-  stderr) by default; `--in-place/-i` overwrites the file.
+  stderr) by default; `--in-place/-i` overwrites the file. A block
+  import refuses (`ProvEntry.repeated`) is kept byte for byte among the
+  kept comment lines (`_kept_comment_lines(lines, refused)`, above the
+  regenerated blocks; before, export deleted it), with one stderr line
+  per block "FILE: KEY (line L, block B): NAME is given more than once;
+  the block is kept as written, not exported"; exit status unchanged.
 
 A note is parsed into ordered segments — `personal` (verbatim) or `prov`
 (a parsed block) — by `_split_note_segments`. Entries are keyed by
