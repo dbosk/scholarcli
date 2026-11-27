@@ -542,6 +542,9 @@ def place(layouts, labels, sources, toc):
     grown = [key for key in dict.fromkeys(k for found in lists for k in found)
              if len({len(found[key][1]) if key in found else 0
                      for found in lists}) > 1]
+    cut_off = {key for key in grown
+               if any(key in found and found[key][1].stop == len(text)
+                      for found, text in zip(lists, pages))}
     in_grown = {(variant, index) for variant, found in enumerate(lists)
                 for key in grown if key in found
                 for index in found[key][1]}
@@ -568,7 +571,8 @@ def place(layouts, labels, sources, toc):
             f"{counted(len(found[key][1]) if key in found else 0)} in "
             f"{named_states(numbers)}"
             for numbers, found in zip(variants, lists))
-        lines.append(f'    "{cut(first)}": {lengths}')
+        lines.append(f'    "{cut(first)}": {lengths}'
+                     + " (cut by the page break)" * (key in cut_off))
     changes = [(variant, line) for variant, own, line in changes
                if (variant, own) not in in_grown]
     if changes:
