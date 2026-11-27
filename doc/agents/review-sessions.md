@@ -195,8 +195,8 @@ warns on stderr and records the decision. Shown in `sessions show`
 the three fields, `null` when unset), the per-decision CSV (three
 columns after the classifier's, before the human record's;
 `paper_id` stays last) and the report (one English sentence after
-the summary, `agent_reasons_sentence`: agent and agent_reviewed
-decisions with/without a reason). An older Scholar loads such files
+the summary: since #349 `decision_reasons_sentence`, see "One trace"
+below). An older Scholar loads such files
 and drops the fields on its next save (checked with the installed
 pre-#249 pipx build).
 
@@ -232,8 +232,10 @@ confidence dropped with one note; llm: `llm_model` =
 time, prompt version and truncation left None (the report's sentence
 now says "for k of them the prompt was not recorded" for decisions with
 a model and no version; `sessions show` shows no model for any
-classifier decision, as before); llm rows store no batch id (it is an
-agent field). With `--sheet`, `whole_sheet` makes a missing sheet row a
+classifier decision, as before); since #349 each source stores the
+row's batch (`agent_batch`, `human_batch` via `record_human_decision(
+batch=)`, `llm_batch`) and the old "batch ids given here are not
+stored" note is gone. With `--sheet`, `whole_sheet` makes a missing sheet row a
 gap: "A verdicts file answers its whole sheet ..." instead of "Missing
 rows are fine", counted in `unanswered` (shared with `screen`, which
 sets `whole_sheet = False`) and refused by `--strict`; rows given twice
@@ -241,3 +243,48 @@ with the same verdict (`twice`, per paper) are listed and refused by
 `--strict` with or without a sheet (reasons files unchanged). Summary
 "Marked 6 kept, 4 discarded by agent N in session 'x'" (dry run "Would
 mark ...; nothing written.").
+**Confirming by a file row (#349, cli.nw `TestConfirmingByAFileRow`).**
+A human's row on an unreviewed agent/llm decision goes through
+`mark_as_reviewed` like a human `--keep/--discard`: same status →
+source `agent_reviewed`/`llm_reviewed`, the machine's trace (reason,
+by, time, `llm_confidence`, batch) kept, `is_example` False, human
+record written (row reason as `human_reason` if given, row batch as
+`human_batch`); other status → `is_example` True. Tags follow
+`tags_after_decision`: the row's tags are appended, the old category
+dropped only when the row names one (so a same-category row moves the
+category behind the old themes: `[supports-claim, loops]` + row
+`supports-claim,recursion` → `[loops, supports-claim, recursion]`),
+and a row that changes only the category still counts as a
+confirmation (`machine_review_rows` follows `is_example`). Stated in
+the `--verdicts-file` help and docstring; behaviour unchanged since
+#347.
+
+**One trace (#349, review.nw `sec:decision-trace`).**
+`review.decision_trace(d)` → `DecisionTrace(source, decider, machine,
+confirmed, parts)` of `TracePart(kind, name, reason, at, confidence,
+batch)` (kinds agent/llm/human; stored field names unchanged). Decider
+by source alone (not status): `REVIEWED_BY_A_HUMAN` → human part,
+unreviewed known → the machine part (`MACHINE_OF_SOURCE`), unknown
+source → None; `machine` = the source's machine also when reviewed;
+`llm_confidence` only on that machine's part (a human part never has a
+confidence); `confirmed` = reviewed source, decided, `is_example`
+False; `parts` = every kind with any field set plus decider/machine
+(an earlier classifier call under an agent's `--keep-trace` is a part,
+not the machine). `.reason` = decider's words, else (confirmed) the
+machine's; `.batches` = distinct part batches. Used by
+`verdict_screener`, `stored_batch_check`, `sessions reset --batch`
+and the reason count. **Decided without a reason** (author's rule):
+reason = `reason_tags(tags)` (not `AUDIT_CATEGORIES`, not a key of
+`AUDIT_STRINGS["en"]["notes"]`) or words. `decision_reason_counts` →
+per source (order of `decision_source_counts`, decided only)
+`ReasonCount(decided, in_words, tags_only, neither)`. `sessions show`
+line "Reasons of the decisions: human (13): 0 in words, 11 tags only, 2
+without a reason; ..." (before the quote "Reasons:" line) and JSON
+`decision_reasons` {source: {decided, in_words, tags_only,
+without_reason}}; both left out (`shows_decision_reasons`) when no
+decision has words and none lacks a reason (all tags only). Report:
+`decision_reasons_sentence` ("Of the N decisions, a give a reason in
+words, b give only tags (themes or motivations) and c were decided
+without a reason (by source, in that order: human 0, 1 and 0 of 1;
+..."); with no words anywhere it returns the old
+`agent_reasons_sentence` (or ""), so such reports are unchanged.
