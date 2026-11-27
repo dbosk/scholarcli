@@ -85,8 +85,11 @@ no request except `--metadata`'s Crossref lookups. Reading
 blocks, `ID`) joined with bibtexparser (entry fields whole,
 LaTeX-decoded) on the 0-based start line (`ProvEntry.entry_start` ==
 `Block.start_line`, equal by construction since #355; the command
-parses each file once and passes the library to `stray_prov_blocks`
-first, then `read_prov_bib`, which decodes entries in place); DOI
+parses each file once (`_prov_bib_library`) and runs the line reader
+once (`_parse_bib_entries`), passing both to `stray_prov_blocks`
+first, then `read_prov_bib`, which decodes entries in place;
+`TestProvCheckReadsOnce` counts; `_bib_entry_type(lines, i)` takes the
+lines split once, as splitting per block made 2000 entries take 10 s); DOI
 and URL from the undecoded entry, read BEFORE `transform_entry`, which
 mutates its argument (DOI via `read_bibtex_verbatim`, URL as written).
 A `DuplicateBlockKeyBlock` (checked from `ignore_error_block`) and a
